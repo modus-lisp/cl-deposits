@@ -29,7 +29,17 @@ cld_pubkey(){ cld_ctl "$1" "(:info)" | sed -E 's/.*:PUBKEY "([0-9a-f]+)".*/\1/';
 # field extraction from an s-expression reply: sx REPLY :KEY  -> value token (strings unquoted)
 sx() { printf '%s' "$1" | grep -oiE "$2 (\"[^\"]*\"|[^ )]+)" | head -1 | sed -E "s/^$2 //; s/^\"//; s/\"$//"; }
 
-relay_running() { pgrep -f "relay.py" >/dev/null; }
+ESPLORA_PORT="${ESPLORA_PORT:-3002}"
+ESPLORA_URL="http://127.0.0.1:$ESPLORA_PORT"
+esplora_running() { pgrep -f "esplora[.]py" >/dev/null; }
+start_esplora() {   # Esplora-compatible API over our bitcoind, for the reference node's wallet
+  esplora_running && return 0
+  mkdir -p "$CLD_ROOT"
+  ESPLORA_BITCOIN_CLI="$BCLI" ESPLORA_PORT=$ESPLORA_PORT setsid nohup python3 "$CLD_SRC/devnet/esplora.py" >"$CLD_ROOT/esplora.log" 2>&1 &
+  for i in $(seq 1 120); do curl -sf "$ESPLORA_URL/blocks/tip/height" >/dev/null 2>&1 && return 0; sleep 1; done
+  echo "esplora shim did not come up" >&2; return 1
+}
+relay_running() { pgrep -f "relay[.]py" >/dev/null; }
 start_relay() {
   relay_running && return 0
   mkdir -p "$CLD_ROOT"

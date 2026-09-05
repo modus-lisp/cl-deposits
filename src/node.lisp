@@ -66,7 +66,8 @@
   (member-ledger-hex nil))                     ; our own ledger used for QuorumJoin / member_ledger_hash
 
 (defun log! (node fmt &rest args)
-  (push (apply #'format nil fmt args) (node-log node)))
+  ;; One line per entry: the control socket is line-oriented.
+  (push (substitute #\Space #\Newline (apply #'format nil fmt args)) (node-log node)))
 
 (defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln relays)
   (let* ((priv (w:even-y-privkey priv))
@@ -415,7 +416,7 @@
               (accept-update node rec u)))
           (unless (equalp (lg:ledger-operator-key (record-ledger rec)) operator) (fail "history is not this operator's"))
           (setf (gethash their-id (node-ledgers node)) rec)
-          (let* ((until (w:jget params "membership_until"))
+          (let* ((until (let ((u (w:jget params "membership_until"))) (if (integerp u) u (+ (height node) 4320))))
                  (consent (schnorr:schnorr-sign (node-priv node)
                                                 (sha256 (cat (ascii->bytes "COLLATERAL_CONSENT") operator (ascii->bytes their-id)))
                                                 (random-aux)))
@@ -458,7 +459,7 @@
                  (let ((v (w:jget params "min_fee_bps"))) (and v (cons 10 (int->be v 2))))
                  (let ((v (w:jget params "min_fee_fixed"))) (and v (cons 11 (int->be v 8))))
                  (let ((v (w:jget params "max_fee_period"))) (and v (cons 12 (int->be v 4))))
-                 (and until (cons 13 (int->be until 4)))))))
+                 (and (integerp until) (cons 13 (int->be until 4)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Inbound: wallet requests (we are the operator)

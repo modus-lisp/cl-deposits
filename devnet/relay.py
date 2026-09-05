@@ -50,6 +50,12 @@ def load():
                 except Exception: pass
     print(f"relay: {len(events)} stored events", flush=True)
 
+async def deliver(ws, text):
+    try:
+        await asyncio.wait_for(ws.send(text), timeout=1.0)
+    except Exception:
+        subs.pop(ws, None)
+
 async def handler(ws):
     subs[ws] = {}
     try:
@@ -61,11 +67,14 @@ async def handler(ws):
                 ev = msg[1]
                 store(ev)
                 await ws.send(json.dumps(["OK", ev["id"], True, ""]))
+                # Fan out concurrently with a per-send timeout: one dead socket
+                # (a restarted daemon) must not delay delivery to the others.
+                sends = []
                 for other, ss in list(subs.items()):
                     for sid, filters in ss.items():
                         if any(matches(f, ev) for f in filters):
-                            try: await other.send(json.dumps(["EVENT", sid, ev]))
-                            except Exception: pass
+                            sends.append(deliver(other, json.dumps(["EVENT", sid, ev])))
+                if sends: await asyncio.gather(*sends, return_exceptions=True)
             elif msg[0] == "REQ" and len(msg) >= 3:
                 sid, filters = msg[1], msg[2:]
                 subs[ws][sid] = filters
@@ -83,7 +92,8 @@ async def handler(ws):
 
 async def main():
     load()
-    async with websockets.serve(handler, "127.0.0.1", PORT, max_size=4 * 1024 * 1024):
+    async with websockets.serve(handler, "127.0.0.1", PORT, max_size=4 * 1024 * 1024,
+                                ping_interval=10, ping_timeout=10):
         print(f"relay: ws://127.0.0.1:{PORT}", flush=True)
         await asyncio.Future()
 
