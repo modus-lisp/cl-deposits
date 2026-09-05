@@ -12,19 +12,21 @@ expect() { local reply=$1; case "$reply" in *":STATUS :OK"*) echo "   $reply";; 
 
 step "1  nodes"
 for n in $(cld_names); do cld_running "$n" || fail "$n not running (devnet/up.sh)"; done
-P1=$(cld_pubkey cld1); P2=$(cld_pubkey cld2); P3=$(cld_pubkey cld3)
-echo "   cld1 $P1"; echo "   cld2 $P2"; echo "   cld3 $P3"
+P1=$(cld_pubkey cld1); P2=$(cld_pubkey cld2); P3=$(cld_pubkey cld3); P4=$(cld_pubkey cld4)
+echo "   cld1 $P1"; echo "   cld2 $P2"; echo "   cld3 $P3"; echo "   cld4 $P4"
 
 step "2  each node opens its own ledger"
 L1=$(sx "$(cld_ctl cld1 "(:open-ledger :reserves-id \"genesis:cld1:$RANDOM\" :reserves-msat 20000000000 :collateral-msat 30000000000)")" ":LEDGER")
 L2=$(sx "$(cld_ctl cld2 "(:open-ledger :reserves-id \"genesis:cld2:$RANDOM\")")" ":LEDGER")
 L3=$(sx "$(cld_ctl cld3 "(:open-ledger :reserves-id \"genesis:cld3:$RANDOM\")")" ":LEDGER")
-[ -n "$L1" ] && [ -n "$L2" ] && [ -n "$L3" ] || fail "ledger open"
+L4=$(sx "$(cld_ctl cld4 "(:open-ledger :reserves-id \"genesis:cld4:$RANDOM\")")" ":LEDGER")
+[ -n "$L1" ] && [ -n "$L2" ] && [ -n "$L3" ] && [ -n "$L4" ] || fail "ledger open"
 echo "   cld1 ledger $L1"
 
-step "3  cld2 and cld3 join cld1's quorum (consent handshake over the relay)"
+step "3  cld2, cld3 and cld4 join cld1's quorum (consent handshake over the relay)"
 expect "$(cld_ctl cld1 "(:add-member :ledger \"$L1\" :member \"$P2\" :member-ledger \"$L2\")")"
 expect "$(cld_ctl cld1 "(:add-member :ledger \"$L1\" :member \"$P3\" :member-ledger \"$L3\")")"
+expect "$(cld_ctl cld1 "(:add-member :ledger \"$L1\" :member \"$P4\" :member-ledger \"$L4\")")"
 R2=$(cld_ctl cld2 "(:info)"); [[ "$R2" == *"$L1"* ]] || fail "cld2 does not replicate $L1"
 echo "   cld2 replicates cld1's ledger"
 
@@ -37,7 +39,7 @@ mine 3   # the reference requires 3 confirmations on signet
 VOUT=$(bcli getrawtransaction "$TXID" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$ADDR'][0])")
 echo "   funded $ADDR in $TXID:$VOUT"
 
-step "5  QuorumBegin — cosigners verify the outpoint against bitcoind"
+step "5  QuorumBegin (Q=3) — cosigners verify the outpoint against bitcoind"
 expect "$(cld_ctl cld1 "(:begin-quorum :ledger \"$L1\" :txid \"$TXID\" :vout $VOUT :sats 20000000 :collateral-sats 30000000)")"
 INFO=$(cld_ctl cld1 "(:info)"); [[ "$INFO" == *":QUORUM :ACTIVE"* ]] || fail "quorum not active: $INFO"
 
@@ -61,9 +63,9 @@ B1=$("$CLD_SRC/devnet/cld-wallet.sh" w1 "$L1" balance "$W1"); B2=$("$CLD_SRC/dev
 echo "   w1 $B1"; echo "   w2 $B2"
 
 step "9  replicas agree"
-T1=$(sx "$(cld_ctl cld1 "(:tip :ledger \"$L1\")")" ":TIP"); T2=$(sx "$(cld_ctl cld2 "(:tip :ledger \"$L1\")")" ":TIP"); T3=$(sx "$(cld_ctl cld3 "(:tip :ledger \"$L1\")")" ":TIP")
-[ "$T1" = "$T2" ] && [ "$T1" = "$T3" ] || fail "tips differ: $T1 $T2 $T3"
-echo "   tip $T1 on all three nodes"
+T1=$(sx "$(cld_ctl cld1 "(:tip :ledger \"$L1\")")" ":TIP"); T2=$(sx "$(cld_ctl cld2 "(:tip :ledger \"$L1\")")" ":TIP"); T3=$(sx "$(cld_ctl cld3 "(:tip :ledger \"$L1\")")" ":TIP"); T4=$(sx "$(cld_ctl cld4 "(:tip :ledger \"$L1\")")" ":TIP")
+[ "$T1" = "$T2" ] && [ "$T1" = "$T3" ] && [ "$T1" = "$T4" ] || fail "tips differ: $T1 $T2 $T3 $T4"
+echo "   tip $T1 on all four nodes"
 step "10 Lightning rail: w1 receives 100000 msat over Lightning (cosigned attestation, InvoiceCredit)"
 INV=$("$CLD_SRC/devnet/cld-wallet.sh" w1 "$L1" invoice "$W1" 100000 "deposit top-up"); echo "   $INV"
 BOLT11=$(sx "$INV" ":BOLT11"); [ -n "$BOLT11" ] || fail "no invoice"

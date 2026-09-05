@@ -15,7 +15,7 @@ bcli() { $BCLI "$@"; }
 wcli() { $BCLI -rpcwallet="$MINER_WALLET" "$@"; }
 mine() { "$SIGNET_ROOT/mine.sh" "${1:-1}" >/dev/null; }
 
-CLD_NODES=("cld1:10041" "cld2:10042" "cld3:10043")     # name:control-port
+CLD_NODES=("cld1:10041" "cld2:10042" "cld3:10043" "cld4:10044")     # name:control-port; cld1 operates, the rest cosign (Q=3)
 CLD_LN_NODE="${CLD_LN_NODE:-clp3}"                       # cld1's Lightning node (a cl-payments daemon)
 CLD_LN_CONTROL="127.0.0.1:$(( 9930 + ${CLD_LN_NODE#clp} + 100 ))"
 ln_cli() { "$SIGNET_ROOT/bin/lightning-cli" --lightning-dir="$SIGNET_ROOT/$1" "${@:2}"; }   # CLN nodes only

@@ -23,7 +23,7 @@
            #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay))
+           #:majority-threshold #:+valid-quorum-sizes+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay))
 (in-package #:cl-deposits.ledger)
 
 (define-condition ledger-error (error)
@@ -32,6 +32,9 @@
   (:report (lambda (c s) (format s "ledger: ~a~@[ (~a)~]" (ledger-error-kind c) (detail c)))))
 
 (defun fail (kind &optional detail) (error 'ledger-error :kind kind :detail detail))
+
+(defparameter +valid-quorum-sizes+ '(3 5 7)
+  "DEP-03 §Pre-release policy cap: odd for clean majorities, >= 3 for redundancy, <= 7.")
 
 (defstruct deposit
   id descriptor (balance 0) (locked-balance 0)
@@ -105,6 +108,9 @@
        (let* ((declared (f :quorum-members))
               (promoted (remove-if-not (lambda (m) (member (member-pubkey m) declared :test #'equalp))
                                        (ledger-next-quorum-members ledger))))
+         ;; DEP-03 pre-release size policy, enforced by every validator.
+         (unless (member (length declared) +valid-quorum-sizes+)
+           (fail :quorum-size-invalid (format nil "Q=~a not in ~a" (length declared) +valid-quorum-sizes+)))
          (setf (ledger-next-quorum-members ledger) '()
                (ledger-reserves-key ledger) (f :reserves-id)
                (ledger-reserves-amount ledger) (f :amount)

@@ -43,7 +43,12 @@
       (check-equal "ledger quorum active with 3 members"
                    (list (lg:ledger-quorum-state (nd:record-ledger la)) (length (lg:ledger-quorum-members (nd:record-ledger la))))
                    '(:active 3))
-      (check-bytes "reserves commit to the pre-QuorumBegin chain hash" (rs:reserves-ledger-hash reserves) (up:update-prev-hash qb)))
+      (check-bytes "reserves commit to the pre-QuorumBegin chain hash" (rs:reserves-ledger-hash reserves) (up:update-prev-hash qb))
+      (check-signals "a Q=2 QuorumBegin is refused by the fold" lg:ledger-error
+        (lg:apply-operation (lg:make-ledger)
+                            (list :type :quorum-begin :reserves-id "x" :spending-txid (u:sha256 (hx "01")) :new-outpoint-txid (u:sha256 (hx "01"))
+                                  :new-outpoint-vout 0 :amount 1 :quorum-expiry 1 :ledger-hash (u:sha256 (hx "02"))
+                                  :quorum-members (list (nd:node-pubkey b) (nd:node-pubkey c)) :collateral-amount 0))))
     ;; Deposits and a transfer.
     (let* ((w1 (nd:make-wallet :priv 55555555555555555555 :bus bus))
            (w2 (nd:make-wallet :priv 66666666666666666666 :bus bus))

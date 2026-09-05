@@ -2,7 +2,7 @@
 
 Runs on the private signet at `/mnt/lisp/signet` (bitcoind + miner wallet must be up).
 
-    devnet/up.sh        # relay (devnet/relay.py, ws://127.0.0.1:7777) + cld1..cld3
+    devnet/up.sh        # relay (devnet/relay.py, ws://127.0.0.1:7777) + cld1..cld4 (cld1 operates; cld2–4 cosign, Q=3)
     devnet/smoke.sh     # quorum formation, on-chain funded QuorumBegin, deposits, transfer
     devnet/status.sh
     devnet/cld-ctl.sh cld1 '(:info)'
