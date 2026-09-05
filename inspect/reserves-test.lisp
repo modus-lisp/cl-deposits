@@ -21,6 +21,10 @@
                                :ledger-hash (op:field o :ledger-hash) :quorum-expiry (op:field o :quorum-expiry)
                                :ruleset (op:field o :protocol-version) :network :mainnet)))
     (check-equal "ruleset pinned in QuorumBegin" (op:field o :protocol-version) "cltv-offset-v2")
+    ;; Wire txids are internal byte order: reversed, this is a confirmed mainnet tx (block 953680).
+    (check-equal "new_outpoint_txid reversed is the real mainnet txid"
+                 (u:txid-hex (op:field o :new-outpoint-txid))
+                 "6559ff37371d0933594129a93f6baa5d219a3b9d50c08b34b3e914a3f21a0f0b")
     (check-bytes "QuorumBegin.ledger_hash is the predecessor's chain_hash"
                  (op:field o :ledger-hash) (up:update-prev-hash qb))
     (check-equal "4 voters (operator + 3 members), 4 tiers" (list (length (rs:reserves-voters r)) (length (rs:reserves-tiers r))) '(4 4))

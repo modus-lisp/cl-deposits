@@ -434,7 +434,7 @@
   "DEP-03: a cosigner verifies the QuorumBegin outpoint against its own chain
    view — exists, unspent, value = (reserves + collateral)/1000 sats, confirmed."
   (when (node-chain-fn node)
-    (let* ((info (funcall (node-chain-fn node) (op:field o :new-outpoint-txid) (op:field o :new-outpoint-vout)))
+    (let* ((info (funcall (node-chain-fn node) (op:field o :new-outpoint-txid) (op:field o :new-outpoint-vout)))   ; internal-order bytes
            (want (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000)))
       (unless info (fail "reserves outpoint not found or spent"))
       (unless (= (getf info :value-sats) want) (fail "reserves outpoint value ~a != ~a" (getf info :value-sats) want))

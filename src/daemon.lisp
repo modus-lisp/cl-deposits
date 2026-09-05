@@ -55,7 +55,7 @@
         (:begin-quorum
          (let ((rec (rec! node form)))
            (multiple-value-bind (u r)
-               (nd:begin-quorum node rec :funding-txid (hex->bytes (arg form :txid)) :funding-vout (arg form :vout 0)
+               (nd:begin-quorum node rec :funding-txid (txid-bytes (arg form :txid)) :funding-vout (arg form :vout 0)
                                 :amount-msats (* 1000 (arg form :sats)) :collateral-msats (* 1000 (arg form :collateral-sats 0)))
              (ok :seq (up:update-seq u) :cosigs (length (up:update-cosignatures u)) :address (rs:reserves-address r)))))
         (:deposit-open
@@ -65,7 +65,7 @@
         (:credit
          (let ((rec (rec! node form)))
            (nd:credit-onchain node rec (hex->bytes (arg form :deposit)) (arg form :msat)
-                              :txid (hex->bytes (arg form :txid)) :vout (arg form :vout 0))
+                              :txid (txid-bytes (arg form :txid)) :vout (arg form :vout 0))
            (ok :seq (lg:ledger-sequence (nd:record-ledger rec)))))
         (:balance
          (let ((d (lg:find-deposit (nd:record-ledger (rec! node form)) (hex->bytes (arg form :deposit)))))
@@ -136,7 +136,7 @@
 (defun bitcoin-cli-chain-fn (cli)
   "gettxout -> (:value-sats n :confirmations n), or NIL when spent/unknown."
   (lambda (txid vout)
-    (let ((out (run-cli cli "gettxout" (bytes->hex txid) (princ-to-string vout))))
+    (let ((out (run-cli cli "gettxout" (txid-hex txid) (princ-to-string vout))))   ; wire bytes -> display hex
       (when (and (plusp (length out)) (char= (char out 0) #\{))
         (let ((j (jzon:parse out)))
           (list :value-sats (round (* (gethash "value" j) 100000000))

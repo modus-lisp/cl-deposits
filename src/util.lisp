@@ -4,7 +4,7 @@
   (:use #:cl)
   (:export #:octets #:cat #:hex->bytes #:bytes->hex #:sha256 #:tagged-hash
            #:be->int #:le->int #:int->be #:int->le #:bytes< #:zero-bytes-p
-           #:ascii->bytes #:bytes->ascii #:base64-decode #:base64-encode))
+           #:ascii->bytes #:bytes->ascii #:base64-decode #:base64-encode #:txid-bytes #:txid-hex))
 (in-package #:cl-deposits.util)
 
 (deftype octets () '(simple-array (unsigned-byte 8) (*)))
@@ -99,3 +99,10 @@
                (write-char (char +b64+ (ldb (byte 6 12) v)) s)
                (write-char (if (> n 1) (char +b64+ (ldb (byte 6 6) v)) #\=) s)
                (write-char (if (> n 2) (char +b64+ (ldb (byte 6 0) v)) #\=) s)))))
+
+;;; Transaction ids on the wire are in INTERNAL byte order (what rust-bitcoin's
+;;; Txid::as_ref() yields); the hex people read is the reverse.  The fixture's
+;;; QuorumBegin proves it: its new_outpoint_txid, reversed, is a confirmed
+;;; mainnet transaction.
+(defun txid-bytes (display-hex) (reverse (hex->bytes display-hex)))
+(defun txid-hex (bytes) (bytes->hex (reverse bytes)))

@@ -33,7 +33,7 @@ PREP=$(cld_ctl cld1 "(:prepare-quorum :ledger \"$L1\" :expiry-blocks 4320)"); ex
 ADDR=$(sx "$PREP" ":ADDRESS")
 SATS=50000000   # 0.5 BTC = 0.2 reserves + 0.3 collateral
 TXID=$(wcli sendtoaddress "$ADDR" 0.5)
-mine 1
+mine 3   # the reference requires 3 confirmations on signet
 VOUT=$(bcli getrawtransaction "$TXID" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$ADDR'][0])")
 echo "   funded $ADDR in $TXID:$VOUT"
 
