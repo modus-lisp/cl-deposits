@@ -96,4 +96,3 @@
     (let ((back (up:decode-update (up:encode-update u))))
       (check-bytes "round trip preserves chain hash" (up:chain-hash back) (up:chain-hash u)))))
 
-(report)

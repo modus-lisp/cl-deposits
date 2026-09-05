@@ -17,4 +17,6 @@
     ((:file "util")    ; bytes, hex, integers, sha256, tagged hashes
      (:file "tlv")     ; DEP-02: BigSize TLV streams, canonical ordering
      (:file "update")  ; DEP-02: SignedLedgerUpdate, hash chain, signatures
+     (:file "operation") ; DEP-02: the 27 ledger operations, typed
+     (:file "ledger")  ; DEP-05: the state machine — balances, quorum, locks
      ))))

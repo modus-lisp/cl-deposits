@@ -7,7 +7,7 @@ Verified means: checked against the reference implementation's artefacts
 |---|---|---|
 | 0 | Repo, deps (cl-consensus, secp256k1-fast, cl-nostr), harness, CI | done |
 | 1 | DEP-02 core: TLV, SignedLedgerUpdate, hash chain, cosign + operator digests (v1 and legacy), Schnorr verify/sign | done — 372-update fixture replays, all signatures verify |
-| 2 | Operations: typed decode/encode of all 27 discriminants, fee structures; ledger state machine (DEP-05) replaying the fixture to its balances | next |
+| 2 | Operations: typed decode/encode of all 27 discriminants, fee structures; ledger state machine (DEP-05) | done — fixture chain replays; ledger_id, deposit_id and cosign-majority rules cross-checked |
 | 3 | DEP-17 canonical encodings + DEP-16 descriptor evaluator (deposit authorization, fraud-proof replay) | |
 | 4 | DEP-03 on-chain: NUMS key, tiered tapscript reserves, rotation tx + OP_RETURN anchor, QuorumBegin chain checks — built and spent with cl-consensus | |
 | 5 | Nostr transport (DEP-04): kinds 9100/39100/20101/20102 over cl-nostr; local relay for the devnet | |
