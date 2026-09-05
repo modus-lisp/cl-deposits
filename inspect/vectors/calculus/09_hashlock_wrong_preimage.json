@@ -1,0 +1,10 @@
+{
+  "name": "09_hashlock_wrong_preimage",
+  "description": "`hashlock(H)` with bytes filed under H that do NOT hash to H. The evaluator re-hashes the witness entry rather than trusting the map key. Verdict: false.",
+  "descriptor_text": "wsh(hashlock(<sha256>))",
+  "descriptor_hex": "010000000009000400020007e4853d1acd940645f51836ecb2c9bfcf8d752b66b5456bb2649dd7e195c803",
+  "operation_hex": "010000000000000000000000000000000000000000000000000000000000000000000000057370656e64000000000000000000000000ffffffff",
+  "snapshot_hex": "0100000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "witness_hex": "0100000000000000010007e4853d1acd940645f51836ecb2c9bfcf8d752b66b5456bb2649dd7e195c8030000000e6e6f74207468652073656372657400000000",
+  "expected_verdict": false
+}

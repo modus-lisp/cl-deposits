@@ -99,4 +99,3 @@
               (unless ok (push (format nil "seq ~a quorum-begin: ~a" (up:update-seq x) why) violations))))))
       (check-equal "post-QuorumBegin updates carry a member majority" (reverse violations) '()))))
 
-(report)

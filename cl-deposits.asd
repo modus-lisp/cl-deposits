@@ -19,4 +19,5 @@
      (:file "update")  ; DEP-02: SignedLedgerUpdate, hash chain, signatures
      (:file "operation") ; DEP-02: the 27 ledger operations, typed
      (:file "ledger")  ; DEP-05: the state machine — balances, quorum, locks
+     (:file "dep17")   ; DEP-17: canonical operation encoding, depositor signatures
      ))))

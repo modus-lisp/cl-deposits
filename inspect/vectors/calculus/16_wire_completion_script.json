@@ -1,0 +1,10 @@
+{
+  "name": "16_wire_completion_script",
+  "description": "The deposits wire form: descriptor built by parsing the literal string `sha256(<bare hex>)` — the exact shape every TransferLock.completion_script carries (DEP-09/DEP-13). Exercises the miniscript hashlock-fragment elision and bare-hex digest acceptance. Verdict: true.",
+  "descriptor_text": "sha256(1b6f713e4f26f6571e5197e6b9e04ab510cc18375fadb4259a33fbf475c34bfd)",
+  "descriptor_hex": "01000000000900040002001b6f713e4f26f6571e5197e6b9e04ab510cc18375fadb4259a33fbf475c34bfd",
+  "operation_hex": "010000000000000000000000000000000000000000000000000000000000000000000000107472616e736665725f72656c65617365000000000000000000000000ffffffff",
+  "snapshot_hex": "0100000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "witness_hex": "010000000000000001001b6f713e4f26f6571e5197e6b9e04ab510cc18375fadb4259a33fbf475c34bfd00000010776972652d666f726d2073656372657400000000",
+  "expected_verdict": true
+}
