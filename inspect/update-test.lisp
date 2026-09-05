@@ -96,3 +96,20 @@
     (let ((back (up:decode-update (up:encode-update u))))
       (check-bytes "round trip preserves chain hash" (up:chain-hash back) (up:chain-hash u)))))
 
+
+(with-gate ("signed-update: signatures verify under concurrent threads")
+  ;; A relay reader and a ledger worker verify at the same time in a daemon;
+  ;; secp256k1-fast's scratch buffers must be per-thread for that to be sound.
+  (let* ((sample (subseq (remove-duplicates *updates* :test #'equalp :key #'up:encode-update) 0 40))
+         (failures (make-array 4 :initial-element 0))
+         (threads (loop for i below 4
+                        collect (let ((i i))
+                                  (bt:make-thread
+                                   (lambda ()
+                                     (dotimes (round 3)
+                                       (dolist (x sample)
+                                         (unless (and (up:verify-operator-signature x)
+                                                      (every (lambda (c) (up:verify-cosignature x c)) (up:update-cosignatures x)))
+                                           (incf (aref failures i)))))))))))
+    (mapc #'bt:join-thread threads)
+    (check-equal "4 threads x 3 rounds x 40 updates: no false rejections" (reduce #'+ failures) 0)))

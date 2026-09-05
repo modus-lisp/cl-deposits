@@ -30,7 +30,8 @@
   (:export #:node #:make-node #:node-pubkey #:node-pubkey-hex #:node-ledgers #:node-log
            #:record #:record-ledger #:record-history #:record-owned-p #:record-id-hex #:record-reserves
            #:find-record #:own-ledger
-           #:open-ledger #:append-operation #:add-member #:begin-quorum #:credit-onchain
+           #:open-ledger #:append-operation #:add-member #:prepare-quorum #:begin-quorum #:credit-onchain
+           #:node-chain-fn #:node-min-confs #:node-data-dir #:record-pinned #:height #:tip
            #:node-error #:request #:wallet #:make-wallet #:wallet-pubkey #:wallet-request
            #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer
            #:save-record #:load-record #:*cosign-timeout*))
@@ -45,7 +46,7 @@
 
 (defstruct record
   id-hex ledger (history '()) owned-p reserves
-  (pending-consents (make-hash-table :test #'equal)))   ; member pubkey hex -> terms plist
+  pinned)                                      ; (reserves . expiry) prepared for the next QuorumBegin
 
 (defstruct (node (:constructor %make-node))
   priv pubkey pubkey-hex keypair bus network
@@ -55,20 +56,45 @@
   (height-fn (lambda () 0))
   (log '())
   data-dir
+  (inbox '()) (inbox-lock (bt:make-lock "inbox")) (inbox-cv (bt:make-condition-variable)) (worker nil)
+  (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
+  (min-confs 1)
   (member-ledger-hex nil))                     ; our own ledger used for QuorumJoin / member_ledger_hash
 
 (defun log! (node fmt &rest args)
   (push (apply #'format nil fmt args) (node-log node)))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1))
   (let* ((priv (w:even-y-privkey priv))
          (pub (up:compressed-pubkey priv))
          (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
-                           :height-fn (or height-fn (lambda () 0)) :data-dir data-dir)))
+                           :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
+                           :chain-fn chain-fn :min-confs min-confs)))
+    ;; On a real relay, events arrive on the reader thread.  Responses are
+    ;; consumed inline (they only wake a waiter); requests and updates go to a
+    ;; worker, because handling a request may itself wait for responses.
+    (when (bus:bus-async-p bus)
+      (setf (node-worker node)
+            (bt:make-thread (lambda () (worker-loop node)) :name "cld-worker")))
     (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-update+ w:+kind-request+ w:+kind-response+))
-                       (lambda (event) (handle-event node event)))
+                       (lambda (event)
+                         (if (and (node-worker node) (/= (ev:event-kind event) w:+kind-response+))
+                             (enqueue node event)
+                             (handle-event node event))))
     node))
+
+(defun enqueue (node event)
+  (bt:with-lock-held ((node-inbox-lock node))
+    (setf (node-inbox node) (append (node-inbox node) (list event)))
+    (bt:condition-notify (node-inbox-cv node))))
+
+(defun worker-loop (node)
+  (loop
+    (let ((event (bt:with-lock-held ((node-inbox-lock node))
+                   (loop until (node-inbox node) do (bt:condition-wait (node-inbox-cv node) (node-inbox-lock node)))
+                   (pop (node-inbox node)))))
+      (handle-event node event))))
 
 (defun height (node) (funcall (node-height-fn node)))
 (defun find-record (node id-hex) (gethash id-hex (node-ledgers node)))
@@ -211,27 +237,39 @@
 (defun %strip-nil-fields (plist)
   (loop for (k v) on plist by #'cddr when v append (list k v)))
 
+(defun prepare-quorum (node rec &key (ruleset "cltv-offset-v2") (expiry-blocks 4320))
+  "Build (and pin) the reserves output the next QuorumBegin will point at, so
+   it can be funded on chain first.  Returns the reserves."
+  (let* ((staged (lg:ledger-next-quorum-members (record-ledger rec)))
+         (expiry (+ (height node) expiry-blocks))
+         (reserves (rs:build-reserves :operator (node-pubkey node) :members (mapcar #'lg:member-pubkey staged)
+                                      :ledger-hash (up:chain-hash (tip rec)) :quorum-expiry expiry
+                                      :ruleset ruleset :network (intern (string-upcase (node-network node)) :keyword))))
+    (when (null staged) (fail "no staged members"))
+    (setf (record-pinned rec) (cons reserves expiry))
+    reserves))
+
 (defun begin-quorum (node rec &key funding-txid funding-vout amount-msats collateral-msats
                                    (ruleset "cltv-offset-v2") (expiry-blocks 4320) (spending-txid funding-txid))
-  "Promote the staged members: build the new reserves output for them, and
-   chain a QuorumBegin pointing at the on-chain outpoint funding it.  Returns
-   (values update reserves)."
+  "Promote the staged members: chain a QuorumBegin pointing at the on-chain
+   outpoint funding the reserves output prepared by PREPARE-QUORUM (or built
+   now).  Returns (values update reserves)."
   (let* ((ledger (record-ledger rec))
          (staged (lg:ledger-next-quorum-members ledger))
          (members (mapcar #'lg:member-pubkey staged))
-         (expiry (+ (height node) expiry-blocks))
-         (reserves (rs:build-reserves :operator (node-pubkey node) :members members
-                                      :ledger-hash (up:chain-hash (tip rec)) :quorum-expiry expiry
-                                      :ruleset ruleset :network (intern (string-upcase (node-network node)) :keyword)))
-         (op (list :type :quorum-begin :reserves-id (rs:reserves-address reserves)
+         (pinned (or (record-pinned rec) (progn (prepare-quorum node rec :ruleset ruleset :expiry-blocks expiry-blocks)
+                                                 (record-pinned rec))))
+         (reserves (car pinned)) (expiry (cdr pinned)))
+    (unless (equalp (rs:reserves-ledger-hash reserves) (up:chain-hash (tip rec)))
+      (fail "ledger moved since the reserves were prepared; prepare again"))
+    (let* ((op (list :type :quorum-begin :reserves-id (rs:reserves-address reserves)
                    :spending-txid spending-txid :new-outpoint-txid funding-txid :new-outpoint-vout funding-vout
                    :amount amount-msats :quorum-expiry expiry :ledger-hash (up:chain-hash (tip rec))
                    :quorum-members members :collateral-amount collateral-msats
                    :quorum-member-ledger-ids (mapcar #'lg:member-ledger-id staged)
-                   :protocol-version ruleset)))
-    (when (null staged) (fail "no staged members"))
-    (let ((update (append-operation node rec op)))
-      (setf (record-reserves rec) reserves)
+                   :protocol-version ruleset))
+           (update (append-operation node rec op)))
+      (setf (record-reserves rec) reserves (record-pinned rec) nil)
       (values update reserves))))
 
 (defun credit-onchain (node rec deposit-id amount-msats &key txid (vout 0) (funding-address ""))
@@ -327,7 +365,8 @@
                  (multiple-value-bind (required signers tier operator-alone allowed)
                      (lg:cosign-requirement ledger o (height node))
                    (declare (ignore required signers tier operator-alone))
-                   (unless allowed (fail "not cosignable at this height"))))
+                   (unless allowed (fail "not cosignable at this height")))
+                 (when (eq (op:operation-type o) :quorum-begin) (check-reserves-outpoint node o)))
                (let* ((mlh (member-ledger-hash node))
                       (c (up:sign-cosignature candidate (node-priv node) (node-pubkey node) mlh)))
                  (log! node "cosigned ~a seq ~a" (subseq (record-id-hex rec) 0 8) seq)
@@ -374,7 +413,21 @@
                                             "member_response" (base64-encode blob) "member_signature" (bytes->hex blob-sig)))))
       (error (e) (log! node "refused consent: ~a" e) (respond node event nil :error (princ-to-string e))))))
 
-(defun random-aux () (let ((a (make-array 32 :element-type '(unsigned-byte 8)))) (dotimes (i 32 a) (setf (aref a i) (random 256)))))
+(defun check-reserves-outpoint (node o)
+  "DEP-03: a cosigner verifies the QuorumBegin outpoint against its own chain
+   view — exists, unspent, value = (reserves + collateral)/1000 sats, confirmed."
+  (when (node-chain-fn node)
+    (let* ((info (funcall (node-chain-fn node) (op:field o :new-outpoint-txid) (op:field o :new-outpoint-vout)))
+           (want (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000)))
+      (unless info (fail "reserves outpoint not found or spent"))
+      (unless (= (getf info :value-sats) want) (fail "reserves outpoint value ~a != ~a" (getf info :value-sats) want))
+      (unless (>= (getf info :confirmations) (node-min-confs node)) (fail "reserves outpoint has ~a confirmations" (getf info :confirmations))))))
+
+(defun random-aux ()
+  "32 bytes from the OS.  CL's RANDOM is deterministic in a fresh image — three
+   daemons once started with the same key because of it."
+  (with-open-file (in "/dev/urandom" :element-type '(unsigned-byte 8))
+    (let ((a (make-array 32 :element-type '(unsigned-byte 8)))) (read-sequence a in) a)))
 
 (defun member-response-blob (node operator their-id ruleset until params)
   "QuorumMemberResponse TLV (deposits-protocol/src/types/quorum_member_response.rs)."

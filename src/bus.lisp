@@ -6,13 +6,16 @@
   (:use #:cl)
   (:local-nicknames (#:ev #:cl-nostr.event) (#:flt #:cl-nostr.filter))
   (:export #:bus #:bus-publish #:bus-subscribe #:bus-fetch #:mock-bus #:make-mock-bus
-           #:mock-bus-events #:ephemeral-kind-p))
+           #:mock-bus-events #:ephemeral-kind-p #:bus-async-p))
 (in-package #:cl-deposits.bus)
 
 (defclass bus () ())
 (defgeneric bus-publish (bus event))
 (defgeneric bus-subscribe (bus filter fn) (:documentation "FN is called with each matching event."))
 (defgeneric bus-fetch (bus filter) (:documentation "Stored events matching FILTER, oldest first."))
+(defgeneric bus-async-p (bus)
+  (:documentation "T when subscriptions fire on the bus's own threads (so handlers must not block on it).")
+  (:method ((bus bus)) t))
 
 (defun ephemeral-kind-p (kind) (<= 20000 kind 29999))
 
@@ -42,3 +45,5 @@
 (defmethod bus-fetch ((bus mock-bus) filter)
   (bt:with-lock-held ((lock bus))
     (reverse (remove-if-not (lambda (e) (flt:filter-matches-p filter e)) (mock-bus-events bus)))))
+
+(defmethod bus-async-p ((bus mock-bus)) nil)

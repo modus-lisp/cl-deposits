@@ -8,7 +8,7 @@
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("secp256k1-fast" "ironclad" "bordeaux-threads" "cl-consensus" "cl-nostr" "com.inuoe.jzon")
+  :depends-on ("secp256k1-fast" "ironclad" "bordeaux-threads" "cl-consensus" "cl-nostr" "com.inuoe.jzon" "usocket")
   :serial t
   :components
   ((:module "src"
@@ -25,4 +25,6 @@
      (:file "wire")     ; DEP-04: ledger updates, requests, responses, ads as Nostr events
      (:file "bus")      ; where events go: in-process bus (gates), Nostr relays (devnet)
      (:file "node")     ; the node: operator, quorum member, and the wallet side
+     (:file "nostr-bus") ; the bus over cl-nostr relays
+     (:file "daemon")   ; control socket, bitcoin-cli chain view
      ))))

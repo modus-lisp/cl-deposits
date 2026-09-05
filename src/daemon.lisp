@@ -1,0 +1,126 @@
+;;;; src/daemon.lisp — the control socket: one s-expression per line on localhost.
+;;;;
+;;;;   (:info)                                   (:log)
+;;;;   (:open-ledger :reserves-id "s" :reserves-msat N :collateral-msat M)
+;;;;   (:add-member :ledger "hex" :member "pubkey hex" [:membership-blocks N])
+;;;;   (:prepare-quorum :ledger "hex" [:expiry-blocks N] [:ruleset "s"])  -> :address to fund
+;;;;   (:begin-quorum :ledger "hex" :txid "hex" :vout N :sats N :collateral-sats M)
+;;;;   (:deposit-open :ledger "hex" :descriptor "pk(...)")
+;;;;   (:credit :ledger "hex" :deposit "hex" :msat N :txid "hex" [:vout N])
+;;;;   (:balance :ledger "hex" :deposit "hex")
+;;;;   (:tip :ledger "hex")
+;;;;   (:advertise :ledger "hex")
+
+(defpackage #:cl-deposits.daemon
+  (:use #:cl #:cl-deposits.util)
+  (:local-nicknames (#:nd #:cl-deposits.node) (#:lg #:cl-deposits.ledger) (#:up #:cl-deposits.update)
+                    (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
+                    (#:bus #:cl-deposits.bus) (#:jzon #:com.inuoe.jzon))
+  (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli))
+(in-package #:cl-deposits.daemon)
+
+(defun arg (form key &optional default) (getf (cdr form) key default))
+(defun rec! (node form) (or (nd:find-record node (arg form :ledger)) (error "no such ledger")))
+(defun ok (&rest plist) (let ((*print-pretty* nil)) (format nil "~s" (list* :status :ok plist))))
+
+(defun ledger-summary (rec)
+  (let ((l (nd:record-ledger rec)))
+    (list :id (nd:record-id-hex rec) :owned (nd:record-owned-p rec) :seq (lg:ledger-sequence l)
+          :quorum (lg:ledger-quorum-state l) :members (length (lg:ledger-quorum-members l))
+          :staged (length (lg:ledger-next-quorum-members l)) :deposits (hash-table-count (lg:ledger-deposits l))
+          :obligations (lg:total-obligations l) :reserves (lg:ledger-reserves-amount l)
+          :collateral (lg:ledger-collateral-amount l) :reserves-id (lg:ledger-reserves-key l)
+          :expiry (lg:ledger-quorum-expiry l))))
+
+(defun handle-command (node form)
+  (handler-case
+      (ecase (car form)
+        (:info (ok :pubkey (nd:node-pubkey-hex node) :height (nd:height node)
+                   :ledgers (loop for rec being the hash-values of (nd:node-ledgers node) collect (ledger-summary rec))))
+        (:log (ok :log (reverse (nd:node-log node))))
+        (:open-ledger
+         (let ((rec (nd:open-ledger node :reserves-id (arg form :reserves-id) :reserves (arg form :reserves-msat 0)
+                                         :collateral (arg form :collateral-msat 0))))
+           (ok :ledger (nd:record-id-hex rec))))
+        (:add-member
+         (let ((rec (rec! node form)))
+           (nd:add-member node rec (hex->bytes (arg form :member)) :membership-blocks (arg form :membership-blocks 4320))
+           (ok :staged (length (lg:ledger-next-quorum-members (nd:record-ledger rec))))))
+        (:prepare-quorum
+         (let* ((rec (rec! node form))
+                (r (nd:prepare-quorum node rec :expiry-blocks (arg form :expiry-blocks 4320) :ruleset (arg form :ruleset "cltv-offset-v2"))))
+           (ok :address (rs:reserves-address r) :expiry (cdr (nd:record-pinned rec))
+               :ledger-hash (bytes->hex (rs:reserves-ledger-hash r)))))
+        (:begin-quorum
+         (let ((rec (rec! node form)))
+           (multiple-value-bind (u r)
+               (nd:begin-quorum node rec :funding-txid (hex->bytes (arg form :txid)) :funding-vout (arg form :vout 0)
+                                :amount-msats (* 1000 (arg form :sats)) :collateral-msats (* 1000 (arg form :collateral-sats 0)))
+             (ok :seq (up:update-seq u) :cosigs (length (up:update-cosignatures u)) :address (rs:reserves-address r)))))
+        (:deposit-open
+         (let* ((rec (rec! node form)) (d (arg form :descriptor)) (id (op:deposit-id d)))
+           (nd:append-operation node rec (list :type :deposit-open :deposit-id id :descriptor d :receive-requires-sig nil))
+           (ok :deposit (bytes->hex id))))
+        (:credit
+         (let ((rec (rec! node form)))
+           (nd:credit-onchain node rec (hex->bytes (arg form :deposit)) (arg form :msat)
+                              :txid (hex->bytes (arg form :txid)) :vout (arg form :vout 0))
+           (ok :seq (lg:ledger-sequence (nd:record-ledger rec)))))
+        (:balance
+         (let ((d (lg:find-deposit (nd:record-ledger (rec! node form)) (hex->bytes (arg form :deposit)))))
+           (ok :balance (lg:deposit-balance d) :locked (lg:deposit-locked-balance d))))
+        (:tip
+         (let ((rec (rec! node form)))
+           (ok :seq (lg:ledger-sequence (nd:record-ledger rec)) :tip (bytes->hex (lg:ledger-chain-tip (nd:record-ledger rec)))
+               :history (length (nd:record-history rec)))))
+        (:advertise
+         (let* ((rec (rec! node form)) (l (nd:record-ledger rec)))
+           (bus:bus-publish (nd::node-bus node)
+                            (w:advertisement-event (nd::node-keypair node)
+                                                   (w:json-object "ledger_id" (nd:record-id-hex rec)
+                                                                  "operator_pubkey" (nd:node-pubkey-hex node)
+                                                                  "reserves_address" (lg:ledger-reserves-key l)
+                                                                  "reserves_amount_msats" (lg:ledger-reserves-amount l)
+                                                                  "collateral_amount_msats" (lg:ledger-collateral-amount l)
+                                                                  "network" (nd::node-network node))
+                                                   :network (nd::node-network node)))
+           (ok))))
+    (error (e) (let ((*print-pretty* nil)) (format nil "~s" (list :status :error :message (princ-to-string e)))))))
+
+(defun start-control-server (node port)
+  (let ((sock (usocket:socket-listen "127.0.0.1" port :reuse-address t)))
+    (bt:make-thread
+     (lambda ()
+       (loop
+         (let ((client (usocket:socket-accept sock)))
+           (bt:make-thread
+            (lambda ()
+              (handler-case
+                  (let ((stream (usocket:socket-stream client)))
+                    (loop for line = (read-line stream nil nil) while line
+                          do (let* ((form (handler-case (let ((*read-eval* nil)) (read-from-string line)) (error () nil)))
+                                    (reply (if (consp form) (handle-command node form) "(:status :error :message \"unreadable\")")))
+                               (write-line reply stream) (finish-output stream))))
+                (error () nil))
+              (ignore-errors (usocket:socket-close client)))
+            :name "cld-control-client"))))
+     :name "cld-control")
+    port))
+
+;;; bitcoin-cli as the chain view.
+
+(defun run-cli (cli &rest args)
+  (string-trim '(#\Newline #\Space)
+               (uiop:run-program (append (uiop:split-string cli :separator " ") args) :output :string :ignore-error-status t)))
+
+(defun bitcoin-cli-height-fn (cli)
+  (lambda () (or (ignore-errors (parse-integer (run-cli cli "getblockcount"))) 0)))
+
+(defun bitcoin-cli-chain-fn (cli)
+  "gettxout -> (:value-sats n :confirmations n), or NIL when spent/unknown."
+  (lambda (txid vout)
+    (let ((out (run-cli cli "gettxout" (bytes->hex txid) (princ-to-string vout))))
+      (when (and (plusp (length out)) (char= (char out 0) #\{))
+        (let ((j (jzon:parse out)))
+          (list :value-sats (round (* (gethash "value" j) 100000000))
+                :confirmations (gethash "confirmations" j)))))))

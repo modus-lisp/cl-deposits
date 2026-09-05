@@ -1,0 +1,45 @@
+;;;; bin/cl-deposits.lisp — the daemon.
+;;;;   CLD_DIR           data dir: node.key (hex privkey, created if absent), ledger_*.json, cld.pid
+;;;;   CLD_RELAYS        comma-separated relay URLs
+;;;;   CLD_CONTROL_PORT  localhost control socket
+;;;;   CLD_NETWORK       signet | testnet | regtest | mainnet   (default signet)
+;;;;   CLD_BITCOIN_CLI   e.g. "bitcoin-cli -signet -datadir=/x"  (chain height + outpoint checks)
+;;;;   CLD_MIN_CONFS     confirmations a cosigner requires on a QuorumBegin outpoint (default 1)
+(require :asdf)
+(require :sb-posix)
+(handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-deposits"))
+(defun env (name &optional default) (or (uiop:getenv name) default))
+(let* ((dir (uiop:ensure-directory-pathname (or (env "CLD_DIR") (error "set CLD_DIR"))))
+       (keyfile (merge-pathnames "node.key" dir)))
+  (ensure-directories-exist dir)
+  (unless (probe-file keyfile)
+    (with-open-file (s keyfile :direction :output)
+      (format s "~a~%" (cl-deposits.util:bytes->hex (cl-deposits.node::random-aux)))))
+  (let* ((priv (cl-deposits.util:be->int (cl-deposits.util:hex->bytes
+                                          (string-trim '(#\Newline #\Space) (uiop:read-file-string keyfile)))))
+         (relays (uiop:split-string (env "CLD_RELAYS" "ws://127.0.0.1:7777") :separator ","))
+         (bus (cl-deposits.nostr-bus:make-nostr-bus relays))
+         (cli (env "CLD_BITCOIN_CLI"))
+         (node (cl-deposits.node:make-node
+                :priv priv :bus bus :network (env "CLD_NETWORK" "signet") :data-dir dir
+                :height-fn (and cli (cl-deposits.daemon:bitcoin-cli-height-fn cli))
+                :chain-fn (and cli (cl-deposits.daemon:bitcoin-cli-chain-fn cli))
+                :min-confs (parse-integer (env "CLD_MIN_CONFS" "1")))))
+    (with-open-file (s (merge-pathnames "cld.pid" dir) :direction :output :if-exists :supersede)
+      (format s "~d~%" (sb-posix:getpid)))
+    ;; Reload what we knew: our ledgers, and the ones we cosign.
+    (dolist (f (directory (merge-pathnames "ledger_*.json" dir)))
+      (handler-case
+          (let* ((first (with-open-file (in f) (read-line in)))
+                 (b64 (string-trim '(#\[ #\" #\, #\Space) first))
+                 (u (cl-deposits.update:decode-update (cl-deposits.util:base64-decode b64)))
+                 (owned (equalp (cl-deposits.update:update-operator-id u) (cl-deposits.node:node-pubkey node))))
+            (cl-deposits.node:load-record node f :owned-p owned)
+            (format t "~&loaded ~a (~a)~%" (file-namestring f) (if owned "ours" "replica")))
+        (error (e) (format t "~&could not load ~a: ~a~%" f e))))
+    (format t "~&cl-deposits ~a on ~{~a~^,~}~%" (cl-deposits.node:node-pubkey-hex node) relays)
+    (let ((cp (env "CLD_CONTROL_PORT")))
+      (when cp (cl-deposits.daemon:start-control-server node (parse-integer cp))
+        (format t "~&control socket on 127.0.0.1:~a~%" cp)))
+    (finish-output)
+    (loop (sleep 3600))))
