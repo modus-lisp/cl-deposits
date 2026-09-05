@@ -21,4 +21,5 @@
      (:file "ledger")  ; DEP-05: the state machine — balances, quorum, locks
      (:file "dep17")   ; DEP-17: canonical operation encoding, depositor signatures
      (:file "reserves") ; DEP-03: the Taproot reserves output and its tapscript tiers
+     (:file "rotation") ; DEP-03: spending the reserves — rotation, recovery, anchors
      ))))

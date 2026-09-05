@@ -17,7 +17,8 @@
                     (#:up #:cl-deposits.update))
   (:export #:reserves #:make-reserves #:reserves-p #:build-reserves
            #:reserves-leaves #:reserves-tiers #:reserves-root #:reserves-spk #:reserves-address
-           #:reserves-internal-key #:reserves-parity #:reserves-voters
+           #:reserves-internal-key #:reserves-parity #:reserves-voters #:reserves-operator #:reserves-members
+           #:reserves-ruleset #:reserves-quorum-expiry #:reserves-ledger-hash #:reserves-network
            #:tier #:make-tier #:tier-threshold #:tier-tie-breaker-p #:tier-locktime #:tier-keys
            #:tiers-for #:leaf-script #:control-block-for-tier #:+nums-point+
            #:script-num #:push-int #:hrp-for))

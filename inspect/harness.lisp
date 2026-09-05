@@ -5,7 +5,8 @@
   (:use #:cl)
   (:local-nicknames (#:u #:cl-deposits.util) (#:tlv #:cl-deposits.tlv)
                     (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation)
-                    (#:lg #:cl-deposits.ledger) (#:d17 #:cl-deposits.dep17) (#:rs #:cl-deposits.reserves)
+                    (#:lg #:cl-deposits.ledger) (#:d17 #:cl-deposits.dep17) (#:rs #:cl-deposits.reserves) (#:rot #:cl-deposits.rotation)
+                    (#:btx #:cl-consensus.tx)
                     (#:secp #:secp256k1-fast.schnorr))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:with-gate #:report
            #:*failures* #:*checks* #:hx #:read-json-string-array #:vector-path))

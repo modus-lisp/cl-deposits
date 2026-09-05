@@ -43,4 +43,3 @@
       (check-equal "control block lengths" (mapcar (lambda (i) (length (rs:control-block-for-tier r i))) '(0 1 2 3))
                    '(65 97 129 161)))))
 
-(report)
