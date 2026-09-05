@@ -26,6 +26,7 @@
      (:file "wire")     ; DEP-04: ledger updates, requests, responses, ads as Nostr events
      (:file "bus")      ; where events go: in-process bus (gates), Nostr relays (devnet)
      (:file "lightning") ; DEP-10: the Lightning rail — cl-payments backend, invoice attestations
+     (:file "fraud")    ; DEP-06: fraud proofs — canonical hashing, verification, JSON
      (:file "node")     ; the node: operator, quorum member, and the wallet side
      (:file "nostr-bus") ; the bus over cl-nostr relays
      (:file "daemon")   ; control socket, bitcoin-cli chain view

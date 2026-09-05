@@ -26,6 +26,8 @@
                     (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:ev #:cl-nostr.event) (#:flt #:cl-nostr.filter)
                     (#:k #:cl-nostr.keys) (#:tlv #:cl-deposits.tlv) (#:ln #:cl-deposits.lightning)
+                    (#:fr #:cl-deposits.fraud) (#:lot #:cl-deposits.lottery) (#:rot #:cl-deposits.rotation)
+                    (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire)
                     (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:node #:make-node #:node-pubkey #:node-pubkey-hex #:node-ledgers #:node-log
            #:record #:record-ledger #:record-history #:record-owned-p #:record-id-hex #:record-reserves
@@ -35,6 +37,10 @@
            #:node-error #:request #:wallet #:make-wallet #:wallet-pubkey #:wallet-request
            #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer
            #:wallet-make-invoice #:credit-paid-invoices #:start-invoice-poller #:node-ln #:node-invoices
+           #:enter-dispute #:arm-dispute #:fork-key #:find-fork #:forks-of #:armers-of #:disputed-reserves
+           #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
+           #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
+           #:node-height-of-block
            #:save-record #:load-record #:*cosign-timeout*))
 (in-package #:cl-deposits.node)
 
@@ -47,7 +53,9 @@
 
 (defstruct record
   id-hex ledger (history '()) owned-p reserves
-  pinned)                                      ; (reserves . expiry) prepared for the next QuorumBegin
+  pinned                                       ; (reserves . expiry) prepared for the next QuorumBegin
+  fork-p fork-of fork-operator                 ; a dispute fork: of which ledger, signed by whom
+  preimage lottery confiscation)               ; our lottery secret; the built lottery; the confiscation tx
 
 (defstruct (node (:constructor %make-node))
   priv pubkey pubkey-hex keypair bus network
@@ -59,6 +67,10 @@
   data-dir
   (inbox '()) (inbox-lock (bt:make-lock "inbox")) (inbox-cv (bt:make-condition-variable)) (worker nil)
   (ln nil)                                     ; a cl-deposits.lightning backend, or NIL
+  (broadcast-fn nil)                           ; (lambda (tx-bytes)) -> txid or NIL; NIL = collect only
+  (broadcasts '())                             ; what we would have broadcast (newest first)
+  (height-of-block nil)                        ; (lambda (hash32)) -> height or NIL (fraud-proof anchors)
+  (reveals (make-hash-table :test #'equal))    ; ledger id hex -> alist (member-pubkey33 . preimage)
   (relays '())                                 ; relay URLs, for advertisements
   (invoices (make-hash-table :test #'equalp))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
   (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
@@ -69,20 +81,22 @@
   ;; One line per entry: the control socket is line-oriented.
   (push (substitute #\Space #\Newline (apply #'format nil fmt args)) (node-log node)))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln relays)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln relays broadcast-fn height-of-block)
   (let* ((priv (w:even-y-privkey priv))
          (pub (up:compressed-pubkey priv))
          (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
-                           :chain-fn chain-fn :min-confs min-confs :ln ln :relays relays)))
+                           :chain-fn chain-fn :min-confs min-confs :ln ln :relays relays
+                           :broadcast-fn broadcast-fn :height-of-block height-of-block)))
     ;; On a real relay, events arrive on the reader thread.  Responses are
     ;; consumed inline (they only wake a waiter); requests and updates go to a
     ;; worker, because handling a request may itself wait for responses.
     (when (bus:bus-async-p bus)
       (setf (node-worker node)
             (bt:make-thread (lambda () (worker-loop node)) :name "cld-worker")))
-    (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-update+ w:+kind-request+ w:+kind-response+))
+    (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-update+ w:+kind-request+ w:+kind-response+
+                                                        w:+kind-fraud-proof+ w:+kind-lottery-reveal+))
                        (lambda (event)
                          (if (and (node-worker node) (/= (ev:event-kind event) w:+kind-response+))
                              (enqueue node event)
@@ -298,7 +312,9 @@
         (#.w:+kind-request+ (unless (string= (ev:event-pubkey event) (k:public-hex (node-keypair node)))
                               (handle-request node event)))
         (#.w:+kind-update+ (unless (string= (ev:event-pubkey event) (k:public-hex (node-keypair node)))
-                             (handle-update node event))))
+                             (handle-update node event)))
+        (#.w:+kind-fraud-proof+ (handle-fraud node event))
+        (#.w:+kind-lottery-reveal+ (handle-reveal node event)))
     (error (e) (log! node "event ~a: ~a" (subseq (ev:event-id event) 0 8) e))))
 
 (defun handle-response (node event)
@@ -313,6 +329,7 @@
 (defun handle-request (node event)
   (let ((action (w:event-action event)) (params (w:parse-json (ev:event-content event))))
     (cond ((string= action "cosign_update") (handle-cosign node event params))
+          ((string= action "confiscation_sign") (handle-confiscation-sign node event params))
           ((string= action "consent_request") (handle-consent node event params))
           ((string= action "cosign_invoice") (handle-cosign-invoice node event params))
           (t (let ((rec (find-record node (w:event-ledger-id event))))
@@ -324,14 +341,31 @@
 
 (defun handle-update (node event)
   (let* ((update (w:event->update event))
-         (rec (find-record node (bytes->hex (up:update-ledger-id update)))))
-    (when (and rec (not (record-owned-p rec)))
-      (accept-update node rec update))))
+         (id (bytes->hex (up:update-ledger-id update)))
+         (rec (find-record node id))
+         (signer (up:update-operator-id update)))
+    (when rec
+      (cond
+        ;; The operator's own chain.
+        ((and (not (record-owned-p rec)) (equalp signer (lg:ledger-operator-key (record-ledger rec))))
+         (accept-update node rec update))
+        ;; A quorum member's dispute fork (or its continuation).
+        ((not (equalp signer (node-pubkey node)))
+         (let ((fork (find-fork node id signer))
+               (o (op:decode-operation (up:update-message update))))
+           (cond (fork (accept-update node fork update))
+                 ((and (eq (op:operation-type o) :dispute-enter)
+                       (member signer (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp))
+                  (let ((fork (make-fork node rec (op:field o :last-valid-sequence) signer)))
+                    (accept-update node fork update)
+                    (log! node "fork of ~a by ~a at seq ~a" (subseq id 0 8) (subseq (bytes->hex signer) 0 8) (op:field o :last-valid-sequence)))))))))))
 
 (defun accept-update (node rec update)
   "Validate an operator's update against our replica and apply it."
   (let ((ledger (record-ledger rec)) (op (op:decode-operation (up:update-message update))))
     (unless (up:verify-operator-signature update) (fail "bad operator signature at seq ~a" (up:update-seq update)))
+    (when (and (record-fork-p rec) (not (equalp (up:update-operator-id update) (record-fork-operator rec))))
+      (fail "fork update not signed by the fork's operator"))
     (when (<= (up:update-seq update) (lg:ledger-sequence ledger)) (return-from accept-update :echo))
     (multiple-value-bind (required signers tier operator-alone allowed)
         (lg:cosign-requirement ledger op (up:update-block-height update))
@@ -700,6 +734,252 @@
                                         (hex->bytes (w:jget res "cosign_signature")))
           (fail "cosigner invoice attestation does not verify")))
       (values (w:jget res "invoice") hash res))))
+
+;;; ---------------------------------------------------------------------------
+;;; Disputes (DEP-06): forks, arming, confiscation, reveal, claim
+
+(defun fork-key (id-hex operator33) (format nil "~a:fork:~a" id-hex (subseq (bytes->hex operator33) 0 16)))
+(defun find-fork (node id-hex operator33) (gethash (fork-key id-hex operator33) (node-ledgers node)))
+(defun forks-of (node id-hex)
+  (loop for rec being the hash-values of (node-ledgers node)
+        when (and (record-fork-p rec) (string= (record-fork-of rec) id-hex)) collect rec))
+
+(defun make-fork (node rec last-valid-seq operator33)
+  "A fork of REC's ledger from LAST-VALID-SEQ, operated by OPERATOR33: the
+   truncated history replayed, quorum cleared (the reference does the same,
+   so fork operations need no cosignatures)."
+  (let* ((history (remove-if (lambda (u) (> (up:update-seq u) last-valid-seq)) (reverse (record-history rec))))
+         (ledger (lg:replay history))
+         (fork (make-record :id-hex (record-id-hex rec) :ledger ledger :history (reverse history)
+                            :owned-p (equalp operator33 (node-pubkey node))
+                            :fork-p t :fork-of (record-id-hex rec) :fork-operator operator33)))
+    (setf (lg:ledger-quorum-members ledger) '() (lg:ledger-next-quorum-members ledger) '())
+    (setf (gethash (fork-key (record-id-hex rec) operator33) (node-ledgers node)) fork)
+    fork))
+
+(defun enter-dispute (node rec last-valid-seq &key (reason "fraud") anchor-block-hash anchor-block-height)
+  "We are a quorum member of REC's ledger and have grounds: fork it and publish DisputeEnter."
+  (let ((fork (or (find-fork node (record-id-hex rec) (node-pubkey node))
+                  (make-fork node rec last-valid-seq (node-pubkey node)))))
+    (commit-update node fork (new-update node fork (%strip-nil-fields
+                                                    (list :type :dispute-enter :last-valid-sequence last-valid-seq :reason reason
+                                                          :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height))))
+    fork))
+
+(defun dispute-lottery-n (rec)
+  "N disputants = the latest QuorumBegin's members minus the original operator."
+  (length (recovery-voters rec)))
+
+(defun recovery-voters (rec)
+  "x-only keys of the latest QuorumBegin's members other than the original operator."
+  (let ((operator nil) (members '()))
+    (dolist (u (reverse (record-history rec)))
+      (let ((o (op:decode-operation (up:update-message u))))
+        (case (op:operation-type o)
+          (:ledger-open (setf operator (op:field o :operator-id)))
+          (:quorum-begin (setf members (op:field o :quorum-members))))))
+    (mapcar #'up:x-only (remove operator members :test #'equalp))))
+
+(defun our-target-address (node)
+  (cl-consensus.encoding:segwit-encode (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)) 1
+                                       (subseq (lot:key-path-spk (up:x-only (node-pubkey node))) 2)))
+
+(defun arm-dispute (node fork &key seed replacement)
+  "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL."
+  (let* ((n (dispute-lottery-n fork))
+         (preimage (lot:derive-preimage (or seed (random-aux)) n)))
+    (setf (record-preimage fork) preimage)
+    (commit-update node fork (new-update node fork (%strip-nil-fields
+                                                    (list :type :dispute-armed :armed-block (height node)
+                                                          :commitment-hash (lot:commitment-of preimage)
+                                                          :target-reserves (our-target-address node)
+                                                          :replacement-collateral-txid (first replacement)
+                                                          :replacement-collateral-vout (second replacement)
+                                                          :replacement-collateral-amount (third replacement)))))
+    preimage))
+
+(defun armers-of (node id-hex)
+  "Every DisputeArmed we have seen on any fork of the ledger: (pubkey33 commitment target)."
+  (loop for fork in (forks-of node id-hex)
+        append (loop for u in (record-history fork)
+                     for o = (op:decode-operation (up:update-message u))
+                     when (eq (op:operation-type o) :dispute-armed)
+                       collect (list (up:update-operator-id u) (op:field o :commitment-hash) (op:field o :target-reserves)))))
+
+(defun disputed-reserves (rec)
+  "From the latest QuorumBegin: (values reserves-struct txid vout sats operator33)."
+  (let ((operator nil) (qb nil))
+    (dolist (u (reverse (record-history rec)))
+      (let ((o (op:decode-operation (up:update-message u))))
+        (case (op:operation-type o)
+          (:ledger-open (setf operator (op:field o :operator-id)))
+          (:quorum-begin (setf qb o)))))
+    (unless qb (fail "no QuorumBegin"))
+    (values (rs:build-reserves :operator operator :members (op:field qb :quorum-members)
+                               :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
+                               :ruleset (or (op:field qb :protocol-version) "cltv-offset-v2")
+                               :network (intern (string-upcase (or (and (string= "bc" (subseq (op:field qb :reserves-id) 0 2)) "mainnet") "signet")) :keyword))
+            (op:field qb :new-outpoint-txid) (op:field qb :new-outpoint-vout)
+            (floor (+ (op:field qb :amount) (op:field qb :collateral-amount)) 1000)
+            operator)))
+
+(defun build-confiscation (node id-hex &key respectful (fee 1000))
+  "The confiscation transaction for a disputed ledger, from public state only,
+   so every cosigner rebuilds the same one.  Returns (values tx lottery prevouts reserves)."
+  (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
+         (armers (sort (copy-list (armers-of node id-hex)) #'bytes< :key #'first))
+         (voters (recovery-voters base))
+         (threshold (lg:majority-threshold (length voters)))
+         (participants (loop for (pk c target) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target)))
+         (lottery (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword))))
+    (when (< (length participants) 2) (fail "fewer than two armers"))
+    (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves base)
+      (let* ((outs (lot:confiscation-outputs (lot:lottery-spk lottery) sats fee :respectful respectful
+                                             :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
+                                             :operator-pubkey33 operator))
+             (tx (btx:parse-tx (bw:make-reader
+                                (btx:serialize-tx
+                                 (btx:make-tx :version 2 :locktime 0 :segwit-p t
+                                              :inputs (list (btx:make-txin :prev-hash txid :prev-index vout :script (octets) :sequence rot:+sequence-rbf+))
+                                              :outputs (loop for (spk . v) in outs collect (btx:make-txout :value v :script spk))
+                                              :witnesses (list nil)))))))
+        (values tx lottery (vector (cons sats (rs:reserves-spk reserves))) reserves)))))
+
+(defun confiscation-sighash (tx prevouts reserves) (rot:tier-sighash tx 0 prevouts (first (rs:reserves-leaves reserves))))
+
+(defun confiscate (node id-hex &key respectful (fee 1000))
+  "Build the confiscation, gather the recovery quorum's tier-0 signatures over
+   the relay (confiscation_sign), assemble, and broadcast.  Returns (values tx lottery)."
+  (multiple-value-bind (tx lottery prevouts reserves) (build-confiscation node id-hex :respectful respectful :fee fee)
+    (let* ((sighash (confiscation-sighash tx prevouts reserves))
+           (tier (first (rs:reserves-tiers reserves)))
+           (keys (rs:tier-keys tier))
+           (ours (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))
+           (sigs (list (cons (up:x-only (node-pubkey node)) ours)))
+           (responses (send-request node id-hex "confiscation_sign"
+                                    (w:json-object "sighash" (bytes->hex sighash) "respectful" (and respectful t) "fee_sats" fee
+                                                   "tx_hex" (bytes->hex (btx:serialize-tx tx)))
+                                    :want (1- (rs:tier-threshold tier)))))
+      (dolist (r responses)
+        (let ((res (w:jget r "result")))
+          (when (and (w:jget r "success") res)
+            (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
+              (when (and (member pk keys :test #'equalp) (schnorr:schnorr-verify pk sighash sig)
+                         (not (assoc pk sigs :test #'equalp)))
+                (push (cons pk sig) sigs))))))
+      (when (< (length sigs) (rs:tier-threshold tier)) (fail "only ~a of ~a confiscation signatures" (length sigs) (rs:tier-threshold tier)))
+      (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
+             (signed (rot:attach-tier-witness tx 0 reserves 0 ordered)))
+        (unless (rot:verify-spend signed 0 prevouts) (fail "assembled confiscation does not verify"))
+        (broadcast node signed)
+        (dolist (fork (forks-of node id-hex)) (setf (record-lottery fork) lottery (record-confiscation fork) signed))
+        (values signed lottery)))))
+
+(defun broadcast (node tx)
+  (push tx (node-broadcasts node))
+  (when (node-broadcast-fn node) (funcall (node-broadcast-fn node) (btx:serialize-tx tx))))
+
+(defun handle-confiscation-sign (node event params)
+  "A recovery-quorum member: rebuild the confiscation from public state, sign
+   only if the proposer's sighash is exactly ours."
+  (let ((id (w:event-ledger-id event)))
+    (handler-case
+        (progn
+          (unless (find-fork node id (node-pubkey node)) (fail "not armed for this dispute"))
+          (multiple-value-bind (tx lottery prevouts reserves)
+              (build-confiscation node id :respectful (w:jget params "respectful") :fee (w:jget params "fee_sats"))
+            (declare (ignore tx))
+            (let ((expected (confiscation-sighash (btx:parse-tx (bw:make-reader (hex->bytes (w:jget params "tx_hex")))) prevouts reserves)))
+              (unless (equalp expected (hex->bytes (w:jget params "sighash"))) (fail "sighash is not for the confiscation we expect"))
+              (dolist (fork (forks-of node id)) (setf (record-lottery fork) lottery))
+              (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
+                                                           "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))))
+      (error (e) (respond node event nil :error (princ-to-string e))))))
+
+(defun publish-reveal (node id-hex)
+  (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork")))
+         (preimage (or (record-preimage fork) (fail "not armed")))
+         (sig (schnorr:schnorr-sign (node-priv node) (w:reveal-message id-hex preimage) (random-aux))))
+    (note-reveal node id-hex (node-pubkey node) preimage)
+    (bus:bus-publish (node-bus node) (w:reveal-event (node-keypair node) (node-pubkey-hex node) id-hex preimage sig))))
+
+(defun note-reveal (node id-hex member33 preimage)
+  (let ((alist (gethash id-hex (node-reveals node))))
+    (unless (assoc member33 alist :test #'equalp)
+      (setf (gethash id-hex (node-reveals node)) (cons (cons member33 preimage) alist)))))
+
+(defun handle-reveal (node event)
+  (let* ((j (w:parse-json (ev:event-content event)))
+         (id (w:jget j "ledger_id")) (member (hex->bytes (w:jget j "member_pubkey")))
+         (preimage (hex->bytes (w:jget j "preimage_hex"))) (sig (hex->bytes (w:jget j "signature"))))
+    (when (and (find-record node id)
+               (schnorr:schnorr-verify (up:x-only member) (w:reveal-message id preimage) sig)
+               (find (lot:commitment-of preimage) (armers-of node id) :key #'second :test #'equalp))
+      (note-reveal node id member preimage))))
+
+(defun reveals-of (node id-hex) (gethash id-hex (node-reveals node)))
+
+(defun claim-or-yield (node id-hex &key confiscation-txid (fee 400))
+  "With every preimage in: the script-selected winner claims the lottery output
+   and takes custody (DisputeAcquire); everyone else yields.  Returns
+   (values :won-or-:yielded claim-tx)."
+  (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork")))
+         (lottery (or (record-lottery fork) (fail "no lottery built")))
+         (participants (lot:lottery-participants lottery))
+         (reveals (reveals-of node id-hex))
+         (preimages (mapcar (lambda (p) (or (cdr (find (lot:participant-pubkey p) reveals :key (lambda (r) (up:x-only (car r))) :test #'equalp))
+                                            (fail "missing a reveal")))
+                            participants))
+         (winner (lot:calculate-winner preimages))
+         (winner-pk (lot:participant-pubkey (nth winner participants))))
+    (if (equalp winner-pk (up:x-only (node-pubkey node)))
+        (let* ((conf (record-confiscation fork))
+               (txid (or confiscation-txid (and conf (btx:tx-txid conf)) (fail "no confiscation tx")))
+               (amount (btx:txout-value (first (btx:tx-outputs conf))))
+               (target (lot:participant-target (nth winner participants)))
+               (spk (multiple-value-bind (witver program)
+                        (cl-consensus.encoding:segwit-decode target (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)))
+                      (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
+               (tx (btx:parse-tx (bw:make-reader
+                                  (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t
+                                                                 :inputs (list (btx:make-txin :prev-hash txid :prev-index 0 :script (octets) :sequence rot:+sequence-rbf+))
+                                                                 :outputs (list (btx:make-txout :value (- amount fee) :script spk))
+                                                                 :witnesses (list nil))))))
+               (prevouts (vector (cons amount (lot:lottery-spk lottery))))
+               (sig (schnorr:schnorr-sign (node-priv node) (rot:tier-sighash tx 0 prevouts (first (lot:lottery-leaves lottery))) (random-aux)))
+               (signed (btx:parse-tx (bw:make-reader
+                                      (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs (btx:tx-inputs tx) :outputs (btx:tx-outputs tx)
+                                                                     :witnesses (list (lot:claim-witness lottery sig preimages))))))))
+          (unless (rot:verify-spend signed 0 prevouts) (fail "claim does not verify"))
+          (broadcast node signed)
+          (commit-update node fork (new-update node fork (list :type :dispute-acquire :new-custodian (node-pubkey node)
+                                                               :claim-txid (btx:tx-txid signed) :new-reserves-address target)))
+          (values :won signed))
+        (progn (commit-update node fork (new-update node fork (list :type :dispute-yield)))
+               (values :yielded nil)))))
+
+;;; Fraud broadcasts (Kind 9101): verify, and if we are a member, dispute.
+
+(defun broadcast-fraud (node proof)
+  (bus:bus-publish (node-bus node) (w:fraud-event (node-keypair node) (getf proof :ledger-id) (getf proof :accused) (fr:broadcast->json proof))))
+
+(defun handle-fraud (node event)
+  (let* ((proof (fr:json->broadcast (w:parse-json (ev:event-content event))))
+         (id (getf proof :ledger-id))
+         (rec (find-record node id)))
+    (when (and rec (not (record-owned-p rec))
+               (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
+               (not (find-fork node id (node-pubkey node))))
+      (multiple-value-bind (ok why)
+          (fr:verify-proof proof :history (reverse (record-history rec)) :height-of-block (node-height-of-block node))
+        (if ok
+            (let ((last-valid (min (lg:ledger-sequence (record-ledger rec))
+                                   (case (getf proof :type)
+                                     ((:equivocation :non-conforming-update) (1- (getf (getf proof :evidence) (if (eq (getf proof :type) :equivocation) :sequence :fault-sequence))))
+                                     (t (lg:ledger-sequence (record-ledger rec)))))))
+              (log! node "fraud proof ~a on ~a verified: disputing from seq ~a" (getf proof :type) (subseq id 0 8) last-valid)
+              (enter-dispute node rec last-valid :reason (string-downcase (symbol-name (getf proof :type)))))
+            (log! node "fraud proof rejected: ~a" why))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Persistence: the fixture format — a JSON array of base64 updates, oldest first.

@@ -13,6 +13,8 @@
   (:local-nicknames (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation)
                     (#:ev #:cl-nostr.event) (#:k #:cl-nostr.keys) (#:jzon #:com.inuoe.jzon))
   (:export #:+kind-update+ #:+kind-request+ #:+kind-response+ #:+kind-advertisement+
+           #:+kind-fraud-proof+ #:+kind-lottery-reveal+ #:fraud-event #:reveal-event #:reveal-message
+           #:event-member #:event-d-tag
            #:nostr-keypair #:update-event #:event->update #:ledger-tag
            #:request-event #:response-event #:advertisement-event
            #:event-action #:event-ledger-id #:event-request-id #:parse-json #:json
@@ -23,6 +25,8 @@
 (defconstant +kind-request+ 20101)
 (defconstant +kind-response+ 20102)
 (defconstant +kind-advertisement+ 39100)
+(defconstant +kind-fraud-proof+ 9101)
+(defconstant +kind-lottery-reveal+ 9106)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys.  A node's protocol key is also its Nostr key.  Nostr sees only the
@@ -104,3 +108,23 @@
   (ev:build-event keypair +kind-advertisement+ (json ad)
                   :tags (list (list "d" (gethash "ledger_id" ad)) (list "n" network)
                               (list "o" (gethash "operator_pubkey" ad)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Kind 9101 (fraud broadcast, JSON) and Kind 9106 (custody lottery reveal)
+
+(defun fraud-event (keypair ledger-id-hex accused-hex broadcast-json)
+  (ev:build-event keypair +kind-fraud-proof+ (json broadcast-json)
+                  :tags (list (list "d" (subseq ledger-id-hex 0 16)) (list "p" (subseq accused-hex 2)))))
+
+(defun reveal-message (ledger-id-hex preimage)
+  "sha256(\"CustodyLotteryReveal:\" || ledger_id_hex || 0x00 || preimage)"
+  (sha256 (cat (ascii->bytes "CustodyLotteryReveal:") (ascii->bytes ledger-id-hex) (octets 0) preimage)))
+
+(defun reveal-event (keypair member-pubkey-hex ledger-id-hex preimage signature64)
+  (ev:build-event keypair +kind-lottery-reveal+
+                  (json (json-object "member_pubkey" member-pubkey-hex "ledger_id" ledger-id-hex
+                                     "preimage_hex" (bytes->hex preimage) "signature" (bytes->hex signature64)))
+                  :tags (list (list "l" ledger-id-hex) (list "member" member-pubkey-hex))))
+
+(defun event-member (event) (ev:first-tag-value event "member"))
+(defun event-d-tag (event) (ev:first-tag-value event "d"))

@@ -16,7 +16,8 @@
   (:local-nicknames (#:nd #:cl-deposits.node) (#:lg #:cl-deposits.ledger) (#:up #:cl-deposits.update)
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:jzon #:com.inuoe.jzon))
-  (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli))
+  (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
+           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn))
 (in-package #:cl-deposits.daemon)
 
 (defun arg (form key &optional default) (getf (cdr form) key default))
@@ -74,6 +75,17 @@
          (let ((rec (rec! node form)))
            (ok :seq (lg:ledger-sequence (nd:record-ledger rec)) :tip (bytes->hex (lg:ledger-chain-tip (nd:record-ledger rec)))
                :history (length (nd:record-history rec)))))
+        (:dispute-enter (let ((rec (rec! node form)))
+                          (nd:enter-dispute node rec (arg form :last-valid-seq (lg:ledger-sequence (nd:record-ledger rec))) :reason (arg form :reason "fraud"))
+                          (ok :fork (nd:fork-key (arg form :ledger) (nd:node-pubkey node)))))
+        (:arm (let ((fork (or (nd:find-fork node (arg form :ledger) (nd:node-pubkey node)) (error "no fork; :dispute-enter first"))))
+                (ok :commitment (bytes->hex (cl-deposits.lottery:commitment-of (nd:arm-dispute node fork))))))
+        (:confiscate (multiple-value-bind (tx lottery) (nd:confiscate node (arg form :ledger) :respectful (arg form :respectful) :fee (arg form :fee 1000))
+                       (ok :txid (txid-hex (cl-consensus.tx:tx-txid tx)) :lottery (cl-deposits.lottery:lottery-address lottery))))
+        (:reveal (nd:publish-reveal node (arg form :ledger)) (ok))
+        (:reveals (ok :reveals (mapcar (lambda (r) (bytes->hex (car r))) (nd:reveals-of node (arg form :ledger)))))
+        (:claim (multiple-value-bind (outcome tx) (nd:claim-or-yield node (arg form :ledger))
+                  (ok :outcome outcome :txid (and tx (txid-hex (cl-consensus.tx:tx-txid tx))))))
         (:poll-invoices (ok :credited (mapcar #'bytes->hex (nd:credit-paid-invoices node))))
         (:invoices (ok :pending (loop for h being the hash-keys of (nd:node-invoices node) collect (bytes->hex h))))
         (:advertise
@@ -141,3 +153,14 @@
         (let ((j (jzon:parse out)))
           (list :value-sats (round (* (gethash "value" j) 100000000))
                 :confirmations (gethash "confirmations" j)))))))
+
+(defun bitcoin-cli-broadcast-fn (cli)
+  (lambda (bytes) (run-cli cli "sendrawtransaction" (bytes->hex bytes))))
+
+(defun bitcoin-cli-height-of-block-fn (cli)
+  "Block hash -> confirmed height, or NIL (fraud-proof anchors)."
+  (lambda (hash32)
+    (let ((out (run-cli cli "getblockheader" (txid-hex hash32))))
+      (when (and (plusp (length out)) (char= (char out 0) #\{))
+        (let ((j (jzon:parse out)))
+          (and (> (or (gethash "confirmations" j) 0) 0) (gethash "height" j)))))))

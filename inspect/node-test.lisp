@@ -132,4 +132,84 @@
     (format t "      A log: ~{~a~^ | ~}~%" (reverse (nd:node-log a)))
     (format t "      B log: ~{~a~^ | ~}~%" (reverse (nd:node-log b)))))
 
+
+
+(with-gate ("disputes: fraud proof, forks, confiscation, lottery, custody transfer")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a2" :reserves 15600000 :collateral 23400000))
+         (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+    (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d2")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((w1 (nd:make-wallet :priv 55555555555555555555 :bus bus)) (d1 (nd:wallet-open-deposit w1 id)))
+      (nd:credit-onchain a la d1 100000 :txid (u:sha256 (hx "c0ffee2")))
+      ;; --- The operator equivocates: two different updates at the same sequence.
+      (let* ((seq (1+ (lg:ledger-sequence (nd:record-ledger la))))
+             (mk (lambda (amount)
+                   (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id) :seq seq
+                                                   :prev-hash (lg:ledger-chain-tip (nd:record-ledger la))
+                                                   :message (op:encode-operation (list :type :onchain-credit :txid (u:sha256 (hx "ee")) :vout 0
+                                                                                       :deposit-id d1 :amount amount :funding-address "x")))))
+                     (up:sign-operator u (nd::node-priv a)) u)))
+             (u1 (funcall mk 1)) (u2 (funcall mk 2))
+             (proof (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) u1 u2)))
+        (check "equivocation proof verifies" (fr:verify-equivocation proof))
+        (check "a same-content pair is not an equivocation" (not (fr:verify-equivocation (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) u1 u1))))
+        (check-bytes "proof hash survives the JSON round trip" (fr:proof-hash (fr:json->proof (fr:proof->json proof))) (fr:proof-hash proof))
+        (check-equal "proof discriminant" (fr:proof-discriminant :equivocation) 8)
+        ;; A non-conforming update: crediting beyond... (a DepositClose on a funded deposit)
+        (let ((bad (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id) :seq seq
+                                                   :prev-hash (lg:ledger-chain-tip (nd:record-ledger la))
+                                                   :message (op:encode-operation (list :type :deposit-close :deposit-id d1)))))
+                     (up:sign-operator u (nd::node-priv a)) u)))
+          (check "non-conforming update proof verifies against the canonical history"
+                 (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) bad)
+                                                  (reverse (nd:record-history la))))
+          (check "a conforming update is not a valid proof"
+                 (not (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) u1)
+                                                       (reverse (nd:record-history la))))))
+        ;; --- Broadcast the proof: every member verifies it and forks.
+        (nd:broadcast-fraud b proof)
+        (check "all three members opened dispute forks"
+               (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c d)))
+        (check "members replicate each other's forks"
+               (every (lambda (m) (= 3 (length (nd:forks-of m id)))) (list b c d)))
+        (check-equal "fork state is disputed" (lg:ledger-dispute-state (nd:record-ledger (nd:find-fork b id (nd:node-pubkey b)))) :disputed)
+        ;; --- Arm.
+        (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m))))
+        (check-equal "three armers visible to everyone" (mapcar (lambda (m) (length (nd:armers-of m id))) (list b c d)) '(3 3 3))
+        ;; --- Confiscation, built by b, signed by the recovery quorum over the relay.
+        (multiple-value-bind (ctx lottery) (nd:confiscate b id)
+          (check "confiscation spends the reserves via tier 0 (verified under consensus)" (and ctx t))
+          (check-equal "punitive: one output, to the lottery" (length (btx:tx-outputs ctx)) 1)
+          (check "lottery output pays the lottery script" (equalp (btx:txout-script (first (btx:tx-outputs ctx))) (lot:lottery-spk lottery)))
+          (check "other members rebuilt the same lottery" (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey m)))) (and (nd:record-lottery f) (equalp (lot:lottery-spk (nd:record-lottery f)) (lot:lottery-spk lottery))))) (list c d)))
+          ;; c and d need the confiscation tx to claim from: they saw the sighash, not the tx; share it.
+          (dolist (m (list c d)) (setf (nd:record-confiscation (nd:find-fork m id (nd:node-pubkey m))) ctx))
+          ;; --- Reveal.
+          (dolist (m (list b c d)) (nd:publish-reveal m id))
+          (check-equal "every member holds all three reveals" (mapcar (lambda (m) (length (nd:reveals-of m id))) (list b c d)) '(3 3 3))
+          ;; --- Claim or yield.
+          (let ((outcomes (mapcar (lambda (m) (multiple-value-list (nd:claim-or-yield m id))) (list b c d))))
+            (check-equal "exactly one winner" (count :won outcomes :key #'first) 1)
+            (check-equal "two yields" (count :yielded outcomes :key #'first) 2)
+            (let* ((winner (nth (position :won outcomes :key #'first) (list b c d)))
+                   (claim (second (find :won outcomes :key #'first)))
+                   (wfork (nd:find-fork winner id (nd:node-pubkey winner))))
+              (check "winner is the script-selected participant"
+                     (equalp (up:x-only (nd:node-pubkey winner))
+                             (lot:participant-pubkey (nth (lot:calculate-winner (mapcar (lambda (p) (cdr (find (lot:participant-pubkey p) (nd:reveals-of b id) :key (lambda (r) (up:x-only (car r))) :test #'equalp))) (lot:lottery-participants lottery))) (lot:lottery-participants lottery)))))
+              (check "claim tx spends the lottery output (verified under consensus)" (equalp (btx:txin-prev-hash (first (btx:tx-inputs claim))) (btx:tx-txid ctx)))
+              (check-equal "winner's fork: DisputeAcquire, custody transferred"
+                           (list (lg:ledger-dispute-state (nd:record-ledger wfork)) (equalp (lg:ledger-operator-key (nd:record-ledger wfork)) (nd:node-pubkey winner)))
+                           '(:normal t))
+              (check "losers' forks tombstoned"
+                     (every (lambda (m) (or (eq m winner) (eq :tombstoned (lg:ledger-dispute-state (nd:record-ledger (nd:find-fork m id (nd:node-pubkey m))))))) (list b c d)))
+              (check "everyone replicates the winner's DisputeAcquire"
+                     (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey winner)))) (and f (equalp (lg:ledger-operator-key (nd:record-ledger f)) (nd:node-pubkey winner))))) (list b c d))))))))))
+
 (report)

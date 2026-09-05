@@ -25,6 +25,8 @@
                 :priv priv :bus bus :network (env "CLD_NETWORK" "signet") :data-dir dir :relays relays
                 :height-fn (and cli (cl-deposits.daemon:bitcoin-cli-height-fn cli))
                 :chain-fn (and cli (cl-deposits.daemon:bitcoin-cli-chain-fn cli))
+                :broadcast-fn (and cli (cl-deposits.daemon:bitcoin-cli-broadcast-fn cli))
+                :height-of-block (and cli (cl-deposits.daemon:bitcoin-cli-height-of-block-fn cli))
                 :min-confs (parse-integer (env "CLD_MIN_CONFS" "1"))
                 :ln (let ((hp (env "CLD_LN_CONTROL")))
                       (and hp (let ((i (position #\: hp)))
