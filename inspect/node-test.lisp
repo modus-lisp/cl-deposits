@@ -183,13 +183,15 @@
         (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m))))
         (check-equal "three armers visible to everyone" (mapcar (lambda (m) (length (nd:armers-of m id))) (list b c d)) '(3 3 3))
         ;; --- Confiscation, built by b, signed by the recovery quorum over the relay.
-        (multiple-value-bind (ctx lottery) (nd:confiscate b id)
+        (multiple-value-bind (ctx lottery)
+            (handler-case (nd:confiscate b id)
+              (error (e) (format t "      confiscate failed: ~a~%      c log: ~{~a~^ | ~}~%      d log: ~{~a~^ | ~}~%" e (reverse (nd:node-log c)) (reverse (nd:node-log d))) (error e)))
           (check "confiscation spends the reserves via tier 0 (verified under consensus)" (and ctx t))
           (check-equal "punitive: one output, to the lottery" (length (btx:tx-outputs ctx)) 1)
           (check "lottery output pays the lottery script" (equalp (btx:txout-script (first (btx:tx-outputs ctx))) (lot:lottery-spk lottery)))
           (check "other members rebuilt the same lottery" (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey m)))) (and (nd:record-lottery f) (equalp (lot:lottery-spk (nd:record-lottery f)) (lot:lottery-spk lottery))))) (list c d)))
-          ;; c and d need the confiscation tx to claim from: they saw the sighash, not the tx; share it.
-          (dolist (m (list c d)) (setf (nd:record-confiscation (nd:find-fork m id (nd:node-pubkey m))) ctx))
+          (check "signers kept the unsigned confiscation (same txid as the broadcast one)"
+                 (every (lambda (m) (equalp (btx:tx-txid (nd:record-confiscation (nd:find-fork m id (nd:node-pubkey m)))) (btx:tx-txid ctx))) (list c d)))
           ;; --- Reveal.
           (dolist (m (list b c d)) (nd:publish-reveal m id))
           (check-equal "every member holds all three reveals" (mapcar (lambda (m) (length (nd:reveals-of m id))) (list b c d)) '(3 3 3))

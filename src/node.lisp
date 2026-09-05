@@ -865,8 +865,10 @@
            (ours (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))
            (sigs (list (cons (up:x-only (node-pubkey node)) ours)))
            (responses (send-request node id-hex "confiscation_sign"
+                                    ;; The reference's field names: sighash, unsigned_tx, last_valid_sequence.
                                     (w:json-object "sighash" (bytes->hex sighash) "respectful" (and respectful t) "fee_sats" fee
-                                                   "tx_hex" (bytes->hex (btx:serialize-tx tx)))
+                                                   "unsigned_tx" (bytes->hex (btx:serialize-tx tx))
+                                                   "last_valid_sequence" (lg:ledger-sequence (record-ledger (or (find-fork node id-hex (node-pubkey node)) (find-record node id-hex)))))
                                     :want (1- (length (recovery-voters (find-record node id-hex)))) :timeout 20)))
       (dolist (r responses)
         (let ((res (w:jget r "result")))
@@ -898,9 +900,11 @@
           (multiple-value-bind (tx lottery prevouts reserves)
               (build-confiscation node id :respectful (w:jget params "respectful") :fee (w:jget params "fee_sats"))
             (declare (ignore tx))
-            (let ((expected (confiscation-sighash (btx:parse-tx (bw:make-reader (hex->bytes (w:jget params "tx_hex")))) prevouts reserves)))
+            (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (w:jget params "tx_hex") (fail "no unsigned_tx"))))))
+                   (expected (confiscation-sighash proposed prevouts reserves)))
               (unless (equalp expected (hex->bytes (w:jget params "sighash"))) (fail "sighash is not for the confiscation we expect"))
-              (dolist (fork (forks-of node id)) (setf (record-lottery fork) lottery))
+              ;; Its txid does not depend on the witness: keep it, the claim spends it.
+              (dolist (fork (forks-of node id)) (setf (record-lottery fork) lottery (record-confiscation fork) proposed))
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
                                                            "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))))
       (error (e) (log! node "refused confiscation_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
