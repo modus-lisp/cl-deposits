@@ -1,0 +1,15 @@
+[submodule "deps/cl-consensus"]
+	path = deps/cl-consensus
+	url = https://github.com/modus-lisp/cl-consensus.git
+[submodule "deps/secp256k1-fast"]
+	path = deps/secp256k1-fast
+	url = https://github.com/modus-lisp/secp256k1-fast.git
+[submodule "deps/cl-nostr"]
+	path = deps/cl-nostr
+	url = https://github.com/modus-lisp/cl-nostr.git
+[submodule "deps/seal"]
+	path = deps/seal
+	url = https://github.com/modus-lisp/seal.git
+[submodule "deps/pagetree"]
+	path = deps/pagetree
+	url = https://github.com/modus-lisp/pagetree.git
