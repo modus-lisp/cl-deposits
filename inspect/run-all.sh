@@ -19,6 +19,6 @@ lisp_gate () {  # name, then test files
   run_gate "$name" "$SBCL" "${args[@]}"
 }
 echo "== cl-deposits offline gate suite =="
-lisp_gate vectors inspect/update-test.lisp inspect/operation-test.lisp inspect/dep17-test.lisp
+lisp_gate vectors inspect/update-test.lisp inspect/operation-test.lisp inspect/dep17-test.lisp inspect/reserves-test.lisp
 echo; echo "$pass passed, $fail failed ${failed[*]:+(${failed[*]})}"
 [ "$fail" -eq 0 ]

@@ -20,4 +20,5 @@
      (:file "operation") ; DEP-02: the 27 ledger operations, typed
      (:file "ledger")  ; DEP-05: the state machine — balances, quorum, locks
      (:file "dep17")   ; DEP-17: canonical operation encoding, depositor signatures
+     (:file "reserves") ; DEP-03: the Taproot reserves output and its tapscript tiers
      ))))

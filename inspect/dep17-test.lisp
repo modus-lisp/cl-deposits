@@ -75,4 +75,3 @@
                    (d17:verify-operation-witness o (format nil "pk(~a)" (u:bytes->hex pub)) (d17:sign-operation o priv))
                    :ok))))
 
-(report)
