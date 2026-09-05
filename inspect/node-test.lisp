@@ -36,6 +36,9 @@
         (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d")) :funding-vout 0
                               :amount-msats 15600000 :collateral-msats 23400000)
       (check "QuorumBegin carries >= 2 of 3 staged cosignatures" (>= (length (up:update-cosignatures qb)) 2))
+      (check "quorum_expiry does not exceed any member's commitment"
+             (<= (rs::reserves-quorum-expiry reserves)
+                 (reduce #'min (mapcar #'lg:member-membership-until (lg:ledger-quorum-members (nd:record-ledger la))))))
       (check "reserves address is signet taproot" (string= "tb1p" (subseq (rs:reserves-address reserves) 0 4)))
       (check-equal "ledger quorum active with 3 members"
                    (list (lg:ledger-quorum-state (nd:record-ledger la)) (length (lg:ledger-quorum-members (nd:record-ledger la))))

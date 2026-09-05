@@ -23,8 +23,8 @@ L3=$(sx "$(cld_ctl cld3 "(:open-ledger :reserves-id \"genesis:cld3:$RANDOM\")")"
 echo "   cld1 ledger $L1"
 
 step "3  cld2 and cld3 join cld1's quorum (consent handshake over the relay)"
-expect "$(cld_ctl cld1 "(:add-member :ledger \"$L1\" :member \"$P2\")")"
-expect "$(cld_ctl cld1 "(:add-member :ledger \"$L1\" :member \"$P3\")")"
+expect "$(cld_ctl cld1 "(:add-member :ledger \"$L1\" :member \"$P2\" :member-ledger \"$L2\")")"
+expect "$(cld_ctl cld1 "(:add-member :ledger \"$L1\" :member \"$P3\" :member-ledger \"$L3\")")"
 R2=$(cld_ctl cld2 "(:info)"); [[ "$R2" == *"$L1"* ]] || fail "cld2 does not replicate $L1"
 echo "   cld2 replicates cld1's ledger"
 

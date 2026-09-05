@@ -44,7 +44,8 @@
            (ok :ledger (nd:record-id-hex rec))))
         (:add-member
          (let ((rec (rec! node form)))
-           (nd:add-member node rec (hex->bytes (arg form :member)) :membership-blocks (arg form :membership-blocks 4320))
+           (nd:add-member node rec (hex->bytes (arg form :member)) :member-ledger-id (arg form :member-ledger)
+                          :membership-blocks (arg form :membership-blocks 4320))
            (ok :staged (length (lg:ledger-next-quorum-members (nd:record-ledger rec))))))
         (:prepare-quorum
          (let* ((rec (rec! node form))

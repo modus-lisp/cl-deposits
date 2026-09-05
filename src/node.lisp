@@ -208,31 +208,36 @@
   (list :min-fee-bps (w:jget res "min_fee_bps") :min-fee-fixed (w:jget res "min_fee_fixed")
         :max-fee-period (w:jget res "max_fee_period") :membership-until (w:jget res "membership_expires")))
 
-(defun add-member (node rec member-pubkey &key (membership-blocks 4320) (ruleset "cltv-offset-v2") (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016))
-  "Ask MEMBER-PUBKEY to join REC's quorum; on consent, stage them with QuorumAddMember."
+(defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) (ruleset "cltv-offset-v2") (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016))
+  "Ask MEMBER-PUBKEY to join REC's quorum; on consent, stage them with QuorumAddMember.
+   The request is addressed (tag l) to MEMBER-LEDGER-ID — the member's own ledger —
+   as the reference does; its nodes only answer requests for ledgers they operate."
   (let* ((until (+ (height node) membership-blocks))
          (params (w:json-object "operator_pubkey" (node-pubkey-hex node) "operator_ledger_id" (record-id-hex rec)
                                 "ledger_history" (coerce (mapcar (lambda (u) (base64-encode (up:encode-update u)))
                                                                  (reverse (record-history rec))) 'vector)
                                 "chosen_ruleset" ruleset "min_fee_bps" min-fee-bps "min_fee_fixed" min-fee-fixed
                                 "max_fee_period" max-fee-period "membership_until" until))
-         (responses (send-request node (record-id-hex rec) "consent_request" params
+         (responses (send-request node (or member-ledger-id (record-id-hex rec)) "consent_request" params
                                   :extra-tags (list (list "p" (x-hex member-pubkey)))))
-         (r (find-if (lambda (r) (equal (gethash "responder" r) (x-hex member-pubkey))) responses)))
-    (unless (and r (w:jget r "success")) (fail "member ~a did not consent" (subseq (bytes->hex member-pubkey) 0 8)))
+         (consent-ok (lambda (r)
+                       ;; The reference signs Nostr events with a per-host delegate key, so
+                       ;; the event pubkey says nothing; the consent signature does.
+                       (let ((res (w:jget r "result")))
+                         (and (w:jget r "success") res (w:jget res "consent_signature")
+                              (schnorr:schnorr-verify (up:x-only member-pubkey)
+                                                      (sha256 (cat (ascii->bytes "COLLATERAL_CONSENT") (node-pubkey node)
+                                                                   (ascii->bytes (record-id-hex rec))))
+                                                      (hex->bytes (w:jget res "consent_signature")))))))
+         (r (find-if consent-ok responses)))
+    (unless r (fail "member ~a did not consent" (subseq (bytes->hex member-pubkey) 0 8)))
     (let* ((res (w:jget r "result"))
            (consent (hex->bytes (w:jget res "consent_signature"))))
-      ;; The consent covers sha256("COLLATERAL_CONSENT" || operator pubkey || ledger id hex).
-      (unless (schnorr:schnorr-verify (up:x-only member-pubkey)
-                                      (sha256 (cat (ascii->bytes "COLLATERAL_CONSENT") (node-pubkey node)
-                                                   (ascii->bytes (record-id-hex rec))))
-                                      consent)
-        (fail "bad consent signature"))
       (append-operation node rec
                         (%strip-nil-fields
                                 (list :type :quorum-add-member :quorum-member member-pubkey
                                       :quorum-member-signature consent
-                                      :member-ledger-id (w:jget res "member_ledger_id")
+                                      :member-ledger-id (or (w:jget res "member_ledger_id") member-ledger-id "")
                                       :min-fee-bps min-fee-bps :min-fee-fixed min-fee-fixed :max-fee-period max-fee-period
                                       :membership-until (w:jget res "membership_expires")
                                       :member-response (let ((b (w:jget res "member_response"))) (and b (base64-decode b)))
@@ -245,7 +250,9 @@
   "Build (and pin) the reserves output the next QuorumBegin will point at, so
    it can be funded on chain first.  Returns the reserves."
   (let* ((staged (lg:ledger-next-quorum-members (record-ledger rec)))
-         (expiry (+ (height node) expiry-blocks))
+         ;; DEP-05: quorum_expiry is the shortest member commitment.
+         (commitments (remove nil (mapcar #'lg:member-membership-until staged)))
+         (expiry (reduce #'min commitments :initial-value (+ (height node) expiry-blocks)))
          (reserves (rs:build-reserves :operator (node-pubkey node) :members (mapcar #'lg:member-pubkey staged)
                                       :ledger-hash (up:chain-hash (tip rec)) :quorum-expiry expiry
                                       :ruleset ruleset :network (intern (string-upcase (node-network node)) :keyword))))
@@ -387,10 +394,15 @@
 ;;; Inbound: consent_request (an operator wants us in their quorum)
 
 (defun handle-consent (node event params)
-  ;; Addressed to one member: the p tag names them.
-  (let ((to (ev:first-tag-value event "p")))
-    (unless (and to (string= to (k:public-hex (node-keypair node))))
-      (return-from handle-consent nil)))
+  ;; For us if the l tag names a ledger we operate (the reference's addressing),
+  ;; or the p tag names our key.
+  (let* ((to (ev:first-tag-value event "p"))
+         (l (w:event-ledger-id event))
+         (ours (and l (find-record node l))))
+    (unless (or (and ours (record-owned-p ours))
+                (and to (string= to (k:public-hex (node-keypair node)))))
+      (return-from handle-consent nil))
+    (when (and ours (record-owned-p ours)) (setf (node-member-ledger-hex node) l)))
   (let* ((their-id (w:jget params "operator_ledger_id"))
          (operator (hex->bytes (w:jget params "operator_pubkey")))
          (history (map 'list (lambda (b64) (up:decode-update (base64-decode b64))) (w:jget params "ledger_history"))))
