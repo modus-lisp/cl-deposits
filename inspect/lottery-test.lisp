@@ -150,4 +150,29 @@
     (check-bytes "scriptPubKey matches EXPECTED_CURRENT_SCRIPT_HEX" (rs:reserves-spk r)
                  (hx "51202da85682af56fd62b6fa106e30831a8dbfa05c74259bdca8e0cfad0242ff0e55"))))
 
+
+
+(with-gate ("lottery: byte-for-byte against the reference builder")
+  ;; inspect/vectors/lottery-reference.txt: deposits-core's LotteryScriptBuilder
+  ;; for keys from secrets [i;32], commitments [i;20], voters 21..23 (2-of-3), signet.
+  (let* ((lines (with-open-file (in (vector-path "lottery-reference.txt"))
+                  (loop for l = (read-line in nil) while l collect l)))
+         (vec (lambda (n key) (let ((pfx (format nil "VEC n=~a ~a=" n key)))
+                                (subseq (find pfx lines :test (lambda (p l) (and (>= (length l) (length p)) (string= p (subseq l 0 (length p)))))) (length pfx)))))
+         (seed-priv (lambda (i) (u:be->int (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))))
+         (voters (mapcar (lambda (i) (xonly-of (funcall seed-priv i))) '(21 22 23))))
+    (dolist (n '(3 6))
+      (let* ((parts (loop for i from 1 to n collect (lot:make-participant :pubkey (xonly-of (funcall seed-priv i))
+                                                                            :commitment (make-array 20 :element-type '(unsigned-byte 8) :initial-element i)
+                                                                            :target (format nil "tb1p~a" i))))
+             (l (lot:build-lottery parts voters 2 :network :signet)))
+        (check-equal (format nil "n=~a primary script" n) (u:bytes->hex (first (lot:lottery-leaves l))) (funcall vec n "script"))
+        (check-equal (format nil "n=~a partial-reveal leaf 0" n) (u:bytes->hex (second (lot:lottery-leaves l))) (funcall vec n "partial0"))
+        (check-equal (format nil "n=~a recovery leaf (CSV 144)" n) (u:bytes->hex (nth (lot::recovery-leaf-index l 0) (lot:lottery-leaves l))) (funcall vec n "recovery144"))
+        (check-equal (format nil "n=~a lottery address" n) (lot:lottery-address l) (funcall vec n "address"))
+        (check-equal (format nil "n=~a control block of the primary leaf" n) (u:bytes->hex (lot:lottery-control-block l 0)) (funcall vec n "control0"))))
+    (check-equal "armer share address"
+                 (lot:armer-share-address (lot:build-armer-share (xonly-of (funcall seed-priv 1)) (make-array 20 :element-type '(unsigned-byte 8) :initial-element 1) voters 2 :network :signet))
+                 (funcall vec 3 "armer_share"))))
+
 (report)

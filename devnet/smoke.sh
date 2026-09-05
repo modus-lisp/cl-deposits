@@ -79,4 +79,17 @@ echo "   w1 $B1"
 T1=$(sx "$(cld_ctl cld1 "(:tip :ledger \"$L1\")")" ":TIP"); T2=$(sx "$(cld_ctl cld2 "(:tip :ledger \"$L1\")")" ":TIP")
 [ "$T1" = "$T2" ] || fail "tips differ after credit"
 echo "   replicas agree at $T1"
+step "11 dispute: cld1 equivocates; members fork, arm, confiscate the reserves on chain, reveal, and the lottery winner claims custody"
+cld_ctl cld1 "(:equivocate :ledger \"$L1\")" >/dev/null; sleep 3
+for n in cld2 cld3 cld4; do F=$(cld_ctl $n "(:forks :ledger \"$L1\")"); [[ "$F" == *":STATE :DISPUTED"* ]] || fail "$n did not fork: $F"; done
+echo "   members detected the equivocation and forked"
+for n in cld2 cld3 cld4; do expect "$(cld_ctl $n "(:arm :ledger \"$L1\")")"; done; sleep 2
+CONF=$(cld_ctl cld2 "(:confiscate :ledger \"$L1\" :fee 1000)"); expect "$CONF"; CTXID=$(sx "$CONF" ":TXID"); LOTTERY=$(sx "$CONF" ":LOTTERY")
+mine 1; C=$(bcli gettxout "$CTXID" 0 | python3 -c "import json,sys; j=json.load(sys.stdin); print(j['confirmations'], j['scriptPubKey']['address'])"); [[ "$C" == "1 $LOTTERY" ]] || fail "confiscation not confirmed to the lottery output: $C"
+echo "   confiscation $CTXID confirmed into lottery output $LOTTERY"
+for n in cld2 cld3 cld4; do cld_ctl $n "(:reveal :ledger \"$L1\")" >/dev/null; done; sleep 2
+WON=""; for n in cld2 cld3 cld4; do R=$(cld_ctl $n "(:claim :ledger \"$L1\")"); expect "$R"; [[ "$R" == *":OUTCOME :WON"* ]] && { WON=$n; CLAIM=$(sx "$R" ":TXID"); }; done
+[ -n "$WON" ] || fail "no winner"; mine 1
+K=$(bcli getrawtransaction "$CLAIM" true | python3 -c "import json,sys; t=json.load(sys.stdin); print(t.get('confirmations',0), t['vin'][0]['txid'])"); [[ "$K" == "1 $CTXID" ]] || fail "claim not confirmed: $K"
+echo "   $WON won the lottery; claim $CLAIM confirmed, spending the lottery output"
 echo; echo "SMOKE OK"

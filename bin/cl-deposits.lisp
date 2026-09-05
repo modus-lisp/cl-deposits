@@ -37,7 +37,7 @@
     (with-open-file (s (merge-pathnames "cld.pid" dir) :direction :output :if-exists :supersede)
       (format s "~d~%" (sb-posix:getpid)))
     ;; Reload what we knew: our ledgers, and the ones we cosign.
-    (dolist (f (directory (merge-pathnames "ledger_*.json" dir)))
+    (dolist (f (sort (directory (merge-pathnames "ledger_*.json" dir)) #'string< :key #'file-namestring)) ; bases before forks
       (handler-case
           (let* ((first (with-open-file (in f) (read-line in)))
                  (b64 (string-trim '(#\[ #\" #\, #\Space) first))

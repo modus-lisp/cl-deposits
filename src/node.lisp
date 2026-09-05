@@ -40,7 +40,7 @@
            #:enter-dispute #:arm-dispute #:fork-key #:find-fork #:forks-of #:armers-of #:disputed-reserves
            #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
-           #:node-height-of-block
+           #:node-height-of-block #:equivocate
            #:save-record #:load-record #:*cosign-timeout*))
 (in-package #:cl-deposits.node)
 
@@ -366,7 +366,15 @@
     (unless (up:verify-operator-signature update) (fail "bad operator signature at seq ~a" (up:update-seq update)))
     (when (and (record-fork-p rec) (not (equalp (up:update-operator-id update) (record-fork-operator rec))))
       (fail "fork update not signed by the fork's operator"))
-    (when (<= (up:update-seq update) (lg:ledger-sequence ledger)) (return-from accept-update :echo))
+    (when (<= (up:update-seq update) (lg:ledger-sequence ledger))
+      ;; Same sequence, different content, validly signed by the operator: equivocation.
+      (let ((ours (find (up:update-seq update) (record-history rec) :key #'up:update-seq)))
+        (when (and ours (not (record-fork-p rec))
+                   (not (equalp (up:content-hash ours) (up:content-hash update)))
+                   (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp))
+          (log! node "EQUIVOCATION on ~a at seq ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq update))
+          (broadcast-fraud node (fr:make-equivocation-proof (up:update-operator-id update) (up:update-ledger-id update) ours update))))
+      (return-from accept-update :echo))
     (multiple-value-bind (required signers tier operator-alone allowed)
         (lg:cosign-requirement ledger op (up:update-block-height update))
       (declare (ignore tier operator-alone))
@@ -859,9 +867,10 @@
            (responses (send-request node id-hex "confiscation_sign"
                                     (w:json-object "sighash" (bytes->hex sighash) "respectful" (and respectful t) "fee_sats" fee
                                                    "tx_hex" (bytes->hex (btx:serialize-tx tx)))
-                                    :want (1- (rs:tier-threshold tier)))))
+                                    :want (1- (length (recovery-voters (find-record node id-hex)))) :timeout 20)))
       (dolist (r responses)
         (let ((res (w:jget r "result")))
+          (unless (w:jget r "success") (log! node "confiscation_sign refused: ~a" (w:jget r "error")))
           (when (and (w:jget r "success") res)
             (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
               (when (and (member pk keys :test #'equalp) (schnorr:schnorr-verify pk sighash sig)
@@ -894,7 +903,7 @@
               (dolist (fork (forks-of node id)) (setf (record-lottery fork) lottery))
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
                                                            "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))))
-      (error (e) (respond node event nil :error (princ-to-string e))))))
+      (error (e) (log! node "refused confiscation_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
 
 (defun publish-reveal (node id-hex)
   (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork")))
@@ -958,6 +967,22 @@
         (progn (commit-update node fork (new-update node fork (list :type :dispute-yield)))
                (values :yielded nil)))))
 
+;;; Testing only: the operator publishes a conflicting update at its current tip
+;;; sequence, so members can be seen catching it.
+
+(defun equivocate (node rec)
+  (let* ((last (tip rec))
+         (o (op:decode-operation (up:update-message last)))
+         (u (up:make-signed-update :operator-id (node-pubkey node) :ledger-id (hex->bytes (record-id-hex rec))
+                                   :seq (up:update-seq last) :prev-hash (up:update-prev-hash last)
+                                   :message (op:encode-operation (append (list :type :onchain-credit :txid (random-aux) :vout 0
+                                                                               :deposit-id (or (op:field o :deposit-id) (make-array 16 :element-type '(unsigned-byte 8)))
+                                                                               :amount 1 :funding-address "equivocation")))
+                                   :block-height (up:update-block-height last))))
+    (up:sign-operator u (node-priv node))
+    (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) u))
+    u))
+
 ;;; Fraud broadcasts (Kind 9101): verify, and if we are a member, dispute.
 
 (defun broadcast-fraud (node proof)
@@ -984,15 +1009,22 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Persistence: the fixture format — a JSON array of base64 updates, oldest first.
 
+(defun record-file-name (rec)
+  (if (record-fork-p rec)
+      (format nil "ledger_~a_fork_~a.json" (subseq (record-id-hex rec) 0 16) (subseq (bytes->hex (record-fork-operator rec)) 0 16))
+      (format nil "ledger_~a.json" (subseq (record-id-hex rec) 0 16))))
+
 (defun save-record (node rec)
   (when (node-data-dir node)
     (ensure-directories-exist (node-data-dir node))
-    (with-open-file (out (merge-pathnames (format nil "ledger_~a.json" (subseq (record-id-hex rec) 0 16)) (node-data-dir node))
+    (with-open-file (out (merge-pathnames (record-file-name rec) (node-data-dir node))
                          :direction :output :if-exists :supersede)
       (format out "[~{~s~^,~%~}]~%" (mapcar (lambda (u) (base64-encode (up:encode-update u))) (reverse (record-history rec)))))))
 
 (defun load-record (node path &key owned-p)
-  "Rebuild a record from a saved (or fixture) file, validating as we go."
+  "Rebuild a record from a saved (or fixture) file, validating as we go.  A
+   fork file (ledger_<id>_fork_<op>.json) becomes a fork record of its base,
+   which must already be loaded."
   (let* ((text (with-open-file (in path) (let ((s (make-string (file-length in)))) (subseq s 0 (read-sequence s in)))))
          (updates (loop with pos = 0
                         for start = (position #\" text :start pos) while start
@@ -1000,10 +1032,19 @@
                                   (setf pos (1+ end))
                                   (up:decode-update (base64-decode (subseq text (1+ start) end))))))
          (first (first updates))
-         (rec (make-record :id-hex (bytes->hex (up:update-ledger-id first)) :ledger (lg:make-ledger) :owned-p owned-p)))
+         (id-hex (bytes->hex (up:update-ledger-id first)))
+         (fork-p (search "_fork_" (file-namestring path)))
+         (rec (if fork-p
+                  (let* ((base (or (find-record node id-hex) (fail "fork file before its base ledger")))
+                         (divergence (or (position-if (lambda (u) (not (equalp (up:update-operator-id u) (lg:ledger-operator-key (record-ledger base))))) updates)
+                                         (fail "fork file with no fork updates")))
+                         (operator (up:update-operator-id (nth divergence updates))))
+                    (make-fork node base (1- (up:update-seq (nth divergence updates))) operator))
+                  (make-record :id-hex id-hex :ledger (lg:make-ledger) :owned-p owned-p))))
     (dolist (u updates)
-      (if owned-p
-          (progn (lg:apply-update (record-ledger rec) u) (push u (record-history rec)))
-          (accept-update node rec u)))
-    (setf (gethash (record-id-hex rec) (node-ledgers node)) rec)
+      (when (> (up:update-seq u) (lg:ledger-sequence (record-ledger rec)))
+        (if (and (record-owned-p rec) (not fork-p))
+            (progn (lg:apply-update (record-ledger rec) u) (push u (record-history rec)))
+            (accept-update node rec u))))
+    (unless fork-p (setf (gethash (record-id-hex rec) (node-ledgers node)) rec))
     rec))
