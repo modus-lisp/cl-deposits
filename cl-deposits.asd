@@ -22,6 +22,7 @@
      (:file "dep17")   ; DEP-17: canonical operation encoding, depositor signatures
      (:file "reserves") ; DEP-03: the Taproot reserves output and its tapscript tiers
      (:file "rotation") ; DEP-03: spending the reserves — rotation, recovery, anchors
+     (:file "lottery")  ; DEP-03/06: the custody lottery scripts, claims, armer shares
      (:file "wire")     ; DEP-04: ledger updates, requests, responses, ads as Nostr events
      (:file "bus")      ; where events go: in-process bus (gates), Nostr relays (devnet)
      (:file "lightning") ; DEP-10: the Lightning rail — cl-payments backend, invoice attestations
