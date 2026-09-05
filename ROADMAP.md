@@ -14,3 +14,25 @@ Verified means: checked against the reference implementation's artefacts
 | 6 | Roles: operator node, quorum member (cosigner), wallet; persistence; control socket | core done — consent/QuorumJoin/QuorumAddMember handshake, QuorumBegin with cosigs from the staged set, cosign_update with chain-continuity + speculative-apply gate, deposit_open/balance/transfer_lock/transfer_complete with DEP-17 witness checks, fixture-format persistence; daemon + control socket + wallet CLI; devnet smoke passes: 3 nodes, on-chain funded QuorumBegin on signet, cosigners check the outpoint via bitcoind |
 | 7 | Lightning rail: InvoiceCredit/Lock/Fulfill through cl-payments; devnet with CLN/LND | receive path done — make_invoice via cl-payments control socket, cosign_invoice attestation (reference digest), InvoiceCredit on settlement; devnet: CLN pays, deposit credited, replicas agree. Pay path (InvoiceLock/Fulfill) next |
 | 8 | Disputes: fraud proofs (DEP-06), custody lottery scripts, recovery cascade | |
+
+## Interoperability with the reference implementation
+
+Verified live on the signet devnet against `deposits-rust` (built from
+`~/workspace/deposits-rust`, run with `LIGHTNING_BACKEND=none`,
+`CHAIN_BACKEND=bitcoind` and `--esplora` pointed at `devnet/esplora.py`):
+
+- their `nostr validate` accepts every ledger our nodes publish;
+- their wallet discovers our advertisement, opens deposits on our operator,
+  requests Lightning invoices from it (cosigned attestations), and reads
+  balances back after a CLN node pays;
+- their node joins our quorum: consent handshake, QuorumJoin on its ledger,
+  cosignatures on our DepositOpen/OnchainCredit, outpoint checks via bitcoind;
+- our nodes join its quorum: it stages cld1–cld3, rotates its reserves into a
+  Q=3 Taproot vault on our signet, and our three nodes cosign its QuorumBegin
+  and subsequent operations; every replica sits at its tip.
+
+Reference quirks worth knowing: its wallet `ledger validate` is stale (expects
+prev_hash = content_hash) — use the node's `nostr validate`; its `quorum begin`
+CLI times out after 30 s while the daemon waits for confirmations, and a rerun
+resumes with the persisted vault; Q must be 3, 5 or 7; fund the per-ledger
+`ledger address`, not the node's main `address`.
