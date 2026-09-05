@@ -73,6 +73,8 @@
          (let ((rec (rec! node form)))
            (ok :seq (lg:ledger-sequence (nd:record-ledger rec)) :tip (bytes->hex (lg:ledger-chain-tip (nd:record-ledger rec)))
                :history (length (nd:record-history rec)))))
+        (:poll-invoices (ok :credited (mapcar #'bytes->hex (nd:credit-paid-invoices node))))
+        (:invoices (ok :pending (loop for h being the hash-keys of (nd:node-invoices node) collect (bytes->hex h))))
         (:advertise
          (let* ((rec (rec! node form)) (l (nd:record-ledger rec)))
            (bus:bus-publish (nd::node-bus node)

@@ -1,6 +1,7 @@
 ;;;; bin/cl-deposits-wallet.lisp — a one-shot wallet.
 ;;;;   sbcl --script bin/cl-deposits-wallet.lisp KEYFILE LEDGER ACTION ARGS...
 ;;;;   actions: pubkey | open | balance DEPOSIT | transfer FROM TO MSAT [HEIGHT] | complete TRANSFER PREIMAGE
+;;;;            invoice DEPOSIT MSAT [DESCRIPTION]
 ;;;;   env: CLD_RELAYS
 (require :asdf)
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-deposits"))
@@ -30,6 +31,12 @@
                (cl-deposits.node:wallet-transfer wal ledger (funcall hx (first rest)) (funcall hx (second rest))
                                                  (parse-integer (third rest)) :height (parse-integer (or (fourth rest) "0")))
              (format t "~s~%" (list :transfer (funcall hex tid) :preimage (funcall hex pre)))))
+          ((string= action "invoice")
+           (multiple-value-bind (bolt11 hash res)
+               (cl-deposits.node:wallet-make-invoice wal ledger (funcall hx (first rest)) (parse-integer (second rest))
+                                                     :description (third rest))
+             (format t "~s~%" (list :bolt11 bolt11 :payment-hash (funcall hex hash)
+                                    :cosigned (and (cl-deposits.wire:jget res "cosign_signature") t)))))
           ((string= action "complete")
            (cl-deposits.node:wallet-complete-transfer wal ledger (funcall hx (first rest)) (funcall hx (second rest)))
            (format t "~s~%" (list :status :ok)))

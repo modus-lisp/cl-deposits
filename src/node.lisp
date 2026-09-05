@@ -25,7 +25,7 @@
                     (#:lg #:cl-deposits.ledger) (#:d17 #:cl-deposits.dep17)
                     (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:ev #:cl-nostr.event) (#:flt #:cl-nostr.filter)
-                    (#:k #:cl-nostr.keys) (#:tlv #:cl-deposits.tlv)
+                    (#:k #:cl-nostr.keys) (#:tlv #:cl-deposits.tlv) (#:ln #:cl-deposits.lightning)
                     (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:node #:make-node #:node-pubkey #:node-pubkey-hex #:node-ledgers #:node-log
            #:record #:record-ledger #:record-history #:record-owned-p #:record-id-hex #:record-reserves
@@ -34,6 +34,7 @@
            #:node-chain-fn #:node-min-confs #:node-data-dir #:record-pinned #:height #:tip
            #:node-error #:request #:wallet #:make-wallet #:wallet-pubkey #:wallet-request
            #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer
+           #:wallet-make-invoice #:credit-paid-invoices #:start-invoice-poller #:node-ln #:node-invoices
            #:save-record #:load-record #:*cosign-timeout*))
 (in-package #:cl-deposits.node)
 
@@ -57,6 +58,8 @@
   (log '())
   data-dir
   (inbox '()) (inbox-lock (bt:make-lock "inbox")) (inbox-cv (bt:make-condition-variable)) (worker nil)
+  (ln nil)                                     ; a cl-deposits.lightning backend, or NIL
+  (invoices (make-hash-table :test #'equalp))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
   (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
   (min-confs 1)
   (member-ledger-hex nil))                     ; our own ledger used for QuorumJoin / member_ledger_hash
@@ -64,13 +67,13 @@
 (defun log! (node fmt &rest args)
   (push (apply #'format nil fmt args) (node-log node)))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1))
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln)
   (let* ((priv (w:even-y-privkey priv))
          (pub (up:compressed-pubkey priv))
          (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
-                           :chain-fn chain-fn :min-confs min-confs)))
+                           :chain-fn chain-fn :min-confs min-confs :ln ln)))
     ;; On a real relay, events arrive on the reader thread.  Responses are
     ;; consumed inline (they only wake a waiter); requests and updates go to a
     ;; worker, because handling a request may itself wait for responses.
@@ -302,6 +305,7 @@
   (let ((action (w:event-action event)) (params (w:parse-json (ev:event-content event))))
     (cond ((string= action "cosign_update") (handle-cosign node event params))
           ((string= action "consent_request") (handle-consent node event params))
+          ((string= action "cosign_invoice") (handle-cosign-invoice node event params))
           (t (let ((rec (find-record node (w:event-ledger-id event))))
                (when (and rec (record-owned-p rec))
                  (handle-wallet-request node rec event action params)))))))
@@ -484,8 +488,101 @@
              (unless (and h wit (= 1 (length wit)) (equalp (sha256 (first wit)) h)) (fail "hashlock not satisfied")))
            (append-operation node rec o)
            (respond node event t :result (w:json-object "transfer_id" (bytes->hex (op:field o :transfer-id))))))
+        ((string= action "make_invoice") (handle-make-invoice node rec event params))
         (t (respond node event nil :error (format nil "unknown action ~a" action))))
     (error (e) (respond node event nil :error (princ-to-string e)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Lightning: make_invoice (operator), cosign_invoice (member), crediting
+
+(defun tip-content-hash (rec)
+  (if (tip rec) (up:content-hash (tip rec)) (make-array 32 :element-type '(unsigned-byte 8))))
+
+(defun handle-make-invoice (node rec event params)
+  (unless (node-ln node) (fail "no lightning node"))
+  (let* ((amount (or (w:jget params "amount_msats") (let ((s (w:jget params "amount_sats"))) (and s (* 1000 s)))
+                     (fail "amount_msats required")))
+         (deposit-id (hex->bytes (w:jget params "deposit_id")))
+         (ledger (record-ledger rec)))
+    (lg:find-deposit ledger deposit-id)
+    (unless (<= (+ (lg:total-obligations ledger) amount) (lg:ledger-reserves-amount ledger))
+      (fail "invoice would exceed reserves"))
+    (multiple-value-bind (bolt11 hash) (ln:ln-make-invoice (node-ln node) amount (w:jget params "description"))
+      (setf (gethash hash (node-invoices node)) (list :rec rec :deposit-id deposit-id :amount amount :bolt11 bolt11))
+      (let* ((operator-hash (tip-content-hash rec))
+             (operator-sig (schnorr:schnorr-sign (node-priv node)
+                                                 (ln:invoice-cosign-message (record-id-hex rec) hash deposit-id amount operator-hash)
+                                                 (random-aux)))
+             (result (w:json-object "invoice" bolt11 "amount_msat" amount "amount_sats" (floor amount 1000)
+                                    "deposit_id" (bytes->hex deposit-id) "payment_hash" (bytes->hex hash)
+                                    "operator_pubkey" (node-pubkey-hex node)
+                                    "operator_ledger_hash" (bytes->hex operator-hash)
+                                    "operator_signature" (bytes->hex operator-sig))))
+        (when (eq (lg:ledger-quorum-state ledger) :active)
+          (let* ((members (lg:ledger-quorum-members ledger))
+                 (responses (send-request node (record-id-hex rec) "cosign_invoice"
+                                          (w:json-object "payment_hash" (bytes->hex hash) "deposit_id" (bytes->hex deposit-id)
+                                                         "amount_msat" amount "invoice" bolt11)))
+                 (good (find-if (lambda (r)
+                                  (let ((res (w:jget r "result")))
+                                    (and (w:jget r "success") res
+                                         (let ((pk (hex->bytes (w:jget res "cosigner_pubkey"))))
+                                           (and (member pk members :key #'lg:member-pubkey :test #'equalp)
+                                                (schnorr:schnorr-verify
+                                                 (up:x-only pk)
+                                                 (ln:invoice-cosign-message (record-id-hex rec) hash deposit-id amount
+                                                                            (hex->bytes (w:jget res "cosigner_ledger_hash")))
+                                                 (hex->bytes (w:jget res "cosign_signature"))))))))
+                                responses)))
+            (unless good (fail "no quorum member cosigned the invoice"))
+            (let ((res (w:jget good "result")))
+              (setf (gethash "cosign_required" result) t
+                    (gethash "cosigner_pubkey" result) (w:jget res "cosigner_pubkey")
+                    (gethash "cosigner_ledger_hash" result) (w:jget res "cosigner_ledger_hash")
+                    (gethash "cosign_signature" result) (w:jget res "cosign_signature")))))
+        (respond node event t :result result)))))
+
+(defun handle-cosign-invoice (node event params)
+  (let ((rec (find-record node (w:event-ledger-id event))))
+    (when (and rec (not (record-owned-p rec)))
+      (handler-case
+          (let* ((hash (hex->bytes (w:jget params "payment_hash")))
+                 (deposit-id (hex->bytes (w:jget params "deposit_id")))
+                 (amount (w:jget params "amount_msat"))
+                 (ledger (record-ledger rec)))
+            (lg:find-deposit ledger deposit-id)
+            (unless (<= (+ (lg:total-obligations ledger) amount) (lg:ledger-reserves-amount ledger))
+              (fail "invoice would exceed reserves"))
+            (let* ((mlh (member-ledger-hash node))
+                   (sig (schnorr:schnorr-sign (node-priv node)
+                                              (ln:invoice-cosign-message (record-id-hex rec) hash deposit-id amount mlh)
+                                              (random-aux))))
+              (respond node event t :result (w:json-object "cosign_signature" (bytes->hex sig)
+                                                           "cosigner_pubkey" (node-pubkey-hex node)
+                                                           "cosigner_ledger_hash" (bytes->hex mlh)))))
+        (error (e) (respond node event nil :error (princ-to-string e)))))))
+
+(defun credit-paid-invoices (node)
+  "Ask the Lightning node about every outstanding invoice; credit the paid ones.
+   Returns the payment hashes credited."
+  (let ((credited '()))
+    (when (node-ln node)
+      (loop for hash being the hash-keys of (node-invoices node) using (hash-value inv)
+            when (eq :paid (ln:ln-invoice-status (node-ln node) hash))
+              do (handler-case
+                     (let ((rec (getf inv :rec)))
+                       (append-operation node rec
+                                         (list :type :invoice-credit :payment-hash hash :deposit-id (getf inv :deposit-id)
+                                               :amount (getf inv :amount)
+                                               :invoice-id (format nil "bolt11:~a" (subseq (getf inv :bolt11) 0 (min 32 (length (getf inv :bolt11)))))
+                                               :sequence-number (1+ (lg:ledger-sequence (record-ledger rec)))))
+                       (push hash credited)
+                       (remhash hash (node-invoices node)))
+                   (error (e) (log! node "credit ~a: ~a" (subseq (bytes->hex hash) 0 8) e)))))
+    credited))
+
+(defun start-invoice-poller (node &key (interval 3))
+  (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (credit-paid-invoices node)))) :name "cld-invoices"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Wallet: a key, a bus, and the requests it can make
@@ -552,6 +649,33 @@
       (declare (ignore res))
       (unless ok (fail "transfer_complete: ~a" err))
       t)))
+
+;;; Wallet: receive over Lightning
+
+(defun wallet-make-invoice (wal ledger-id-hex deposit-id amount-msat &key description operator-pubkey)
+  "Ask the operator for an invoice; verify the attestation signatures it and a
+   cosigner put on (ledger, payment hash, deposit, amount).  Returns
+   (values bolt11 payment-hash attestation)."
+  (multiple-value-bind (ok res err)
+      (wallet-request wal ledger-id-hex "make_invoice"
+                      (w:json-object "amount_msats" amount-msat "deposit_id" (bytes->hex deposit-id) "description" description))
+    (unless ok (fail "make_invoice: ~a" err))
+    (let* ((hash (hex->bytes (w:jget res "payment_hash")))
+           (op-pk (hex->bytes (w:jget res "operator_pubkey"))))
+      (when (and operator-pubkey (not (equalp op-pk operator-pubkey))) (fail "invoice attested by the wrong operator"))
+      (unless (= (w:jget res "amount_msat") amount-msat) (fail "amount mismatch"))
+      (unless (schnorr:schnorr-verify (up:x-only op-pk)
+                                      (ln:invoice-cosign-message ledger-id-hex hash deposit-id amount-msat
+                                                                 (hex->bytes (w:jget res "operator_ledger_hash")))
+                                      (hex->bytes (w:jget res "operator_signature")))
+        (fail "operator invoice attestation does not verify"))
+      (when (w:jget res "cosign_signature")
+        (unless (schnorr:schnorr-verify (up:x-only (hex->bytes (w:jget res "cosigner_pubkey")))
+                                        (ln:invoice-cosign-message ledger-id-hex hash deposit-id amount-msat
+                                                                   (hex->bytes (w:jget res "cosigner_ledger_hash")))
+                                        (hex->bytes (w:jget res "cosign_signature")))
+          (fail "cosigner invoice attestation does not verify")))
+      (values (w:jget res "invoice") hash res))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Persistence: the fixture format — a JSON array of base64 updates, oldest first.

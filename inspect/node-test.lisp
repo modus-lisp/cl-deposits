@@ -9,7 +9,8 @@
 (with-gate ("nodes: quorum formation over the bus")
   (let* ((bus (bus:make-mock-bus))
          (hf (lambda () *height*))
-         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (mock-ln (ln:make-mock-ln))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf :ln mock-ln))
          (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
          (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
          (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
@@ -55,6 +56,23 @@
         (check "TransferComplete with the preimage" (nd:wallet-complete-transfer w1 id tid preimage))
         (check-equal "balances settle 60000 / 40000"
                      (list (nd:wallet-balance w1 id d1) (nd:wallet-balance w2 id d2)) '(60000 40000)))
+      ;; Lightning: an invoice, cosigned attestation, payment, InvoiceCredit.
+      (multiple-value-bind (bolt11 hash res) (nd:wallet-make-invoice w2 id d2 25000 :operator-pubkey (nd:node-pubkey a))
+        (check "invoice minted by the (mock) Lightning node" (string= "lnmock1" (subseq bolt11 0 7)))
+        (check "attestation cosigned by a quorum member" (and (w:jget res "cosign_signature") t))
+        (check-equal "nothing credited before payment" (nd:credit-paid-invoices a) '())
+        (ln:mock-ln-settle mock-ln hash)
+        (check-equal "payment settled -> one InvoiceCredit" (nd:credit-paid-invoices a) (list hash))
+        (check-equal "w2 balance includes the credit" (nd:wallet-balance w2 id d2) 65000)
+        (check "InvoiceCredit carries the bolt11-derived invoice id"
+               (let ((o (op:decode-operation (up:update-message (first (nd:record-history la))))))
+                 (and (eq (op:operation-type o) :invoice-credit)
+                      (string= (op:field o :invoice-id) (format nil "bolt11:~a" (subseq bolt11 0 32))))))
+        (check-signals "the same payment cannot be credited twice" lg:ledger-error
+          (lg:apply-operation (nd:record-ledger la)
+                              (list :type :invoice-credit :payment-hash hash :deposit-id d2 :amount 1 :invoice-id "x" :sequence-number 99)))
+        (check-signals "an invoice beyond reserves is refused" nd:node-error
+          (nd:wallet-make-invoice w2 id d2 (* 2 (lg:ledger-reserves-amount (nd:record-ledger la))))))
       ;; Rejections.
       (check-signals "transfer signed by the wrong wallet is refused" nd:node-error
         (nd:wallet-transfer w2 id d1 d2 1000 :height *height*))
@@ -87,7 +105,7 @@
                       (up:update-cosignatures (car (last updates)))))
         (dolist (u updates) (lg:apply-update fresh u))
         (check-bytes "fold of published updates reaches A's tip" (lg:ledger-chain-tip fresh) (lg:ledger-chain-tip (nd:record-ledger la)))
-        (check-equal "obligations from the fold" (lg:total-obligations fresh) 100000))
+        (check-equal "obligations from the fold" (lg:total-obligations fresh) 125000))
       ;; Persistence round trip in the fixture format.
       (let* ((dir (format nil "/tmp/cl-deposits-test-~a/" (random 1000000)))
              (path (progn (setf (nd::node-data-dir a) dir) (nd:save-record a la)

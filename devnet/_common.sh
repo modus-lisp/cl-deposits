@@ -16,6 +16,9 @@ wcli() { $BCLI -rpcwallet="$MINER_WALLET" "$@"; }
 mine() { "$SIGNET_ROOT/mine.sh" "${1:-1}" >/dev/null; }
 
 CLD_NODES=("cld1:10041" "cld2:10042" "cld3:10043")     # name:control-port
+CLD_LN_NODE="${CLD_LN_NODE:-clp3}"                       # cld1's Lightning node (a cl-payments daemon)
+CLD_LN_CONTROL="127.0.0.1:$(( 9930 + ${CLD_LN_NODE#clp} + 100 ))"
+ln_cli() { "$SIGNET_ROOT/bin/lightning-cli" --lightning-dir="$SIGNET_ROOT/$1" "${@:2}"; }   # CLN nodes only
 cld_names() { for e in "${CLD_NODES[@]}"; do echo "${e%%:*}"; done; }
 cld_port()  { for e in "${CLD_NODES[@]}"; do [ "${e%%:*}" = "$1" ] && echo "${e##*:}" && return; done; return 1; }
 cld_dir()   { echo "$CLD_ROOT/$1"; }
@@ -37,10 +40,11 @@ start_relay() {
 start_cld() {
   local n=$1 dir; dir=$(cld_dir "$n"); mkdir -p "$dir"
   cld_running "$n" && { echo "$n already running"; return 0; }
-  ( cd "$CLD_SRC" && CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=signet \
-      CLD_BITCOIN_CLI="$BCLI" CLD_MIN_CONFS=1 \
+  local lnenv=(); [ "$n" = cld1 ] && lnenv=("CLD_LN_CONTROL=$CLD_LN_CONTROL")
+  ( cd "$CLD_SRC" && setsid nohup env CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=signet \
+      CLD_BITCOIN_CLI="$BCLI" CLD_MIN_CONFS=1 "${lnenv[@]}" \
       CL_SOURCE_REGISTRY="(:source-registry (:tree \"$CLD_SRC\") :inherit-configuration)" \
-      setsid nohup sbcl --noinform --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 & )
+      sbcl --noinform --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 & )
   for i in $(seq 1 120); do (echo >/dev/tcp/127.0.0.1/$(cld_port "$n")) 2>/dev/null && { echo "$n up (control $(cld_port "$n"))"; return 0; }; sleep 0.5; done
   echo "$n did not come up; see $dir/cld.log" >&2; return 1
 }

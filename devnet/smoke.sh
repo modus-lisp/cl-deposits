@@ -64,4 +64,17 @@ step "9  replicas agree"
 T1=$(sx "$(cld_ctl cld1 "(:tip :ledger \"$L1\")")" ":TIP"); T2=$(sx "$(cld_ctl cld2 "(:tip :ledger \"$L1\")")" ":TIP"); T3=$(sx "$(cld_ctl cld3 "(:tip :ledger \"$L1\")")" ":TIP")
 [ "$T1" = "$T2" ] && [ "$T1" = "$T3" ] || fail "tips differ: $T1 $T2 $T3"
 echo "   tip $T1 on all three nodes"
+step "10 Lightning rail: w1 receives 100000 msat over Lightning (cosigned attestation, InvoiceCredit)"
+INV=$("$CLD_SRC/devnet/cld-wallet.sh" w1 "$L1" invoice "$W1" 100000 "deposit top-up"); echo "   $INV"
+BOLT11=$(sx "$INV" ":BOLT11"); [ -n "$BOLT11" ] || fail "no invoice"
+[[ "$INV" == *":COSIGNED T"* ]] || fail "attestation not cosigned"
+ln_cli cln3 pay "$BOLT11" >/dev/null 2>&1 || ln_cli cln4 pay "$BOLT11" >/dev/null || fail "payment failed"
+echo "   paid from cln"
+for i in $(seq 1 10); do R=$(cld_ctl cld1 "(:poll-invoices)"); [[ "$R" == *":CREDITED (\""* ]] && break; sleep 1; done
+[[ "$R" == *":CREDITED (\""* ]] || fail "not credited: $R"
+B1=$("$CLD_SRC/devnet/cld-wallet.sh" w1 "$L1" balance "$W1"); [[ "$B1" == *":BALANCE 3100000"* ]] || fail "balance after LN: $B1"
+echo "   w1 $B1"
+T1=$(sx "$(cld_ctl cld1 "(:tip :ledger \"$L1\")")" ":TIP"); T2=$(sx "$(cld_ctl cld2 "(:tip :ledger \"$L1\")")" ":TIP")
+[ "$T1" = "$T2" ] || fail "tips differ after credit"
+echo "   replicas agree at $T1"
 echo; echo "SMOKE OK"

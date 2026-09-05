@@ -5,6 +5,7 @@
 ;;;;   CLD_NETWORK       signet | testnet | regtest | mainnet   (default signet)
 ;;;;   CLD_BITCOIN_CLI   e.g. "bitcoin-cli -signet -datadir=/x"  (chain height + outpoint checks)
 ;;;;   CLD_MIN_CONFS     confirmations a cosigner requires on a QuorumBegin outpoint (default 1)
+;;;;   CLD_LN_CONTROL    host:port of a cl-payments daemon's control socket (the Lightning rail)
 (require :asdf)
 (require :sb-posix)
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-deposits"))
@@ -24,7 +25,13 @@
                 :priv priv :bus bus :network (env "CLD_NETWORK" "signet") :data-dir dir
                 :height-fn (and cli (cl-deposits.daemon:bitcoin-cli-height-fn cli))
                 :chain-fn (and cli (cl-deposits.daemon:bitcoin-cli-chain-fn cli))
-                :min-confs (parse-integer (env "CLD_MIN_CONFS" "1")))))
+                :min-confs (parse-integer (env "CLD_MIN_CONFS" "1"))
+                :ln (let ((hp (env "CLD_LN_CONTROL")))
+                      (and hp (let ((i (position #\: hp)))
+                                (cl-deposits.lightning:make-clp-backend (subseq hp 0 i) (parse-integer hp :start (1+ i)))))))))
+    (when (cl-deposits.node:node-ln node)
+      (cl-deposits.node:start-invoice-poller node)
+      (format t "~&lightning rail: ~a~%" (env "CLD_LN_CONTROL")))
     (with-open-file (s (merge-pathnames "cld.pid" dir) :direction :output :if-exists :supersede)
       (format s "~d~%" (sb-posix:getpid)))
     ;; Reload what we knew: our ledgers, and the ones we cosign.
