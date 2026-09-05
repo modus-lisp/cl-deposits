@@ -22,7 +22,7 @@
          (bus (cl-deposits.nostr-bus:make-nostr-bus relays))
          (cli (env "CLD_BITCOIN_CLI"))
          (node (cl-deposits.node:make-node
-                :priv priv :bus bus :network (env "CLD_NETWORK" "signet") :data-dir dir
+                :priv priv :bus bus :network (env "CLD_NETWORK" "signet") :data-dir dir :relays relays
                 :height-fn (and cli (cl-deposits.daemon:bitcoin-cli-height-fn cli))
                 :chain-fn (and cli (cl-deposits.daemon:bitcoin-cli-chain-fn cli))
                 :min-confs (parse-integer (env "CLD_MIN_CONFS" "1"))

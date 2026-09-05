@@ -59,6 +59,7 @@
   data-dir
   (inbox '()) (inbox-lock (bt:make-lock "inbox")) (inbox-cv (bt:make-condition-variable)) (worker nil)
   (ln nil)                                     ; a cl-deposits.lightning backend, or NIL
+  (relays '())                                 ; relay URLs, for advertisements
   (invoices (make-hash-table :test #'equalp))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
   (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
   (min-confs 1)
@@ -67,13 +68,13 @@
 (defun log! (node fmt &rest args)
   (push (apply #'format nil fmt args) (node-log node)))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln relays)
   (let* ((priv (w:even-y-privkey priv))
          (pub (up:compressed-pubkey priv))
          (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
-                           :chain-fn chain-fn :min-confs min-confs :ln ln)))
+                           :chain-fn chain-fn :min-confs min-confs :ln ln :relays relays)))
     ;; On a real relay, events arrive on the reader thread.  Responses are
     ;; consumed inline (they only wake a waiter); requests and updates go to a
     ;; worker, because handling a request may itself wait for responses.
@@ -463,9 +464,13 @@
                                             :receive-requires-sig nil))
            (respond node event t :result (w:json-object "deposit_id" (bytes->hex id)))))
         ((string= action "balance_query")
-         (let ((d (lg:find-deposit (record-ledger rec) (hex->bytes (w:jget params "deposit_id")))))
-           (respond node event t :result (w:json-object "balance_msats" (lg:deposit-balance d)
+         (let ((d (lg:find-deposit (record-ledger rec) (deposit-id-param params))))
+           (respond node event t :result (w:json-object "deposit_id" (bytes->hex (lg:deposit-id d))
+                                                        "balance_msats" (lg:deposit-balance d)
                                                         "locked_msats" (lg:deposit-locked-balance d)
+                                                        "available_msats" (lg:deposit-available-balance d)
+                                                        "balance" (lg:deposit-balance d)
+                                                        "locked_balance" (lg:deposit-locked-balance d)
                                                         "sequence" (lg:ledger-sequence (record-ledger rec))))))
         ((string= action "transfer_lock")
          (let* ((o (op:decode-operation (base64-decode (w:jget params "operation"))))
@@ -498,11 +503,17 @@
 (defun tip-content-hash (rec)
   (if (tip rec) (up:content-hash (tip rec)) (make-array 32 :element-type '(unsigned-byte 8))))
 
+(defun deposit-id-param (params)
+  "Wallets name a deposit by id or by descriptor (the reference wallet sends the descriptor)."
+  (cond ((w:jget params "deposit_id") (hex->bytes (w:jget params "deposit_id")))
+        ((w:jget params "descriptor") (op:deposit-id (w:jget params "descriptor")))
+        (t (fail "deposit_id or descriptor required"))))
+
 (defun handle-make-invoice (node rec event params)
   (unless (node-ln node) (fail "no lightning node"))
   (let* ((amount (or (w:jget params "amount_msats") (let ((s (w:jget params "amount_sats"))) (and s (* 1000 s)))
                      (fail "amount_msats required")))
-         (deposit-id (hex->bytes (w:jget params "deposit_id")))
+         (deposit-id (deposit-id-param params))
          (ledger (record-ledger rec)))
     (lg:find-deposit ledger deposit-id)
     (unless (<= (+ (lg:total-obligations ledger) amount) (lg:ledger-reserves-amount ledger))

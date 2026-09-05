@@ -79,12 +79,26 @@
          (let* ((rec (rec! node form)) (l (nd:record-ledger rec)))
            (bus:bus-publish (nd::node-bus node)
                             (w:advertisement-event (nd::node-keypair node)
+                                                   ;; Every non-defaulted field of the reference's
+                                                   ;; LedgerAdvertisement, or its wallet drops the event.
                                                    (w:json-object "ledger_id" (nd:record-id-hex rec)
                                                                   "operator_pubkey" (nd:node-pubkey-hex node)
+                                                                  "delegate_pubkey" ""
                                                                   "reserves_address" (lg:ledger-reserves-key l)
+                                                                  "operator_name" "cl-deposits"
+                                                                  "annual_fee_bps" 0 "deposit_fee_bps" 0 "withdrawal_fee_bps" 0 "invoice_fee_bps" 0
+                                                                  "annualized_fixed_msats" 0 "fee_period_blocks" 2016
+                                                                  "transfer_fee_fixed_msats" 0 "transfer_fee_rate_bps" 0
+                                                                  "max_deposit_msats" (lg:ledger-reserves-amount l) "min_deposit_msats" 1000
+                                                                  "max_deposit_balance_msats" (lg:ledger-reserves-amount l)
                                                                   "reserves_amount_msats" (lg:ledger-reserves-amount l)
                                                                   "collateral_amount_msats" (lg:ledger-collateral-amount l)
-                                                                  "network" (nd::node-network node))
+                                                                  "relay_url" (first (nd::node-relays node))
+                                                                  "network" (nd::node-network node)
+                                                                  "current_block" (nd:height node)
+                                                                  "quorum_state" (string-downcase (symbol-name (lg:ledger-quorum-state l)))
+                                                                  "quorum_members" (coerce (mapcar (lambda (m) (bytes->hex (lg:member-pubkey m))) (lg:ledger-quorum-members l)) 'vector)
+                                                                  "version" 1)
                                                    :network (nd::node-network node)))
            (ok))))
     (error (e) (let ((*print-pretty* nil)) (format nil "~s" (list :status :error :message (princ-to-string e)))))))
