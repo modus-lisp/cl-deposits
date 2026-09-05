@@ -62,4 +62,5 @@
                                              :destination-spk (rs:reserves-spk r2) :fee-rate 2)))
                     (rot:verify-spend (rot:attach-tier-witness tx 0 r 4 '()) 0 prevouts)))))))
 
+
 (report)

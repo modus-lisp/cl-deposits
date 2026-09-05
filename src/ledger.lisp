@@ -23,7 +23,7 @@
            #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold))
+           #:majority-threshold #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay))
 (in-package #:cl-deposits.ledger)
 
 (define-condition ledger-error (error)
@@ -279,3 +279,48 @@
   (setf (ledger-sequence ledger) (up:update-seq update)
         (ledger-chain-tip ledger) (up:chain-hash update))
   ledger)
+
+;;; ---------------------------------------------------------------------------
+;;; DEP-05 §Lifecycle: how many cosignatures an operation needs at a height.
+
+(defparameter +tier-1-offset+ 720)
+(defparameter +tier-2-offset+ 4032)
+(defparameter +tier-3-offset+ 8064)
+
+(defun establishment-p (op)
+  (member (cl-deposits.operation:operation-type op) '(:quorum-add-member :quorum-remove-member :quorum-begin)))
+
+(defun lifecycle-tier (ledger height)
+  (let ((expiry (ledger-quorum-expiry ledger)))
+    (cond ((null expiry) :tier0)
+          ((< height expiry) :tier0)
+          ((< height (+ expiry +tier-1-offset+)) :tier0-post-expiry)
+          ((< height (+ expiry +tier-2-offset+)) :tier1)
+          ((< height (+ expiry +tier-3-offset+)) :tier2)
+          (t :tier3))))
+
+(defun cosign-requirement (ledger op height)
+  "(values required-sigs signers tier operator-alone-p allowed-p).  SIGNERS is the
+   member list the signatures must come from: the active quorum, or for the
+   first QuorumBegin the staged set."
+  (let* ((active (ledger-quorum-members ledger))
+         (staged (ledger-next-quorum-members ledger))
+         (signers (cond (active active)
+                        ((and staged (eq (cl-deposits.operation:operation-type op) :quorum-begin)) staged)
+                        (t nil))))
+    (when (null signers)
+      (return-from cosign-requirement (values 0 '() :tier0 nil t)))
+    (let* ((n (length signers)) (majority (majority-threshold n)) (minority (max 1 (floor n 3)))
+           (tier (if (member (ledger-active-ruleset ledger) '("legacy" "cltv-offset-literal") :test #'string=)
+                     :tier0
+                     (lifecycle-tier ledger height))))
+      (cond ((eq tier :tier0) (values majority signers tier nil t))
+            ((not (establishment-p op)) (values 0 signers tier nil nil))
+            ((eq tier :tier0-post-expiry) (values majority signers tier nil t))
+            ((eq tier :tier1) (values minority signers tier nil t))
+            ((eq tier :tier2) (values 1 signers tier nil t))
+            (t (values 0 signers tier t t))))))
+
+(defun replay (updates)
+  "A fresh ledger folded from UPDATES in order (the cheap deep copy)."
+  (let ((l (make-ledger))) (dolist (u updates l) (apply-update l u))))
