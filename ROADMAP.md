@@ -41,3 +41,5 @@ CLI times out after 30 s while the daemon waits for confirmations, and a rerun
 resumes with the persisted vault; Q must be 3, 5 or 7; fund the per-ledger
 `ledger address`, not the node's main `address`; its validator is happy only if
 the genesis update is on the relay (`ledger republish` fixes a missing seq 0).
+
+Reference quirks, bugs and undocumented wire facts are collected in `UPSTREAM-NOTES.md`.

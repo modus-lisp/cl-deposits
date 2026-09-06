@@ -17,4 +17,5 @@ verify here byte-for-byte.
     git clone --recursive https://github.com/modus-lisp/cl-deposits
     inspect/run-all.sh
 
-See `ROADMAP.md` for what exists and what is next.
+See `ROADMAP.md` for what exists and what is next, and `UPSTREAM-NOTES.md` for
+what we learned about the spec and the reference implementation on the way.
