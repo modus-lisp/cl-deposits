@@ -33,7 +33,9 @@ Verified live on the signet devnet against `deposits-rust` (built from
   Q=3 Taproot vault on our signet, and our three nodes cosign its QuorumBegin
   and subsequent operations; every replica sits at its tip.
 
-Reference quirks worth knowing: its wallet `ledger validate` is stale (expects
+Reference quirks worth knowing: the partial-reveal lottery leaf under-reduces the
+contribution sum (N-1 subtractions for a sum up to (N-1)·N), so when every revealer
+contributes the maximum the leaf cannot be spent and funds fall to the recovery cascade; its wallet `ledger validate` is stale (expects
 prev_hash = content_hash) — use the node's `nostr validate`; its `quorum begin`
 CLI times out after 30 s while the daemon waits for confirmations, and a rerun
 resumes with the persisted vault; Q must be 3, 5 or 7; fund the per-ledger

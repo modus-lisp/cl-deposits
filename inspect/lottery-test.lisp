@@ -72,8 +72,13 @@
                (sub-pre (mapcar (lambda (i) (nth i ordered-pre)) revealers))
                (sub-winner (nth (lot:calculate-winner sub-pre :bounds-n n) revealers))
                (leaf (nth (1+ missing) (lot:lottery-leaves l))))
-          (check (format nil "partial reveal (missing ~a): sub-winner ~a claims after CSV 72" missing sub-winner)
-                 (spend-lottery l amount (lambda (tx pv) (lot:partial-reveal-witness l missing (sig-for l tx pv leaf (nth sub-winner ordered-priv)) sub-pre)) :sequence 72))
+          ;; Reference quirk: the sub-lottery reduces the sum with N-1 conditional
+          ;; subtractions of N-1, which is one short exactly when every revealer
+          ;; contributed the maximum (sum = (N-1)*N).  That leaf is then unspendable.
+          (let ((sum (loop for p in sub-pre sum (- (length p) 16))) (spends (spend-lottery l amount (lambda (tx pv) (lot:partial-reveal-witness l missing (sig-for l tx pv leaf (nth sub-winner ordered-priv)) sub-pre)) :sequence 72)))
+            (if (= sum (* (1- n) n))
+                (check (format nil "partial reveal (missing ~a): all-maximum contributions hit the reference's under-reduction (leaf unspendable)" missing) (not spends))
+                (check (format nil "partial reveal (missing ~a): sub-winner ~a claims after CSV 72" missing sub-winner) spends)))
           (check "partial reveal without the CSV wait fails"
                  (not (spend-lottery l amount (lambda (tx pv) (lot:partial-reveal-witness l missing (sig-for l tx pv leaf (nth sub-winner ordered-priv)) sub-pre)))))))
       ;; Recovery cascade: 2-of-3 voters after 144; 1 voter after 1008 (T-1=1); escape hatch after 8064.
