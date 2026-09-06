@@ -36,7 +36,7 @@
            #:node-chain-fn #:node-min-confs #:node-data-dir #:record-pinned #:height #:tip
            #:node-error #:request #:wallet #:make-wallet #:wallet-pubkey #:wallet-request
            #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer
-           #:wallet-make-invoice #:credit-paid-invoices #:start-invoice-poller #:node-ln #:node-invoices
+           #:wallet-make-invoice #:wallet-pay-invoice #:credit-paid-invoices #:start-invoice-poller #:node-ln #:node-invoices
            #:enter-dispute #:arm-dispute #:fork-key #:find-fork #:forks-of #:armers-of #:disputed-reserves
            #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
@@ -576,7 +576,7 @@
                                                         "locked_balance" (lg:deposit-locked-balance d)
                                                         "sequence" (lg:ledger-sequence (record-ledger rec))))))
         ((string= action "transfer_lock")
-         (let* ((o (op:decode-operation (base64-decode (w:jget params "operation"))))
+         (let* ((o (transfer-lock-from-request params))
                 (src (lg:find-deposit (record-ledger rec) (op:field o :source-deposit-id))))
            (unless (eq (op:operation-type o) :transfer-lock) (fail "not a TransferLock"))
            (unless (eq :ok (d17:verify-operation-witness o (lg:deposit-descriptor src) (op:field o :witness)))
@@ -587,7 +587,10 @@
            (append-operation node rec o)
            (respond node event t :result (w:json-object "transfer_id" (bytes->hex (op:field o :transfer-id))))))
         ((string= action "transfer_complete")
-         (let* ((o (op:decode-operation (base64-decode (w:jget params "operation"))))
+         (let* ((o (if (w:jget params "operation")
+                       (op:decode-operation (base64-decode (w:jget params "operation")))
+                       (list :type :transfer-complete :transfer-id (hex->bytes (w:jget params "transfer_id"))
+                             :script-witness (list (hex->bytes (or (w:jget params "preimage") (w:jget params "scalar") (fail "preimage required")))))))
                 (pending (gethash (op:field o :transfer-id) (lg:ledger-pending-transfers (record-ledger rec)))))
            (unless pending (fail "no such transfer"))
            (let* ((script (getf pending :completion-script))
@@ -597,8 +600,80 @@
            (append-operation node rec o)
            (respond node event t :result (w:json-object "transfer_id" (bytes->hex (op:field o :transfer-id))))))
         ((string= action "make_invoice") (handle-make-invoice node rec event params))
+        ((string= action "pay_invoice") (handle-pay-invoice node rec event params))
         (t (respond node event nil :error (format nil "unknown action ~a" action))))
     (error (e) (respond node event nil :error (princ-to-string e)))))
+
+;;; Requests in the reference wallet's shape (field by field, signature = witness)
+
+(defun witness-from-json (v)
+  "A DescriptorWitness as the reference serialises it: {\"stack\": [...]}, a bare
+   array, or a single hex signature; elements as hex strings or byte arrays."
+  (let ((stack (cond ((hash-table-p v) (gethash "stack" v)) (t v))))
+    (cond ((stringp stack) (list (hex->bytes stack)))
+          ((vectorp stack) (map 'list (lambda (e) (if (stringp e) (hex->bytes e) (coerce (map 'list #'identity e) 'octets))) stack))
+          (t '()))))
+
+(defun transfer-lock-from-request (params)
+  (if (w:jget params "operation")
+      (op:decode-operation (base64-decode (w:jget params "operation")))
+      (list :type :transfer-lock
+            :transfer-nonce (hex->bytes (w:jget params "transfer_nonce"))
+            :source-deposit-id (hex->bytes (w:jget params "source_deposit_id"))
+            :destination-deposit-id (hex->bytes (w:jget params "destination_deposit_id"))
+            :amount (w:jget params "amount") :fee (or (w:jget params "fee") 0)
+            :completion-script (w:jget params "completion_script") :timeout-height (w:jget params "timeout_height")
+            :transfer-id (hex->bytes (w:jget params "transfer_id"))
+            :nonce (w:jget params "op_nonce") :expiry (w:jget params "op_expiry")
+            :witness (or (witness-from-json (w:jget params "witness"))
+                         (list (hex->bytes (or (w:jget params "signature") (fail "signature required"))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Lightning: pay_invoice (DEP-10 pay).  InvoiceLock on the deposit, pay through
+;;; the node's Lightning backend, then InvoiceFulfill with the preimage or
+;;; InvoiceFail.
+
+(defun handle-pay-invoice (node rec event params)
+  (unless (node-ln node) (fail "no lightning node"))
+  (let* ((deposit-id (deposit-id-param params))
+         (bolt11 (w:jget params "invoice"))
+         (hash (or (and (w:jget params "payment_hash") (hex->bytes (w:jget params "payment_hash"))) (ln:invoice-payment-hash bolt11)))
+         (amount (w:jget params "amount_msats"))
+         (fee (or (w:jget params "fee_msats") 0))
+         (o (if (w:jget params "operation")
+                (op:decode-operation (base64-decode (w:jget params "operation")))
+                (list :type :invoice-lock :deposit-id deposit-id :amount amount :payment-id hash
+                      :sequence-number (1+ (lg:ledger-sequence (record-ledger rec)))
+                      :nonce (w:jget params "nonce") :expiry (w:jget params "expiry") :fee fee
+                      :witness (witness-from-json (w:jget params "witness")))))
+         (d (lg:find-deposit (record-ledger rec) (op:field o :deposit-id))))
+    (unless (equalp (ln:invoice-payment-hash bolt11) (op:field o :payment-id)) (fail "payment_hash does not match the invoice"))
+    (unless (eq :ok (d17:verify-operation-witness o (lg:deposit-descriptor d) (op:field o :witness))) (fail "witness does not authorize this lock"))
+    (when (> (height node) (op:field o :expiry)) (fail "operation expired"))
+    (append-operation node rec o)
+    ;; Pay, then settle the lock either way.
+    (let ((outcome :failed) (preimage nil))
+      (handler-case
+          (progn (ln:ln-pay (node-ln node) bolt11 :amount-msat (op:field o :amount) :height (height node))
+                 (loop repeat 60
+                       do (multiple-value-bind (st pre) (ln:ln-payment-status (node-ln node) (op:field o :payment-id))
+                            (case st (:succeeded (setf outcome :succeeded preimage pre) (return))
+                                     (:failed (return))
+                                     (t (sleep 0.5))))))
+        (error (e) (log! node "pay failed: ~a" e)))
+      (if (and (eq outcome :succeeded) preimage (equalp (sha256 preimage) (op:field o :payment-id)))
+          (progn
+            (append-operation node rec (list :type :invoice-fulfill :deposit-id (op:field o :deposit-id) :amount (op:field o :amount)
+                                             :payment-id (op:field o :payment-id) :sequence-number (1+ (lg:ledger-sequence (record-ledger rec)))
+                                             :witness (op:field o :witness) :preimage preimage))
+            (respond node event t :result (w:json-object "payment_id" (bytes->hex (op:field o :payment-id))
+                                                         "deposit_id" (bytes->hex (op:field o :deposit-id))
+                                                         "amount_msat" (op:field o :amount) "preimage" (bytes->hex preimage)
+                                                         "status" "succeeded")))
+          (progn
+            (append-operation node rec (list :type :invoice-fail :deposit-id (op:field o :deposit-id) :payment-id (op:field o :payment-id)
+                                             :sequence-number (1+ (lg:ledger-sequence (record-ledger rec)))))
+            (respond node event nil :error "payment failed; lock released"))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Lightning: make_invoice (operator), cosign_invoice (member), crediting
@@ -768,6 +843,22 @@
       (declare (ignore res))
       (unless ok (fail "transfer_complete: ~a" err))
       t)))
+
+;;; Wallet: pay a Lightning invoice from a deposit
+
+(defun wallet-pay-invoice (wal ledger-id-hex deposit-id bolt11 amount-msat &key (fee 0) (height 0))
+  "InvoiceLock signed by us; the operator pays and settles.  Returns (values ok preimage error)."
+  (let* ((hash (ln:invoice-payment-hash bolt11))
+         (o (list :type :invoice-lock :deposit-id deposit-id :amount amount-msat :payment-id hash :sequence-number 0
+                  :nonce (incf (wallet-nonce wal)) :expiry (+ height 144) :fee fee :witness '())))
+    (setf (getf o :witness) (d17:sign-operation o (wallet-priv wal)))
+    (multiple-value-bind (ok res err)
+        (wallet-request wal ledger-id-hex "pay_invoice"
+                        (w:json-object "descriptor" (wallet-descriptor wal) "invoice" bolt11 "payment_hash" (bytes->hex hash)
+                                       "amount_msats" amount-msat "fee_msats" fee "nonce" (op:field o :nonce) "expiry" (op:field o :expiry)
+                                       "witness" (w:json-object "stack" (coerce (mapcar #'bytes->hex (op:field o :witness)) 'vector)))
+                        :timeout 40)
+      (values ok (and ok (hex->bytes (w:jget res "preimage"))) err))))
 
 ;;; Wallet: DEP-12 escalation through a quorum member
 

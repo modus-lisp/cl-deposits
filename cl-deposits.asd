@@ -25,6 +25,7 @@
      (:file "lottery")  ; DEP-03/06: the custody lottery scripts, claims, armer shares
      (:file "wire")     ; DEP-04: ledger updates, requests, responses, ads as Nostr events
      (:file "bus")      ; where events go: in-process bus (gates), Nostr relays (devnet)
+     (:file "bolt11")   ; enough BOLT #11 to read a payment hash
      (:file "lightning") ; DEP-10: the Lightning rail — cl-payments backend, invoice attestations
      (:file "fraud")    ; DEP-06: fraud proofs — canonical hashing, verification, JSON
      (:file "node")     ; the node: operator, quorum member, and the wallet side

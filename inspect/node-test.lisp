@@ -294,4 +294,60 @@
             (check-equal "courier's E balance fell by the forward amount" (nd:wallet-balance kwe ide ke) (- 800000 forward))
             (check "route recorded the preimage" (equalp (getf (gethash (u:sha256 preimage) (cr:courier-routes k)) :preimage) preimage))))))))
 
+
+
+(with-gate ("lightning pay path and reference-shaped requests")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*)) (mock-ln (ln:make-mock-ln))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf :ln mock-ln))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a4" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d4")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((w1 (nd:make-wallet :priv 55555555555555555555 :bus bus)) (w2 (nd:make-wallet :priv 66666666666666666666 :bus bus))
+           (d1 (nd:wallet-open-deposit w1 id)) (d2 (nd:wallet-open-deposit w2 id)))
+      (nd:credit-onchain a la d1 100000 :txid (u:sha256 (hx "05")))
+      ;; bolt11 decoding against a real invoice (cl-payments minted, from the devnet)
+      (check-bytes "payment hash read from a real BOLT11"
+                   (cl-deposits.lightning.decode:payment-hash "lntbs1230n1p4fe4mnpp5xsy0ed6dr4tum0066kf468m57d8nzdwfym2ct9mm0ghmkxaeq6xqsp5mrgjknqahtx4lj3mphpjf7el9vdatm4p4sm50uuld3ny3zzlj73qdq2wejkxar0wgxqrrsscqpj9qrsgqsc30p2g88av7u6gg040kvdps454u54xgemdqls346l7dhe8x4krs9jz0je67a3n2a3yak3ty5ztgpr47qsfgj5wwevk2yr9sw5hpg6qpj77x6e")
+                   (hx "3408fcb74d1d57cdbdfad5935d1f74f34f3135c926d585977b7a2fbb1bb9068c"))
+      (check-equal "amount read from the hrp (1230n = 123000 msat)" (cl-deposits.lightning.decode:invoice-amount-msat "lntbs1230n1p4fe4mnpp5xsy0ed6dr4tum0066kf468m57d8nzdwfym2ct9mm0ghmkxaeq6xqsp5mrgjknqahtx4lj3mphpjf7el9vdatm4p4sm50uuld3ny3zzlj73qdq2wejkxar0wgxqrrsscqpj9qrsgqsc30p2g88av7u6gg040kvdps454u54xgemdqls346l7dhe8x4krs9jz0je67a3n2a3yak3ty5ztgpr47qsfgj5wwevk2yr9sw5hpg6qpj77x6e") 123000)
+      ;; Pay an external invoice the mock can settle.
+      (multiple-value-bind (bolt11 hash preimage) (ln:mock-ln-external-invoice mock-ln 30000)
+        (multiple-value-bind (ok pre err) (nd:wallet-pay-invoice w1 id d1 bolt11 30000 :fee 100 :height *height*)
+          (check "pay_invoice succeeded" ok err)
+          (check-bytes "wallet learns the preimage" pre preimage)
+          (check-equal "deposit debited amount + fee, nothing locked" (multiple-value-list (nd:wallet-balance w1 id d1)) '(69900 0))
+          (check-equal "fee accumulated" (lg:ledger-fees-accumulated (nd:record-ledger la)) 100)
+          (check "InvoiceFulfill carries the preimage"
+                 (let ((o (op:decode-operation (up:update-message (first (nd:record-history la))))))
+                   (and (eq (op:operation-type o) :invoice-fulfill) (equalp (op:field o :preimage) preimage) (equalp (op:field o :payment-id) hash))))))
+      ;; A payment that fails: lock released, InvoiceFail on the chain.
+      (multiple-value-bind (ok pre err) (nd:wallet-pay-invoice w1 id d1 (format nil "lnmock19~a" (u:bytes->hex (u:sha256 (hx "dead")))) 5000 :height *height*)
+        (declare (ignore pre))
+        (check "failed payment reported" (and (not ok) (search "failed" err)))
+        (check-equal "funds released after InvoiceFail" (multiple-value-list (nd:wallet-balance w1 id d1)) '(69900 0))
+        (check-equal "InvoiceFail recorded" (op:operation-type (op:decode-operation (up:update-message (first (nd:record-history la))))) :invoice-fail))
+      ;; Reference-shaped transfer_lock / transfer_complete (field by field, signature).
+      (let* ((preimage (u:sha256 (hx "77"))) (hash (u:sha256 preimage)) (nonce (u:sha256 (hx "88")))
+             (tid (u:sha256 (u:cat nonce d1 d2)))
+             (o (list :type :transfer-lock :transfer-nonce nonce :source-deposit-id d1 :destination-deposit-id d2 :amount 10000 :fee 0
+                      :completion-script (format nil "sha256(~a)" (u:bytes->hex hash)) :timeout-height (+ *height* 144) :transfer-id tid
+                      :nonce 424242 :expiry (+ *height* 144) :witness '()))
+             (sig (first (d17:sign-operation o (nd::wallet-priv w1)))))
+        (multiple-value-bind (ok res err)
+            (nd:wallet-request w1 id "transfer_lock"
+                               (w:json-object "transfer_nonce" (u:bytes->hex nonce) "source_deposit_id" (u:bytes->hex d1) "destination_deposit_id" (u:bytes->hex d2)
+                                              "amount" 10000 "fee" 0 "completion_script" (op:field o :completion-script) "timeout_height" (+ *height* 144)
+                                              "transfer_id" (u:bytes->hex tid) "op_nonce" 424242 "op_expiry" (+ *height* 144) "signature" (u:bytes->hex sig)))
+          (declare (ignore res))
+          (check "reference-shaped transfer_lock accepted" ok err))
+        (multiple-value-bind (ok res err)
+            (nd:wallet-request w2 id "transfer_complete" (w:json-object "transfer_id" (u:bytes->hex tid) "preimage" (u:bytes->hex preimage)))
+          (declare (ignore res))
+          (check "reference-shaped transfer_complete accepted" ok err))
+        (check-equal "balances after the field-by-field transfer" (list (nd:wallet-balance w1 id d1) (nd:wallet-balance w2 id d2)) '(59900 10000))))))
+
 (report)
