@@ -14,7 +14,7 @@ Verified means: checked against the reference implementation's artefacts
 | 6 | Roles: operator node, quorum member (cosigner), wallet; persistence; control socket | core done — consent/QuorumJoin/QuorumAddMember handshake, QuorumBegin with cosigs from the staged set, cosign_update with chain-continuity + speculative-apply gate, deposit_open/balance/transfer_lock/transfer_complete with DEP-17 witness checks, fixture-format persistence; daemon + control socket + wallet CLI; devnet smoke passes: 3 nodes, on-chain funded QuorumBegin on signet, cosigners check the outpoint via bitcoind |
 | 7 | Lightning rail: InvoiceCredit/Lock/Fulfill through cl-payments; devnet with CLN/LND | receive path done — make_invoice via cl-payments control socket, cosign_invoice attestation (reference digest), InvoiceCredit on settlement; devnet: CLN pays, deposit credited, replicas agree. Pay path (InvoiceLock/Fulfill) next |
 | 9 | DEP-12 delivery escalation: wallet → member `delivery_embed`, DeliveryEmbed on the member's ledger, censorship proof (embed, causal link via member_ledger_hash, service deadline, no answer) | done — gate covers ignored request → escalation → proof only after the member cosigns past the embed and the deadline passes |
-| 10 | DEP-13 couriers: advertisement (Kind 39102), request_route, two-leg HTLC with shorter leg-2 timeout, preimage relay back to leg 1 | done — gate moves funds from a deposit on ledger A to a deposit on ledger E through a courier |
+| 10 | DEP-13 couriers: advertisement (Kind 39102), request_route, two-leg HTLC with shorter leg-2 timeout, preimage relay back to leg 1; PTLC variant with the courier's blinding point | done — gates move funds across two ledgers through a courier over HTLC and PTLC |
 | 8 | Disputes: fraud proofs (DEP-06), custody lottery scripts, recovery cascade | done — lottery scripts/tree/claims/armer shares/sweeps spent under cl-consensus; fraud proofs (equivocation, quorum-expired, non-conforming-update) with the reference hashing and JSON; forks, arming, confiscation via confiscation_sign, reveals (Kind 9106), winner claim + DisputeAcquire, yields; devnet smoke step 11: operator equivocates, members detect it, fork, arm, confiscate the reserves on signet, reveal, and the script-selected winner's claim confirms |
 
 ## Interoperability with the reference implementation
@@ -43,3 +43,9 @@ resumes with the persisted vault; Q must be 3, 5 or 7; fund the per-ledger
 the genesis update is on the relay (`ledger republish` fixes a missing seq 0).
 
 Reference quirks, bugs and undocumented wire facts are collected in `UPSTREAM-NOTES.md`.
+
+## Open items
+
+- Daemon control commands for escalation and the courier role (the flows exist in-process and in the gates only).
+- Dispute interop with the reference node: our fraud broadcasts use its JSON shape but have not been fed to a reference member.
+- Attestation obligations (`attest`) check only the witness's attestation set; oracle signature verification is not wired.
