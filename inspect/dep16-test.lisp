@@ -1,0 +1,63 @@
+;;;; inspect/dep16-test.lisp — the descriptor calculus against the reference's
+;;;; conformance vectors (inspect/vectors/calculus/*.json).
+
+(in-package #:cl-deposits.test)
+
+(defun read-vector (path)
+  (let ((text (with-open-file (in path) (let ((s (make-string (file-length in)))) (subseq s 0 (read-sequence s in))))))
+    (flet ((field (k) (json-string-field text k)))
+      (list :name (field "name") :text (field "descriptor_text") :descriptor (hx (field "descriptor_hex"))
+            :operation (hx (field "operation_hex")) :snapshot (hx (field "snapshot_hex")) :witness (hx (field "witness_hex"))
+            :verdict (search "\"expected_verdict\": true" text)))))
+
+(with-gate ("dep16: reference conformance vectors")
+  (let* ((dir (directory (merge-pathnames "calculus/*.json" (vector-path ""))))
+         (vectors (sort (mapcar #'read-vector dir) #'string< :key (lambda (v) (getf v :name))))
+         (parsed 0))
+    (check-equal "16 vectors" (length vectors) 16)
+    (dolist (v vectors)
+      (let* ((d (d16:decode-descriptor (getf v :descriptor)))
+             (op (d16:decode-operation (getf v :operation)))
+             (st (d16:decode-snapshot (getf v :snapshot)))
+             (w (d16:decode-witness (getf v :witness)))
+             (verdict (handler-case (d16:evaluate d op st w) (d16:eval-error () :error))))
+        (check-bytes (format nil "~a: descriptor re-encodes byte-identical" (getf v :name)) (d16:encode-descriptor d) (getf v :descriptor))
+        (check-bytes (format nil "~a: witness re-encodes byte-identical" (getf v :name)) (d16:encode-witness w) (getf v :witness))
+        (check-bytes (format nil "~a: snapshot re-encodes byte-identical" (getf v :name)) (d16:encode-snapshot st) (getf v :snapshot))
+        (check-equal (format nil "~a: verdict" (getf v :name)) verdict (and (getf v :verdict) t))
+        ;; The text form, where it is concrete (no placeholder names), must parse to the same bytes.
+        (let ((text (getf v :text)))
+          (handler-case
+              (let ((p (d16:parse-descriptor text)))
+                (when (equalp (d16:encode-descriptor p) (getf v :descriptor)) (incf parsed)))
+            (error () nil)))))
+    (format t "      descriptor texts that parse to the vector bytes: ~a/16~%" parsed)
+    (check "the five concrete texts parse to their canonical bytes" (= parsed 5))))
+
+(with-gate ("dep16: parser and evaluator beyond the vectors")
+  (let* ((priv 123456789) (pub (up:compressed-pubkey priv))
+         (d (d16:parse-descriptor (format nil "wsh(with(K = ~a, cap = 1000, in and(pk(K), amount_at_most(cap), older(10))))" (u:bytes->hex pub))))
+         (op (d16:make-operation :deposit-id (make-array 32 :element-type '(unsigned-byte 8)) :op-type "spend"
+                                 :args '(("amount" . (:int 500)) ("kind" . (:symbol "invoice")))))
+         (st (d16:make-snapshot :balance 10000 :blocks-since-activity 12 :height 500))
+         (sig (first (d17::%sign-preimage priv (d16::operation-preimage op)))))
+    (check "descriptor id is a tagged hash" (= 32 (length (d16:descriptor-id d))))
+    (check "constants + pk + amount + older authorize" (d16:evaluate d op st (d16:make-witness :signatures (list (cons pub sig)))))
+    (check "over the cap: refused" (not (d16:evaluate d (d16:make-operation :deposit-id (make-array 32 :element-type '(unsigned-byte 8)) :op-type "spend" :args '(("amount" . (:int 5000)))) st (d16:make-witness :signatures (list (cons pub sig))))))
+    (check "too recent activity: refused" (not (d16:evaluate d op (d16:make-snapshot :balance 10000 :blocks-since-activity 3 :height 500) (d16:make-witness :signatures (list (cons pub sig))))))
+    (check "no signature: refused" (not (d16:evaluate d op st (d16:make-witness))))
+    (let ((m (d16:parse-descriptor (format nil "wsh(match(operation_type(), branch(spend, pk(~a)), branch(else, false)))" (u:bytes->hex pub)))))
+      (check "match on operation_type: spend arm" (d16:evaluate m op st (d16:make-witness :signatures (list (cons pub sig)))))
+      (check "match on operation_type: else arm"
+             (not (d16:evaluate m (d16:make-operation :deposit-id (make-array 32 :element-type '(unsigned-byte 8)) :op-type "update" :args '()) st (d16:make-witness :signatures (list (cons pub sig)))))))
+    (let* ((pre (u:sha256 (hx "aa"))) (h (u:sha256 pre))
+           (hl (d16:parse-descriptor (format nil "wsh(or(hashlock(sha256(~a)), pk(~a)))" (u:bytes->hex h) (u:bytes->hex pub)))))
+      (check "hashlock satisfied by the preimage" (d16:evaluate hl op st (d16:make-witness :preimages (list (cons (cons :sha256 h) pre)))))
+      (check "hashlock refused with a wrong preimage" (not (d16:evaluate hl op st (d16:make-witness :preimages (list (cons (cons :sha256 h) (u:sha256 (hx "bb"))))))))
+      (check "witness-from-stack maps a ledger witness stack onto the calculus witness"
+             (d16:evaluate hl op st (d16:witness-from-stack (list pre) hl op))))
+    (let* ((s 987654321) (point (up:compressed-pubkey s))
+           (pl (d16:parse-descriptor (format nil "wsh(pointlock(~a))" (u:bytes->hex point)))))
+      (check "pointlock satisfied by the scalar" (d16:evaluate pl op st (d16:make-witness :scalars (list (cons point (u:int->be s 32))))))
+      (check "pointlock refused with a wrong scalar" (not (d16:evaluate pl op st (d16:make-witness :scalars (list (cons point (u:int->be (1+ s) 32))))))))
+    (check-signals "unknown combinator rejected" d16:eval-error (d16:parse-descriptor "wsh(frob(1))"))))

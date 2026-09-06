@@ -79,6 +79,20 @@ echo "   w1 $B1"
 T1=$(sx "$(cld_ctl cld1 "(:tip :ledger \"$L1\")")" ":TIP"); T2=$(sx "$(cld_ctl cld2 "(:tip :ledger \"$L1\")")" ":TIP")
 [ "$T1" = "$T2" ] || fail "tips differ after credit"
 echo "   replicas agree at $T1"
+step "10b Lightning pay: w1 pays a CLN invoice from its deposit; the reference wallet pays one through our operator"
+INV=$(ln_cli cln3 invoice 50000 "clpay-$RANDOM" "pay from deposit" | python3 -c "import json,sys; print(json.load(sys.stdin)['bolt11'])")
+P=$("$CLD_SRC/devnet/cld-wallet.sh" w1 "$L1" pay "$W1" "$INV" 50000 0 "$(bcli getblockcount)"); [[ "$P" == *":STATUS :OK"* ]] || fail "pay: $P"
+B1=$("$CLD_SRC/devnet/cld-wallet.sh" w1 "$L1" balance "$W1"); [[ "$B1" == *":BALANCE 3050000"* ]] || fail "balance after pay: $B1"; echo "   w1 paid 50000 msat over Lightning: $B1"
+RW=~/workspace/deposits-rust/target/release/deposits-wallet; if [ -x "$RW" ]; then
+  export WALLET_DATA_DIR=/tmp/refwallet-smoke; rm -rf "$WALLET_DATA_DIR"; unset WALLET_SEED
+  REFDEP=$(timeout 120 $RW open "$L1" --alias sm --relay $RELAY_URL --network signet 2>&1 | grep -q "created" && echo ok); [ "$REFDEP" = ok ] || fail "reference wallet open"
+  RD=$(python3 -c "import json,hashlib; d=json.load(open('$WALLET_DATA_DIR/deposits.json'))[0]; print(d['deposit_id'])")
+  expect "$(cld_ctl cld1 "(:credit :ledger \"$L1\" :deposit \"$RD\" :msat 200000 :txid \"$TXID\" :vout $VOUT)")"
+  INV2=$(ln_cli cln3 invoice 20000 "refpay-$RANDOM" "ref pays" | python3 -c "import json,sys; print(json.load(sys.stdin)['bolt11'])")
+  timeout 180 $RW pay_invoice sm "$INV2" --relay $RELAY_URL --network signet 2>&1 | grep -iE "succeeded|preimage|paid" | head -2 | sed 's/^/   /' || fail "reference pay_invoice"
+  RB=$(timeout 120 $RW balance --relay $RELAY_URL --network signet 2>&1 | grep -E "sm .*sats" | head -1); echo "   reference wallet: $RB"
+fi
+
 step "11 dispute: cld1 equivocates; members fork, arm, confiscate the reserves on chain, reveal, and the lottery winner claims custody"
 cld_ctl cld1 "(:equivocate :ledger \"$L1\")" >/dev/null; sleep 3
 for n in cld2 cld3 cld4; do F=$(cld_ctl $n "(:forks :ledger \"$L1\")"); [[ "$F" == *":STATE :DISPUTED"* ]] || fail "$n did not fork: $F"; done

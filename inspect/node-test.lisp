@@ -350,4 +350,31 @@
           (check "reference-shaped transfer_complete accepted" ok err))
         (check-equal "balances after the field-by-field transfer" (list (nd:wallet-balance w1 id d1) (nd:wallet-balance w2 id d2)) '(59900 10000))))))
 
+
+
+(with-gate ("descriptor deposits: a spending cap enforced by the calculus")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a5" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d5")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((w1 (nd:make-wallet :priv 55555555555555555555 :bus bus)) (w2 (nd:make-wallet :priv 66666666666666666666 :bus bus))
+           (desc (format nil "wsh(and(pk(~a), amount_at_most(60000), blocks_since_open_at_least(5)))" (u:bytes->hex (nd:wallet-pubkey w1))))
+           (d1 (nd:wallet-open-deposit w1 id :descriptor desc)) (d2 (nd:wallet-open-deposit w2 id)))
+      (check-bytes "deposit id is the descriptor's hash" d1 (op:deposit-id desc))
+      (nd:credit-onchain a la d1 200000 :txid (u:sha256 (hx "06")))
+      (check-signals "spend too soon after opening is refused" nd:node-error (nd:wallet-transfer w1 id d1 d2 10000 :height *height*))
+      (let ((*height* (+ *height* 10)))
+        (check-signals "spend above the cap is refused" nd:node-error (nd:wallet-transfer w1 id d1 d2 70000 :height *height*))
+        (multiple-value-bind (tid pre) (nd:wallet-transfer w1 id d1 d2 50000 :height *height*)
+          (check "spend within the cap after the wait is authorized" (and tid t))
+          (nd:wallet-complete-transfer w1 id tid pre)
+          (check-equal "balances" (list (nd:wallet-balance w1 id d1) (nd:wallet-balance w2 id d2)) '(150000 50000))))
+      (check-signals "an unparseable descriptor cannot open a deposit" nd:node-error
+        (nd:wallet-open-deposit w2 id :descriptor "wsh(frob(1))")))))
+
 (report)

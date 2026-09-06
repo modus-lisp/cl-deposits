@@ -21,6 +21,7 @@
            #:ledger-active-ruleset
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
+           #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
            #:majority-threshold #:+valid-quorum-sizes+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay))
@@ -41,6 +42,7 @@
   (fees (op:make-fees)) (transfer-fees (op:make-transfer-fees))
   (receive-requires-sig nil) fee-change-after-blocks fee-change-notice-blocks fee-change-limit-bps
   (opened-at-block 0) pending-fee-change (last-fee-assessment 0)
+  (last-activity-block 0) (last-received-block 0)
   (seen-nonces '()))
 
 (defun deposit-available-balance (d) (max 0 (- (deposit-balance d) (deposit-locked-balance d))))
@@ -92,9 +94,23 @@
     (decf (deposit-balance d) charged)
     (incf (ledger-fees-accumulated ledger) charged)))
 
+(defvar *block-height* 0 "The block height of the update being applied (for descriptor snapshots).")
+
+(defun %touch (ledger o)
+  "Record activity heights on the deposits an operation moves."
+  (dolist (name '(:deposit-id :source-deposit-id))
+    (let ((d (and (op:field o name) (gethash (op:field o name) (ledger-deposits ledger)))))
+      (when d (setf (deposit-last-activity-block d) *block-height*))))
+  (when (member (op:operation-type o) '(:invoice-credit :onchain-credit))
+    (let ((d (gethash (op:field o :deposit-id) (ledger-deposits ledger))))
+      (when d (setf (deposit-last-received-block d) *block-height*)))))
+
 (defun apply-operation (ledger o)
   "Fold one operation into LEDGER, or signal LEDGER-ERROR leaving it untouched
    in the ways that matter (callers replaying a chain treat any error as fatal)."
+  (prog1 (%apply-operation ledger o) (%touch ledger o)))
+
+(defun %apply-operation (ledger o)
   (flet ((f (name) (op:field o name)))
     (ecase (op:operation-type o)
       (:ledger-open
@@ -122,7 +138,8 @@
       (:deposit-open
        (let ((id (f :deposit-id)))
          (when (gethash id (ledger-deposits ledger)) (fail :deposit-exists))
-         (let ((d (make-deposit :id id :descriptor (f :descriptor))))
+         (let ((d (make-deposit :id id :descriptor (f :descriptor) :opened-at-block *block-height*
+                                :last-activity-block *block-height*)))
            (when (f :fees) (setf (deposit-fees d) (f :fees)))
            (when (f :transfer-fees) (setf (deposit-transfer-fees d) (f :transfer-fees)))
            (setf (deposit-receive-requires-sig d) (f :receive-requires-sig)
@@ -281,7 +298,8 @@
       (fail :sequence (format nil "expected ~a, got ~a" (1+ (ledger-sequence ledger)) (up:update-seq update))))
     (unless (equalp (up:update-prev-hash update) (ledger-chain-tip ledger))
       (fail :chain-break (format nil "at sequence ~a" (up:update-seq update)))))
-  (apply-operation ledger (op:decode-operation (up:update-message update)))
+  (let ((*block-height* (up:update-block-height update)))
+    (apply-operation ledger (op:decode-operation (up:update-message update))))
   (setf (ledger-sequence ledger) (up:update-seq update)
         (ledger-chain-tip ledger) (up:chain-hash update))
   ledger)

@@ -27,6 +27,7 @@
                     (#:bus #:cl-deposits.bus) (#:ev #:cl-nostr.event) (#:flt #:cl-nostr.filter)
                     (#:k #:cl-nostr.keys) (#:tlv #:cl-deposits.tlv) (#:ln #:cl-deposits.lightning)
                     (#:fr #:cl-deposits.fraud) (#:lot #:cl-deposits.lottery) (#:rot #:cl-deposits.rotation)
+                    (#:d16 #:cl-deposits.dep16)
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire)
                     (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:node #:make-node #:node-pubkey #:node-pubkey-hex #:node-ledgers #:node-log
@@ -560,6 +561,7 @@
         ((string= action "deposit_open")
          (let* ((descriptor (w:jget params "descriptor"))
                 (id (op:deposit-id descriptor)))
+           (unless (d17:descriptor-key descriptor) (d16:parse-descriptor descriptor))   ; must be a descriptor we can evaluate
            (append-operation node rec (list :type :deposit-open :deposit-id id :descriptor descriptor
                                             :fees (op:make-fees :annualized-msats (or (w:jget params "annualized_msats") 0)
                                                                 :annualized-bps (or (w:jget params "annualized_bps") 0)
@@ -579,8 +581,7 @@
          (let* ((o (transfer-lock-from-request params))
                 (src (lg:find-deposit (record-ledger rec) (op:field o :source-deposit-id))))
            (unless (eq (op:operation-type o) :transfer-lock) (fail "not a TransferLock"))
-           (unless (eq :ok (d17:verify-operation-witness o (lg:deposit-descriptor src) (op:field o :witness)))
-             (fail "witness does not authorize this operation"))
+           (unless (authorized-p node rec o src (op:field o :witness)) (fail "witness does not authorize this operation"))
            (when (> (height node) (op:field o :expiry)) (fail "operation expired"))
            (when (member (cons (op:field o :nonce) (op:field o :expiry)) (lg:deposit-seen-nonces src) :test #'equal)
              (fail "nonce replayed"))
@@ -603,6 +604,31 @@
         ((string= action "pay_invoice") (handle-pay-invoice node rec event params))
         (t (respond node event nil :error (format nil "unknown action ~a" action))))
     (error (e) (respond node event nil :error (princ-to-string e)))))
+
+;;; Authorization: pk(K) deposits take the direct ECDSA path; anything else is
+;;; a DEP-16 descriptor evaluated against the deposit's state snapshot.
+
+(defun deposit-snapshot (node ledger d)
+  (let ((h (height node)))
+    (d16:make-snapshot :balance (lg:deposit-balance d)
+                       :blocks-since-activity (max 0 (- h (lg:deposit-last-activity-block d)))
+                       :blocks-since-open (max 0 (- h (lg:deposit-opened-at-block d)))
+                       :blocks-since-received (max 0 (- h (lg:deposit-last-received-block d)))
+                       :height h)
+    ))
+
+(defun authorized-p (node rec o d witness)
+  "Does deposit D's descriptor authorize operation O with WITNESS (a stack)?"
+  (let ((desc (lg:deposit-descriptor d)))
+    (if (d17:descriptor-key desc)
+        (eq :ok (d17:verify-operation-witness o desc witness))
+        (multiple-value-bind (id type args nonce expiry) (d17:operation->dep16 o)
+          (and id
+               (let ((descriptor (d16:parse-descriptor desc))
+                     (op (d16:make-operation :deposit-id id :op-type type :args args :nonce nonce :expiry expiry)))
+                 (handler-case (d16:evaluate descriptor op (deposit-snapshot node (record-ledger rec) d)
+                                             (d16:witness-from-stack witness descriptor op))
+                   (d16:eval-error (e) (log! node "descriptor evaluation: ~a" e) nil))))))))
 
 ;;; Requests in the reference wallet's shape (field by field, signature = witness)
 
@@ -648,7 +674,7 @@
                       :witness (witness-from-json (w:jget params "witness")))))
          (d (lg:find-deposit (record-ledger rec) (op:field o :deposit-id))))
     (unless (equalp (ln:invoice-payment-hash bolt11) (op:field o :payment-id)) (fail "payment_hash does not match the invoice"))
-    (unless (eq :ok (d17:verify-operation-witness o (lg:deposit-descriptor d) (op:field o :witness))) (fail "witness does not authorize this lock"))
+    (unless (authorized-p node rec o d (op:field o :witness)) (fail "witness does not authorize this lock"))
     (when (> (height node) (op:field o :expiry)) (fail "operation expired"))
     (append-operation node rec o)
     ;; Pay, then settle the lock either way.
@@ -810,8 +836,8 @@
 
 (defun wallet-descriptor (wal) (format nil "pk(~a)" (bytes->hex (wallet-pubkey wal))))
 
-(defun wallet-open-deposit (wal ledger-id-hex)
-  (multiple-value-bind (ok res err) (wallet-request wal ledger-id-hex "deposit_open" (w:json-object "descriptor" (wallet-descriptor wal)))
+(defun wallet-open-deposit (wal ledger-id-hex &key descriptor)
+  (multiple-value-bind (ok res err) (wallet-request wal ledger-id-hex "deposit_open" (w:json-object "descriptor" (or descriptor (wallet-descriptor wal))))
     (unless ok (fail "deposit_open: ~a" err))
     (hex->bytes (w:jget res "deposit_id"))))
 

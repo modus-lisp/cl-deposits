@@ -123,6 +123,14 @@ not say it, the code decides it; **quirk** = surprising but deliberate.
 
 ## Specification gaps
 
+- DEP-17's snapshot encoding omits `blocks_since_received` (u32, after
+  `blocks_since_open`); the reference encodes it and the conformance vectors
+  carry it.  The `blocks_since_received` value function and
+  `blocks_since_received_at_least` predicate are likewise absent from the
+  DEP-16 registry text.
+- DEP-17 lists six obligation forms; the reference has a seventh,
+  `pointlock = 0x0006`, and a witness v2 layout carrying scalars for it.
+
 - DEP-02 does not define the cosign/operator digests (only the hash chain);
   the tagged v1 forms and their legacy predecessors live in
   `types/updates.rs`.

@@ -20,6 +20,7 @@
      (:file "operation") ; DEP-02: the 27 ledger operations, typed
      (:file "ledger")  ; DEP-05: the state machine — balances, quorum, locks
      (:file "dep17")   ; DEP-17: canonical operation encoding, depositor signatures
+     (:file "dep16")   ; DEP-16: the descriptor calculus — parse, encode, evaluate
      (:file "reserves") ; DEP-03: the Taproot reserves output and its tapscript tiers
      (:file "rotation") ; DEP-03: spending the reserves — rotation, recovery, anchors
      (:file "lottery")  ; DEP-03/06: the custody lottery scripts, claims, armer shares
