@@ -429,4 +429,48 @@
                                         (and f (equalp (lg:ledger-chain-tip (nd:record-ledger f)) (lg:ledger-chain-tip (nd:record-ledger wfork))))))
                           (remove winner (list a b c d))))))))))
 
+
+
+(with-gate ("replacement collateral: declared, verified, and spent into the new vault by the winner")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (chain (make-hash-table :test #'equalp))      ; "txid:vout" -> sats  (a mock chain view)
+         (cf (lambda (txid vout) (let ((v (gethash (cons (coerce txid 'list) vout) chain))) (and v (list :value-sats v :confirmations 3)))))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf :chain-fn cf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf :chain-fn cf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf :chain-fn cf))
+         (la (nd:open-ledger a :reserves-id "genesis:a7" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (setf (gethash (cons (coerce (u:sha256 (hx "f00d8")) 'list) 0) chain) (floor (+ 15600000 23400000) 1000))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d8")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((w (nd:make-wallet :priv 55555555555555555555 :bus bus)) (dw (nd:wallet-open-deposit w id)))
+      (nd:credit-onchain a la dw 4000000 :txid (u:sha256 (hx "09")))
+      (let ((floor-sats (nd:collateral-floor-sats la)))
+        (check-equal "collateral floor = obligations x ratio + claim fee" floor-sats (+ (ceiling (* 4000 3/2)) 400))
+        ;; Members fund their own collateral UTXOs (key-path P2TR) on the mock chain, then dispute.
+        (dolist (m (list b c d))
+          (setf (gethash (cons (coerce (u:sha256 (nd:node-pubkey m)) 'list) 1) chain) (+ floor-sats 1000)))
+        (dolist (m (list b c d)) (nd:enter-dispute m la (lg:ledger-sequence (nd:record-ledger la)) :reason "test"))
+        (dolist (m (list b c d))
+          (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 1 (+ floor-sats 1000))))
+        (check "every armer's collateral is visible" (every (lambda (x) (fourth x)) (nd:armers-of b id)))
+        ;; A too-small declaration is refused by the cosigners' rebuild.
+        (let ((short (nd:make-node :priv 88888888888888888888 :bus bus :height-fn hf :chain-fn cf)))
+          (declare (ignore short)))
+        (multiple-value-bind (ctx lottery) (nd:confiscate b id)
+          (declare (ignore lottery))
+          (check "confiscation signed with collateral checks passing" (and ctx t))
+          (dolist (m (list b c d)) (nd:publish-reveal m id))
+          (let* ((outcomes (mapcar (lambda (m) (multiple-value-list (nd:claim-or-yield m id))) (list b c d)))
+                 (won (find :won outcomes :key #'first)) (claim (second won)))
+            (check-equal "claim has two inputs: lottery output + replacement collateral" (length (btx:tx-inputs claim)) 2)
+            (check-equal "claim pays lottery + collateral - fee into the new vault"
+                         (btx:txout-value (first (btx:tx-outputs claim)))
+                         (- (+ (btx:txout-value (first (btx:tx-outputs ctx))) (+ floor-sats 1000)) 400))
+            (check "second input is a key-path spend with a 64-byte signature" (= 64 (length (first (second (btx:tx-witnesses claim))))))))
+        ;; Missing collateral on chain: confiscation refused.
+        (remhash (cons (coerce (u:sha256 (nd:node-pubkey c)) 'list) 1) chain)
+        (check-signals "a vanished collateral outpoint blocks the confiscation" nd:node-error (nd:confiscate b id))))))
+
 (report)

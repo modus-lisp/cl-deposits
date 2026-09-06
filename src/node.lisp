@@ -42,7 +42,7 @@
            #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
            #:node-height-of-block #:equivocate
-           #:check-expired-quorums #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
+           #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock
            #:save-record #:load-record #:*cosign-timeout*))
 (in-package #:cl-deposits.node)
@@ -139,23 +139,28 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Waiting for responses
 
-(defstruct waiter (lock (bt:make-lock)) (cv (bt:make-condition-variable)) (responses '()) (done nil) want)
+(defstruct waiter (lock (bt:make-lock)) (cv (bt:make-condition-variable)) (responses '()) (done nil) want (successes-only nil))
+
+(defun waiter-count (wt)
+  (if (waiter-successes-only wt)
+      (count-if (lambda (r) (w:jget r "success")) (waiter-responses wt))
+      (length (waiter-responses wt))))
 
 (defun wait-for (node request-id want &key (timeout *cosign-timeout*))
   "Block until WANT responses (or DONE) for REQUEST-ID, or TIMEOUT.  Returns the responses."
   (let ((wt (gethash request-id (node-pending node))))
     (bt:with-lock-held ((waiter-lock wt))
       (loop with deadline = (+ (get-internal-real-time) (* timeout internal-time-units-per-second))
-            until (or (waiter-done wt) (>= (length (waiter-responses wt)) want)
+            until (or (waiter-done wt) (>= (waiter-count wt) want)
                       (> (get-internal-real-time) deadline))
             do (bt:condition-wait (waiter-cv wt) (waiter-lock wt) :timeout 0.2)))
     (remhash request-id (node-pending node))
     (reverse (waiter-responses wt))))
 
-(defun send-request (node ledger-id-hex action params &key (want 1) (timeout *cosign-timeout*) extra-tags)
-  "Publish a Kind 20101 request and collect WANT Kind 20102 responses."
+(defun send-request (node ledger-id-hex action params &key (want 1) (timeout *cosign-timeout*) extra-tags successes-only)
+  "Publish a Kind 20101 request and collect WANT Kind 20102 responses (successful ones when SUCCESSES-ONLY)."
   (let ((event (w:request-event (node-keypair node) ledger-id-hex action params :extra-tags extra-tags)))
-    (setf (gethash (ev:event-id event) (node-pending node)) (make-waiter :want want))
+    (setf (gethash (ev:event-id event) (node-pending node)) (make-waiter :want want :successes-only successes-only))
     (bus:bus-publish (node-bus node) event)
     (wait-for node (ev:event-id event) want :timeout timeout)))
 
@@ -1033,7 +1038,32 @@
         append (loop for u in (record-history fork)
                      for o = (op:decode-operation (up:update-message u))
                      when (eq (op:operation-type o) :dispute-armed)
-                       collect (list (up:update-operator-id u) (op:field o :commitment-hash) (op:field o :target-reserves)))))
+                       collect (list (up:update-operator-id u) (op:field o :commitment-hash) (op:field o :target-reserves)
+                                     (and (op:field o :replacement-collateral-txid)
+                                          (list (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)
+                                                (op:field o :replacement-collateral-amount)))))))
+
+(defun collateral-floor-sats (base &key (claim-fee 400))
+  "DEP-06: obligations x the ledger's collateral ratio, plus the claim fee."
+  (let* ((l (record-ledger base))
+         (obligations (floor (lg:total-obligations l) 1000))
+         (ratio (if (plusp (lg:ledger-reserves-amount l)) (/ (lg:ledger-collateral-amount l) (lg:ledger-reserves-amount l)) 0)))
+    (+ (ceiling (* obligations ratio)) claim-fee)))
+
+(defun check-armer-collateral (node base armers)
+  "Every armer that declared replacement collateral must have declared enough,
+   and (when we have a chain view) it must exist, be unspent and confirmed."
+  (let ((floor-sats (collateral-floor-sats base)))
+    (loop for entry in armers
+          for pk = (first entry) for coll = (fourth entry)
+          do (when coll
+               (destructuring-bind (txid vout sats) coll
+                 (when (< sats floor-sats) (fail "armer ~a declared ~a sats, below the floor ~a" (subseq (bytes->hex pk) 0 8) sats floor-sats))
+                 (when (node-chain-fn node)
+                   (let ((info (funcall (node-chain-fn node) txid vout)))
+                     (unless info (fail "armer ~a's collateral outpoint not found or spent" (subseq (bytes->hex pk) 0 8)))
+                     (when (< (getf info :value-sats) sats) (fail "armer ~a's collateral outpoint is smaller than declared" (subseq (bytes->hex pk) 0 8)))
+                     (when (< (getf info :confirmations) (node-min-confs node)) (fail "armer ~a's collateral is unconfirmed" (subseq (bytes->hex pk) 0 8))))))))))
 
 (defun disputed-reserves (rec)
   "From the latest QuorumBegin: (values reserves-struct txid vout sats operator33)."
@@ -1059,9 +1089,10 @@
          (armers (sort (copy-list (armers-of node id-hex)) #'bytes< :key #'first))
          (voters (recovery-voters base))
          (threshold (lg:majority-threshold (length voters)))
-         (participants (loop for (pk c target) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target)))
+         (participants (loop for (pk c target nil) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target)))
          (lottery (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword))))
     (when (< (length participants) 2) (fail "fewer than two armers"))
+    (check-armer-collateral node base armers)
     (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves base)
       (let* ((outs (lot:confiscation-outputs (lot:lottery-spk lottery) sats fee :respectful respectful
                                              :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
@@ -1090,7 +1121,7 @@
                                     (w:json-object "sighash" (bytes->hex sighash) "respectful" (and respectful t) "fee_sats" fee
                                                    "unsigned_tx" (bytes->hex (btx:serialize-tx tx))
                                                    "last_valid_sequence" (lg:ledger-sequence (record-ledger (or (find-fork node id-hex (node-pubkey node)) (find-record node id-hex)))))
-                                    :want (1- (length (recovery-voters (find-record node id-hex)))) :timeout 20)))
+                                    :want (1- (rs:tier-threshold (first (rs:reserves-tiers reserves)))) :timeout 20 :successes-only t)))
       (dolist (r responses)
         (let ((res (w:jget r "result")))
           (unless (w:jget r "success") (log! node "confiscation_sign refused: ~a" (w:jget r "error")))
@@ -1115,9 +1146,10 @@
   "A recovery-quorum member: rebuild the confiscation from public state, sign
    only if the proposer's sighash is exactly ours."
   (let ((id (w:event-ledger-id event)))
+    (unless (find-fork node id (node-pubkey node))
+      (return-from handle-confiscation-sign nil))   ; not a disputant: not ours to answer
     (handler-case
         (progn
-          (unless (find-fork node id (node-pubkey node)) (fail "not armed for this dispute"))
           (multiple-value-bind (tx lottery prevouts reserves)
               (build-confiscation node id :respectful (w:jget params "respectful") :fee (w:jget params "fee_sats"))
             (declare (ignore tx))
@@ -1174,17 +1206,25 @@
                (spk (multiple-value-bind (witver program)
                         (cl-consensus.encoding:segwit-decode target (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)))
                       (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
+               ;; Our declared replacement collateral (a key-path P2TR of our key) comes along as input 1.
+               (coll (fourth (find (node-pubkey node) (armers-of node id-hex) :key #'first :test #'equalp)))
+               (coll-spk (and coll (lot:key-path-spk (up:x-only (node-pubkey node)))))
+               (inputs (append (list (btx:make-txin :prev-hash txid :prev-index 0 :script (octets) :sequence rot:+sequence-rbf+))
+                               (and coll (list (btx:make-txin :prev-hash (first coll) :prev-index (second coll) :script (octets) :sequence rot:+sequence-rbf+)))))
+               (total (+ amount (if coll (third coll) 0)))
                (tx (btx:parse-tx (bw:make-reader
-                                  (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t
-                                                                 :inputs (list (btx:make-txin :prev-hash txid :prev-index 0 :script (octets) :sequence rot:+sequence-rbf+))
-                                                                 :outputs (list (btx:make-txout :value (- amount fee) :script spk))
-                                                                 :witnesses (list nil))))))
-               (prevouts (vector (cons amount (lot:lottery-spk lottery))))
+                                  (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs inputs
+                                                                 :outputs (list (btx:make-txout :value (- total fee) :script spk))
+                                                                 :witnesses (make-list (length inputs) :initial-element nil))))))
+               (prevouts (coerce (append (list (cons amount (lot:lottery-spk lottery))) (and coll (list (cons (third coll) coll-spk)))) 'vector))
                (sig (schnorr:schnorr-sign (node-priv node) (rot:tier-sighash tx 0 prevouts (first (lot:lottery-leaves lottery))) (random-aux)))
+               (witnesses (append (list (lot:claim-witness lottery sig preimages))
+                                  (and coll (list (list (key-path-signature node tx 1 prevouts))))))
                (signed (btx:parse-tx (bw:make-reader
                                       (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs (btx:tx-inputs tx) :outputs (btx:tx-outputs tx)
-                                                                     :witnesses (list (lot:claim-witness lottery sig preimages))))))))
-          (unless (rot:verify-spend signed 0 prevouts) (fail "claim does not verify"))
+                                                                     :witnesses witnesses))))))
+          (dotimes (i (length inputs))
+            (unless (rot:verify-spend signed i prevouts) (fail "claim input ~a does not verify" i)))
           (broadcast node signed)
           (commit-update node fork (new-update node fork (list :type :dispute-acquire :new-custodian (node-pubkey node)
                                                                :claim-txid (btx:tx-txid signed) :new-reserves-address target)))
@@ -1229,6 +1269,18 @@
                                   :anchor-block-hash anchor-block-hash :anchor-block-height h))
                  (push (record-id-hex rec) disputed)))
     disputed))
+
+;;; Key-path Taproot spend of our own P2TR (replacement collateral inputs).
+
+(defun key-path-signature (node tx in-index prevouts)
+  "BIP-341 key-path signature for input IN-INDEX under our tweaked key."
+  (let* ((xonly (up:x-only (node-pubkey node)))
+         (tweak (cl-consensus.wallet::taproot-tweak xonly))
+         (d (mod (+ (node-priv node) tweak) secp256k1-fast:*secp256k1-n*))
+         (sighash (cl-consensus.script:taproot-sighash tx in-index prevouts 0 :ext-flag 0)))
+    (multiple-value-bind (spk parity) (lot:p2tr-spk xonly (octets))
+      (declare (ignore spk))
+      (schnorr:schnorr-sign (if (= parity 1) (- secp256k1-fast:*secp256k1-n* d) d) sighash (random-aux)))))
 
 ;;; Fraud broadcasts (Kind 9101): verify, and if we are a member, dispute.
 
