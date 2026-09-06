@@ -35,7 +35,7 @@
            #:cosign-digest #:operator-digest
            #:verify-operator-signature #:verify-cosignature #:verify-cosignatures
            #:x-only #:compressed-pubkey #:sign-cosignature #:sign-operator
-           #:+cosign-tag+ #:+operator-tag+))
+           #:+cosign-tag+ #:+operator-tag+ #:encode-cosignatures-for-test))
 (in-package #:cl-deposits.update)
 
 ;;; Outer TLV tags (DEP-02 §Signed Update Format).
@@ -101,6 +101,8 @@
                        out))
                (incf pos (+ 2 len))))
     (nreverse out)))
+
+(defun encode-cosignatures-for-test (u) (encode-cosignatures (sorted-cosignatures u)))
 
 (defun encode-cosignatures (cosigs)
   (apply #'cat (loop for c in cosigs

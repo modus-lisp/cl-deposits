@@ -54,6 +54,22 @@ not say it, the code decides it; **quirk** = surprising but deliberate.
    ledger_id_hex_ascii)`) but no reference code path verifies it.  We verify
    it when staging a member.
 
+6. **TransferComplete books a fee that no balance pays** — bug, not reported.
+   `apply_in_place` for `TransferComplete` subtracts only `pending.amount`
+   from the source deposit while adding `pending.fee` to `fees_accumulated`
+   (the lock had reserved `amount + fee`).  The sender keeps the fee, the
+   ledger's fee ledger grows anyway, and obligations do not fall by the fee.
+   `InvoiceFulfill` and the fail paths do debit their fees.  `FeeCollect`
+   has the mirror-image problem: it books the full requested amount in
+   `fees_accumulated` while only `min(amount, balance)` leaves the deposit.
+   And `FeeCollect` ignores `locked_balance`: it can take funds that an
+   open InvoiceLock/TransferLock has reserved, after which `fulfill` /
+   `TransferComplete` hit saturating subtraction on the source while still
+   crediting the destination in full — obligations rise with no credit.
+   Found by the property gate; our fold mirrors the reference for interop,
+   the generator only issues conforming FeeCollects, and a check documents
+   the quirk.
+
 ## Wire facts the DEPs do not state
 
 - **Cosignature list (tag 22)**: repeated `u16 len (=129) || pubkey33 || sig64
