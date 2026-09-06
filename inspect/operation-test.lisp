@@ -99,3 +99,58 @@
               (unless ok (push (format nil "seq ~a quorum-begin: ~a" (up:update-seq x) why) violations))))))
       (check-equal "post-QuorumBegin updates carry a member majority" (reverse violations) '()))))
 
+
+(with-gate ("ledger rules at their boundaries (mutation survivors)")
+  (flet ((fresh () (let ((l (lg:make-ledger)) (d (op:deposit-id "b")))
+                     (lg:apply-operation l (list :type :ledger-open :operator-id (up:compressed-pubkey 7) :reserves-id "g" :genesis-block 0 :reserves-amount 100000000 :collateral-amount 0))
+                     (lg:apply-operation l (list :type :deposit-open :deposit-id d :descriptor "b" :receive-requires-sig nil))
+                     (lg:apply-operation l (list :type :onchain-credit :txid (u:sha256 (hx "01")) :vout 0 :deposit-id d :amount 1000 :funding-address "x"))
+                     (values l d))))
+    (multiple-value-bind (l d) (fresh)
+      (check "lock exactly the available balance succeeds"
+             (progn (lg:apply-operation l (list :type :invoice-lock :deposit-id d :amount 1000 :payment-id (u:sha256 (hx "02")) :sequence-number 1 :nonce 1 :expiry 9 :witness '())) t))
+      (check-equal "nothing available after" (lg:deposit-available-balance (lg:find-deposit l d)) 0))
+    (multiple-value-bind (l d) (fresh)
+      (check-signals "lock one more than available is refused" lg:ledger-error
+        (lg:apply-operation l (list :type :invoice-lock :deposit-id d :amount 1001 :payment-id (u:sha256 (hx "02")) :sequence-number 1 :nonce 1 :expiry 9 :witness '()))))
+    (multiple-value-bind (l d) (fresh)
+      (check-signals "lock amount + fee beyond available is refused (fee counts)" lg:ledger-error
+        (lg:apply-operation l (list :type :invoice-lock :deposit-id d :amount 1000 :payment-id (u:sha256 (hx "02")) :sequence-number 1 :nonce 1 :expiry 9 :witness '() :fee 1))))
+    (multiple-value-bind (l d) (fresh)
+      (lg:apply-operation l (list :type :invoice-credit :payment-hash (u:sha256 (hx "03")) :deposit-id d :amount 5 :invoice-id "i" :sequence-number 1))
+      (check-signals "the same payment hash cannot be credited twice" lg:ledger-error
+        (lg:apply-operation l (list :type :invoice-credit :payment-hash (u:sha256 (hx "03")) :deposit-id d :amount 5 :invoice-id "i" :sequence-number 2))))
+    (multiple-value-bind (l d) (fresh)
+      (check-signals "closing a funded deposit is refused" lg:ledger-error (lg:apply-operation l (list :type :deposit-close :deposit-id d)))
+      (lg:apply-operation l (list :type :fee-collect :deposit-id d :amount 1000 :block-height 1))
+      (check "closing an empty deposit succeeds" (progn (lg:apply-operation l (list :type :deposit-close :deposit-id d)) t)))
+    (check-equal "majority thresholds" (mapcar #'lg:majority-threshold '(1 2 3 4 5 7)) '(1 2 2 3 3 4))
+    (check-equal "valid quorum sizes are exactly 3, 5, 7" lg:+valid-quorum-sizes+ '(3 5 7))
+    (let ((l (lg:make-ledger)))
+      (setf (lg:ledger-quorum-expiry l) 1000)
+      (check-equal "lifecycle tiers at their edges"
+                   (mapcar (lambda (h) (lg:lifecycle-tier l h)) '(999 1000 1719 1720 5031 5032 9063 9064))
+                   '(:tier0 :tier0-post-expiry :tier0-post-expiry :tier1 :tier1 :tier2 :tier2 :tier3)))
+    ;; sequence continuity is enforced on apply-update
+    (let* ((chain (chain-in-order *distinct*)) (l (lg:make-ledger)))
+      (lg:apply-update l (first chain))
+      (check-signals "skipping a sequence is refused" lg:ledger-error (lg:apply-update l (third chain))))
+    ;; cosignatures are canonicalised on encode even when supplied unsorted
+    (let* ((x (find-if (lambda (x) (= 2 (length (up:update-cosignatures x)))) *distinct*))
+           (y (up:decode-update (up:encode-update x))))
+      (setf (up:update-cosignatures y) (reverse (up:update-cosignatures y)))
+      (check-bytes "unsorted cosignatures encode to the canonical (sorted) bytes" (up:encode-update y) (up:encode-update x))
+      (check-bytes "and hash the same" (up:content-hash y) (up:content-hash x)))))
+
+(with-gate ("sequence continuity is checked independently of the hash chain")
+  (let* ((priv 424242) (pub (up:compressed-pubkey priv)) (lid (u:sha256 (hx "1d")))
+         (genesis (up:make-signed-update :operator-id pub :ledger-id lid :seq 0 :prev-hash (make-array 32 :element-type '(unsigned-byte 8))
+                                         :message (op:encode-operation (list :type :ledger-open :operator-id pub :reserves-id "g" :genesis-block 0 :reserves-amount 1 :collateral-amount 0))))
+         (l (lg:make-ledger)))
+    (up:sign-operator genesis priv)
+    (lg:apply-update l genesis)
+    ;; correct prev_hash, wrong sequence: only the sequence rule can refuse this
+    (let ((skip (up:make-signed-update :operator-id pub :ledger-id lid :seq 5 :prev-hash (up:chain-hash genesis)
+                                       :message (op:encode-operation (list :type :fee-change :deposit-id (op:deposit-id "x") :new-fees (op:make-fees) :effective-block 1)))))
+      (up:sign-operator skip priv)
+      (check-signals "seq 5 after seq 0 is refused even though it chains" lg:ledger-error (lg:apply-update l skip)))))
