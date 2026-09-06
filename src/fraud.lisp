@@ -14,7 +14,7 @@
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
            #:proof->json #:json->proof #:broadcast->json #:json->broadcast #:make-equivocation-proof
-           #:make-quorum-expired-proof #:make-non-conforming-update-proof))
+           #:make-quorum-expired-proof #:make-non-conforming-update-proof #:verify-censorship))
 (in-package #:cl-deposits.fraud)
 
 (defparameter +types+
@@ -174,3 +174,40 @@
                  "causal_chain" (coerce causal-chain 'vector)))
 
 (defun json->broadcast (j) (values (json->proof (w:jget j "proof")) (w:jget j "embedding") (w:jget j "causal_chain")))
+
+;;; ---------------------------------------------------------------------------
+;;; DEP-12: provable censorship.  Not a DEP-06 proof type yet in the reference;
+;;; this is the verification the spec describes, over public ledger data.
+
+(defun verify-censorship (request-content embed-update member-history operator-history
+                          &key (service-response-blocks 72) processed-p)
+  "REQUEST-CONTENT: the signed request's content string.  EMBED-UPDATE: the
+   member's DeliveryEmbed update.  PROCESSED-P: (lambda (op)) -> true when an
+   operator operation answers the request.  (values ok reason)."
+  (let* ((h (sha256 (ascii->bytes request-content)))
+         (embed-op (op:decode-operation (up:update-message embed-update)))
+         (member-chain (make-hash-table :test #'equalp)))
+    (dolist (u member-history) (setf (gethash (up:chain-hash u) member-chain) u))
+    (cond
+      ((not (eq (op:operation-type embed-op) :delivery-embed)) (values nil "not a DeliveryEmbed"))
+      ((not (equalp (op:field embed-op :request-hash) h)) (values nil "embed does not commit to this request"))
+      ((not (or (zerop (up:update-seq embed-update)) (gethash (up:update-prev-hash embed-update) member-chain)))
+       (values nil "embed is not on the member's chain"))
+      (t
+       (let* ((member (up:update-operator-id embed-update))
+              (embed-height (up:update-block-height embed-update))
+              ;; content hashes of the member's ledger at and after the embed
+              (later (mapcar #'up:content-hash (remove-if (lambda (u) (< (up:update-seq u) (up:update-seq embed-update))) member-history)))
+              (link (find-if (lambda (u) (some (lambda (c) (and (equalp (up:cosig-pubkey c) member)
+                                                               (member (up:cosig-member-ledger-hash c) later :test #'equalp)))
+                                               (up:update-cosignatures u)))
+                             operator-history))
+              (deadline (+ embed-height service-response-blocks))
+              (breach (find-if (lambda (u) (>= (up:update-block-height u) deadline)) operator-history))
+              (answered (and processed-p
+                             (some (lambda (u) (funcall processed-p (op:decode-operation (up:update-message u))))
+                                   (remove-if (lambda (u) (or (null link) (< (up:update-seq u) (up:update-seq link)))) operator-history)))))
+         (cond ((null link) (values nil "no causal link: the member has not cosigned past the embed"))
+               ((null breach) (values nil "deadline not reached"))
+               (answered (values nil "the operator processed the request"))
+               (t (values t nil))))))))

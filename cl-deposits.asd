@@ -28,6 +28,7 @@
      (:file "lightning") ; DEP-10: the Lightning rail — cl-payments backend, invoice attestations
      (:file "fraud")    ; DEP-06: fraud proofs — canonical hashing, verification, JSON
      (:file "node")     ; the node: operator, quorum member, and the wallet side
+     (:file "courier")  ; DEP-13: couriers — two-leg HTLC transfers across ledgers
      (:file "nostr-bus") ; the bus over cl-nostr relays
      (:file "daemon")   ; control socket, bitcoin-cli chain view
      ))))

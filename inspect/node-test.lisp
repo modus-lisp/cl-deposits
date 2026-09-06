@@ -214,4 +214,84 @@
               (check "everyone replicates the winner's DisputeAcquire"
                      (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey winner)))) (and f (equalp (lg:ledger-operator-key (nd:record-ledger f)) (nd:node-pubkey winner))))) (list b c d))))))))))
 
+
+
+(with-gate ("messaging: delivery escalation (DEP-12) and couriers (DEP-13)")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (e (nd:make-node :priv 99999999999999999999 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (kn (nd:make-node :priv 77777777777777777777 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a3" :reserves 15600000 :collateral 23400000))
+         (le (nd:open-ledger e :reserves-id "genesis:e3" :reserves 15600000 :collateral 23400000))
+         (ida (nd:record-id-hex la)) (ide (nd:record-id-hex le)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+    (dolist (opnode (list a e))
+      (let ((rec (if (eq opnode a) la le)))
+        (dolist (m (list b c d)) (nd:add-member opnode rec (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+        (nd:begin-quorum opnode rec :funding-txid (u:sha256 (u:cat (hx "f00d") (nd:node-pubkey opnode))) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)))
+    ;; Wallets: w1 on A, w2 on E; courier deposits on both, funded by the operators.
+    (let* ((w1 (nd:make-wallet :priv 55555555555555555555 :bus bus)) (w2 (nd:make-wallet :priv 66666666666666666666 :bus bus))
+           (kwa (nd:make-wallet :priv 77777777777777777777 :bus bus)) (kwe (nd:make-wallet :priv 77777777777777777777 :bus bus))
+           (d1 (nd:wallet-open-deposit w1 ida)) (d2 (nd:wallet-open-deposit w2 ide))
+           (ka (nd:wallet-open-deposit kwa ida)) (ke (nd:wallet-open-deposit kwe ide)))
+      (nd:credit-onchain a la d1 500000 :txid (u:sha256 (hx "01")))
+      (nd:credit-onchain e le ke 800000 :txid (u:sha256 (hx "02")))
+      ;; --- DEP-12: A ignores w1's transfer; w1 escalates through member b.
+      (setf (nd:node-ignore-actions a) '("transfer_lock"))
+      (let* ((params (w:json-object "operation" "AAAA"))   ; content of the ignored request (any signed request)
+             (h (nd:wallet-request-hash w1 ida "transfer_lock" params)))
+        (multiple-value-bind (ok res err rh) (nd:wallet-request w1 ida "transfer_lock" params :timeout 1)
+          (declare (ignore res))
+          (check "operator silently ignored the request" (and (not ok) (string= err "timeout")))
+          (check-bytes "request hash = sha256(content)" rh h))
+        (let* ((lb (nd:own-ledger b))
+               (reply (nd:wallet-escalate w1 (nd:record-id-hex lb) h ida (nd:node-pubkey-hex a)))
+               (embed (first (nd:record-history lb))))
+          (check-equal "member anchored a DeliveryEmbed on its ledger" (op:operation-type (op:decode-operation (up:update-message embed))) :delivery-embed)
+          (check-equal "reply carries the embed sequence" (w:jget reply "sequence") (up:update-seq embed))
+          ;; No causal link yet: b has not cosigned on A since the embed.
+          (check-equal "no proof before the member cosigns again"
+                       (nth-value 1 (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))))
+                       "no causal link: the member has not cosigned past the embed")
+          ;; A keeps operating (b cosigns, carrying its post-embed ledger hash) and time passes.
+          (setf (nd:node-ignore-actions a) '())
+          (nd:credit-onchain a la d1 1 :txid (u:sha256 (hx "03")))
+          (check-equal "deadline not reached yet"
+                       (nth-value 1 (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))))
+                       "deadline not reached")
+          (let ((*height* (+ *height* 100)))
+            (nd:credit-onchain a la d1 1 :txid (u:sha256 (hx "04")))
+            (check "past the service deadline with no answer: censorship proven"
+                   (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))
+                                         :processed-p (lambda (o) (eq (op:operation-type o) :transfer-lock))))
+            (check "not censorship if the operator answered"
+                   (not (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))
+                                              :processed-p (lambda (o) (eq (op:operation-type o) :onchain-credit))))))))
+      ;; --- DEP-13: w1 (ledger A) pays w2 (ledger E) through courier k.
+      (let ((k (cr:make-courier kn)))
+        (cr:courier-serve k ida ka kwa) (cr:courier-serve k ide ke kwe)
+        (cr:advertise-courier k)
+        (let ((ad (cr:courier-advertisement k)))
+          (check-equal "advertisement lists both ledgers" (length (w:jget ad "ledgers")) 2)
+          (check-equal "courier liquidity on E" (cr::courier-balance k ide) 800000))
+        (check-equal "route fee = fee_out(A) + fee_in(E)" (cr:route-fee k ida ide 100000) (+ 100 300 100 100))
+        (multiple-value-bind (leg1 preimage forward) (cr:wallet-route w1 (nd:node-pubkey-hex kn) ida ide d1 d2 100000 :height *height*)
+          (check-equal "forward amount = amount - fee" forward (- 100000 600))
+          (check-equal "leg 1 locked on A" (multiple-value-list (nd:wallet-balance w1 ida d1)) '(500002 100000))
+          ;; The courier saw leg 1 and locked leg 2 on E.
+          (let ((leg2 (nd:wallet-pending-lock kn ide (u:sha256 preimage) d2)))
+            (check "courier locked leg 2 to w2 on E behind the same hash" (and leg2 t))
+            (check-equal "leg 2 amount is the forward amount" (getf leg2 :amount) forward)
+            (check "leg 2 times out before leg 1" (< (getf leg2 :timeout-height) (+ *height* 144)))
+            ;; w2 claims leg 2 with the preimage; the courier completes leg 1.
+            (check "w2 completes leg 2" (nd:wallet-complete-transfer w2 ide (getf leg2 :transfer-id) preimage))
+            (check-equal "w2 received the forward amount" (nd:wallet-balance w2 ide d2) forward)
+            (check-equal "courier collected leg 1 on A" (nd:wallet-balance kwa ida ka) 100000)
+            (check-equal "w1 paid the full amount" (multiple-value-list (nd:wallet-balance w1 ida d1)) '(400002 0))
+            (check-equal "courier's E balance fell by the forward amount" (nd:wallet-balance kwe ide ke) (- 800000 forward))
+            (check "route recorded the preimage" (equalp (getf (gethash (u:sha256 preimage) (cr:courier-routes k)) :preimage) preimage))))))))
+
 (report)

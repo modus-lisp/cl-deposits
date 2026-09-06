@@ -41,6 +41,8 @@
            #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
            #:node-height-of-block #:equivocate
+           #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
+           #:node-hooks #:add-hook #:wallet-pending-lock
            #:save-record #:load-record #:*cosign-timeout*))
 (in-package #:cl-deposits.node)
 
@@ -55,6 +57,7 @@
   id-hex ledger (history '()) owned-p reserves
   pinned                                       ; (reserves . expiry) prepared for the next QuorumBegin
   fork-p fork-of fork-operator                 ; a dispute fork: of which ledger, signed by whom
+  last-event-id                                ; Nostr id of the last update we published
   preimage lottery confiscation)               ; our lottery secret; the built lottery; the confiscation tx
 
 (defstruct (node (:constructor %make-node))
@@ -72,6 +75,8 @@
   (height-of-block nil)                        ; (lambda (hash32)) -> height or NIL (fraud-proof anchors)
   (reveals (make-hash-table :test #'equal))    ; ledger id hex -> alist (member-pubkey33 . preimage)
   (relays '())                                 ; relay URLs, for advertisements
+  (ignore-actions '())                         ; testing: wallet actions the operator silently drops
+  (hooks '())                                  ; (lambda (rec update op)) called after every accepted/committed update
   (invoices (make-hash-table :test #'equalp))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
   (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
   (min-confs 1)
@@ -80,6 +85,15 @@
 (defun log! (node fmt &rest args)
   ;; One line per entry: the control socket is line-oriented.
   (push (substitute #\Space #\Newline (apply #'format nil fmt args)) (node-log node)))
+
+(defun add-hook (node fn) (push fn (node-hooks node)))
+(defun extra-actions (node)
+  "Actions registered by roles layered on the node (couriers), addressed to us by p tag."
+  (or (get (intern (node-pubkey-hex node) :keyword) 'actions)
+      (setf (get (intern (node-pubkey-hex node) :keyword) 'actions) (make-hash-table :test #'equal))))
+(defun run-hooks (node rec update)
+  (let ((o (op:decode-operation (up:update-message update))))
+    (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
 
 (defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln relays broadcast-fn height-of-block)
   (let* ((priv (w:even-y-privkey priv))
@@ -165,8 +179,9 @@
   (up:sign-operator update (node-priv node))
   (lg:apply-update (record-ledger rec) update)       ; signals ledger-error if invalid
   (push update (record-history rec))
-  (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) update))
+  (setf (record-last-event-id rec) (ev:event-id (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) update))))
   (save-record node rec)
+  (run-hooks node rec update)
   update)
 
 (defun solicit-cosignatures (node rec update signers required)
@@ -328,7 +343,10 @@
 
 (defun handle-request (node event)
   (let ((action (w:event-action event)) (params (w:parse-json (ev:event-content event))))
-    (cond ((string= action "cosign_update") (handle-cosign node event params))
+    (cond ((and (ev:first-tag-value event "p") (string= (ev:first-tag-value event "p") (k:public-hex (node-keypair node)))
+                (gethash action (extra-actions node)))
+           (funcall (gethash action (extra-actions node)) event params))
+          ((string= action "cosign_update") (handle-cosign node event params))
           ((string= action "confiscation_sign") (handle-confiscation-sign node event params))
           ((string= action "consent_request") (handle-consent node event params))
           ((string= action "cosign_invoice") (handle-cosign-invoice node event params))
@@ -386,7 +404,22 @@
     (lg:apply-update ledger update)
     (push update (record-history rec))
     (save-record node rec)
+    (run-hooks node rec update)
     :applied))
+
+;;; Following a ledger we are not a member of (couriers, watchers): bootstrap a
+;;; replica from what the relays hold, then keep it current like any replica.
+
+(defun follow-ledger (node id-hex)
+  (or (find-record node id-hex)
+      (let* ((events (bus:bus-fetch (node-bus node)
+                                    (flt:make-filter :kinds (list w:+kind-update+) :tags (list (cons "d" (list (subseq id-hex 0 16)))))))
+             (updates (sort (remove-duplicates (mapcar #'w:event->update events) :test #'equalp :key #'up:encode-update)
+                            #'< :key #'up:update-seq))
+             (rec (make-record :id-hex id-hex :ledger (lg:make-ledger))))
+        (dolist (u updates) (when (string= (bytes->hex (up:update-ledger-id u)) id-hex) (accept-update node rec u)))
+        (setf (gethash id-hex (node-ledgers node)) rec)
+        rec)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Inbound: cosign_update (we are a quorum member of this ledger)
@@ -507,8 +540,23 @@
 ;;; Inbound: wallet requests (we are the operator)
 
 (defun handle-wallet-request (node rec event action params)
+  (when (member action (node-ignore-actions node) :test #'string=)
+    (log! node "ignoring ~a (test switch)" action)
+    (return-from handle-wallet-request nil))
   (handler-case
       (cond
+        ((string= action "delivery_embed")
+         ;; DEP-12: a wallet asks us (a quorum member) to anchor its unanswered request.
+         (let ((h (hex->bytes (w:jget params "request_hash")))
+               (target (hex->bytes (w:jget params "target_ledger_id")))
+               (operator (hex->bytes (w:jget params "target_operator"))))
+           (unless (= (length h) 32) (fail "request_hash must be 32 bytes"))
+           (append-operation node rec (list :type :delivery-embed :request-hash h :target-ledger-id target :target-operator operator))
+           (respond node event t :result (w:json-object "ledger_id" (record-id-hex rec)
+                                                        "event_id" (record-last-event-id rec)
+                                                        "sequence" (lg:ledger-sequence (record-ledger rec))
+                                                        "tip_hash" (bytes->hex (lg:ledger-chain-tip (record-ledger rec)))
+                                                        "request_hash" (bytes->hex h)))))
         ((string= action "deposit_open")
          (let* ((descriptor (w:jget params "descriptor"))
                 (id (op:deposit-id descriptor)))
@@ -666,9 +714,9 @@
                                       (bt:condition-notify (waiter-cv wt)))))))
     wal))
 
-(defun wallet-request (wal ledger-id-hex action params &key (timeout *cosign-timeout*))
-  "Send a request; return (values success result error)."
-  (let* ((event (w:request-event (wallet-keypair wal) ledger-id-hex action params))
+(defun wallet-request (wal ledger-id-hex action params &key (timeout *cosign-timeout*) extra-tags)
+  "Send a request; return (values success result error request-hash)."
+  (let* ((event (w:request-event (wallet-keypair wal) ledger-id-hex action params :extra-tags extra-tags))
          (wt (make-waiter :want 1)))
     (setf (gethash (ev:event-id event) (wallet-pending wal)) wt)
     (bus:bus-publish (wallet-bus wal) event)
@@ -677,8 +725,13 @@
             until (or (waiter-responses wt) (> (get-internal-real-time) deadline))
             do (bt:condition-wait (waiter-cv wt) (waiter-lock wt) :timeout 0.2)))
     (remhash (ev:event-id event) (wallet-pending wal))
-    (let ((r (first (waiter-responses wt))))
-      (if r (values (w:jget r "success") (w:jget r "result") (w:jget r "error")) (values nil nil "timeout")))))
+    (let ((r (first (waiter-responses wt))) (h (sha256 (ascii->bytes (ev:event-content event)))))
+      (if r (values (w:jget r "success") (w:jget r "result") (w:jget r "error") h) (values nil nil "timeout" h)))))
+
+(defun wallet-request-hash (wal ledger-id-hex action params)
+  "The request hash DEP-12 anchors: SHA256 of the signed request's content."
+  (declare (ignore wal ledger-id-hex action))
+  (sha256 (ascii->bytes (w:json params))))
 
 (defun wallet-descriptor (wal) (format nil "pk(~a)" (bytes->hex (wallet-pubkey wal))))
 
@@ -715,6 +768,41 @@
       (declare (ignore res))
       (unless ok (fail "transfer_complete: ~a" err))
       t)))
+
+;;; Wallet: DEP-12 escalation through a quorum member
+
+(defun wallet-escalate (wal member-ledger-hex request-hash target-ledger-hex target-operator-hex)
+  "Ask a quorum member to anchor our unanswered request on its ledger.
+   Returns the member's reply (sequence, tip_hash)."
+  (multiple-value-bind (ok res err)
+      (wallet-request wal member-ledger-hex "delivery_embed"
+                      (w:json-object "request_hash" (bytes->hex request-hash) "target_ledger_id" target-ledger-hex
+                                     "target_operator" target-operator-hex))
+    (unless ok (fail "delivery_embed: ~a" err))
+    res))
+
+(defun wallet-lock-to (wal ledger-id-hex from to amount-msats hash &key (fee 0) (timeout-blocks 144) (height 0))
+  "A TransferLock behind an externally chosen sha256 HASH (HTLC legs).  Returns the transfer id."
+  (let* ((transfer-nonce (random-aux))
+         (transfer-id (sha256 (cat transfer-nonce from to)))
+         (o (list :type :transfer-lock :transfer-nonce transfer-nonce :source-deposit-id from :destination-deposit-id to
+                  :amount amount-msats :fee fee :completion-script (format nil "sha256(~a)" (bytes->hex hash))
+                  :timeout-height (+ height timeout-blocks) :transfer-id transfer-id
+                  :nonce (incf (wallet-nonce wal)) :expiry (+ height 144) :witness '())))
+    (setf (getf o :witness) (d17:sign-operation o (wallet-priv wal)))
+    (multiple-value-bind (ok res err)
+        (wallet-request wal ledger-id-hex "transfer_lock" (w:json-object "operation" (base64-encode (op:encode-operation o))))
+      (declare (ignore res))
+      (unless ok (fail "transfer_lock: ~a" err))
+      transfer-id)))
+
+(defun wallet-pending-lock (node ledger-id-hex hash to-deposit)
+  "In a followed/replicated ledger, the pending TransferLock to TO-DEPOSIT behind HASH, or NIL."
+  (let ((rec (find-record node ledger-id-hex)) (script (format nil "sha256(~a)" (bytes->hex hash))))
+    (when rec
+      (loop for tid being the hash-keys of (lg:ledger-pending-transfers (record-ledger rec)) using (hash-value p)
+            when (and (equalp (getf p :destination) to-deposit) (string= (getf p :completion-script) script))
+              return (list :transfer-id tid :amount (getf p :amount) :timeout-height (getf p :timeout-height) :source (getf p :source))))))
 
 ;;; Wallet: receive over Lightning
 
