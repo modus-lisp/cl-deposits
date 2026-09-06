@@ -9,9 +9,10 @@
 (defpackage #:cl-deposits.courier
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:nd #:cl-deposits.node) (#:w #:cl-deposits.wire) (#:op #:cl-deposits.operation)
-                    (#:lg #:cl-deposits.ledger) (#:ev #:cl-nostr.event) (#:bus #:cl-deposits.bus) (#:k #:cl-nostr.keys))
+                    (#:lg #:cl-deposits.ledger) (#:ev #:cl-nostr.event) (#:bus #:cl-deposits.bus) (#:k #:cl-nostr.keys)
+                    (#:up #:cl-deposits.update) (#:d17 #:cl-deposits.dep17) (#:secp #:secp256k1-fast))
   (:export #:courier #:make-courier #:courier-node #:courier-serve #:advertise-courier #:courier-routes
-           #:route-fee #:courier-advertisement #:wallet-route #:+kind-courier-ad+ #:+leg-delta+))
+           #:route-fee #:courier-advertisement #:wallet-route #:+kind-courier-ad+ #:+leg-delta+ #:point-add #:scalar-add))
 (in-package #:cl-deposits.courier)
 
 (defconstant +kind-courier-ad+ 39102)
@@ -61,6 +62,18 @@
                      (ev:build-event (nd::node-keypair node) +kind-courier-ad+ (w:json (courier-advertisement c :network network))
                                      :tags (list (list "d" (nd:node-pubkey-hex node)) (list "service" "htlc_routing") (list "n" network))))))
 
+;;; Point arithmetic for PTLC legs
+
+(defun point-add (p33 q33)
+  "Compressed P + Q."
+  (secp:secp-init)
+  (let ((r (secp:secp-add-points (d17:parse-pubkey p33) (d17:parse-pubkey q33))))
+    (cat (octets (if (evenp (secp:secp-y r)) 2 3)) (int->be (secp:secp-x r) 32))))
+
+(defun scalar-add (a32 b32) (int->be (mod (+ (be->int a32) (be->int b32)) secp:*secp256k1-n*) 32))
+
+(defun route-key (route) (or (getf route :point-b) (getf route :hash)))
+
 ;;; The route request (DEP-13 §Route Request Protocol)
 
 (defun handle-route-request (c event params)
@@ -69,18 +82,28 @@
         (let* ((source (w:jget params "source_ledger")) (dest (w:jget params "dest_ledger"))
                (dest-deposit (hex->bytes (w:jget params "dest_deposit_id")))
                (amount (w:jget params "amount_msats"))
-               (hash (hex->bytes (w:jget params "hash")))
+               (lock-type (or (w:jget params "lock_type") "htlc"))
+               (ptlc (string= lock-type "ptlc"))
+               (hash (and (not ptlc) (hex->bytes (w:jget params "hash"))))
+               (point-p (and ptlc (hex->bytes (w:jget params "point_p"))))
                (fee (route-fee c source dest amount)))
-          (unless (string= (or (w:jget params "lock_type") "htlc") "htlc") (error "only htlc routes here"))
-          (unless (= (length hash) 32) (error "hash must be 32 bytes"))
+          (unless (member lock-type '("htlc" "ptlc") :test #'string=) (error "unknown lock_type"))
+          (when (and hash (/= (length hash) 32)) (error "hash must be 32 bytes"))
+          (when (and point-p (/= (length point-p) 33)) (error "point_p must be a 33-byte point"))
           (when (<= amount fee) (error "amount too small to cover fees"))
           (when (> (- amount fee) (courier-balance c dest)) (error "insufficient courier liquidity on the destination ledger"))
-          (setf (gethash hash (courier-routes c))
-                (list :source source :dest dest :dest-deposit dest-deposit :amount amount :fee fee :forward (- amount fee)))
-          (nd::respond node event t
-                       :result (w:json-object "courier_deposit_id" (bytes->hex (getf (gethash source (courier-ledgers c)) :deposit-id))
-                                              "lock_type" "htlc" "hash" (bytes->hex hash) "fee_msats" fee
-                                              "forward_amount_msats" (- amount fee))))
+          (let* ((t-scalar (and ptlc (nd::random-aux)))
+                 (point-t (and ptlc (up:compressed-pubkey (be->int t-scalar))))
+                 (point-b (and ptlc (point-add point-p point-t)))     ; P_b = P + T: what leg 1 locks to
+                 (route (list :source source :dest dest :dest-deposit dest-deposit :amount amount :fee fee :forward (- amount fee)
+                              :hash hash :point-p point-p :point-b point-b :blinding t-scalar)))
+            (setf (gethash (route-key route) (courier-routes c)) route)
+            (nd::respond node event t
+                         :result (apply #'w:json-object
+                                        "courier_deposit_id" (bytes->hex (getf (gethash source (courier-ledgers c)) :deposit-id))
+                                        "lock_type" lock-type "fee_msats" fee "forward_amount_msats" (- amount fee)
+                                        (if ptlc (list "point_p" (bytes->hex point-p) "blinding_point" (bytes->hex point-t))
+                                            (list "hash" (bytes->hex hash)))))))
       (error (e) (nd::respond node event nil :error (princ-to-string e))))))
 
 ;;; Watching both ledgers
@@ -92,8 +115,9 @@
       (:transfer-lock
        ;; Leg 1 arrived?  Lock leg 2.
        (let* ((script (op:field o :completion-script))
-              (hash (and (search "sha256(" script) (hex->bytes (subseq script 7 (position #\) script)))))
-              (route (and hash (gethash hash (courier-routes c)))))
+              (arg (and (position #\( script) (hex->bytes (subseq script (1+ (position #\( script)) (position #\) script)))))
+              (hash arg)                                    ; sha256(H) or pointlock(P_b): both key the route
+              (route (and arg (gethash arg (courier-routes c)))))
          (when (and route (string= id (getf route :source)) (null (getf route :leg1))
                     (equalp (op:field o :destination-deposit-id) (getf (gethash id (courier-ledgers c)) :deposit-id))
                     (>= (op:field o :amount) (getf route :amount)))
@@ -102,7 +126,8 @@
                   (timeout (- (op:field o :timeout-height) +leg-delta+ (nd:height (courier-node c)))))
              (when (<= timeout 0) (error "leg 1 timeout leaves no room for leg 2"))
              (setf (getf route :leg2)
-                   (nd:wallet-lock-to (getf l :wallet) dest (getf l :deposit-id) (getf route :dest-deposit) (getf route :forward) hash
+                   (nd:wallet-lock-to (getf l :wallet) dest (getf l :deposit-id) (getf route :dest-deposit) (getf route :forward)
+                                      (getf route :hash) :point (getf route :point-p)      ; leg 2 locks to P itself
                                       :timeout-blocks timeout :height (nd:height (courier-node c))))
              (setf (gethash hash (courier-routes c)) route)))))
       (:transfer-complete
@@ -112,23 +137,33 @@
                           when (equalp (getf r :leg2) tid) return h))
               (route (and hash (gethash hash (courier-routes c)))))
          (when (and route (string= id (getf route :dest)) (null (getf route :preimage)))
-           (let ((preimage (first (op:field o :script-witness))))
-             (setf (getf route :preimage) preimage)
+           (let* ((revealed (first (op:field o :script-witness)))
+                  ;; HTLC: relay the preimage.  PTLC: leg 1 wants s + t.
+                  (opening (if (getf route :blinding) (scalar-add revealed (getf route :blinding)) revealed)))
+             (setf (getf route :preimage) revealed)
              (nd:wallet-complete-transfer (getf (gethash (getf route :source) (courier-ledgers c)) :wallet)
-                                          (getf route :source) (getf route :leg1) preimage)
+                                          (getf route :source) (getf route :leg1) opening)
              (setf (gethash hash (courier-routes c)) route))))))))
 
 
 ;;; The sender's side
 
-(defun wallet-route (wal courier-pubkey-hex source dest from-deposit dest-deposit amount &key (height 0) preimage)
-  "Request a route, lock leg 1 to the courier.  Returns (values leg1-transfer-id preimage forward-amount)."
-  (let* ((preimage (or preimage (nd::random-aux))) (hash (sha256 preimage)))
+(defun wallet-route (wal courier-pubkey-hex source dest from-deposit dest-deposit amount &key (height 0) preimage ptlc)
+  "Request a route, lock leg 1 to the courier.  HTLC: returns (values leg1-id preimage forward).
+   PTLC: the secret is a scalar s; leg 1 locks to P_b = P + T, leg 2 to P = s*G.
+   Returns (values leg1-id s forward point-p)."
+  (let* ((secret (or preimage (nd::random-aux)))
+         (hash (and (not ptlc) (sha256 secret)))
+         (point-p (and ptlc (up:compressed-pubkey (be->int secret)))))
     (multiple-value-bind (ok res err)
         (nd:wallet-request wal (make-string 64 :initial-element #\0) "request_route"
-                           (w:json-object "source_ledger" source "dest_ledger" dest "dest_deposit_id" (bytes->hex dest-deposit)
-                                          "amount_msats" amount "lock_type" "htlc" "hash" (bytes->hex hash))
+                           (apply #'w:json-object "source_ledger" source "dest_ledger" dest "dest_deposit_id" (bytes->hex dest-deposit)
+                                  "amount_msats" amount "lock_type" (if ptlc "ptlc" "htlc")
+                                  (if ptlc (list "point_p" (bytes->hex point-p)) (list "hash" (bytes->hex hash))))
                            :extra-tags (list (list "p" (subseq courier-pubkey-hex 2))))
       (unless ok (error "request_route: ~a" err))
-      (let ((tid (nd:wallet-lock-to wal source from-deposit (hex->bytes (w:jget res "courier_deposit_id")) amount hash :height height)))
-        (values tid preimage (w:jget res "forward_amount_msats"))))))
+      (when ptlc (unless (equalp (hex->bytes (w:jget res "point_p")) point-p) (error "courier substituted our point")))
+      (let* ((point-b (and ptlc (point-add point-p (hex->bytes (w:jget res "blinding_point")))))
+             (tid (nd:wallet-lock-to wal source from-deposit (hex->bytes (w:jget res "courier_deposit_id")) amount hash
+                                     :point point-b :height height)))
+        (values tid secret (w:jget res "forward_amount_msats") point-p)))))

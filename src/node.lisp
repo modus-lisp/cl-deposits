@@ -43,7 +43,7 @@
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
            #:node-height-of-block #:equivocate
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
-           #:node-hooks #:add-hook #:wallet-pending-lock
+           #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p
            #:save-record #:load-record #:*cosign-timeout*))
 (in-package #:cl-deposits.node)
 
@@ -615,10 +615,8 @@
                              :script-witness (list (hex->bytes (or (w:jget params "preimage") (w:jget params "scalar") (fail "preimage required")))))))
                 (pending (gethash (op:field o :transfer-id) (lg:ledger-pending-transfers (record-ledger rec)))))
            (unless pending (fail "no such transfer"))
-           (let* ((script (getf pending :completion-script))
-                  (h (and (search "sha256(" script) (hex->bytes (subseq script 7 (position #\) script)))))
-                  (wit (op:field o :script-witness)))
-             (unless (and h wit (= 1 (length wit)) (equalp (sha256 (first wit)) h)) (fail "hashlock not satisfied")))
+           (unless (completion-satisfied-p (getf pending :completion-script) (op:field o :script-witness))
+             (fail "completion script not satisfied"))
            (append-operation node rec o)
            (respond node event t :result (w:json-object "transfer_id" (bytes->hex (op:field o :transfer-id))))))
         ((string= action "make_invoice") (handle-make-invoice node rec event params))
@@ -907,6 +905,19 @@
                         :timeout 40)
       (values ok (and ok (hex->bytes (w:jget res "preimage"))) err))))
 
+;;; Completion scripts (DEP-09/13): sha256(H) opened by a preimage, pointlock(P)
+;;; opened by the scalar s with s*G = P.
+
+(defun completion-satisfied-p (script witness)
+  (let ((arg (and (position #\( script) (position #\) script) (subseq script (1+ (position #\( script)) (position #\) script)))))
+    (and witness (= 1 (length witness)) arg
+         (cond ((search "sha256(" script) (equalp (sha256 (first witness)) (hex->bytes arg)))
+               ((search "pointlock(" script)
+                (let ((s (be->int (first witness))))
+                  (and (= 32 (length (first witness))) (< 0 s secp256k1-fast:*secp256k1-n*)
+                       (equalp (up:compressed-pubkey s) (hex->bytes arg)))))
+               (t nil)))))
+
 ;;; Wallet: DEP-12 escalation through a quorum member
 
 (defun wallet-escalate (wal member-ledger-hex request-hash target-ledger-hex target-operator-hex)
@@ -919,12 +930,14 @@
     (unless ok (fail "delivery_embed: ~a" err))
     res))
 
-(defun wallet-lock-to (wal ledger-id-hex from to amount-msats hash &key (fee 0) (timeout-blocks 144) (height 0))
-  "A TransferLock behind an externally chosen sha256 HASH (HTLC legs).  Returns the transfer id."
+(defun wallet-lock-to (wal ledger-id-hex from to amount-msats hash &key (fee 0) (timeout-blocks 144) (height 0) point)
+  "A TransferLock behind an externally chosen sha256 HASH, or a POINT (33 bytes)
+   for a PTLC leg.  Returns the transfer id."
   (let* ((transfer-nonce (random-aux))
          (transfer-id (sha256 (cat transfer-nonce from to)))
          (o (list :type :transfer-lock :transfer-nonce transfer-nonce :source-deposit-id from :destination-deposit-id to
-                  :amount amount-msats :fee fee :completion-script (format nil "sha256(~a)" (bytes->hex hash))
+                  :amount amount-msats :fee fee
+                  :completion-script (if point (format nil "pointlock(~a)" (bytes->hex point)) (format nil "sha256(~a)" (bytes->hex hash)))
                   :timeout-height (+ height timeout-blocks) :transfer-id transfer-id
                   :nonce (incf (wallet-nonce wal)) :expiry (+ height 144) :witness '())))
     (setf (getf o :witness) (d17:sign-operation o (wallet-priv wal)))
@@ -934,9 +947,10 @@
       (unless ok (fail "transfer_lock: ~a" err))
       transfer-id)))
 
-(defun wallet-pending-lock (node ledger-id-hex hash to-deposit)
-  "In a followed/replicated ledger, the pending TransferLock to TO-DEPOSIT behind HASH, or NIL."
-  (let ((rec (find-record node ledger-id-hex)) (script (format nil "sha256(~a)" (bytes->hex hash))))
+(defun wallet-pending-lock (node ledger-id-hex hash to-deposit &key point)
+  "In a followed/replicated ledger, the pending TransferLock to TO-DEPOSIT behind HASH (or POINT), or NIL."
+  (let ((rec (find-record node ledger-id-hex))
+        (script (if point (format nil "pointlock(~a)" (bytes->hex point)) (format nil "sha256(~a)" (bytes->hex hash)))))
     (when rec
       (loop for tid being the hash-keys of (lg:ledger-pending-transfers (record-ledger rec)) using (hash-value p)
             when (and (equalp (getf p :destination) to-deposit) (string= (getf p :completion-script) script))
