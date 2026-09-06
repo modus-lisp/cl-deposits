@@ -42,7 +42,7 @@
            #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
            #:node-height-of-block #:equivocate
-           #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
+           #:check-expired-quorums #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock
            #:save-record #:load-record #:*cosign-timeout*))
 (in-package #:cl-deposits.node)
@@ -190,7 +190,8 @@
   (let* ((params (w:json-object "sequence_number" (up:update-seq update)
                                 "cosign_data_hex" (bytes->hex (up::cosign-data update))
                                 "content_hash_hex" (bytes->hex (up:content-hash update))
-                                "message_type" 32769))
+                                "message_type" 32769
+                                "fork_operator" (and (record-fork-p rec) (bytes->hex (record-fork-operator rec)))))
          (responses (send-request node (record-id-hex rec) "cosign_update" params :want required)))
     (dolist (r responses)
       (let ((res (w:jget r "result")))
@@ -431,7 +432,8 @@
     (if (and own (tip own)) (up:content-hash (tip own)) (make-array 32 :element-type '(unsigned-byte 8)))))
 
 (defun handle-cosign (node event params)
-  (let* ((rec (find-record node (w:event-ledger-id event)))
+  (let* ((rec (let ((fo (w:jget params "fork_operator")))
+                (if fo (find-fork node (w:event-ledger-id event) (hex->bytes fo)) (find-record node (w:event-ledger-id event)))))
          (data (hex->bytes (w:jget params "cosign_data_hex")))
          (seq (w:jget params "sequence_number")))
     (cond
@@ -485,13 +487,27 @@
          (history (map 'list (lambda (b64) (up:decode-update (base64-decode b64))) (w:jget params "ledger_history"))))
     (unless (own-ledger node) (return-from handle-consent (respond node event nil :error "no ledger of our own")))
     (handler-case
-        (let ((rec (or (find-record node their-id) (make-record :id-hex their-id :ledger (lg:make-ledger)))))
-          ;; Bootstrap / catch up the replica from the piggybacked history.
+        (let* ((genesis-operator (up:update-operator-id (first history)))
+               (forked (not (equalp genesis-operator operator)))
+               (div (and forked (position-if (lambda (u) (equalp (up:update-operator-id u) operator)) history)))
+               (base (or (find-record node their-id)
+                         ;; No replica yet: build it from the history's base prefix.
+                         (let ((b (make-record :id-hex their-id :ledger (lg:make-ledger))))
+                           (dolist (u (if forked (subseq history 0 div) history)) (accept-update node b u))
+                           (setf (gethash their-id (node-ledgers node)) b)
+                           b)))
+               (rec (if (not forked)
+                        base
+                        ;; A dispute winner re-establishing on its fork: find or build the fork.
+                        (or (find-fork node their-id operator)
+                            (progn (unless div (fail "history has no fork by this operator"))
+                                   (make-fork node base (1- (up:update-seq (nth div history))) operator))))))
+          ;; Catch up from the piggybacked history.
           (dolist (u history)
             (when (> (up:update-seq u) (lg:ledger-sequence (record-ledger rec)))
               (accept-update node rec u)))
           (unless (equalp (lg:ledger-operator-key (record-ledger rec)) operator) (fail "history is not this operator's"))
-          (setf (gethash their-id (node-ledgers node)) rec)
+          (unless (record-fork-p rec) (setf (gethash their-id (node-ledgers node)) rec))
           (let* ((until (let ((u (w:jget params "membership_until"))) (if (integerp u) u (+ (height node) 4320))))
                  (consent (schnorr:schnorr-sign (node-priv node)
                                                 (sha256 (cat (ascii->bytes "COLLATERAL_CONSENT") operator (ascii->bytes their-id)))
@@ -1192,6 +1208,28 @@
     (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) u))
     u))
 
+;;; Respectful disputes: the quorum expired and the operator has not rotated.
+
+(defun check-expired-quorums (node &key anchor-block-hash)
+  "For every ledger we cosign whose quorum_expiry is behind the chain tip,
+   publish a QuorumExpired proof and open a dispute fork.  Returns the ledger ids disputed."
+  (let ((h (height node)) (disputed '()))
+    (loop for rec being the hash-values of (node-ledgers node)
+          for ledger = (record-ledger rec)
+          when (and (not (record-owned-p rec)) (not (record-fork-p rec))
+                    (lg:ledger-quorum-expiry ledger) (> h (lg:ledger-quorum-expiry ledger))
+                    (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
+                    (not (find-fork node (record-id-hex rec) (node-pubkey node))))
+            do (let ((proof (fr:make-quorum-expired-proof (lg:ledger-operator-key ledger) (hex->bytes (record-id-hex rec))
+                                                          (or anchor-block-hash (make-array 32 :element-type '(unsigned-byte 8)))
+                                                          (lg:ledger-quorum-expiry ledger))))
+                 (broadcast-fraud node proof)
+                 (unless (find-fork node (record-id-hex rec) (node-pubkey node))
+                   (enter-dispute node rec (lg:ledger-sequence ledger) :reason "quorum_expired"
+                                  :anchor-block-hash anchor-block-hash :anchor-block-height h))
+                 (push (record-id-hex rec) disputed)))
+    disputed))
+
 ;;; Fraud broadcasts (Kind 9101): verify, and if we are a member, dispute.
 
 (defun broadcast-fraud (node proof)
@@ -1205,7 +1243,10 @@
                (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
                (not (find-fork node id (node-pubkey node))))
       (multiple-value-bind (ok why)
-          (fr:verify-proof proof :history (reverse (record-history rec)) :height-of-block (node-height-of-block node))
+          (fr:verify-proof proof :history (reverse (record-history rec))
+                           :height-of-block (or (node-height-of-block node)
+                                                ;; no chain view: trust our own tip for the anchor
+                                                (lambda (hash) (declare (ignore hash)) (height node))))
         (if ok
             (let ((last-valid (min (lg:ledger-sequence (record-ledger rec))
                                    (case (getf proof :type)

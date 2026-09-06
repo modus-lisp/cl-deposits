@@ -87,6 +87,7 @@
         (:confiscate (multiple-value-bind (tx lottery) (nd:confiscate node (arg form :ledger) :respectful (arg form :respectful) :fee (arg form :fee 1000))
                        (ok :txid (txid-hex (cl-consensus.tx:tx-txid tx)) :lottery (cl-deposits.lottery:lottery-address lottery))))
         (:reveal (nd:publish-reveal node (arg form :ledger)) (ok))
+        (:check-expired (ok :disputed (nd:check-expired-quorums node :anchor-block-hash (txid-bytes (run-cli (or (uiop:getenv "CLD_BITCOIN_CLI") "bitcoin-cli") "getbestblockhash")))))
         (:reveals (ok :reveals (mapcar (lambda (r) (bytes->hex (car r))) (nd:reveals-of node (arg form :ledger)))))
         (:claim (multiple-value-bind (outcome tx) (nd:claim-or-yield node (arg form :ledger))
                   (ok :outcome outcome :txid (and tx (txid-hex (cl-consensus.tx:tx-txid tx))))))

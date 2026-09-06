@@ -377,4 +377,56 @@
       (check-signals "an unparseable descriptor cannot open a deposit" nd:node-error
         (nd:wallet-open-deposit w2 id :descriptor "wsh(frob(1))")))))
 
+
+
+(with-gate ("respectful dispute on quorum expiry; the winner re-establishes a quorum on its fork")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a6" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d6")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
+    (let* ((expiry (lg:ledger-quorum-expiry (nd:record-ledger la)))
+           (w (nd:make-wallet :priv 55555555555555555555 :bus bus)) (dw (nd:wallet-open-deposit w id)))
+      (check-equal "nothing to dispute before expiry" (nd:check-expired-quorums b) '())
+      (let ((*height* (+ expiry 1)))
+        (check-signals "past expiry, value-moving operations are uncosignable" nd:node-error
+          (nd:credit-onchain a la dw 1 :txid (u:sha256 (hx "78"))))
+        (check-equal "member b disputes the expired quorum" (nd:check-expired-quorums b) (list id))
+        (check "the QuorumExpired proof made c and d fork too"
+               (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list c d)))
+        (check "respectful proof type" (fr:respectful-p (fr:make-quorum-expired-proof (nd:node-pubkey a) (u:hex->bytes id) (make-array 32) expiry)))
+        ;; Run the lottery through (respectful: obligations to the lottery, change back to the operator).
+        (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m))))
+        (multiple-value-bind (ctx lottery) (nd:confiscate b id :respectful t)
+          (declare (ignore lottery))
+          (check-equal "respectful confiscation: lottery output + operator change" (length (btx:tx-outputs ctx)) 2)
+          (dolist (m (list b c d)) (nd:publish-reveal m id))
+          (let* ((outcomes (mapcar (lambda (m) (multiple-value-list (nd:claim-or-yield m id))) (list b c d)))
+                 (winner (nth (position :won outcomes :key #'first) (list b c d)))
+                 (wfork (nd:find-fork winner id (nd:node-pubkey winner))))
+            (check "a winner took custody" (and winner t))
+            ;; Re-establishment: the new custodian stages the other members and begins a quorum on the fork.
+            (let ((e (nd:make-node :priv 99999999999999999999 :bus bus :height-fn hf)))
+              (nd:open-ledger e :reserves-id "genesis:e6")
+              (dolist (m (cons e (remove winner (list b c d))))
+                (nd:add-member winner wfork (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m))))
+            ;; The deposed operator cannot join: its own expired ledger takes no QuorumJoin.
+            (check-signals "the deposed operator's consent fails on its expired ledger" nd:node-error
+              (nd:add-member winner wfork (nd:node-pubkey a) :member-ledger-id (nd:record-id-hex la)))
+            (check-equal "three members staged on the fork" (length (lg:ledger-next-quorum-members (nd:record-ledger wfork))) 3)
+            (multiple-value-bind (qb reserves) (nd:begin-quorum winner wfork :funding-txid (u:sha256 (hx "f00d7")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+              (check "QuorumBegin on the fork cosigned by the staged majority" (>= (length (up:update-cosignatures qb)) 2))
+              (check-equal "fork quorum active under the new custodian"
+                           (list (lg:ledger-quorum-state (nd:record-ledger wfork)) (equalp (lg:ledger-operator-key (nd:record-ledger wfork)) (nd:node-pubkey winner)))
+                           '(:active t))
+              (check "new reserves belong to the winner's voter set" (equalp (rs:reserves-operator reserves) (nd:node-pubkey winner))))
+            (check "every node replicates the fork at the winner's tip"
+                   (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey winner))))
+                                        (and f (equalp (lg:ledger-chain-tip (nd:record-ledger f)) (lg:ledger-chain-tip (nd:record-ledger wfork))))))
+                          (remove winner (list a b c d))))))))))
+
 (report)

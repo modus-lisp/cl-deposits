@@ -64,8 +64,9 @@
 (defmethod ln-payment-status ((b clp-backend) payment-hash)
   (let ((r (clp-call b (format nil "(:payment-status :payment-hash ~s)" (bytes->hex payment-hash)))))
     (case (getf r :status)
-      (:succeeded (values :succeeded (let ((p (getf r :preimage))) (and (stringp p) (hex->bytes p)))))
-      ((:failed :unknown) (values :failed nil))
+      ((:succeeded :complete :completed :paid)
+       (values :succeeded (let ((p (getf r :preimage))) (and (stringp p) (hex->bytes p)))))
+      ((:failed :unknown :error) (values :failed nil))
       (t (values :pending nil)))))
 
 (defmethod ln-invoice-status ((b clp-backend) payment-hash)
