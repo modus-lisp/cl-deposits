@@ -87,8 +87,16 @@
 ;;; Kinds 20101 / 20102
 
 (defun request-event (keypair ledger-id-hex action params &key (extra-tags '()))
+  ;; A random "r" tag keeps two identical requests in one second from sharing an
+  ;; event id (relays and nodes dedupe by id).
   (ev:build-event keypair +kind-request+ (json params)
-                  :tags (append (list (list "l" ledger-id-hex) (list "action" action)) extra-tags)))
+                  :tags (append (list (list "l" ledger-id-hex) (list "action" action)
+                                      (list "r" (bytes->hex (subseq (%random16) 0 8))))
+                                extra-tags)))
+
+(defun %random16 ()
+  (with-open-file (in "/dev/urandom" :element-type '(unsigned-byte 8))
+    (let ((a (make-array 16 :element-type '(unsigned-byte 8)))) (read-sequence a in) a)))
 
 (defun response-event (keypair request-id ledger-id-hex success &key result error)
   (let ((body (json-object "result" result "error" error)))

@@ -43,7 +43,7 @@
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
            #:node-height-of-block #:equivocate
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
-           #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p
+           #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
            #:save-record #:load-record #:*cosign-timeout*))
 (in-package #:cl-deposits.node)
 
@@ -69,7 +69,8 @@
   (height-fn (lambda () 0))
   (log '())
   data-dir
-  (inbox '()) (inbox-lock (bt:make-lock "inbox")) (inbox-cv (bt:make-condition-variable)) (worker nil)
+  (inbox '()) (inbox-lock (bt:make-lock "inbox")) (inbox-cv (bt:make-condition-variable)) (worker nil) (busy nil)
+  (seen (make-hash-table :test #'equal)) (seen-order '())   ; event ids already handled (relays redeliver)
   (ln nil)                                     ; a cl-deposits.lightning backend, or NIL
   (broadcast-fn nil)                           ; (lambda (tx-bytes)) -> txid or NIL; NIL = collect only
   (broadcasts '())                             ; what we would have broadcast (newest first)
@@ -109,7 +110,9 @@
     ;; worker, because handling a request may itself wait for responses.
     (when (bus:bus-async-p bus)
       (setf (node-worker node)
-            (bt:make-thread (lambda () (worker-loop node)) :name "cld-worker")))
+            (bt:make-thread (lambda () (worker-loop node)) :name "cld-worker"))
+      (when (typep bus 'bus:chaos-bus)
+        (bus:bus-add-idle-hook bus (lambda () (and (null (node-inbox node)) (not (node-busy node)))))))
     (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-update+ w:+kind-request+ w:+kind-response+
                                                         w:+kind-fraud-proof+ w:+kind-lottery-reveal+))
                        (lambda (event)
@@ -127,8 +130,9 @@
   (loop
     (let ((event (bt:with-lock-held ((node-inbox-lock node))
                    (loop until (node-inbox node) do (bt:condition-wait (node-inbox-cv node) (node-inbox-lock node)))
+                   (setf (node-busy node) t)
                    (pop (node-inbox node)))))
-      (handle-event node event))))
+      (unwind-protect (handle-event node event) (setf (node-busy node) nil)))))
 
 (defun height (node) (funcall (node-height-fn node)))
 (defun find-record (node id-hex) (gethash id-hex (node-ledgers node)))
@@ -139,12 +143,12 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Waiting for responses
 
-(defstruct waiter (lock (bt:make-lock)) (cv (bt:make-condition-variable)) (responses '()) (done nil) want (successes-only nil))
+(defstruct waiter (lock (bt:make-lock)) (cv (bt:make-condition-variable)) (responses '()) (done nil) want (successes-only nil) (ids '()) (counts nil))
 
 (defun waiter-count (wt)
-  (if (waiter-successes-only wt)
-      (count-if (lambda (r) (w:jget r "success")) (waiter-responses wt))
-      (length (waiter-responses wt))))
+  (cond ((waiter-counts wt) (count-if (waiter-counts wt) (waiter-responses wt)))
+        ((waiter-successes-only wt) (count-if (lambda (r) (w:jget r "success")) (waiter-responses wt)))
+        (t (length (waiter-responses wt)))))
 
 (defun wait-for (node request-id want &key (timeout *cosign-timeout*))
   "Block until WANT responses (or DONE) for REQUEST-ID, or TIMEOUT.  Returns the responses."
@@ -157,10 +161,11 @@
     (remhash request-id (node-pending node))
     (reverse (waiter-responses wt))))
 
-(defun send-request (node ledger-id-hex action params &key (want 1) (timeout *cosign-timeout*) extra-tags successes-only)
-  "Publish a Kind 20101 request and collect WANT Kind 20102 responses (successful ones when SUCCESSES-ONLY)."
+(defun send-request (node ledger-id-hex action params &key (want 1) (timeout *cosign-timeout*) extra-tags successes-only counts)
+  "Publish a Kind 20101 request and collect WANT Kind 20102 responses (successful
+   ones when SUCCESSES-ONLY; those satisfying COUNTS when given)."
   (let ((event (w:request-event (node-keypair node) ledger-id-hex action params :extra-tags extra-tags)))
-    (setf (gethash (ev:event-id event) (node-pending node)) (make-waiter :want want :successes-only successes-only))
+    (setf (gethash (ev:event-id event) (node-pending node)) (make-waiter :want want :successes-only successes-only :counts counts))
     (bus:bus-publish (node-bus node) event)
     (wait-for node (ev:event-id event) want :timeout timeout)))
 
@@ -197,18 +202,30 @@
                                 "content_hash_hex" (bytes->hex (up:content-hash update))
                                 "message_type" 32769
                                 "fork_operator" (and (record-fork-p rec) (bytes->hex (record-fork-operator rec)))))
-         (responses (send-request node (record-id-hex rec) "cosign_update" params :want required)))
-    (dolist (r responses)
-      (let ((res (w:jget r "result")))
-        (when (and (w:jget r "success") res)
-          (let* ((pk (hex->bytes (w:jget res "cosigner_pubkey")))
-                 (c (up:make-cosignature :pubkey pk
-                                         :signature (hex->bytes (w:jget res "cosign_signature_hex"))
-                                         :member-ledger-hash (hex->bytes (w:jget res "member_ledger_hash_hex")))))
-            (when (and (member pk signers :key #'lg:member-pubkey :test #'equalp)
-                       (up:verify-cosignature update c)
-                       (not (member pk (up:update-cosignatures update) :key #'up:cosig-pubkey :test #'equalp)))
-              (push c (up:update-cosignatures update)))))))
+         (attempt 0))
+    (flet ((collect (responses)
+             (dolist (r responses)
+               (let ((res (w:jget r "result")))
+                 (when (and (w:jget r "success") res)
+                   (let* ((pk (hex->bytes (w:jget res "cosigner_pubkey")))
+                          (c (up:make-cosignature :pubkey pk
+                                                  :signature (hex->bytes (w:jget res "cosign_signature_hex"))
+                                                  :member-ledger-hash (hex->bytes (w:jget res "member_ledger_hash_hex")))))
+                     (when (and (member pk signers :key #'lg:member-pubkey :test #'equalp)
+                                (up:verify-cosignature update c)
+                                (not (member pk (up:update-cosignatures update) :key #'up:cosig-pubkey :test #'equalp)))
+                       (push c (up:update-cosignatures update)))))))))
+      ;; A member may still be applying the update this one chains onto (relays
+      ;; reorder); ask again after a pause before giving up.
+      (loop do (collect (send-request node (record-id-hex rec) "cosign_update" params
+                                      :want (- required (length (up:update-cosignatures update)))
+                                      :counts (lambda (r) (let ((res (w:jget r "result")))
+                                                            (and (w:jget r "success") res
+                                                                 (member (hex->bytes (w:jget res "cosigner_pubkey")) signers :key #'lg:member-pubkey :test #'equalp))))
+                                      :timeout (if (zerop attempt) *cosign-timeout* 3)))
+               (incf attempt)
+            until (or (>= (length (up:update-cosignatures update)) required) (>= attempt 3))
+            do (sleep 0.3)))
     (when (< (length (up:update-cosignatures update)) required)
       (fail "only ~a of ~a cosignatures for seq ~a" (length (up:update-cosignatures update)) required (up:update-seq update)))
     update))
@@ -327,7 +344,22 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Inbound: dispatch
 
+(defun seen-before-p (node event)
+  "T if this event id was handled already; remembers the last 5000 ids."
+  (let ((id (ev:event-id event)))
+    (bt:with-lock-held ((node-lock node))
+      (if (gethash id (node-seen node))
+          t
+          (progn (setf (gethash id (node-seen node)) t)
+                 (push id (node-seen-order node))
+                 (when (> (length (node-seen-order node)) 5000)
+                   (remhash (car (last (node-seen-order node))) (node-seen node))
+                   (setf (node-seen-order node) (butlast (node-seen-order node))))
+                 nil)))))
+
 (defun handle-event (node event)
+  (when (and (/= (ev:event-kind event) w:+kind-response+) (seen-before-p node event))
+    (return-from handle-event nil))
   (handler-case
       (case (ev:event-kind event)
         (#.w:+kind-response+ (handle-response node event))
@@ -343,6 +375,9 @@
   (let ((wt (gethash (w:event-request-id event) (node-pending node))))
     (when wt
       (bt:with-lock-held ((waiter-lock wt))
+        ;; relays redeliver: one response per event id
+        (when (member (ev:event-id event) (waiter-ids wt) :test #'string=) (return-from handle-response nil))
+        (push (ev:event-id event) (waiter-ids wt))
         (push (w:parse-json (ev:event-content event)) (waiter-responses wt))
         ;; carry the responder's pubkey alongside
         (setf (gethash "responder" (car (waiter-responses wt))) (ev:event-pubkey event))
@@ -443,6 +478,11 @@
          (seq (w:jget params "sequence_number")))
     (cond
       ((or (null rec) (record-owned-p rec)) nil)      ; not a ledger we replicate
+      ;; Only a member (or a staged member, for the QuorumBegin that promotes it) answers.
+      ((not (let ((l (record-ledger rec)))
+              (or (member (node-pubkey node) (lg:ledger-quorum-members l) :key #'lg:member-pubkey :test #'equalp)
+                  (member (node-pubkey node) (lg:ledger-next-quorum-members l) :key #'lg:member-pubkey :test #'equalp))))
+       nil)
       ((< (length data) 40) (respond node event nil :error "malformed cosign_data"))
       (t
        (let* ((ledger (record-ledger rec))
@@ -830,8 +870,10 @@
                        (lambda (event)
                          (let ((wt (gethash (w:event-request-id event) (wallet-pending wal))))
                            (when wt (bt:with-lock-held ((waiter-lock wt))
-                                      (push (w:parse-json (ev:event-content event)) (waiter-responses wt))
-                                      (bt:condition-notify (waiter-cv wt)))))))
+                                      (unless (member (ev:event-id event) (waiter-ids wt) :test #'string=)
+                                        (push (ev:event-id event) (waiter-ids wt))
+                                        (push (w:parse-json (ev:event-content event)) (waiter-responses wt))
+                                        (bt:condition-notify (waiter-cv wt))))))))
     wal))
 
 (defun wallet-request (wal ledger-id-hex action params &key (timeout *cosign-timeout*) extra-tags)
