@@ -1135,7 +1135,7 @@
                      (when (< (getf info :value-sats) sats) (fail "armer ~a's collateral outpoint is smaller than declared" (subseq (bytes->hex pk) 0 8)))
                      (when (< (getf info :confirmations) (node-min-confs node)) (fail "armer ~a's collateral is unconfirmed" (subseq (bytes->hex pk) 0 8))))))))))
 
-(defun disputed-reserves (rec)
+(defun disputed-reserves (node rec)
   "From the latest QuorumBegin: (values reserves-struct txid vout sats operator33)."
   (let ((operator nil) (qb nil))
     (dolist (u (reverse (record-history rec)))
@@ -1147,7 +1147,7 @@
     (values (rs:build-reserves :operator operator :members (op:field qb :quorum-members)
                                :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
                                :ruleset (or (op:field qb :protocol-version) "cltv-offset-v2")
-                               :network (intern (string-upcase (or (and (string= "bc" (subseq (op:field qb :reserves-id) 0 2)) "mainnet") "signet")) :keyword))
+                               :network (intern (string-upcase (node-network node)) :keyword))
             (op:field qb :new-outpoint-txid) (op:field qb :new-outpoint-vout)
             (floor (+ (op:field qb :amount) (op:field qb :collateral-amount)) 1000)
             operator)))
@@ -1163,7 +1163,7 @@
          (lottery (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword))))
     (when (< (length participants) 2) (fail "fewer than two armers"))
     (check-armer-collateral node base armers)
-    (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves base)
+    (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node base)
       (let* ((outs (lot:confiscation-outputs (lot:lottery-spk lottery) sats fee :respectful respectful
                                              :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
                                              :operator-pubkey33 operator))

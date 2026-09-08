@@ -30,12 +30,12 @@ expect "$(cld_ctl cld1 "(:add-member :ledger \"$L1\" :member \"$P4\" :member-led
 R2=$(cld_ctl cld2 "(:info)"); [[ "$R2" == *"$L1"* ]] || fail "cld2 does not replicate $L1"
 echo "   cld2 replicates cld1's ledger"
 
-step "4  prepare the reserves output and fund it on signet"
+step "4  prepare the reserves output and fund it on $CLD_CHAIN"
 PREP=$(cld_ctl cld1 "(:prepare-quorum :ledger \"$L1\" :expiry-blocks 4320)"); expect "$PREP"
 ADDR=$(sx "$PREP" ":ADDRESS")
 SATS=50000000   # 0.5 BTC = 0.2 reserves + 0.3 collateral
 TXID=$(wcli sendtoaddress "$ADDR" 0.5)
-mine 3   # the reference requires 3 confirmations on signet
+mine 3   # the reference requires 3 confirmations
 VOUT=$(bcli getrawtransaction "$TXID" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$ADDR'][0])")
 echo "   funded $ADDR in $TXID:$VOUT"
 
@@ -66,6 +66,7 @@ step "9  replicas agree"
 T1=$(sx "$(cld_ctl cld1 "(:tip :ledger \"$L1\")")" ":TIP"); T2=$(sx "$(cld_ctl cld2 "(:tip :ledger \"$L1\")")" ":TIP"); T3=$(sx "$(cld_ctl cld3 "(:tip :ledger \"$L1\")")" ":TIP"); T4=$(sx "$(cld_ctl cld4 "(:tip :ledger \"$L1\")")" ":TIP")
 [ "$T1" = "$T2" ] && [ "$T1" = "$T3" ] && [ "$T1" = "$T4" ] || fail "tips differ: $T1 $T2 $T3 $T4"
 echo "   tip $T1 on all four nodes"
+if [ "${CLD_NO_LN:-}" = 1 ]; then echo; echo "== 10 Lightning steps skipped (CLD_NO_LN=1)"; else
 step "10 Lightning rail: w1 receives 100000 msat over Lightning (cosigned attestation, InvoiceCredit)"
 INV=$("$CLD_SRC/devnet/cld-wallet.sh" w1 "$L1" invoice "$W1" 100000 "deposit top-up"); echo "   $INV"
 BOLT11=$(sx "$INV" ":BOLT11"); [ -n "$BOLT11" ] || fail "no invoice"
@@ -92,6 +93,7 @@ RW=~/workspace/deposits-rust/target/release/deposits-wallet; if [ -x "$RW" ]; th
   timeout 180 $RW pay_invoice sm "$INV2" --relay $RELAY_URL --network signet 2>&1 | grep -iE "succeeded|preimage|paid" | head -2 | sed 's/^/   /' || fail "reference pay_invoice"
   RB=$(timeout 120 $RW balance --relay $RELAY_URL --network signet 2>&1 | grep -E "sm .*sats" | head -1); echo "   reference wallet: $RB"
 fi
+fi   # CLD_NO_LN
 
 step "11 dispute: cld1 equivocates; members fork, arm, confiscate the reserves on chain, reveal, and the lottery winner claims custody"
 cld_ctl cld1 "(:equivocate :ledger \"$L1\")" >/dev/null; sleep 3
