@@ -44,7 +44,7 @@
            #:node-height-of-block #:equivocate
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
-           #:save-record #:load-record #:*cosign-timeout*))
+           #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout*))
 (in-package #:cl-deposits.node)
 
 (define-condition node-error (error)
@@ -70,6 +70,7 @@
   (log '())
   data-dir
   (inbox '()) (inbox-lock (bt:make-lock "inbox")) (inbox-cv (bt:make-condition-variable)) (worker nil) (busy nil)
+  (subscription nil)                           ; our bus handler, so STOP-NODE can remove it
   (seen (make-hash-table :test #'equal)) (seen-order '())   ; event ids already handled (relays redeliver)
   (ln nil)                                     ; a cl-deposits.lightning backend, or NIL
   (broadcast-fn nil)                           ; (lambda (tx-bytes)) -> txid or NIL; NIL = collect only
@@ -113,13 +114,21 @@
             (bt:make-thread (lambda () (worker-loop node)) :name "cld-worker"))
       (when (typep bus 'bus:chaos-bus)
         (bus:bus-add-idle-hook bus (lambda () (and (null (node-inbox node)) (not (node-busy node)))))))
-    (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-update+ w:+kind-request+ w:+kind-response+
-                                                        w:+kind-fraud-proof+ w:+kind-lottery-reveal+))
-                       (lambda (event)
-                         (if (and (node-worker node) (/= (ev:event-kind event) w:+kind-response+))
-                             (enqueue node event)
-                             (handle-event node event))))
+    (setf (node-subscription node)
+          (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-update+ w:+kind-request+ w:+kind-response+
+                                                              w:+kind-fraud-proof+ w:+kind-lottery-reveal+))
+                             (lambda (event)
+                               (if (and (node-worker node) (/= (ev:event-kind event) w:+kind-response+))
+                                   (enqueue node event)
+                                   (handle-event node event)))))
     node))
+
+(defun stop-node (node)
+  "Leave the bus and stop the worker: what a process exit does, for tests that
+   then rebuild the node from its data dir."
+  (bus:bus-unsubscribe (node-bus node) (node-subscription node))
+  (when (node-worker node) (ignore-errors (bt:destroy-thread (node-worker node))) (setf (node-worker node) nil))
+  node)
 
 (defun enqueue (node event)
   (bt:with-lock-held ((node-inbox-lock node))
@@ -1074,10 +1083,15 @@
   (cl-consensus.encoding:segwit-encode (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)) 1
                                        (subseq (lot:key-path-spk (up:x-only (node-pubkey node))) 2)))
 
+(defun lottery-seed (node id-hex)
+  "Our lottery seed for a dispute on ID-HEX, derived from the node key so a
+   restarted node recovers the preimage it committed to."
+  (sha256 (cat (ascii->bytes "deposits/cl/lottery-seed/v1") (int->be (node-priv node) 32) (hex->bytes id-hex))))
+
 (defun arm-dispute (node fork &key seed replacement)
   "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL."
   (let* ((n (dispute-lottery-n fork))
-         (preimage (lot:derive-preimage (or seed (random-aux)) n)))
+         (preimage (lot:derive-preimage (or seed (lottery-seed node (record-id-hex fork))) n)))
     (setf (record-preimage fork) preimage)
     (commit-update node fork (new-update node fork (%strip-nil-fields
                                                     (list :type :dispute-armed :armed-block (height node)
@@ -1228,7 +1242,24 @@
 (defun note-reveal (node id-hex member33 preimage)
   (let ((alist (gethash id-hex (node-reveals node))))
     (unless (assoc member33 alist :test #'equalp)
-      (setf (gethash id-hex (node-reveals node)) (cons (cons member33 preimage) alist)))))
+      (setf (gethash id-hex (node-reveals node)) (cons (cons member33 preimage) alist))
+      (save-reveals node id-hex))))
+
+(defun reveals-file-name (id-hex) (format nil "reveals_~a.json" (subseq id-hex 0 16)))
+
+(defun save-reveals (node id-hex)
+  (when (node-data-dir node)
+    (ensure-directories-exist (node-data-dir node))
+    (with-open-file (out (merge-pathnames (reveals-file-name id-hex) (node-data-dir node)) :direction :output :if-exists :supersede)
+      (format out "[~{~a~^,~%~}]~%"
+              (mapcar (lambda (r) (format nil "[~s,~s]" (bytes->hex (car r)) (bytes->hex (cdr r)))) (reverse (gethash id-hex (node-reveals node))))))))
+
+(defun load-reveals (node id-hex path)
+  (let* ((text (uiop:read-file-string path))
+         (strings (loop with pos = 0
+                        for start = (position #\" text :start pos) while start
+                        collect (let ((end (position #\" text :start (1+ start)))) (setf pos (1+ end)) (subseq text (1+ start) end)))))
+    (loop for (m pre) on strings by #'cddr do (note-reveal node id-hex (hex->bytes m) (hex->bytes pre)))))
 
 (defun handle-reveal (node event)
   (let* ((j (w:parse-json (ev:event-content event)))
@@ -1246,7 +1277,11 @@
    and takes custody (DisputeAcquire); everyone else yields.  Returns
    (values :won-or-:yielded claim-tx)."
   (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork")))
-         (lottery (or (record-lottery fork) (fail "no lottery built")))
+         (lottery (or (record-lottery fork)
+                      ;; After a restart: rebuild from public state (the unsigned tx has the claim's txid).
+                      (multiple-value-bind (tx l) (build-confiscation node id-hex)
+                        (setf (record-lottery fork) l (record-confiscation fork) tx)
+                        l)))
          (participants (lot:lottery-participants lottery))
          (reveals (reveals-of node id-hex))
          (preimages (mapcar (lambda (p) (or (cdr (find (lot:participant-pubkey p) reveals :key (lambda (r) (up:x-only (car r))) :test #'equalp))
@@ -1405,4 +1440,35 @@
             (progn (lg:apply-update (record-ledger rec) u) (push u (record-history rec)))
             (accept-update node rec u))))
     (unless fork-p (setf (gethash (record-id-hex rec) (node-ledgers node)) rec))
+    (when (and owned-p (not fork-p) (null (node-member-ledger-hex node)))
+      (setf (node-member-ledger-hex node) (record-id-hex rec)))
+    ;; Our own fork, armed before the restart: the preimage is re-derivable.
+    (when (and fork-p (record-owned-p rec))
+      (let ((armed (find :dispute-armed (record-history rec) :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u)))))))
+        (when armed
+          (let ((preimage (lot:derive-preimage (lottery-seed node id-hex) (dispute-lottery-n rec))))
+            (if (equalp (lot:commitment-of preimage) (op:field (op:decode-operation (up:update-message armed)) :commitment-hash))
+                (setf (record-preimage rec) preimage)
+                (log! node "fork ~a: armed with a preimage we cannot re-derive" (subseq id-hex 0 8)))))))
     rec))
+
+(defun load-data-dir (node &key (log-fn (lambda (fmt &rest args) (apply #'log! node fmt args))))
+  "Reload everything we knew: our ledgers, the ones we cosign, forks, reveals."
+  (let ((dir (node-data-dir node)))
+    (dolist (f (sort (directory (merge-pathnames "ledger_*.json" dir)) #'string< :key #'file-namestring)) ; bases before forks
+      (handler-case
+          (let* ((first (with-open-file (in f) (read-line in)))
+                 (u (up:decode-update (base64-decode (string-trim '(#\[ #\" #\, #\Space) first))))
+                 (owned (equalp (up:update-operator-id u) (node-pubkey node)))
+                 (fork-op (let ((i (search "_fork_" (file-namestring f)))) (and i (subseq (file-namestring f) (+ i 6) (+ i 22)))))
+                 (rec (load-record node f :owned-p owned)))
+            (funcall log-fn "loaded ~a (~a)" (file-namestring f)
+                     (cond ((and fork-op (record-owned-p rec)) "our fork") (fork-op "their fork") (owned "ours") (t "replica"))))
+        (error (e) (funcall log-fn "could not load ~a: ~a" f e))))
+    (dolist (f (directory (merge-pathnames "reveals_*.json" dir)))
+      (let* ((prefix (subseq (pathname-name f) 8))
+             (id (loop for k being the hash-keys of (node-ledgers node) when (and (>= (length k) 16) (string= prefix (subseq k 0 16))) return k)))
+        (if id
+            (handler-case (load-reveals node id f) (error (e) (funcall log-fn "could not load ~a: ~a" f e)))
+            (funcall log-fn "reveals file ~a for a ledger we do not hold" (file-namestring f)))))
+    node))

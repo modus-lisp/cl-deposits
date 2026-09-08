@@ -5,7 +5,7 @@
 (defpackage #:cl-deposits.bus
   (:use #:cl)
   (:local-nicknames (#:ev #:cl-nostr.event) (#:flt #:cl-nostr.filter))
-  (:export #:bus #:bus-publish #:bus-subscribe #:bus-fetch #:mock-bus #:make-mock-bus
+  (:export #:bus #:bus-publish #:bus-subscribe #:bus-fetch #:bus-unsubscribe #:mock-bus #:make-mock-bus
            #:mock-bus-events #:ephemeral-kind-p #:bus-async-p #:chaos-bus #:make-chaos-bus #:bus-settle #:bus-add-idle-hook))
 (in-package #:cl-deposits.bus)
 
@@ -13,6 +13,8 @@
 (defgeneric bus-publish (bus event))
 (defgeneric bus-subscribe (bus filter fn) (:documentation "FN is called with each matching event."))
 (defgeneric bus-fetch (bus filter) (:documentation "Stored events matching FILTER, oldest first."))
+(defgeneric bus-unsubscribe (bus fn) (:documentation "Stop delivering to the handler FN.")
+  (:method ((bus t) fn) (declare (ignore fn)) nil))
 (defgeneric bus-async-p (bus)
   (:documentation "T when subscriptions fire on the bus's own threads (so handlers must not block on it).")
   (:method ((bus bus)) t))
@@ -41,6 +43,9 @@
 (defmethod bus-subscribe ((bus mock-bus) filter fn)
   (bt:with-lock-held ((lock bus)) (push (cons filter fn) (subscriptions bus)))
   fn)
+
+(defmethod bus-unsubscribe ((bus mock-bus) fn)
+  (bt:with-lock-held ((lock bus)) (setf (subscriptions bus) (remove fn (subscriptions bus) :key #'cdr))))
 
 (defmethod bus-fetch ((bus mock-bus) filter)
   (bt:with-lock-held ((lock bus))

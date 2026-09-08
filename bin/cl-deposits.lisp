@@ -36,16 +36,7 @@
       (format t "~&lightning rail: ~a~%" (env "CLD_LN_CONTROL")))
     (with-open-file (s (merge-pathnames "cld.pid" dir) :direction :output :if-exists :supersede)
       (format s "~d~%" (sb-posix:getpid)))
-    ;; Reload what we knew: our ledgers, and the ones we cosign.
-    (dolist (f (sort (directory (merge-pathnames "ledger_*.json" dir)) #'string< :key #'file-namestring)) ; bases before forks
-      (handler-case
-          (let* ((first (with-open-file (in f) (read-line in)))
-                 (b64 (string-trim '(#\[ #\" #\, #\Space) first))
-                 (u (cl-deposits.update:decode-update (cl-deposits.util:base64-decode b64)))
-                 (owned (equalp (cl-deposits.update:update-operator-id u) (cl-deposits.node:node-pubkey node))))
-            (cl-deposits.node:load-record node f :owned-p owned)
-            (format t "~&loaded ~a (~a)~%" (file-namestring f) (if owned "ours" "replica")))
-        (error (e) (format t "~&could not load ~a: ~a~%" f e))))
+    (cl-deposits.node:load-data-dir node :log-fn (lambda (fmt &rest args) (format t "~&~?~%" fmt args)))
     (format t "~&cl-deposits ~a on ~{~a~^,~}~%" (cl-deposits.node:node-pubkey-hex node) relays)
     (let ((cp (env "CLD_CONTROL_PORT")))
       (when cp (cl-deposits.daemon:start-control-server node (parse-integer cp))

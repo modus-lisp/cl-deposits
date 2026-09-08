@@ -23,5 +23,6 @@ lisp_gate vectors inspect/update-test.lisp inspect/operation-test.lisp inspect/d
 lisp_gate nodes   inspect/update-test.lisp inspect/operation-test.lisp inspect/node-test.lisp
 lisp_gate property inspect/update-test.lisp inspect/operation-test.lisp inspect/property-test.lisp
 lisp_gate chaos    inspect/chaos-test.lisp
+lisp_gate restart  inspect/restart-test.lisp
 echo; echo "$pass passed, $fail failed ${failed[*]:+(${failed[*]})}"
 [ "$fail" -eq 0 ]
