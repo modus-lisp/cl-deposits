@@ -32,8 +32,10 @@ jobs:
 
   # secp256k1-fast's own suite, including the concurrency check that cl-deposits
   # depends on.  Run here as well as upstream: cl-deposits derives an ephemeral
-  # key per connection, so a regression in CT-MUL-G's thread safety corrupts keys
-  # here first and is far cheaper to catch at this pin than in production.
+  # key per connection and builds taproot outputs on worker threads, so a
+  # regression in the backend's thread safety (CT-MUL-G, or the affine
+  # point/inverse entry points the chaos gate once caught) corrupts keys here
+  # first and is far cheaper to catch at this pin than in production.
   dependency-thread-safety:
     runs-on: ubuntu-latest
     timeout-minutes: 15

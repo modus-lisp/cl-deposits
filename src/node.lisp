@@ -1225,7 +1225,11 @@
             (declare (ignore tx))
             (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (w:jget params "tx_hex") (fail "no unsigned_tx"))))))
                    (expected (confiscation-sighash proposed prevouts reserves)))
-              (unless (equalp expected (hex->bytes (w:jget params "sighash"))) (fail "sighash is not for the confiscation we expect"))
+              (unless (equalp expected (hex->bytes (w:jget params "sighash")))
+                (fail "sighash is not for the confiscation we expect (ours: sats ~a, reserves spk ~a, base seq ~a, outputs ~a)"
+                      (car (aref prevouts 0)) (subseq (bytes->hex (cdr (aref prevouts 0))) 0 16)
+                      (lg:ledger-sequence (record-ledger (find-record node id)))
+                      (mapcar (lambda (o) (cons (btx:txout-value o) (subseq (bytes->hex (btx:txout-script o)) 0 12))) (btx:tx-outputs tx))))
               ;; Its txid does not depend on the witness: keep it, the claim spends it.
               (dolist (fork (forks-of node id)) (setf (record-lottery fork) lottery (record-confiscation fork) proposed))
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
