@@ -404,6 +404,7 @@
            (funcall (gethash action (extra-actions node)) event params))
           ((string= action "cosign_update") (handle-cosign node event params))
           ((string= action "confiscation_sign") (handle-confiscation-sign node event params))
+          ((string= action "lottery_reveal") (handle-lottery-reveal-request node event params))
           ((string= action "consent_request") (handle-consent node event params))
           ((string= action "cosign_invoice") (handle-cosign-invoice node event params))
           (t (let ((rec (find-record node (w:event-ledger-id event))))
@@ -1259,11 +1260,28 @@
       (error (e) (log! node "refused confiscation_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
 
 (defun publish-reveal (node id-hex)
+  "Our preimage, both ways it travels: the durable Kind 9106 event, and the
+   reference daemon's lottery_reveal request (which it fetches from the relay
+   and matches to a participant by commitment hash; no reply expected)."
   (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork")))
          (preimage (or (record-preimage fork) (fail "not armed")))
          (sig (schnorr:schnorr-sign (node-priv node) (w:reveal-message id-hex preimage) (random-aux))))
     (note-reveal node id-hex (node-pubkey node) preimage)
+    (bus:bus-publish (node-bus node) (w:request-event (node-keypair node) id-hex "lottery_reveal"
+                                                      (w:json-object "ledger_id" id-hex "preimage" (bytes->hex preimage))))
     (bus:bus-publish (node-bus node) (w:reveal-event (node-keypair node) (node-pubkey-hex node) id-hex preimage sig))))
+
+(defun handle-lottery-reveal-request (node event params)
+  "The reference's reveal: {ledger_id, preimage}, authored by the node's Nostr
+   key (not the participant's key), so the participant is the armer whose
+   commitment the preimage opens."
+  (let* ((id (or (w:jget params "ledger_id") (w:event-ledger-id event)))
+         (preimage (hex->bytes (or (w:jget params "preimage") (return-from handle-lottery-reveal-request nil))))
+         (armer (and (find-record node id)
+                     (find (lot:commitment-of preimage) (armers-of node id) :key #'second :test #'equalp))))
+    (when armer
+      (log! node "lottery reveal for ~a from ~a opens ~a's commitment" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8) (subseq (bytes->hex (first armer)) 0 8))
+      (note-reveal node id (first armer) preimage))))
 
 (defun note-reveal (node id-hex member33 preimage)
   (let ((alist (gethash id-hex (node-reveals node))))

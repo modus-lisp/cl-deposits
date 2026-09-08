@@ -240,3 +240,12 @@ Learned while building the mixed signet devnet (`devnet/mixed.sh`: cld nodes and
   subscription.  Responses are ephemeral kinds; a NIP-01 relay that does not
   store them (our devnet relay, until it kept them for ten minutes) makes every
   reference confiscation time out with all signatures already delivered.
+- The reference daemon's auto-reveal is not a Kind 9106 event: it is a Kind
+  20101 request `lottery_reveal` with `{ledger_id, preimage}` (no signature,
+  no reply expected; our operator used to answer "unknown action").  It
+  matches preimages to participants by HASH160(preimage) = commitment_hash,
+  not by the author key (its Nostr key is not the participant key), and it
+  gathers peers' reveals by fetching those requests from the relay by `l`
+  tag: another place where it relies on the relay storing ephemeral kinds.
+  Only its CLI `recovery reveal` publishes the durable 9106.  We accept both
+  and publish both.
