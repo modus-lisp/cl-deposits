@@ -9,6 +9,10 @@ import websockets
 PORT = int(os.environ.get("RELAY_PORT", "7777"))
 STORE = os.environ.get("RELAY_STORE", "/tmp/cld-relay.jsonl")
 events = []          # dicts, oldest first
+recent = []          # ephemeral events kept in memory for RECENT_TTL seconds: the reference
+                     # daemon collects confiscation_sign responses (kind 20102) by fetching
+                     # them from the relay rather than from its subscription
+RECENT_TTL = 600
 subs = {}            # websocket -> {subid: [filters]}
 
 def d_tag(ev):
@@ -33,7 +37,11 @@ def matches(f, ev):
     return True
 
 def store(ev):
-    if ephemeral(ev["kind"]): return
+    if ephemeral(ev["kind"]):
+        now = time.time()
+        recent[:] = [e for e in recent if e["created_at"] > now - RECENT_TTL]
+        if not any(e["id"] == ev["id"] for e in recent): recent.append(ev)
+        return
     if replaceable(ev["kind"]):
         key = (ev["pubkey"], ev["kind"], d_tag(ev))
         events[:] = [e for e in events if (e["pubkey"], e["kind"], d_tag(e)) != key or e["created_at"] > ev["created_at"]]
@@ -78,7 +86,7 @@ async def handler(ws):
             elif msg[0] == "REQ" and len(msg) >= 3:
                 sid, filters = msg[1], msg[2:]
                 subs[ws][sid] = filters
-                out = [e for e in events if any(matches(f, e) for f in filters)]
+                out = [e for e in events + recent if any(matches(f, e) for f in filters)]
                 limit = min([f["limit"] for f in filters if "limit" in f] or [len(out)])
                 for e in out[-limit:]:
                     await ws.send(json.dumps(["EVENT", sid, e]))

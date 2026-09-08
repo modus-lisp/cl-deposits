@@ -10,6 +10,8 @@
 ;;;;   (:balance :ledger "hex" :deposit "hex")
 ;;;;   (:tip :ledger "hex")
 ;;;;   (:advertise :ledger "hex")
+;;;;   (:address)                                 the node key's address (replacement collateral, lottery target)
+;;;;   (:arm :ledger "hex" [:txid "hex" :vout N :sats N])   arm a dispute, optionally pledging replacement collateral
 
 (defpackage #:cl-deposits.daemon
   (:use #:cl #:cl-deposits.util)
@@ -82,8 +84,12 @@
         (:dispute-enter (let ((rec (rec! node form)))
                           (nd:enter-dispute node rec (arg form :last-valid-seq (lg:ledger-sequence (nd:record-ledger rec))) :reason (arg form :reason "fraud"))
                           (ok :fork (nd:fork-key (arg form :ledger) (nd:node-pubkey node)))))
-        (:arm (let ((fork (or (nd:find-fork node (arg form :ledger) (nd:node-pubkey node)) (error "no fork; :dispute-enter first"))))
-                (ok :commitment (bytes->hex (cl-deposits.lottery:commitment-of (nd:arm-dispute node fork))))))
+        (:arm (let ((fork (or (nd:find-fork node (arg form :ledger) (nd:node-pubkey node)) (error "no fork; :dispute-enter first")))
+                    ;; Optional replacement collateral: an outpoint we control (see :address), DEP-06.
+                    (replacement (and (arg form :txid) (list (txid-bytes (arg form :txid)) (arg form :vout 0) (arg form :sats)))))
+                (ok :commitment (bytes->hex (cl-deposits.lottery:commitment-of (nd:arm-dispute node fork :replacement replacement)))
+                    :replacement (and replacement t))))
+        (:address (ok :address (nd::our-target-address node)))   ; the node key's P2TR key-path address: collateral, lottery target
         (:confiscate (multiple-value-bind (tx lottery) (nd:confiscate node (arg form :ledger) :respectful (arg form :respectful) :fee (arg form :fee 1000))
                        (ok :txid (txid-hex (cl-consensus.tx:tx-txid tx)) :lottery (cl-deposits.lottery:lottery-address lottery))))
         (:reveal (nd:publish-reveal node (arg form :ledger)) (ok))

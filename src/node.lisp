@@ -378,7 +378,7 @@
                              (handle-update node event)))
         (#.w:+kind-fraud-proof+ (handle-fraud node event))
         (#.w:+kind-lottery-reveal+ (handle-reveal node event)))
-    (error (e) (log! node "event ~a: ~a" (subseq (ev:event-id event) 0 8) e))))
+    (error (e) (log! node "event ~a (kind ~a from ~a): ~a" (subseq (ev:event-id event) 0 8) (ev:event-kind event) (subseq (ev:event-pubkey event) 0 8) e))))
 
 (defun handle-response (node event)
   (let ((wt (gethash (w:event-request-id event) (node-pending node))))
@@ -393,6 +393,11 @@
         (bt:condition-notify (waiter-cv wt))))))
 
 (defun handle-request (node event)
+  ;; Addressed requests (a "p" tag) for someone else are not ours: the reference
+  ;; CLI talks to its own daemon this way, encrypted, over the same relay.
+  (let ((to (ev:first-tag-value event "p")))
+    (when (and to (string/= to (k:public-hex (node-keypair node))))
+      (return-from handle-request nil)))
   (let ((action (w:event-action event)) (params (w:parse-json (ev:event-content event))))
     (cond ((and (ev:first-tag-value event "p") (string= (ev:first-tag-value event "p") (k:public-hex (node-keypair node)))
                 (gethash action (extra-actions node)))
@@ -927,7 +932,17 @@
                   :nonce (incf (wallet-nonce wal)) :expiry (+ height 144) :witness '())))
     (setf (getf o :witness) (d17:sign-operation o (wallet-priv wal)))
     (multiple-value-bind (ok res err)
-        (wallet-request wal ledger-id-hex "transfer_lock" (w:json-object "operation" (base64-encode (op:encode-operation o))))
+        ;; Both shapes: our operator takes the encoded operation; the reference
+        ;; operator wants the fields (and a 64-byte "signature" for the witness).
+        (wallet-request wal ledger-id-hex "transfer_lock"
+                        (w:json-object "operation" (base64-encode (op:encode-operation o))
+                                       "transfer_nonce" (bytes->hex transfer-nonce)
+                                       "source_deposit_id" (bytes->hex from) "destination_deposit_id" (bytes->hex to)
+                                       "amount" amount-msats "fee" fee
+                                       "completion_script" (getf o :completion-script) "timeout_height" (getf o :timeout-height)
+                                       "transfer_id" (bytes->hex transfer-id)
+                                       "op_nonce" (getf o :nonce) "op_expiry" (getf o :expiry)
+                                       "signature" (bytes->hex (first (getf o :witness)))))
       (declare (ignore res))
       (unless ok (fail "transfer_lock: ~a" err))
       (values transfer-id preimage))))
@@ -935,7 +950,9 @@
 (defun wallet-complete-transfer (wal ledger-id-hex transfer-id preimage)
   (let ((o (list :type :transfer-complete :transfer-id transfer-id :script-witness (list preimage))))
     (multiple-value-bind (ok res err)
-        (wallet-request wal ledger-id-hex "transfer_complete" (w:json-object "operation" (base64-encode (op:encode-operation o))))
+        (wallet-request wal ledger-id-hex "transfer_complete"
+                        (w:json-object "operation" (base64-encode (op:encode-operation o))
+                                       "transfer_id" (bytes->hex transfer-id) "preimage" (bytes->hex preimage)))
       (declare (ignore res))
       (unless ok (fail "transfer_complete: ~a" err))
       t)))
@@ -1217,14 +1234,18 @@
    only if the proposer's sighash is exactly ours."
   (let ((id (w:event-ledger-id event)))
     (unless (find-fork node id (node-pubkey node))
+      (log! node "confiscation_sign for ~a from ~a: we hold no fork, not answering" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8))
       (return-from handle-confiscation-sign nil))   ; not a disputant: not ours to answer
     (handler-case
-        (progn
+        (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (w:jget params "tx_hex") (fail "no unsigned_tx"))))))
+               (outputs-total (reduce #'+ (btx:tx-outputs proposed) :key #'btx:txout-value))
+               ;; The reference sends neither fee nor shape: read both off the proposed tx.
+               (fee (or (w:jget params "fee_sats")
+                        (- (nth-value 3 (disputed-reserves node (or (find-record node id) (fail "unknown ledger")))) outputs-total)))
+               (respectful (let ((r (w:jget params "respectful"))) (if (eq r nil) (> (length (btx:tx-outputs proposed)) 1) r))))
           (multiple-value-bind (tx lottery prevouts reserves)
-              (build-confiscation node id :respectful (w:jget params "respectful") :fee (w:jget params "fee_sats"))
-            (declare (ignore tx))
-            (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (w:jget params "tx_hex") (fail "no unsigned_tx"))))))
-                   (expected (confiscation-sighash proposed prevouts reserves)))
+              (build-confiscation node id :respectful respectful :fee fee)
+            (let ((expected (confiscation-sighash proposed prevouts reserves)))
               (unless (equalp expected (hex->bytes (w:jget params "sighash")))
                 (fail "sighash is not for the confiscation we expect (ours: sats ~a, reserves spk ~a, base seq ~a, outputs ~a)"
                       (car (aref prevouts 0)) (subseq (bytes->hex (cdr (aref prevouts 0))) 0 16)
@@ -1232,6 +1253,7 @@
                       (mapcar (lambda (o) (cons (btx:txout-value o) (subseq (bytes->hex (btx:txout-script o)) 0 12))) (btx:tx-outputs tx))))
               ;; Its txid does not depend on the witness: keep it, the claim spends it.
               (dolist (fork (forks-of node id)) (setf (record-lottery fork) lottery (record-confiscation fork) proposed))
+              (log! node "signed confiscation of ~a proposed by ~a (fee ~a sats)" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8) fee)
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
                                                            "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))))
       (error (e) (log! node "refused confiscation_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))

@@ -173,3 +173,70 @@ deposits-node run --network signet --relay ws://127.0.0.1:7777 --esplora
 http://127.0.0.1:3002 --data-dir <dir> --seed-file <seed>`.  The lottery
 vectors in `inspect/vectors/lottery-reference.txt` came from a throwaway
 `deposits-core/tests/cl_vector.rs`.
+
+## Running mixed quorums with the reference node (2026-09-08)
+
+Learned while building the mixed signet devnet (`devnet/mixed.sh`: cld nodes and
+`deposits-node` daemons in each other's quorums):
+
+- The reference's protocol identity (operator/cosigner key) is not its Nostr
+  key.  `quorum show-identity` prints the key to give `add-member`; `info`
+  prints the Nostr pubkey.
+- `ledger open --collateral-ratio` is not carried into `quorum begin`: the
+  QuorumBegin came out with collateral 0 (and then every credit is refused with
+  "would exceed quorum collateral (0)").  Pass `--collateral-ratio` to `quorum
+  begin` itself.  A second `quorum begin` on an active ledger starts an
+  "auto_rotation ... Tier-2 operator-alone" spend and does not record a new
+  QuorumBegin; open a fresh ledger instead.
+- `ledger address <id>` returns a per-ledger funding address; `quorum begin`
+  needs > 1000 sats there before it builds the vault.  The CLI returns "No
+  response from daemon" whenever the daemon is still waiting for confirmations
+  (and sometimes on the first request after `ledger open`); rerunning resumes.
+- `deposit credit <ledger> <deposit_id> <msats> <invoice_id>` takes the 16-byte
+  deposit id, not a pubkey, despite the usage text.
+- Their operator's `transfer_lock` wants `transfer_nonce`, `source_deposit_id`,
+  `destination_deposit_id`, `amount`, `fee`, `completion_script`,
+  `timeout_height`, `transfer_id`, `op_nonce`, `op_expiry` and a 64-byte
+  `signature` (the compact DEP-17 witness); `transfer_complete` wants
+  `transfer_id` and `preimage`.  Our wallet now sends these beside the encoded
+  operation.  The fee is enforced against the ledger's schedule (default fixed
+  2 msat + 20 bps): "Fee mismatch: expected 4002 msats".
+- Their wallet's `send` needs the ledger's Kind 39100 advertisement ("No
+  advertisement for ledger"); `:advertise` first.
+- Their members detect an operator equivocation on their own, publish
+  DisputeEnter and DisputeArmed, and start a confiscation, asking co-disputants
+  for `confiscation_sign`.  But their `confiscation_sign` handler requires
+  every armer's DisputeArmed to declare replacement collateral, while their
+  auto-arm declares none unless the operator-key P2WPKH address
+  (`pubkey-to-p2wpkh --seed-file`) already holds a UTXO — so two reference
+  members refuse each other's confiscations out of the box ("disputant ...
+  declared no replacement_collateral").  Fund that address before a dispute.
+- Two reference members arming at the same moment both call bitcoind's
+  `scantxoutset` for their collateral UTXO; the second gets "Scan already in
+  progress", arms without collateral, and re-arms with it on a later periodic
+  cycle.  Their `confiscation_sign` requests carry `sighash`, `unsigned_tx`,
+  `last_valid_sequence` only: no fee, no shape; read both off the transaction.
+- Some reference Kind 20101 requests arrive with non-JSON content from a key
+  that publishes nothing else (a wallet session key); our nodes log and ignore
+  them.
+- After an equivocation-triggered arm without collateral the reference never
+  re-arms: the re-arm logic only runs from its expiry-driven periodic.  A manual
+  `recovery arm <id> --replacement-collateral-outpoint <txid:vout>
+  --replacement-collateral-amount <sats>` (txid in internal byte order, or it
+  looks up the reversed id and reports "not on-chain") publishes a DisputeArmed
+  whose prev_hash does not chain to the daemon's fork tip and whose operator
+  signature does not verify under any digest we know; other nodes reject it.
+  So a reference member that lost the scan race stays useless for that dispute.
+  The mixed devnet therefore puts one reference member on a ledger, not two.
+- The reference daemon rebuilds its quorum on its dispute fork
+  (QuorumAddMember at seq 14 on ref2's fork) where we clear the quorum; both
+  validate each other's forks regardless.
+- The reference CLI drives its running daemon over the relay: Kind 20101
+  requests with a `p` tag naming the daemon and NIP-44-encrypted content (and
+  encrypted 20102 replies).  Nodes must skip requests addressed to others
+  before parsing.
+- The reference daemon collects `confiscation_sign` replies by *fetching*
+  Kind 20102 events from the relay (`since` now-120s), not from its
+  subscription.  Responses are ephemeral kinds; a NIP-01 relay that does not
+  store them (our devnet relay, until it kept them for ten minutes) makes every
+  reference confiscation time out with all signatures already delivered.

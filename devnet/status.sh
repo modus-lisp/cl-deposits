@@ -4,3 +4,6 @@ echo "height: $(bcli getblockcount 2>/dev/null)   relay: $(relay_running && echo
 for n in $(cld_names); do
   if cld_running "$n"; then echo "$n: $(cld_ctl "$n" "(:info)")"; else echo "$n: down"; fi
 done
+for n in $(ref_names); do
+  if ref_running "$n"; then echo "$n (reference): pid $(ref_pid "$n"), identity $(ref_pubkey "$n")"; else echo "$n (reference): down"; fi
+done

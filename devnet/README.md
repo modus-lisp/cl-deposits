@@ -16,6 +16,20 @@ On signet:
     devnet/cld-ctl.sh cld1 '(:info)'
     devnet/cld-wallet.sh w1 <ledger> open|balance|transfer|complete ...
     devnet/down.sh [--wipe]
+    devnet/mixed.sh     # cld and reference (deposits-rust) nodes in each other's quorums; see below
+
+## Mixed quorums with the reference implementation
+
+`up.sh` also starts `ref2` and `ref3`, two `deposits-node` daemons from
+`~/workspace/deposits-rust/target/release` (override with `DEPOSITS_RUST`),
+each with its own data dir under `/mnt/lisp/signet/deposits/<name>/` (seed,
+wallet, node.log) and talking to the same relay, bitcoind, and Esplora shim.
+`ref_cli ref2 <command>` in `_common.sh` runs their CLI against that node.
+`mixed.sh` then forms ledger A (cld1 operates; cld2, ref2, ref3 cosign) and
+ledger B (ref2 operates; cld2, cld3, ref3 cosign), moves funds on both from
+both wallets, and has cld1 equivocate on A so that members of both
+implementations fork and arm.  What we learned about driving the reference
+node is in `UPSTREAM-NOTES.md`.
 
 Data lives under `/mnt/lisp/signet/deposits/<node>/`: `node.key`, `cld.log`,
 and `ledger_<id16>.json` — the same JSON-array-of-base64 format as the
