@@ -16,6 +16,9 @@
          (bus (and (not (string= action "pubkey"))
                    (cl-deposits.nostr-bus:make-nostr-bus (uiop:split-string (env "CLD_RELAYS" "ws://127.0.0.1:7777") :separator ","))))
          (wal (cl-deposits.node:make-wallet :priv priv :bus (or bus (cl-deposits.bus:make-mock-bus))))
+         ;; One process per command: operation nonces must still climb across
+         ;; invocations (an operator refuses a nonce it accepted within the expiry window).
+         (_ (setf (cl-deposits.node::wallet-nonce wal) (get-universal-time)))
          (hx #'cl-deposits.util:hex->bytes) (hex #'cl-deposits.util:bytes->hex)
          (*print-pretty* nil))
     (handler-case
