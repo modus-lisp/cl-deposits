@@ -3,7 +3,7 @@
 (defpackage #:cl-deposits.nostr-bus
   (:use #:cl)
   (:local-nicknames (#:bus #:cl-deposits.bus) (#:pool #:cl-nostr.pool) (#:ev #:cl-nostr.event))
-  (:export #:nostr-bus #:make-nostr-bus #:nostr-bus-pool #:close-nostr-bus))
+  (:export #:bus-ready-p #:wait-for-bus #:nostr-bus #:make-nostr-bus #:nostr-bus-pool #:close-nostr-bus))
 (in-package #:cl-deposits.nostr-bus)
 
 (defclass nostr-bus (bus:bus)
@@ -28,3 +28,12 @@
 
 (defmethod bus:bus-fetch ((bus nostr-bus) filter)
   (reverse (pool:fetch-events (nostr-bus-pool bus) filter :timeout 5)))
+
+(defun bus-ready-p (bus)
+  "T once at least one relay of the pool is connected."
+  (some #'cl-nostr.relay:relay-connected-p (cl-nostr.pool::%relays (nostr-bus-pool bus))))
+
+(defun wait-for-bus (bus &key (seconds 15))
+  "Block until BUS-READY-P or SECONDS pass; returns the readiness."
+  (loop repeat (round (* 2 seconds)) until (bus-ready-p bus) do (sleep 0.5))
+  (bus-ready-p bus))

@@ -44,7 +44,7 @@
            #:node-height-of-block #:equivocate
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
-           #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout*))
+           #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary))
 (in-package #:cl-deposits.node)
 
 (define-condition node-error (error)
@@ -59,26 +59,42 @@
   pinned                                       ; (reserves . expiry) prepared for the next QuorumBegin
   fork-p fork-of fork-operator                 ; a dispute fork: of which ledger, signed by whom
   last-event-id                                ; Nostr id of the last update we published
+  (persisted 0)                                ; how many history entries the file on disk holds (append-only save)
+  (append-lock (bt:make-lock "append"))        ; one append at a time per owned ledger, cosign wait included
   preimage lottery confiscation)               ; our lottery secret; the built lottery; the confiscation tx
 
 (defstruct (node (:constructor %make-node))
   priv pubkey pubkey-hex keypair bus network
-  (ledgers (make-hash-table :test #'equal))    ; ledger id hex -> record
+  (ledgers (make-hash-table :test #'equal :synchronized t))    ; ledger id hex -> record (both lanes add records)
   (pending (make-hash-table :test #'equal))    ; request event id -> waiter
   (lock (bt:make-lock "node"))
   (height-fn (lambda () 0))
   (log '())
   data-dir
   (inbox '()) (inbox-lock (bt:make-lock "inbox")) (inbox-cv (bt:make-condition-variable)) (worker nil) (busy nil)
+  ;; The replica lane: other operators' updates and their cosign requests, in
+  ;; arrival order.  Neither ever waits on anyone, but an operator request does
+  ;; (up to 3 rounds of *cosign-timeout*), and every node here is both an
+  ;; operator and a cosigner.  On one queue the four cl nodes convoy: each sits
+  ;; in wait-for while the others' cosign requests age behind it, and under load
+  ;; no operator ever completes a round (the soak's 50% failure rate).  Cosigns
+  ;; alone on the lane are not enough: a cosigner whose replica is behind
+  ;; refuses ("expected seq N"), so the updates it chains onto must arrive on the
+  ;; same lane ahead of it.  Owned ledgers are never replicas, so the two lanes
+  ;; mutate disjoint records.
+  (fast-inbox '()) (fast-lock (bt:make-lock "cosign-inbox")) (fast-cv (bt:make-condition-variable)) (fast-worker nil)
   (subscription nil)                           ; our bus handler, so STOP-NODE can remove it
   (seen (make-hash-table :test #'equal)) (seen-order '())   ; event ids already handled (relays redeliver)
+  (not-ours (make-hash-table :test #'equal :synchronized t))   ; ledger id -> retry-after, for refollow-if-member
   (ln nil)                                     ; a cl-deposits.lightning backend, or NIL
   (broadcast-fn nil)                           ; (lambda (tx-bytes)) -> txid or NIL; NIL = collect only
   (broadcasts '())                             ; what we would have broadcast (newest first)
   (height-of-block nil)                        ; (lambda (hash32)) -> height or NIL (fraud-proof anchors)
+  (block-hash-fn nil)                          ; (lambda (height)) -> hash32 or NIL (TransferFail anchors)
   (reveals (make-hash-table :test #'equal))    ; ledger id hex -> alist (member-pubkey33 . preimage)
   (relays '())                                 ; relay URLs, for advertisements
   (ignore-actions '())                         ; testing: wallet actions the operator silently drops
+  (adversary '())                              ; red team (docs/REDTEAM.md): plist of misbehaviours this node performs on purpose
   (hooks '())                                  ; (lambda (rec update op)) called after every accepted/committed update
   (invoices (make-hash-table :test #'equalp))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
   (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
@@ -98,29 +114,39 @@
   (let ((o (op:decode-operation (up:update-message update))))
     (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln relays broadcast-fn height-of-block)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn)
   (let* ((priv (w:even-y-privkey priv))
          (pub (up:compressed-pubkey priv))
          (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
                            :chain-fn chain-fn :min-confs min-confs :ln ln :relays relays
-                           :broadcast-fn broadcast-fn :height-of-block height-of-block)))
+                           :broadcast-fn broadcast-fn :height-of-block height-of-block :block-hash-fn block-hash-fn)))
     ;; On a real relay, events arrive on the reader thread.  Responses are
     ;; consumed inline (they only wake a waiter); requests and updates go to a
     ;; worker, because handling a request may itself wait for responses.
     (when (bus:bus-async-p bus)
       (setf (node-worker node)
             (bt:make-thread (lambda () (worker-loop node)) :name "cld-worker"))
+      (setf (node-fast-worker node)
+            (bt:make-thread (lambda () (fast-worker-loop node)) :name "cld-cosigner"))
       (when (typep bus 'bus:chaos-bus)
         (bus:bus-add-idle-hook bus (lambda () (and (null (node-inbox node)) (not (node-busy node)))))))
     (setf (node-subscription node)
+          ;; SINCE a minute ago: the relay would otherwise replay its whole store
+          ;; (tens of thousands of events) into this subscription at every start;
+          ;; anything we missed while down, catch-up fetches per ledger on demand.
           (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-update+ w:+kind-request+ w:+kind-response+
-                                                              w:+kind-fraud-proof+ w:+kind-lottery-reveal+))
+                                                              w:+kind-fraud-proof+ w:+kind-lottery-reveal+)
+                                                  :since (if (bus:bus-async-p bus) (- (get-universal-time) 2208988800 60) nil))
                              (lambda (event)
-                               (if (and (node-worker node) (/= (ev:event-kind event) w:+kind-response+))
-                                   (enqueue node event)
-                                   (handle-event node event)))))
+                               (cond ((or (null (node-worker node)) (= (ev:event-kind event) w:+kind-response+))
+                                      (handle-event node event))
+                                     ((or (= (ev:event-kind event) w:+kind-update+)
+                                          (and (= (ev:event-kind event) w:+kind-request+)
+                                               (equal (w:event-action event) "cosign_update")))
+                                      (enqueue-fast node event))
+                                     (t (enqueue node event))))))
     node))
 
 (defun stop-node (node)
@@ -128,6 +154,7 @@
    then rebuild the node from its data dir."
   (bus:bus-unsubscribe (node-bus node) (node-subscription node))
   (when (node-worker node) (ignore-errors (bt:destroy-thread (node-worker node))) (setf (node-worker node) nil))
+  (when (node-fast-worker node) (ignore-errors (bt:destroy-thread (node-fast-worker node))) (setf (node-fast-worker node) nil))
   node)
 
 (defun enqueue (node event)
@@ -142,6 +169,24 @@
                    (setf (node-busy node) t)
                    (pop (node-inbox node)))))
       (unwind-protect (handle-event node event) (setf (node-busy node) nil)))))
+
+(defun enqueue-fast (node event)
+  (bt:with-lock-held ((node-fast-lock node))
+    (setf (node-fast-inbox node) (append (node-fast-inbox node) (list event)))
+    (bt:condition-notify (node-fast-cv node))))
+
+(defun fast-worker-loop (node)
+  ;; Replicas are applied and read here only; the main worker mutates owned
+  ;; records.  What the two share (the seen table, the ledgers table) is locked.
+  (loop
+    (let ((event (bt:with-lock-held ((node-fast-lock node))
+                   (loop until (node-fast-inbox node) do (bt:condition-wait (node-fast-cv node) (node-fast-lock node)))
+                   (pop (node-fast-inbox node)))))
+      (handle-event node event))))
+
+(defun inbox-depths (node)
+  "(:inbox N :cosign-inbox N) — how far behind the two lanes are."
+  (list :inbox (length (node-inbox node)) :cosign-inbox (length (node-fast-inbox node))))
 
 (defun height (node) (funcall (node-height-fn node)))
 (defun find-record (node id-hex) (gethash id-hex (node-ledgers node)))
@@ -243,15 +288,25 @@
   "The operator's one entry point: chain OP onto REC's ledger with whatever
    cosignatures DEP-05 requires at HEIGHT."
   (unless (record-owned-p rec) (fail "not our ledger"))
-  ;; Would it apply?  Check on a replay before asking anyone to cosign it.
-  (lg:apply-operation (lg:replay (reverse (record-history rec))) op)
-  (let ((update (new-update node rec op :height height)))
-    (multiple-value-bind (required signers tier operator-alone allowed)
-        (lg:cosign-requirement (record-ledger rec) op height)
-      (declare (ignore operator-alone))
-      (unless allowed (fail "~a not cosignable at ~a" (op:operation-type op) tier))
-      (when (plusp required) (solicit-cosignatures node rec update signers required)))
-    (commit-update node rec update)))
+  ;; Serialised per ledger, cosign round included: the control socket (a
+  ;; rotation's QuorumAddMember) and the worker (a wallet's transfer) both
+  ;; append here, and an update built from a tip that moved during its own
+  ;; cosign round commits as "SEQUENCE (expected N+1, got N)".  Under steady
+  ;; traffic a rotation never won that race and only succeeded post-expiry,
+  ;; when value-moving operations were being refused and nothing competed.
+  (bt:with-lock-held ((record-append-lock rec))
+    ;; Would it apply?  Check on a copy before asking anyone to cosign it.
+    ;; ADVERSARY :sign-invalid — an operator that asks its quorum to cosign an
+    ;; operation its own validator rejects (red team #1).
+    (unless (getf (node-adversary node) :sign-invalid)
+      (lg:apply-operation (lg:copy-ledger (record-ledger rec)) op))
+    (let ((update (new-update node rec op :height height)))
+      (multiple-value-bind (required signers tier operator-alone allowed)
+          (lg:cosign-requirement (record-ledger rec) op height)
+        (declare (ignore operator-alone))
+        (unless allowed (fail "~a not cosignable at ~a" (op:operation-type op) tier))
+        (when (plusp required) (solicit-cosignatures node rec update signers required)))
+      (commit-update node rec update))))
 
 (defun open-ledger (node &key reserves-id (genesis-block (height node)) (reserves 0) (collateral 0))
   "Genesis: LedgerOpen at sequence 0.  Returns the record."
@@ -271,17 +326,33 @@
   (list :min-fee-bps (w:jget res "min_fee_bps") :min-fee-fixed (w:jget res "min_fee_fixed")
         :max-fee-period (w:jget res "max_fee_period") :membership-until (w:jget res "membership_expires")))
 
+(defparameter +consent-timeout+ 60 "Seconds to wait for a member's consent.")
+(defparameter +consent-history-limit+ 40
+  "How much of the history a consent request carries: the reference's nostr client drops any
+   event over 70 KB (~70 updates), and it needs LedgerOpen; the rest is gap-filled from the relay.")
+
 (defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) (ruleset "cltv-offset-v2") (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016))
   "Ask MEMBER-PUBKEY to join REC's quorum; on consent, stage them with QuorumAddMember.
    The request is addressed (tag l) to MEMBER-LEDGER-ID — the member's own ledger —
    as the reference does; its nodes only answer requests for ledgers they operate."
   (let* ((until (+ (height node) membership-blocks))
+         ;; Only a PREFIX of the history rides along.  At 46k updates the whole
+         ;; of it is ~60 MB of base64 in one event — no relay carries that.  The
+         ;; reference member insists on seeing LedgerOpen (it validates the
+         ;; ledger id from it) and gap-fills the rest itself; ours catches up
+         ;; from the relay to `ledger_sequence`.
          (params (w:json-object "operator_pubkey" (node-pubkey-hex node) "operator_ledger_id" (record-id-hex rec)
-                                "ledger_history" (coerce (mapcar (lambda (u) (base64-encode (up:encode-update u)))
-                                                                 (reverse (record-history rec))) 'vector)
+                                "ledger_history" (coerce (let ((h (reverse (record-history rec))))
+                                                           (mapcar (lambda (u) (base64-encode (up:encode-update u)))
+                                                                   (subseq h 0 (min (length h) +consent-history-limit+))))
+                                                         'vector)
+                                "ledger_sequence" (lg:ledger-sequence (record-ledger rec))
                                 "chosen_ruleset" ruleset "min_fee_bps" min-fee-bps "min_fee_fixed" min-fee-fixed
                                 "max_fee_period" max-fee-period "membership_until" until))
+         ;; A member validates (the reference imports and gap-fills) before it
+         ;; answers: allow it well beyond a cosign round.
          (responses (send-request node (or member-ledger-id (record-id-hex rec)) "consent_request" params
+                                  :timeout +consent-timeout+
                                   :extra-tags (list (list "p" (x-hex member-pubkey)))))
          (consent-ok (lambda (r)
                        ;; The reference signs Nostr events with a per-host delegate key, so
@@ -423,6 +494,8 @@
       (cond
         ;; The operator's own chain.
         ((and (not (record-owned-p rec)) (equalp signer (lg:ledger-operator-key (record-ledger rec))))
+         (when (and (not (record-fork-p rec)) (> (up:update-seq update) (1+ (lg:ledger-sequence (record-ledger rec)))))
+           (catch-up node rec))
          (accept-update node rec update))
         ;; A quorum member's dispute fork (or its continuation).
         ((not (equalp signer (node-pubkey node)))
@@ -467,14 +540,94 @@
 ;;; Following a ledger we are not a member of (couriers, watchers): bootstrap a
 ;;; replica from what the relays hold, then keep it current like any replica.
 
+(defun ledger-updates-from-relays (node id-hex &key from to)
+  "Updates the relays hold for ID-HEX, deduplicated, in sequence order — all of
+   them, or just sequences FROM..TO (the `n` tag every update event carries).
+   A gap is usually one or two updates; fetching a 6000-update history to fill
+   it took 3 s a time and put the replica lane into a spiral."
+  (let ((events (bus:bus-fetch (node-bus node)
+                               (flt:make-filter :kinds (list w:+kind-update+)
+                                                :tags (append (list (cons "d" (list (subseq id-hex 0 16))))
+                                                              (when (and from to)
+                                                                (list (cons "n" (loop for i from from to to collect (princ-to-string i))))))))))
+    ;; Dedup through a hash table: REMOVE-DUPLICATES on a 6000-update list was
+    ;; quadratic in EQUALP on 300-byte vectors and took minutes per ledger.
+    (let ((seen (make-hash-table :test #'equalp)) (out '()))
+      (dolist (e events)
+        (let* ((u (w:event->update e)) (k (up:encode-update u)))
+          (when (and (string= (bytes->hex (up:update-ledger-id u)) id-hex) (not (gethash k seen)))
+            (setf (gethash k seen) t) (push u out))))
+      (sort out #'< :key #'up:update-seq))))
+
+(defun catch-up (node rec)
+  "A replica that missed an update (a restart, a relay that dropped us) can never
+   apply another: every later one fails 'expected seq N'.  Fetch the operator's
+   chain past our sequence and apply it in order.  Returns how many applied."
+  (let ((ledger (record-ledger rec)) (n 0) (from (lg:ledger-sequence (record-ledger rec))) (window 200))
+    ;; Windows of WINDOW sequences past our tip, until a window adds nothing.
+    (loop
+      (let* ((lo (1+ (lg:ledger-sequence ledger))) (hi (+ lo window -1)) (applied 0)
+             (updates (handler-case (ledger-updates-from-relays node (record-id-hex rec) :from lo :to hi)
+                        (error (e) (log! node "catch-up on ~a: fetch failed: ~a" (subseq (record-id-hex rec) 0 8) e) '()))))
+        (dolist (u updates)
+          (when (and (= (up:update-seq u) (1+ (lg:ledger-sequence ledger)))
+                     (equalp (up:update-operator-id u) (lg:ledger-operator-key ledger)))
+            (handler-case (when (eq (accept-update node rec u) :applied) (incf n) (incf applied))
+              (error (e) (log! node "catch-up on ~a stopped at seq ~a: ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq u) e)
+                (return)))))
+        (when (zerop applied) (return))))
+    (when (plusp n) (log! node "caught up ~a from seq ~a to ~a" (subseq (record-id-hex rec) 0 8) from (lg:ledger-sequence ledger)))
+    n))
+
+(defun catch-up-all (node)
+  "At startup: every replica we cosign, before the first cosign request arrives."
+  (loop for rec being the hash-values of (node-ledgers node)
+        unless (or (record-owned-p rec) (record-fork-p rec))
+          do (ignore-errors (catch-up node rec))))
+
+(defun quorum-names-us-p (node id-hex)
+  "Cheap membership pre-check from the relay: the newest QuorumBegin (update
+   events carry the operation discriminant as their `t` tag) names the active
+   quorum.  NIL also when the relay has none."
+  (let* ((events (bus:bus-fetch (node-bus node)
+                                (flt:make-filter :kinds (list w:+kind-update+)
+                                                 :tags (list (cons "d" (list (subseq id-hex 0 16)))
+                                                             (cons "t" (list (princ-to-string (op:discriminant :quorum-begin)))))
+                                                 :limit 1)))
+         (u (and events (w:event->update (first events))))
+         (o (and u (op:decode-operation (up:update-message u)))))
+    (and o (member (node-pubkey node) (op:field o :quorum-members) :test #'equalp) t)))
+
+(defvar *deferred-saves* nil "When a list, SAVE-RECORD queues the record here instead of writing.")
+
+(defun refollow-if-member (node id-hex)
+  "Rebuild ID-HEX from the relay if its quorum names us; else remember it as not
+   ours for six hours.  NIL when not ours or not reconstructible.  The rebuild
+   used to run FIRST — every signature verified and a file write per update
+   for a 90k-update ledger, then discarded because we were not a member, then
+   again ten minutes later: the replica lane spent its life on it."
+  (let ((until (gethash id-hex (node-not-ours node))))
+    (when (and until (< (get-universal-time) until)) (return-from refollow-if-member nil)))
+  (unless (handler-case (quorum-names-us-p node id-hex) (error () nil))
+    (setf (gethash id-hex (node-not-ours node)) (+ (get-universal-time) 21600))
+    (return-from refollow-if-member nil))
+  (handler-case
+      (let* ((rec (let ((*deferred-saves* (list nil))) (follow-ledger node id-hex)))   ; one write at the end, below
+             (l (record-ledger rec)))
+        (if (or (member (node-pubkey node) (lg:ledger-quorum-members l) :key #'lg:member-pubkey :test #'equalp)
+                (member (node-pubkey node) (lg:ledger-next-quorum-members l) :key #'lg:member-pubkey :test #'equalp))
+            (progn (log! node "rebuilt our replica of ~a from the relay (seq ~a)" (subseq id-hex 0 8) (lg:ledger-sequence l))
+                   (remhash id-hex (node-not-ours node)) (save-record node rec) rec)
+            (progn (remhash id-hex (node-ledgers node))
+                   (let ((f (merge-pathnames (record-file-name rec) (node-data-dir node)))) (when (probe-file f) (delete-file f)))
+                   nil)))
+    (error (e) (log! node "cannot follow ~a: ~a" (subseq id-hex 0 8) e) nil)))
+
 (defun follow-ledger (node id-hex)
   (or (find-record node id-hex)
-      (let* ((events (bus:bus-fetch (node-bus node)
-                                    (flt:make-filter :kinds (list w:+kind-update+) :tags (list (cons "d" (list (subseq id-hex 0 16)))))))
-             (updates (sort (remove-duplicates (mapcar #'w:event->update events) :test #'equalp :key #'up:encode-update)
-                            #'< :key #'up:update-seq))
+      (let* ((updates (ledger-updates-from-relays node id-hex))
              (rec (make-record :id-hex id-hex :ledger (lg:make-ledger))))
-        (dolist (u updates) (when (string= (bytes->hex (up:update-ledger-id u)) id-hex) (accept-update node rec u)))
+        (dolist (u updates) (accept-update node rec u))
         (setf (gethash id-hex (node-ledgers node)) rec)
         rec)))
 
@@ -488,7 +641,13 @@
 
 (defun handle-cosign (node event params)
   (let* ((rec (let ((fo (w:jget params "fork_operator")))
-                (if fo (find-fork node (w:event-ledger-id event) (hex->bytes fo)) (find-record node (w:event-ledger-id event)))))
+                (if fo
+                    (find-fork node (w:event-ledger-id event) (hex->bytes fo))
+                    (or (find-record node (w:event-ledger-id event))
+                        ;; A ledger we do not hold — perhaps a replica we LOST (see
+                        ;; save-record).  Rebuild it from the relay; keep it only if
+                        ;; its quorum names us, and cosign again from here on.
+                        (refollow-if-member node (w:event-ledger-id event))))))
          (data (hex->bytes (w:jget params "cosign_data_hex")))
          (seq (w:jget params "sequence_number")))
     (cond
@@ -507,12 +666,16 @@
                                                 :seq seq :prev-hash prev :message message)))
          (handler-case
              (progn
+               (when (and (> seq (1+ (lg:ledger-sequence ledger))) (not (record-fork-p rec)))
+                 (catch-up node rec))
                (unless (= seq (1+ (lg:ledger-sequence ledger)))
                  (fail "expected seq ~a" (1+ (lg:ledger-sequence ledger))))
                (unless (equalp prev (lg:ledger-chain-tip ledger)) (fail "chain mismatch: not our tip"))
                (let ((o (op:decode-operation message)))
                  ;; Speculative apply on a fresh replica: the op must be valid on our state.
-                 (lg:apply-operation (lg:replay (reverse (record-history rec))) o)
+                 ;; ADVERSARY :cosign-blind — a member that signs whatever chains (red team #1).
+                 (unless (getf (node-adversary node) :cosign-blind)
+                   (lg:apply-operation (lg:copy-ledger (record-ledger rec)) o))
                  (multiple-value-bind (required signers tier operator-alone allowed)
                      (lg:cosign-requirement ledger o (height node))
                    (declare (ignore required signers tier operator-alone))
@@ -547,25 +710,31 @@
          (history (map 'list (lambda (b64) (up:decode-update (base64-decode b64))) (w:jget params "ledger_history"))))
     (unless (own-ledger node) (return-from handle-consent (respond node event nil :error "no ledger of our own")))
     (handler-case
-        (let* ((genesis-operator (up:update-operator-id (first history)))
+        (let* ((genesis-operator (if history (up:update-operator-id (first history)) operator))
                (forked (not (equalp genesis-operator operator)))
                (div (and forked (position-if (lambda (u) (equalp (up:update-operator-id u) operator)) history)))
                (base (or (find-record node their-id)
-                         ;; No replica yet: build it from the history's base prefix.
-                         (let ((b (make-record :id-hex their-id :ledger (lg:make-ledger))))
-                           (dolist (u (if forked (subseq history 0 div) history)) (accept-update node b u))
-                           (setf (gethash their-id (node-ledgers node)) b)
-                           b)))
+                         ;; No replica yet: build it from the history's base prefix,
+                         ;; or — no history sent (a long ledger) — from the relay.
+                         (if history
+                             (let ((b (make-record :id-hex their-id :ledger (lg:make-ledger))))
+                               (dolist (u (if forked (subseq history 0 div) history)) (accept-update node b u))
+                               (setf (gethash their-id (node-ledgers node)) b)
+                               b)
+                             (follow-ledger node their-id))))
                (rec (if (not forked)
                         base
                         ;; A dispute winner re-establishing on its fork: find or build the fork.
                         (or (find-fork node their-id operator)
                             (progn (unless div (fail "history has no fork by this operator"))
                                    (make-fork node base (1- (up:update-seq (nth div history))) operator))))))
-          ;; Catch up from the piggybacked history.
+          ;; Catch up from the piggybacked history, or from the relay when none came.
           (dolist (u history)
             (when (> (up:update-seq u) (lg:ledger-sequence (record-ledger rec)))
               (accept-update node rec u)))
+          (let ((want (w:jget params "ledger_sequence")))
+            (when (and (integerp want) (> want (lg:ledger-sequence (record-ledger rec))) (not (record-fork-p rec)))
+              (catch-up node rec)))
           (unless (equalp (lg:ledger-operator-key (record-ledger rec)) operator) (fail "history is not this operator's"))
           (unless (record-fork-p rec) (setf (gethash their-id (node-ledgers node)) rec))
           (let* ((until (let ((u (w:jget params "membership_until"))) (if (integerp u) u (+ (height node) 4320))))
@@ -869,6 +1038,35 @@
                        (remhash hash (node-invoices node)))
                    (error (e) (log! node "credit ~a: ~a" (subseq (bytes->hex hash) 0 8) e)))))
     credited))
+
+(defun fail-expired-transfers (node &key (per-ledger 20))
+  "DEP-11 §Transfer Timeout: on every ledger we operate, append TransferFail
+   for each pending transfer whose timeout_height has passed.  Never done
+   before this: after two days of a soak nearly every sat on our ledgers sat
+   locked behind a completion that had timed out, and every update we signed
+   past those heights was provable non-conformance.  Bounded per pass so a
+   backlog does not monopolise the ledger's append lock."
+  (let ((h (height node)) (n 0))
+    (when (plusp h)
+      (loop for rec being the hash-values of (node-ledgers node)
+            when (and (record-owned-p rec) (not (record-fork-p rec)))
+              do (let ((expired '()))
+                   (maphash (lambda (tid p) (let ((th (getf p :timeout-height)))
+                                              (when (and (integerp th) (>= h th)) (push tid expired))))
+                            (lg:ledger-pending-transfers (record-ledger rec)))
+                   (dolist (tid (subseq expired 0 (min per-ledger (length expired))))
+                     (handler-case
+                         (progn (append-operation node rec (list :type :transfer-fail :transfer-id tid
+                                                                 :block-hash (or (and (node-block-hash-fn node) (funcall (node-block-hash-fn node) h))
+                                                                                 (make-array 32 :element-type '(unsigned-byte 8)))
+                                                                 :reason 1))
+                                (incf n))
+                       (error (e) (log! node "transfer-fail on ~a: ~a" (subseq (record-id-hex rec) 0 8) e) (return)))))))
+    (when (plusp n) (log! node "failed ~a expired transfer~:p at height ~a" n h))
+    n))
+
+(defun start-transfer-timeout-poller (node &key (interval 30))
+  (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (fail-expired-transfers node)))) :name "cld-timeouts"))
 
 (defun start-invoice-poller (node &key (interval 3))
   (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (credit-paid-invoices node)))) :name "cld-invoices"))
@@ -1452,22 +1650,54 @@
       (format nil "ledger_~a.json" (subseq (record-id-hex rec) 0 16))))
 
 (defun save-record (node rec)
-  (when (node-data-dir node)
+  "Persist the history as a JSON array of base64 updates, one per line.  The
+   common case — one new update on a file we wrote — APPENDS inside the closing
+   bracket; rewriting the whole file per update was O(sequence) and at seq 1800
+   (a 5.7 MB file, six updates a second across the ledgers a node replicates)
+   it pegged a core in base64 alone."
+  (when (and *deferred-saves* (not (member rec (car *deferred-saves*))))
+    (push rec (car *deferred-saves*)))
+  (when (and (node-data-dir node) (not *deferred-saves*))
     (ensure-directories-exist (node-data-dir node))
-    (with-open-file (out (merge-pathnames (record-file-name rec) (node-data-dir node))
-                         :direction :output :if-exists :supersede)
-      (format out "[~{~s~^,~%~}]~%" (mapcar (lambda (u) (base64-encode (up:encode-update u))) (reverse (record-history rec)))))))
+    (let* ((path (merge-pathnames (record-file-name rec) (node-data-dir node)))
+           (n (length (record-history rec)))
+           (appendable (and (plusp (record-persisted rec)) (= n (1+ (record-persisted rec))) (probe-file path)
+                            (with-open-file (in path :external-format :latin-1)
+                              (and (> (file-length in) 2)
+                                   (progn (file-position in (- (file-length in) 2))
+                                          (and (char= (read-char in) #\]) (char= (read-char in) #\Newline))))))))
+      (if appendable
+          (with-open-file (out path :direction :output :if-exists :overwrite :external-format :latin-1)
+            (file-position out (- (file-length out) 2))
+            (format out ",~%~s]~%" (base64-encode (up:encode-update (first (record-history rec))))))
+          ;; Whole file: write beside it and rename.  SBCL DELETES a :supersede
+          ;; target when the write is aborted — and a node killed mid-write (or
+          ;; an error inside FORMAT) aborts it: that is how replicas vanished.
+          (let ((tmp (make-pathname :type "tmp" :defaults path)))
+            (with-open-file (out tmp :direction :output :if-exists :supersede :external-format :latin-1)
+              (format out "[~{~s~^,~%~}]~%" (mapcar (lambda (u) (base64-encode (up:encode-update u))) (reverse (record-history rec)))))
+            (uiop:rename-file-overwriting-target tmp path)))
+      (setf (record-persisted rec) n))))
 
 (defun load-record (node path &key owned-p)
   "Rebuild a record from a saved (or fixture) file, validating as we go.  A
    fork file (ledger_<id>_fork_<op>.json) becomes a fork record of its base,
    which must already be loaded."
-  (let* ((text (with-open-file (in path) (let ((s (make-string (file-length in)))) (subseq s 0 (read-sequence s in)))))
-         (updates (loop with pos = 0
-                        for start = (position #\" text :start pos) while start
-                        collect (let ((end (position #\" text :start (1+ start))))
-                                  (setf pos (1+ end))
-                                  (up:decode-update (base64-decode (subseq text (1+ start) end))))))
+  (let* (;; One entry per line, streamed: slurping an 84 MB file into a Lisp
+         ;; string (4 bytes a character, then a SUBSEQ copy) blew a 1 GB heap
+         ;; at startup.  A node killed mid-append leaves a truncated last entry:
+         ;; keep what decodes, drop the tail, catch-up refills it from the relay.
+         (clean t)   ; NIL if we stopped before the end: the file must be REWRITTEN, never appended to
+         (updates (with-open-file (in path :external-format :latin-1)
+                    (loop for line = (read-line in nil nil) while line
+                          for start = (position #\" line)
+                          for end = (and start (position #\" line :start (1+ start)))
+                          for u = (and end (handler-case (up:decode-update (base64-decode (subseq line (1+ start) end)))
+                                             (error () nil)))
+                          for closing = (string= (string-trim '(#\Space #\Return #\Tab) line) "]")
+                          while (or u (and closing (not (read-line in nil nil))))   ; a lone "]" as the last line
+                          when u collect u
+                          finally (unless (or u closing) (setf clean nil)))))
          (first (first updates))
          (id-hex (bytes->hex (up:update-ledger-id first)))
          (fork-p (search "_fork_" (file-namestring path)))
@@ -1478,12 +1708,22 @@
                          (operator (up:update-operator-id (nth divergence updates))))
                     (make-fork node base (1- (up:update-seq (nth divergence updates))) operator))
                   (make-record :id-hex id-hex :ledger (lg:make-ledger) :owned-p owned-p))))
+    ;; An entry that does not chain (a gap or a bad update mid-file, from a
+    ;; rewrite of a history that was itself loaded past damage) ends the load
+    ;; there, like a damaged tail: keep the prefix, rewrite, catch up.
     (dolist (u updates)
       (when (> (up:update-seq u) (lg:ledger-sequence (record-ledger rec)))
-        (if (and (record-owned-p rec) (not fork-p))
-            (progn (lg:apply-update (record-ledger rec) u) (push u (record-history rec)))
-            (accept-update node rec u))))
+        (handler-case
+            (if (and (record-owned-p rec) (not fork-p))
+                (progn (lg:apply-update (record-ledger rec) u) (push u (record-history rec)))
+                (accept-update node rec u))
+          (error (e)
+            (log! node "~a: entry at seq ~a does not apply (~a); keeping ~a entries"
+                  (file-namestring path) (up:update-seq u) e (length (record-history rec)))
+            (setf clean nil) (return)))))
     (unless fork-p (setf (gethash (record-id-hex rec) (node-ledgers node)) rec))
+    (setf (record-persisted rec) (if clean (length (record-history rec)) 0))   ; a damaged file is rewritten whole on the next save
+    (unless clean (log! node "~a: damaged after seq ~a; will rewrite, catch-up refills the rest" (file-namestring path) (lg:ledger-sequence (record-ledger rec))))
     (when (and owned-p (not fork-p) (null (node-member-ledger-hex node)))
       (setf (node-member-ledger-hex node) (record-id-hex rec)))
     ;; Our own fork, armed before the restart: the preimage is re-derivable.

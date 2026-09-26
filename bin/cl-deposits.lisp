@@ -27,6 +27,7 @@
                 :chain-fn (and cli (cl-deposits.daemon:bitcoin-cli-chain-fn cli))
                 :broadcast-fn (and cli (cl-deposits.daemon:bitcoin-cli-broadcast-fn cli))
                 :height-of-block (and cli (cl-deposits.daemon:bitcoin-cli-height-of-block-fn cli))
+                :block-hash-fn (and cli (cl-deposits.daemon:bitcoin-cli-block-hash-fn cli))
                 :min-confs (parse-integer (env "CLD_MIN_CONFS" "1"))
                 :ln (let ((hp (env "CLD_LN_CONTROL")))
                       (and hp (let ((i (position #\: hp)))
@@ -37,6 +38,12 @@
     (with-open-file (s (merge-pathnames "cld.pid" dir) :direction :output :if-exists :supersede)
       (format s "~d~%" (sb-posix:getpid)))
     (cl-deposits.node:load-data-dir node :log-fn (lambda (fmt &rest args) (format t "~&~?~%" fmt args)))
+    ;; catch-up needs the relay: the pool connects asynchronously, and a catch-up that
+    ;; ran first silently did nothing (cld2 sat at seq 11605 of 84k).
+    (unless (cl-deposits.nostr-bus:wait-for-bus bus :seconds 20) (format t "~&relay not connected after 20 s; catching up later on demand~%"))
+    (cl-deposits.node:catch-up-all node)   ; replicas may have missed updates while we were down
+    (cl-deposits.node:start-transfer-timeout-poller node)   ; DEP-11: TransferFail past timeout_height
+    (dolist (line (reverse (cl-deposits.node:node-log node))) (when (search "caught up" line) (format t "~&~a~%" line)))
     (format t "~&cl-deposits ~a on ~{~a~^,~}~%" (cl-deposits.node:node-pubkey-hex node) relays)
     (let ((cp (env "CLD_CONTROL_PORT")))
       (when cp (cl-deposits.daemon:start-control-server node (parse-integer cp))

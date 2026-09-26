@@ -19,7 +19,7 @@
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:jzon #:com.inuoe.jzon))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
-           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn))
+           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn))
 (in-package #:cl-deposits.daemon)
 
 (defun arg (form key &optional default) (getf (cdr form) key default))
@@ -39,8 +39,22 @@
   (handler-case
       (ecase (car form)
         (:info (ok :pubkey (nd:node-pubkey-hex node) :height (nd:height node)
+                   :inbox (getf (nd:inbox-depths node) :inbox) :cosign-inbox (getf (nd:inbox-depths node) :cosign-inbox)
                    :ledgers (loop for rec being the hash-values of (nd:node-ledgers node) collect (ledger-summary rec))))
         (:log (ok :log (reverse (nd:node-log node))))
+        (:adversary   ; (:adversary :set KEY t|nil ...) / (:adversary) — red team switches, docs/REDTEAM.md
+         (loop for (k v) on (cdr (member :set form)) by #'cddr
+               do (setf (getf (nd:node-adversary node) k) v))
+         (ok :adversary (nd:node-adversary node)))
+        (:threads   ; a backtrace of every thread, for a node that is busy and silent
+         (ok :threads (mapcar (lambda (th)
+                                (let ((out (make-string-output-stream)) (done (sb-thread:make-semaphore)))
+                                  (if (eq th sb-thread:*current-thread*)
+                                      (sb-debug:print-backtrace :stream out :count 25)
+                                      (progn (sb-thread:interrupt-thread th (lambda () (ignore-errors (sb-debug:print-backtrace :stream out :count 25)) (sb-thread:signal-semaphore done)))
+                                             (sb-thread:wait-on-semaphore done :timeout 2)))
+                                  (list :name (sb-thread:thread-name th) :backtrace (substitute #\Space #\Newline (get-output-stream-string out)))))
+                              (sb-thread:list-all-threads))))
         (:open-ledger
          (let ((rec (nd:open-ledger node :reserves-id (arg form :reserves-id) :reserves (arg form :reserves-msat 0)
                                          :collateral (arg form :collateral-msat 0))))
@@ -167,6 +181,12 @@
 
 (defun bitcoin-cli-broadcast-fn (cli)
   (lambda (bytes) (run-cli cli "sendrawtransaction" (bytes->hex bytes))))
+
+(defun bitcoin-cli-block-hash-fn (cli)
+  "Height -> block hash (32 bytes), or NIL."
+  (lambda (height)
+    (let ((out (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string height)))))
+      (and (= (length out) 64) (hex->bytes out)))))
 
 (defun bitcoin-cli-height-of-block-fn (cli)
   "Block hash -> confirmed height, or NIL (fraud-proof anchors)."

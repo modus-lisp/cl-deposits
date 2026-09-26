@@ -82,10 +82,11 @@ start_ref() {
   local n=$1 dir; dir=$(ref_dir "$n"); mkdir -p "$dir"
   ref_running "$n" && { echo "$n already running"; return 0; }
   [ -f "$dir/seed.hex" ] || head -c 32 /dev/urandom | xxd -p -c 64 >"$dir/seed.hex"
+  local from=$(( $(stat -c %s "$dir/node.log" 2>/dev/null || echo 0) + 1 ))   # the log is ~1 GB: grep only this run's part
   ( cd "$dir" && setsid nohup env $(ref_env) "$REF_NODE_BIN" run --network "$CLD_CHAIN" --relay "$RELAY_URL" --esplora "$ESPLORA_URL" \
       --data-dir "$dir" --seed-file "$dir/seed.hex" --name "$n" --admin-bind "127.0.0.1:$(ref_port "$n")" >>"$dir/node.log" 2>&1 &
     sleep 1; pgrep -nf "deposits-node run .*--data-dir $dir " >"$dir/ref.pid" )
-  for i in $(seq 1 120); do grep -q 'Wallet synced' "$dir/node.log" 2>/dev/null && { echo "$n up (admin $(ref_port "$n"))"; return 0; }; ref_running "$n" || break; sleep 1; done
+  for i in $(seq 1 120); do tail -c +"$from" "$dir/node.log" 2>/dev/null | grep -q 'Wallet synced' && { echo "$n up (admin $(ref_port "$n"))"; return 0; }; ref_running "$n" || break; sleep 1; done
   echo "$n did not come up; see $dir/node.log" >&2; return 1
 }
 # ref_begin_quorum NAME LEDGER [ratio] — fund the ledger's reserves address, then drive `quorum begin`
@@ -118,20 +119,38 @@ start_relay() {
   relay_running && return 0
   mkdir -p "$CLD_ROOT"
   RELAY_PORT=$RELAY_PORT RELAY_STORE=$RELAY_STORE setsid nohup python3 "$CLD_SRC/devnet/relay.py" >"$CLD_ROOT/relay.log" 2>&1 &
-  echo $! >"$CLD_ROOT/relay.pid"
+  sleep 0.5; pgrep -nf "python3 $CLD_SRC/devnet/relay.py" >"$CLD_ROOT/relay.pid"   # the python, not the setsid wrapper
   for i in $(seq 1 30); do (echo >/dev/tcp/127.0.0.1/$RELAY_PORT) 2>/dev/null && return 0; sleep 0.2; done
   echo "relay did not come up" >&2; return 1
 }
 start_cld() {
   local n=$1 dir; dir=$(cld_dir "$n"); mkdir -p "$dir"
   cld_running "$n" && { echo "$n already running"; return 0; }
+  (echo >/dev/tcp/127.0.0.1/$(cld_port "$n")) 2>/dev/null && { echo "$n: control port $(cld_port "$n") already bound by another process; stop_cld first" >&2; return 1; }
   local lnenv=(); [ "$n" = cld1 ] && lnenv=("CLD_LN_CONTROL=$CLD_LN_CONTROL")
   ( cd "$CLD_SRC" && setsid nohup env CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=$CLD_CHAIN \
       CLD_BITCOIN_CLI="$BCLI" CLD_MIN_CONFS=1 "${lnenv[@]}" \
       CL_SOURCE_REGISTRY="(:source-registry (:tree \"$CLD_SRC\") :inherit-configuration)" \
-      sbcl --noinform --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 & )
+      "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --dynamic-space-size "${CLD_HEAP_MB:-32768}" --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 & )
+      # A pinned SBCL, not whatever is first on PATH: under the 2.6.8 in ~/.local/bin
+      # secp256k1-fast derives a WRONG public key and no signature verifies — a node
+      # started with it comes back as a stranger to its own ledgers (2026-09-24 night).
+      # 32 GB, not SBCL's 1 GB default: a node keeps every replica's full history in memory
+      # (~1 KB per update; the soak's ledgers passed 80k updates overnight) and the old
+      # loader held an 84 MB file as a 4-byte-per-char string.  Three nodes died "Heap
+      # exhausted, game over" on the first night.
   for i in $(seq 1 120); do (echo >/dev/tcp/127.0.0.1/$(cld_port "$n")) 2>/dev/null && { echo "$n up (control $(cld_port "$n"))"; return 0; }; sleep 0.5; done
   echo "$n did not come up; see $dir/cld.log" >&2; return 1
 }
 stop_relay() { local p; p=$(cat "$CLD_ROOT/relay.pid" 2>/dev/null) && [ -n "$p" ] && kill "$p" 2>/dev/null; rm -f "$CLD_ROOT/relay.pid"; }
-stop_cld() { local p; p=$(cld_pid "$1") || return 0; [ -n "$p" ] && kill "$p" 2>/dev/null && echo "$1 stopped"; rm -f "$(cld_dir "$1")/cld.pid"; }
+stop_cld() {   # every daemon on this data dir, not just the one the pid file names: a stale
+               # instance kept a control port and its ledger files while a new one died
+               # beside it, and "did not come up" hid it (2026-09-25)
+  local p killed=0
+  for p in $(pgrep -f "sbcl.*bin/cl-deposits.lisp"); do
+    if tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -qx "CLD_DIR=$(cld_dir "$1")"; then kill "$p" 2>/dev/null && killed=$((killed+1)); fi
+  done
+  [ "$killed" -gt 0 ] && echo "$1 stopped ($killed process(es))"; rm -f "$(cld_dir "$1")/cld.pid"
+  local i; for i in $(seq 1 20); do (echo >/dev/tcp/127.0.0.1/$(cld_port "$1")) 2>/dev/null || return 0; sleep 1; done
+  echo "$1: control port $(cld_port "$1") still bound after stop" >&2; return 1
+}

@@ -24,7 +24,7 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay))
+           #:majority-threshold #:+valid-quorum-sizes+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
 (in-package #:cl-deposits.ledger)
 
 (define-condition ledger-error (error)
@@ -80,6 +80,14 @@
 (defun majority-threshold (n) (1+ (floor n 2)))
 
 (defun %credit (d amount) (incf (deposit-balance d) amount))
+(defun %check-obligation-room (ledger amount)
+  "DEP-05: refuse a credit that would push total obligations above reserves.
+   Pre-quorum ledgers (reserves 0, no QuorumBegin yet) are exempt: nothing is
+   bonded and nothing can be cosigned on them anyway."
+  (when (and (plusp (ledger-reserves-amount ledger))
+             (> (+ (total-obligations ledger) amount) (ledger-reserves-amount ledger)))
+    (fail :over-obligation (format nil "credit ~a would take obligations ~a over reserves ~a"
+                                   amount (total-obligations ledger) (ledger-reserves-amount ledger)))))
 (defun %lock (d amount)
   (when (< (deposit-available-balance d) amount)
     (fail :insufficient-balance (format nil "available ~a, need ~a" (deposit-available-balance d) amount)))
@@ -186,6 +194,11 @@
          (remhash (f :payment-id) (ledger-open-invoice-locks ledger))
          (incf (ledger-fees-accumulated ledger) fee)))
       (:onchain-credit
+       ;; DEP-05 §Obligation Limits: total obligations (the sum of balances) must
+       ;; not exceed the reserves amount.  Unchecked until the red team read this
+       ;; arm (docs/REDTEAM.md #1): a cl cosigner would sign an operator crediting
+       ;; itself any amount.  (The reference additionally caps by collateral.)
+       (%check-obligation-room ledger (f :amount))
        (%credit (find-deposit ledger (f :deposit-id)) (f :amount)))
       (:onchain-lock
        (let ((d (find-deposit ledger (f :deposit-id))))
@@ -346,5 +359,31 @@
             (t (values 0 signers tier t t))))))
 
 (defun replay (updates)
-  "A fresh ledger folded from UPDATES in order (the cheap deep copy)."
+  "A fresh ledger folded from UPDATES in order."
   (let ((l (make-ledger))) (dolist (u updates l) (apply-update l u))))
+
+(defun deep-copy (x)
+  "Structures, lists, hash tables and general vectors are copied; strings, byte
+   vectors and atoms are shared (nothing mutates them)."
+  (typecase x
+    (cons (loop for tail = x then (cdr tail)
+                collect (deep-copy (car tail)) into acc
+                while (consp (cdr tail))
+                finally (return (if (null (cdr tail)) acc (nconc acc (deep-copy (cdr tail)))))))
+    (hash-table (let ((h (make-hash-table :test (hash-table-test x) :size (hash-table-count x))))
+                  (maphash (lambda (k v) (setf (gethash k h) (deep-copy v))) x) h))
+    (string x)
+    ((array (unsigned-byte 8)) x)
+    ((and vector (not simple-array)) (map 'vector #'deep-copy x))
+    (simple-vector (map 'simple-vector #'deep-copy x))
+    (structure-object (let ((c (copy-structure x)))
+                        (dolist (slot (sb-mop:class-slots (class-of c)) c)
+                          (let ((n (sb-mop:slot-definition-name slot)))
+                            (setf (slot-value c n) (deep-copy (slot-value c n)))))))
+    (t x)))
+
+(defun copy-ledger (ledger)
+  "A private copy to try an operation on.  Replaying the history from genesis
+   was the old way and cost O(sequence) per operation and per cosign: at
+   sequence 1400 the operator of a busy ledger spent its whole worker on it."
+  (deep-copy ledger))
