@@ -1,0 +1,135 @@
+# Red team: the claims the spec makes, and the attacks that test them
+
+Devnet: `devnet/soak.sh` (six mixed ledgers) is the substrate; attacks run
+against a live quorum with both implementations present.  cl nodes play the
+attackers (an adversary mode on the control socket); the reference nodes are
+victims and detectors, then roles are swapped where our code has the detection.
+Every attack states its pass condition as what the HONEST side must do.
+
+| # | claim (where) | attack | status |
+|---|---|---|---|
+| 1 | strict-majority cosign, independent validation (DEP-05 §63, whitepaper) | operator + colluding majority sign an invalid update; honest minority must refuse and dispute | |
+| 2 | equivocation caught and punished (DEP-06) | equivocate with a colluding cosigner on both branches; double-spend across forks; colluder's slashing share excluded | |
+| 3 | censorship provable (DEP-11, DEP-12) | operator ignores a signed request; DeliveryEmbed; clock; censorship proof; dispute | |
+| 4 | inactivity moves custody (DEP-19 §1–3) | operator silent past inactivity_blocks; majority attestation; respectful custody | |
+| 5 | co-sign refusal provable; withholding majority is the stated limit (DEP-19 §9) | cosigner answers all but the clock-satisfying update | |
+| 6 | fraud proofs cannot be forged or replayed (DEP-06 §Verification) | malformed / stale / wrong-ledger / replayed proofs; cross-implementation acceptance rules | |
+| 7 | lottery fair and spendable (DEP-03 §Custody Lottery) | out-of-range preimage; withheld reveal (partial leaf); commit≠reveal | |
+| 8 | transport outside the trust model | censoring / delaying relay; replayed ephemeral requests vs nonce+expiry | |
+| 9 | stated limitation: majority can spend an honest vault at Tier 0 (DEP-05 §120) | measure cost and footprint, not disprove | |
+
+## Capital efficiency vs security: the axis every attack is measured on
+
+The protocol's security is bought with idle capital: the collateral fraction
+of every operator's vault, the reserves that cap obligations, the collateral
+each quorum member must keep on its own ledger, and the funds a wallet has
+parked behind a lock or a clock.  Every attack above has a COST to the
+attacker (collateral at risk, quorum seats to hold, blocks to wait) and an
+EXPOSURE (reserves, deposits, or a hold on someone's funds for N blocks), and
+both scale with the parameters the spec leaves to operators:
+
+| knob | where | efficiency side | security side |
+|---|---|---|---|
+| collateral / reserves ratio | QuorumBegin | idle sats per sat of deposit capacity | slashable loss per byte of fraud |
+| quorum size Q ∈ {3,5,7} | QuorumBegin | seats to fund and cosign latency | seats a coalition must buy |
+| quorum_expiry / membership | member terms | rotation frequency (on-chain fees) | how long a stale quorum can hold |
+| timeout_height on locks | wallet | capital parked per failed transfer (the soak found 450k of 640k sats parked) | window a counterparty can stall |
+| service_response_blocks, inactivity_blocks | member terms | how long a wallet's funds can be held hostage | how soon censorship / silence is provable |
+
+Each harness is parameterised by these and reports attacker cost, exposure,
+and time-to-detection as numbers, so the output is a curve per claim rather
+than a pass/fail.  The question to answer for growth is: at which settings
+does the cheapest attack cost more than it can take, and how much capital
+sits idle to get there.
+
+Findings go below, dated, with the harness that reproduces them.
+
+## Findings
+
+### 2026-09-25 — organic #1: the reference member forked ledger A on an unnamed rule and the dispute went nowhere
+
+Found while diagnosing why ledger A was stuck (see devnet/README.md).  At
+15:28:50Z ref2 (a cosigner of A) received seq 81027 — an ordinary
+`TransferLock` of 11 536 319 msat, fee 23 074, carrying 2 cosignatures from
+the cl members — and logged `NON-CONFORMING COSIGNED update … quorum
+cosigned an update that fails conformance — arming dispute`, created a
+dispute fork at 81026, "Published DisputeEnter on fork", added ref3 to the
+fork's quorum, and from then on treated every further update on A as a gap.
+
+What the honest side should have done per DEP-06: publish DisputeEnter,
+arm (DisputeArmed with collateral), and drive confiscation.  What happened:
+
+- the rule is not named in its log, and our validator (and our replica of
+  its own state) accepted the update; the two implementations disagree on
+  conformance of a plain transfer lock, and the reference does not say why
+  (its violation kinds: InsufficientReserves, InvalidWitness, ZeroAmount,
+  EmptyDestination, UnparseableDescriptor, ExceedsCollateral,
+  FeeWindowNotElapsed);
+- **no DisputeEnter for A exists on the relay** (no update with the
+  dispute-enter discriminant under A's tag from any key), so the cl members
+  never learned a member had forked, and `(:forks)` on every cl node is NIL;
+- ref2 never armed (no DisputeArmed, no collateral scan in its log), so the
+  fork was a private opinion with no on-chain consequence;
+- A's remaining cosigners were the two cl nodes, so the ledger kept going with
+  exactly the threshold and no slack, until one cl node fell behind and A froze.
+
+Attack #1's harness (`redteam/attack1-invalid-credit.sh`) reproduces this
+shape deliberately — a cl majority cosigns a credit over reserves — with the
+reference as the honest minority; its pass condition is precisely the three
+things that did not happen here.  Its file is quarantined at
+`/mnt/lisp/signet/deposits/ref2/quarantine/`.
+
+Lead on the unnamed rule: `LedgerState::check_speculative` first APPLIES the
+operation to a copy and reports a refusal as `StateMachineRejected`; a plain
+TransferLock can only be refused for insufficient available balance.  So the
+reference's replica most likely held a different balance for the source
+deposit than ours at 81026 — a **fold divergence between the two
+implementations**, i.e. a consensus bug, not a policy disagreement.  Next:
+replay A's history through both folds (`deposits-node nostr validate` /
+`ledger validate` vs `cl-deposits.ledger:replay`) and diff every deposit's
+balance and locked_balance at 81026.  Candidates from UPSTREAM-NOTES #6:
+TransferComplete fee accounting, FeeCollect vs locked balance.
+
+
+### 2026-09-26 — organic #2: consent could not cross between implementations, so reference ledgers could not rotate
+
+A, then F, froze past (or at) their rotation window overnight.  Three causes, peeled in order:
+
+1. **devnet relay saturated** (`devnet/relay.py`, ours, not the protocol): every REQ without `#d`
+   scanned all 670k stored events; the reference bots issue one per transfer.  94% CPU, delivery
+   p90 11–13 s, max 52 s; a cl cosign round gives up at 16 s, so rotations (a cosigned
+   QuorumAddMember) failed.  Fixed with kind/author/tag indexes sorted by created_at: same results
+   on 11 filter shapes, 0.5–1.5 s → 1–57 ms, delivery p90 0.9 s.  `kill -USR1` toggles a REQ trace.
+2. **reference consent_request carried the whole ledger history** (`coordination.rs`
+   `request_consent`): ~102 MB for B's 108k updates, built under the global `ledgers` mutex.  The
+   relay dropped the connection on it (4 MB cap) every cycle, taking ref2's subscriptions with it.
+   Even a relay that carried it would not help: nostr-sdk drops received events over 70 kB
+   (`RelayLimits` MAX_EVENT_SIZE), so no reference member could ever see a consent for a ledger
+   longer than ~70 updates.  The in-memory history is also truncated, so history[0] was not the
+   LedgerOpen and ref↔ref consent was refused outright.  Fixed in deposits-rust: a 40-update
+   LedgerOpen-rooted prefix (from disk when memory is truncated) plus `ledger_sequence`, as cl sends.
+3. **reference consent timeout 10 s** — shorter than the member's own QuorumJoin cosign round;
+   a busy member's grant arrived at 16 s, after the operator gave up.  Raised to 60 s (cl's value).
+
+Claim this bears on: DEP-11 rotation / DEP-19 — a quorum that cannot re-consent expires, and at
+Tier 0 post-expiry value stops.  A spec-level bound on consent size is missing.
+
+### 2026-09-26 — organic #3: a cl ledger under traffic could not rotate before expiry
+
+`begin-quorum` required the tip not to have moved since `prepare-quorum`, but funding the reserves
+needs confirmations, and transfers chain meanwhile.  Every cl rotation so far succeeded only after
+expiry, when value-moving operations were refused and nothing competed.  The QuorumBegin
+`ledger_hash` is a state anchor committed in the reserves script, not a chain link (the reference
+says so explicitly), so it now anchors the prepared hash; what is checked instead is that the
+staged members still match the prepared reserves.  Gate: inspect/node-test.lisp "rotation: a
+ledger that moves between prepare and begin still rotates".  D rotated under traffic 13:06.
+
+### Open (2026-09-26)
+
+- **B cannot rotate: reference spends an already-spent reserves UTXO.**  Consents now complete;
+  the rotation then fails `bad-txns-inputs-missingorspent` every cycle and members answer
+  rotation_sign "reserves UTXO not found on-chain (already spent?)".  ref2 launches rotations of
+  ~8 ledgers from one wallet at the same instant.  B expires at 6674.
+- **F frozen, not expired** (expiry 6719): ref2 logs `Non-conforming-cosig: failed to arm dispute
+  on 74bde8be… cannot determine lottery N (Q)` — organic #1's shape again, with a second defect in
+  the arming path.
