@@ -405,11 +405,17 @@
          (pinned (or (record-pinned rec) (progn (prepare-quorum node rec :ruleset ruleset :expiry-blocks expiry-blocks)
                                                  (record-pinned rec))))
          (reserves (car pinned)) (expiry (cdr pinned)))
-    (unless (equalp (rs:reserves-ledger-hash reserves) (up:chain-hash (tip rec)))
-      (fail "ledger moved since the reserves were prepared; prepare again"))
+    ;; The QuorumBegin's ledger_hash is a state ANCHOR committed in the reserves
+    ;; script, not a chain link (the reference: "a state anchor, not a chain
+    ;; link"), so it is the tip the reserves were prepared on.  Requiring the tip
+    ;; not to have moved meant a ledger under traffic — funding needs three
+    ;; confirmations — never rotated until it expired and went quiet.  What must
+    ;; still hold is that the reserves were built for the quorum being promoted.
+    (unless (equalp (rs:reserves-members reserves) members)
+      (fail "staged members changed since the reserves were prepared; prepare again"))
     (let* ((op (list :type :quorum-begin :reserves-id (rs:reserves-address reserves)
                    :spending-txid spending-txid :new-outpoint-txid funding-txid :new-outpoint-vout funding-vout
-                   :amount amount-msats :quorum-expiry expiry :ledger-hash (up:chain-hash (tip rec))
+                   :amount amount-msats :quorum-expiry expiry :ledger-hash (rs:reserves-ledger-hash reserves)
                    :quorum-members members :collateral-amount collateral-msats
                    :quorum-member-ledger-ids (mapcar #'lg:member-ledger-id staged)
                    :protocol-version ruleset))

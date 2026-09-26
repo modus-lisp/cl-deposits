@@ -516,4 +516,32 @@
           (check-equal "courier completed leg 1 with s + t" (nd:wallet-balance kwa ida ka) 100000)
           (check-equal "sender paid in full" (multiple-value-list (nd:wallet-balance w1 ida d1)) '(400000 0)))))))
 
+(with-gate ("rotation: a ledger that moves between prepare and begin still rotates")
+  ;; The soak's cl ledgers never rotated under traffic: funding the reserves
+  ;; takes confirmations, transfers chain meanwhile, and begin-quorum refused
+  ;; "ledger moved since the reserves were prepared".  The QuorumBegin anchors
+  ;; the hash the reserves commit to, which need not be the tip.
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a9" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d9")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((w (nd:make-wallet :priv 55555555555555555555 :bus bus)) (dw (nd:wallet-open-deposit w id)))
+      (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+      (let* ((reserves (nd:prepare-quorum a la)) (anchor (rs:reserves-ledger-hash reserves)))
+        (nd:credit-onchain a la dw 1000 :txid (u:sha256 (hx "79")))
+        (check "the ledger moved after prepare" (not (equalp anchor (up:chain-hash (nd::tip la)))))
+        (multiple-value-bind (qb r2) (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00da")) :funding-vout 0
+                                                          :amount-msats 15600000 :collateral-msats 23400000)
+          (let ((o (op:decode-operation (up:update-message qb))))
+            (check "rotation commits" (eq (op:operation-type o) :quorum-begin))
+            (check-equal "QuorumBegin anchors the prepared hash" (op:field o :ledger-hash) anchor)
+            (check-equal "and the reserves it promotes are the prepared ones" (rs:reserves-address r2) (rs:reserves-address reserves))
+            (check-equal "cosigners replicated it" (lg:ledger-sequence (nd:record-ledger (nd:find-record b id)))
+                         (up:update-seq qb))))))))
+
 (report)
