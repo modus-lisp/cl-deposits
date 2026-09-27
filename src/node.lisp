@@ -248,7 +248,17 @@
   "Operator-sign, apply, record, publish, persist.  The update's cosignatures
    must already be in place."
   (up:sign-operator update (node-priv node))
-  (lg:apply-update (record-ledger rec) update)       ; signals ledger-error if invalid
+  (handler-case (lg:apply-update (record-ledger rec) update)       ; signals ledger-error if invalid
+    (lg:ledger-error (e)
+      ;; ADVERSARY :sign-invalid — an operator that publishes, with its colluders'
+      ;; cosignatures, an update its own validator rejects: the chain advances,
+      ;; the operation's effect does not (red team #1: what an honest minority
+      ;; must catch is exactly this update on the relay).
+      (unless (getf (node-adversary node) :sign-invalid) (error e))
+      (log! node "ADVERSARY: committing seq ~a on ~a that our validator rejects: ~a"
+            (up:update-seq update) (subseq (record-id-hex rec) 0 8) e)
+      (setf (lg:ledger-sequence (record-ledger rec)) (up:update-seq update)
+            (lg:ledger-chain-tip (record-ledger rec)) (up:chain-hash update))))
   (push update (record-history rec))
   (setf (record-last-event-id rec) (ev:event-id (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) update))))
   (save-record node rec)

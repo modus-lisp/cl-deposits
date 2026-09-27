@@ -17,17 +17,28 @@ RES=$(cld_ctl cld2 "(:info)" | grep -oE "\(:ID \"$C\"[^)]*:MEMBERS [1-9][^)]*" |
 AMT=$(( RES * 2 ))     # twice the reserves: unambiguously over the limit
 for n in cld3 cld4; do cld_ctl $n "(:adversary :set :cosign-blind $([ "$ARM" = collude ] && echo t || echo nil))" >/dev/null; done
 cld_ctl cld2 "(:adversary :set :sign-invalid t)" >/dev/null
-t0=$(date +%s); R=$(cld_ctl cld2 "(:credit :ledger \"$C\" :deposit \"$D\" :msat $AMT :txid \"$CTX\" :vout $CVOUT)")
+t0=$(date +%s); T0=$(date -u +%FT%T); CS=${C:0:8}; CS16=${C:0:16}
+R=$(cld_ctl cld2 "(:credit :ledger \"$C\" :deposit \"$D\" :msat $AMT :txid \"$CTX\" :vout $CVOUT)")
 echo "== operator's attempt (arm=$ARM): $R"
 cld_ctl cld2 "(:adversary :set :sign-invalid nil)" >/dev/null; for n in cld3 cld4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null; done
 echo "== C after: $(info)"
-echo "== cosigners' verdicts:"; for n in cld3 cld4; do echo "   $n: $(cld_ctl $n '(:log)' | tr '"' '\n' | grep -E "cosigned 2b01cc1a|refused cosign" | tail -1)"; done
-sleep 5; echo "   ref3: $(tail -c 3000000 "$(ref_dir ref3)/node.log" | sed 's/\x1b\[[0-9;]*m//g' | grep "2b01cc1a" | grep -iE "refus|violation|cosign_update.*success=false" | tail -1 | cut -c1-200)"
-if [ "$ARM" = collude ]; then
-  echo "== waiting up to $WAIT s for the honest minority to dispute"
+ref3_since() { tail -c 30000000 "$(ref_dir ref3)/node.log" | sed 's/\x1b\[[0-9;]*m//g' | awk -v t="$T0" '$1 > t' | grep -E "$CS"; }
+SEQ=$(cld_ctl cld3 '(:log)' | tr '"' '\n' | grep -oE "cosigned $CS seq [0-9]+" | tail -1 | grep -oE '[0-9]+$')
+echo "== cosigners' verdicts on seq ${SEQ:-?}:"; for n in cld3 cld4; do echo "   $n: $(cld_ctl $n '(:log)' | tr '"' '\n' | grep -E "cosigned $CS|refused cosign" | tail -1)"; done
+sleep 5; echo "   ref3: $(ref3_since | grep -E "cosign_update|refus|violation|DROP" | sed -E 's/^[^ ]+ +//' | cut -c1-150 | sort | uniq -c | sort -rn | head -3 | tr '\n' ';')"
+PUBLISHED=$(cld_ctl cld2 '(:log)' | tr '"' '\n' | grep -c "ADVERSARY: committing seq ${SEQ:-x} on $CS")
+echo "== published by the operator: $([ "$PUBLISHED" -gt 0 ] && echo "yes, seq $SEQ" || echo no)"
+if [ "$ARM" = collude ] && [ "$PUBLISHED" -gt 0 ]; then
+  echo "== waiting up to $WAIT s for the honest minority (ref3) to detect seq $SEQ and dispute"
+  DET=""; DIS=""
   for i in $(seq 1 $((WAIT/5))); do
-    F=$(cld_ctl cld3 "(:forks :ledger \"$C\")"); P=$(tail -c 3000000 "$(ref_dir ref3)/node.log" | sed 's/\x1b\[[0-9;]*m//g' | grep -c "2b01cc1a.*\(DisputeEnter\|fraud\|dispute fork\)")
-    [[ "$F" == *":OPERATOR"* ]] || [ "$P" -gt 0 ] && { echo "   DISPUTED after $(( $(date +%s) - t0 )) s: forks=$F ref3-lines=$P"; break; }; sleep 5
-  done; [ "$i" -ge $((WAIT/5)) ] && echo "   NOT DISPUTED within $WAIT s (forks: $(cld_ctl cld3 "(:forks :ledger \"$C\")"))"
+    L=$(ref3_since)
+    [ -z "$DET" ] && echo "$L" | grep -qE "NON-CONFORMING.*seq $SEQ|seq=$SEQ.*(non-conforming|violation)|Non-conforming.*$CS16" && DET=$(( $(date +%s) - t0 ))
+    [ -z "$DIS" ] && echo "$L" | grep -qE "DisputeEnter|dispute fork|Published DisputeEnter" && DIS=$(( $(date +%s) - t0 ))
+    [ -n "$DET" ] && [ -n "$DIS" ] && break; sleep 5
+  done
+  echo "   ref3 detected: ${DET:+after $DET s}${DET:-NO}; ref3 disputed: ${DIS:+after $DIS s}${DIS:-NO}"
+  echo "   ref3's lines on $CS since the attack:"; ref3_since | grep -iE "non-conforming|dispute|violation|fraud|arm" | sed -E 's/^[^ ]+T([0-9:]{8})[^ ]* +/\1 /' | cut -c1-200 | head -8 | sed 's/^/     /'
+  echo "   cl forks of $CS (fraud proofs reach them too): $(cld_ctl cld3 "(:forks :ledger \"$C\")" | cut -c1-200)"
 fi
 echo "== cost/exposure: attacker bonded $(( $(cld_ctl cld2 "(:info)" | grep -oE "\(:ID \"$C\"[^)]*:MEMBERS [1-9][^)]*" | grep -oE ':COLLATERAL [0-9]+' | cut -d' ' -f2) / 1000 )) sats collateral; attempted exposure $(( AMT / 1000 )) sats"
