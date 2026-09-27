@@ -45,7 +45,8 @@
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
            #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
-           #:dispute-expired-quorums #:start-expiry-watch #:*expiry-grace-blocks*))
+           #:dispute-expired-quorums #:start-expiry-watch #:*expiry-grace-blocks*
+           #:required-replacement-sats #:pledge-collateral #:release-pledges #:our-utxos #:node-pledges))
 (in-package #:cl-deposits.node)
 
 (define-condition node-error (error)
@@ -99,6 +100,8 @@
   (hooks '())                                  ; (lambda (rec update op)) called after every accepted/committed update
   (invoices (make-hash-table :test #'equalp))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
   (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
+  (utxos-fn nil)                               ; (lambda (address)) -> list of plists :txid :vout :sats :confirmations
+  (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
   (min-confs 1)
   (member-ledger-hex nil))                     ; our own ledger used for QuorumJoin / member_ledger_hash
 
@@ -115,13 +118,13 @@
   (let ((o (op:decode-operation (up:update-message update))))
     (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn)
   (let* ((priv (w:even-y-privkey priv))
          (pub (up:compressed-pubkey priv))
          (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
-                           :chain-fn chain-fn :min-confs min-confs :ln ln :relays relays
+                           :chain-fn chain-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
                            :broadcast-fn broadcast-fn :height-of-block height-of-block :block-hash-fn block-hash-fn)))
     ;; On a real relay, events arrive on the reader thread.  Responses are
     ;; consumed inline (they only wake a waiter); requests and updates go to a
@@ -1682,6 +1685,103 @@
                  (push (record-id-hex rec) disputed)))
     disputed))
 
+;;; ---------------------------------------------------------------------------
+;;; Collateral wallet: the node key's own P2TR (our-target-address) holds the
+;;; UTXOs a disputant pledges as replacement collateral (DEP-06 Phase 1).
+;;; Discovery goes through UTXOS-FN (bitcoind scantxoutset: no bitcoind wallet);
+;;; a pledge is a whole UTXO declared at its full value, because the winner's
+;;; claim signs that input for exactly the declared amount; pledges persist in
+;;; the data dir so a restart never pledges one UTXO to two disputes.
+
+(defparameter *reference-claim-fee-sats* 5000
+  "The reference cosigner's claim_fee_estimate: its floor is the stricter of the two.")
+
+(defun required-replacement-sats (base)
+  "What a pledge on BASE must cover to pass every cosigner: our floor and the
+   reference's (obligations x collateral/reserves, rounded up, + 5000 sats)."
+  (let* ((l (record-ledger base))
+         (reserves (lg:ledger-reserves-amount l))
+         (theirs (if (plusp reserves)
+                     (+ (ceiling (* (lg:total-obligations l) (lg:ledger-collateral-amount l)) (* reserves 1000))
+                        *reference-claim-fee-sats*)
+                     0)))
+    (max theirs (collateral-floor-sats base))))
+
+(defun outpoint-key (txid vout) (format nil "~a:~a" (txid-hex txid) vout))
+
+(defun save-pledges (node)
+  (when (node-data-dir node)
+    (with-open-file (out (merge-pathnames "pledges.sexp" (node-data-dir node)) :direction :output :if-exists :supersede)
+      (with-standard-io-syntax
+        (prin1 (loop for k being the hash-keys of (node-pledges node) using (hash-value v) collect (cons k v)) out)))))
+
+(defun load-pledges (node)
+  (let ((f (and (node-data-dir node) (probe-file (merge-pathnames "pledges.sexp" (node-data-dir node))))))
+    (when f
+      (with-open-file (in f)
+        (dolist (p (with-standard-io-syntax (let ((*read-eval* nil)) (read in nil '()))))
+          (setf (gethash (car p) (node-pledges node)) (cdr p)))))))
+
+(defun release-pledges (node id-hex)
+  (loop for k being the hash-keys of (node-pledges node) using (hash-value v)
+        when (equal v id-hex) do (remhash k (node-pledges node)))
+  (save-pledges node))
+
+(defun our-utxos (node)
+  "Our P2TR's UTXOs, each a plist :txid (wire order) :vout :sats :confirmations."
+  (and (node-utxos-fn node) (funcall (node-utxos-fn node) (our-target-address node))))
+
+(defun consolidate-utxos (node utxos &key (sat-per-vb 2))
+  "Key-path spend of UTXOS into one output back to us.  Returns (values txid vout sats)."
+  (let* ((spk (lot:key-path-spk (up:x-only (node-pubkey node))))
+         (total (reduce #'+ utxos :key (lambda (u) (getf u :sats))))
+         (fee (* sat-per-vb (+ 11 (* 58 (length utxos)) 43)))
+         (inputs (loop for u in utxos collect (btx:make-txin :prev-hash (getf u :txid) :prev-index (getf u :vout) :script (octets) :sequence rot:+sequence-rbf+)))
+         (unsigned (btx:parse-tx (bw:make-reader
+                                  (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs inputs
+                                                                 :outputs (list (btx:make-txout :value (- total fee) :script spk))
+                                                                 :witnesses (make-list (length inputs) :initial-element nil))))))
+         (prevouts (coerce (loop for u in utxos collect (cons (getf u :sats) spk)) 'vector))
+         (signed (btx:parse-tx (bw:make-reader
+                                (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs (btx:tx-inputs unsigned)
+                                                               :outputs (btx:tx-outputs unsigned)
+                                                               :witnesses (loop for i below (length inputs)
+                                                                                collect (list (key-path-signature node unsigned i prevouts)))))))))
+    (dotimes (i (length inputs))
+      (unless (rot:verify-spend signed i prevouts) (fail "consolidation input ~a does not verify" i)))
+    (broadcast node signed)
+    (values (btx:tx-txid signed) 0 (- total fee))))
+
+(defun pledge-collateral (node id-hex)
+  "A confirmed UTXO of ours, pledged to ID-HEX, covering its required replacement
+   collateral: (txid vout sats), or NIL.  When no single UTXO is large enough but
+   together they are, consolidate them (the result is pledgeable once confirmed)
+   and return NIL for now; a pledge already made for ID-HEX is returned again."
+  (let ((mine (loop for k being the hash-keys of (node-pledges node) using (hash-value v) when (equal v id-hex) collect k))
+        (utxos (our-utxos node)))
+    (when mine
+      (let ((u (find (first mine) utxos :key (lambda (u) (outpoint-key (getf u :txid) (getf u :vout))) :test #'equal)))
+        (when u (return-from pledge-collateral (list (getf u :txid) (getf u :vout) (getf u :sats))))
+        (remhash (first mine) (node-pledges node))))           ; spent or gone: pledge afresh
+    (let* ((need (required-replacement-sats (or (find-record node id-hex) (fail "unknown ledger"))))
+           (free (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
+                                            (gethash (outpoint-key (getf u :txid) (getf u :vout)) (node-pledges node))))
+                            utxos))
+           (fits (sort (remove-if (lambda (u) (< (getf u :sats) need)) free) #'< :key (lambda (u) (getf u :sats)))))
+      (cond (fits
+             (let ((u (first fits)))
+               (setf (gethash (outpoint-key (getf u :txid) (getf u :vout)) (node-pledges node)) id-hex)
+               (save-pledges node)
+               (list (getf u :txid) (getf u :vout) (getf u :sats))))
+            ((and (rest free) (>= (reduce #'+ free :key (lambda (u) (getf u :sats))) (+ need 1000)))
+             (multiple-value-bind (txid vout sats) (consolidate-utxos node free)
+               (log! node "collateral for ~a: consolidated ~a UTXOs into ~a:~a (~a sats), pledgeable once confirmed"
+                     (subseq id-hex 0 8) (length free) (txid-hex txid) vout sats))
+             nil)
+            (t (log! node "collateral for ~a: need ~a sats at ~a, have ~a unpledged"
+                     (subseq id-hex 0 8) need (our-target-address node) (reduce #'+ free :key (lambda (u) (getf u :sats))))
+               nil)))))
+
 ;;; Key-path Taproot spend of our own P2TR (replacement collateral inputs).
 
 (defun key-path-signature (node tx in-index prevouts)
@@ -1834,4 +1934,5 @@
         (if id
             (handler-case (load-reveals node id f) (error (e) (funcall log-fn "could not load ~a: ~a" f e)))
             (funcall log-fn "reveals file ~a for a ledger we do not hold" (file-namestring f)))))
+    (handler-case (load-pledges node) (error (e) (funcall log-fn "could not load pledges: ~a" e)))
     node))

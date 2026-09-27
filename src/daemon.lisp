@@ -19,7 +19,7 @@
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:jzon #:com.inuoe.jzon))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
-           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn))
+           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn))
 (in-package #:cl-deposits.daemon)
 
 (defun arg (form key &optional default) (getf (cdr form) key default))
@@ -187,6 +187,22 @@
   (lambda (height)
     (let ((out (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string height)))))
       (and (= (length out) 64) (hex->bytes out)))))
+
+(defun bitcoin-cli-utxos-fn (cli &key (retries 5))
+  "Address -> its confirmed UTXOs, via scantxoutset (no bitcoind wallet needed):
+   plists :txid (wire order) :vout :sats :confirmations.  bitcoind runs one scan
+   at a time (the esplora shim scans too), so a busy scanner is retried."
+  (lambda (address)
+    (loop repeat retries
+          for out = (run-cli cli "scantxoutset" "start" (format nil "[\"addr(~a)\"]" address))
+          when (and (plusp (length out)) (char= (char out 0) #\{))
+            do (let* ((j (jzon:parse out)) (tip (gethash "height" j)))
+                 (return (map 'list (lambda (u)
+                                      (list :txid (txid-bytes (gethash "txid" u)) :vout (gethash "vout" u)
+                                            :sats (round (* (gethash "amount" u) 100000000))
+                                            :confirmations (1+ (- tip (gethash "height" u)))))
+                              (gethash "unspents" j))))
+          do (sleep 2))))
 
 (defun bitcoin-cli-height-of-block-fn (cli)
   "Block hash -> confirmed height, or NIL (fraud-proof anchors)."
