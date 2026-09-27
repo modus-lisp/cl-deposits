@@ -554,7 +554,12 @@
         (multiple-value-bind (ok why)
             (up:verify-cosignatures update :quorum (mapcar #'lg:member-pubkey signers) :threshold required)
           (unless ok (fail "seq ~a: ~a" (up:update-seq update) why)))))
-    (lg:apply-update ledger update)
+    (handler-case (lg:apply-update ledger update)
+      (lg:ledger-error (e)
+        ;; Signed by the operator, cosigned by the threshold, the next sequence —
+        ;; and the rules reject it.  That is provable fraud, not a glitch to retry.
+        (report-non-conforming node rec update e)
+        (error e)))
     (push update (record-history rec))
     (save-record node rec)
     (run-hooks node rec update)
@@ -2107,6 +2112,24 @@
       (schnorr:schnorr-sign (if (= parity 1) (- secp256k1-fast:*secp256k1-n* d) d) sighash (random-aux)))))
 
 ;;; Fraud broadcasts (Kind 9101): verify, and if we are a member, dispute.
+
+(defun report-non-conforming (node rec update condition)
+  "UPDATE passed every signature check on REC (operator, cosign threshold, chain)
+   and the ledger rules reject it: publish a NonConformingUpdate proof and, as a
+   quorum member, dispute from the last valid sequence.  A member that could only
+   refuse such an update left the ledger's fraud to someone else — on the soak a
+   majority-cosigned credit of twice the reserves went unreported by every
+   replica that rejected it (docs/REDTEAM.md attack #1)."
+  (let ((id (record-id-hex rec)) (ledger (record-ledger rec)))
+    (when (and (not (record-owned-p rec)) (not (record-fork-p rec))
+               (equalp (up:update-prev-hash update) (lg:ledger-chain-tip ledger))
+               (= (up:update-seq update) (1+ (lg:ledger-sequence ledger)))
+               (not (find-fork node id (node-pubkey node))))
+      (log! node "NON-CONFORMING cosigned update on ~a at seq ~a: ~a" (subseq id 0 8) (up:update-seq update) condition)
+      (broadcast-fraud node (fr:make-non-conforming-update-proof (up:update-operator-id update) (up:update-ledger-id update) update))
+      (when (and (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
+                 (not (find-fork node id (node-pubkey node))))   ; the proof may have looped back and forked us already
+        (enter-dispute node rec (lg:ledger-sequence ledger) :reason "non_conforming_update")))))
 
 (defun broadcast-fraud (node proof)
   (bus:bus-publish (node-bus node) (w:fraud-event (node-keypair node) (getf proof :ledger-id) (getf proof :accused) (fr:broadcast->json proof))))

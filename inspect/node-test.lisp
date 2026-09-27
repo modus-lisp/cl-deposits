@@ -764,4 +764,33 @@
                                            (zerop (hash-table-count (nd:node-pledges m)))))
                           (list b c)))))))))
 
+(with-gate ("red team #1: a majority-cosigned invalid update is reported and disputed by every replica")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:b1" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "b1f0")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((w (nd:make-wallet :priv 55555555555555555555 :bus bus)) (dw (nd:wallet-open-deposit w id))
+           (before (lg:ledger-sequence (nd:record-ledger (nd:find-record d id)))))
+      ;; Honest cosigners: the over-reserves credit gathers no cosignature.
+      (setf (getf (nd:node-adversary a) :sign-invalid) t)
+      (check-signals "honest quorum: the invalid credit cannot be cosigned" nd:node-error
+        (nd:credit-onchain a la dw 999999999999 :txid (u:sha256 (hx "b1c1"))))
+      ;; b and c collude (cosign blind): it commits and is published.
+      (dolist (m (list b c)) (setf (getf (nd:node-adversary m) :cosign-blind) t))
+      (nd:credit-onchain a la dw 999999999999 :txid (u:sha256 (hx "b1c2")))
+      (check "the colluding operator published it" (> (lg:ledger-sequence (nd:record-ledger la)) before))
+      (check "the honest replica did not apply it" (= (lg:ledger-sequence (nd:record-ledger (nd:find-record d id))) before))
+      (let ((fork (nd:find-fork d id (nd:node-pubkey d))))
+        (check "the honest minority disputed" (and fork t))
+        (check-equal "for non-conformance, in the reference's words"
+                     (op:field (nth-value 1 (nd::fork-op fork :dispute-enter)) :reason) "non_conforming_update")
+        (check-equal "from the last valid sequence" (lg:ledger-sequence (nd:record-ledger fork)) (1+ before)))
+      (check "so did the colluders' own replicas (their validation is honest)"
+             (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c))))))
+
 (report)
