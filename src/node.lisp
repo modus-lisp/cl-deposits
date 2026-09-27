@@ -46,7 +46,8 @@
            #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
            #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
            #:dispute-expired-quorums #:start-expiry-watch #:*expiry-grace-blocks*
-           #:required-replacement-sats #:pledge-collateral #:release-pledges #:our-utxos #:node-pledges))
+           #:required-replacement-sats #:pledge-collateral #:release-pledges #:our-utxos #:node-pledges
+           #:drive-disputes #:dispute-arm-closes #:outpoint-key #:save-pledges))
 (in-package #:cl-deposits.node)
 
 (define-condition node-error (error)
@@ -102,6 +103,7 @@
   (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
   (utxos-fn nil)                               ; (lambda (address)) -> list of plists :txid :vout :sats :confirmations
   (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
+  (dispute-notes (make-hash-table :test #'equal))   ; ledger id -> the last dispute-driver state we logged
   (min-confs 1)
   (member-ledger-hex nil))                     ; our own ledger used for QuorumJoin / member_ledger_hash
 
@@ -1101,8 +1103,106 @@
         (dolist (id disputed) (log! node "quorum expired on ~a at height ~a: disputed" (subseq id 0 8) h))
         disputed))))
 
+;;; The member's side of a dispute, driven to the end (DEP-06): arm with pledged
+;;; collateral, propose the confiscation once the arm window closes, reveal once
+;;; it is on chain, claim or yield once every reveal is in.  Until now each step
+;;; was a control-socket command, so a cl member's dispute stopped at DisputeEnter.
+
+(defparameter *default-dispute-arm-blocks* 6
+  "The arm window when no member's QuorumAddMember terms name one.  The
+   reference neither sets nor enforces dispute_arm_blocks; this is our policy.")
+(defparameter *proposer-grace-blocks* 3
+  "Blocks the lowest-keyed armer has to propose before the others do too.")
+
+(defun fork-op (fork type)
+  "FORK's most recent update of operation TYPE, and its decoded operation."
+  (let ((u (find type (record-history fork) :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u)))))))
+    (and u (values u (op:decode-operation (up:update-message u))))))
+
+(defun dispute-arm-closes (node base)
+  "The block the arm window closes: the earliest DisputeEnter on any fork of
+   BASE's ledger plus the members' dispute_arm_blocks (the longest named)."
+  (let ((entered (loop for f in (forks-of node (record-id-hex base))
+                       for (u o) = (multiple-value-list (fork-op f :dispute-enter))
+                       when u minimize (or (op:field o :anchor-block-height) (up:update-block-height u))))
+        ;; No member names one (the reference never sets dispute_arm_blocks): ours.
+        (window (let ((named (loop for m in (lg:ledger-quorum-members (record-ledger base))
+                                   for b = (lg::member-dispute-arm-blocks m) when (and b (plusp b)) collect b)))
+                  (if named (reduce #'max named) *default-dispute-arm-blocks*))))
+    (and entered (+ entered window))))
+
+(defun confiscation-on-chain (node id-hex)
+  "The confiscation of ID-HEX whose lottery output is in the UTXO set (we
+   proposed or signed it, or it rebuilds from public state), or NIL.  Reserves
+   that are merely spent prove nothing: a stranded rotation spends them too."
+  (when (node-chain-fn node)
+    (let ((known (loop for f in (forks-of node id-hex) thereis (record-confiscation f))))
+      (or (and known (funcall (node-chain-fn node) (btx:tx-txid known) 0) known)
+          (loop for ti below (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))
+                for tx = (ignore-errors (build-confiscation node id-hex :tier-index ti))
+                when (and tx (funcall (node-chain-fn node) (btx:tx-txid tx) 0)) return tx)))))
+
+(defun note-dispute (node id-hex fmt &rest args)
+  "Log a dispute's state only when it changes: a stuck dispute is retried every
+   pass and would otherwise fill the log."
+  (let ((line (apply #'format nil fmt args)))
+    (unless (equal line (gethash id-hex (node-dispute-notes node)))
+      (setf (gethash id-hex (node-dispute-notes node)) line)
+      (log! node "dispute ~a: ~a" (subseq id-hex 0 8) line))))
+
+(defun drive-dispute (node fork)
+  (let* ((id (record-id-hex fork)) (base (find-record node id)) (h (height node)))
+    (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
+      (unless (and base enter) (return-from drive-dispute nil))
+      (when (or (fork-op fork :dispute-acquire) (fork-op fork :dispute-yield))
+        (when (loop for v being the hash-values of (node-pledges node) thereis (equal v id)) (release-pledges node id))
+        (return-from drive-dispute (note-dispute node id "concluded")))
+      (let ((conf (confiscation-on-chain node id))
+            (reserves-spent (multiple-value-bind (r txid vout) (disputed-reserves node base)
+                              (declare (ignore r))
+                              (and (node-chain-fn node) (null (funcall (node-chain-fn node) txid vout))))))
+        (cond
+          ;; Nothing left to confiscate (a stranded rotation spent it): arming would
+          ;; only tie up a pledge.
+          ((and reserves-spent (not conf))
+           (note-dispute node id "reserves spent, but not by a confiscation we can rebuild"))
+          ((null (fork-op fork :dispute-armed))
+           (let ((p (pledge-collateral node id)))
+             (if p
+                 (progn (arm-dispute node fork :replacement p)
+                        (note-dispute node id "armed, pledging ~a:~a (~a sats)" (txid-hex (first p)) (second p) (third p)))
+                 (note-dispute node id "waiting for collateral (~a sats)" (required-replacement-sats base)))))
+          (conf
+           (if (not (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
+               (progn (publish-reveal node id)
+                      (note-dispute node id "confiscation ~a on chain; revealed" (txid-hex (btx:tx-txid conf))))
+               (handler-case (let ((outcome (claim-or-yield node id :confiscation-txid (btx:tx-txid conf))))
+                               (release-pledges node id)
+                               (note-dispute node id "lottery: ~(~a~)" outcome))
+                 (error (e) (note-dispute node id "waiting to claim: ~a" e)))))
+          (t
+           (let ((closes (dispute-arm-closes node base))
+                 (armers (sort (mapcar #'first (armers-of node id)) #'bytes<)))
+             (cond ((< (length armers) 2) (note-dispute node id "armed; waiting for a second armer"))
+                   ((< h closes) (note-dispute node id "armed; arm window closes at ~a" closes))
+                   ((or (equalp (first armers) (node-pubkey node)) (>= h (+ closes *proposer-grace-blocks*)))
+                    (handler-case
+                        (let ((tx (confiscate node id :respectful (equal (op:field enter-op :reason) "quorum_expired"))))
+                          (note-dispute node id "proposed confiscation ~a" (txid-hex (btx:tx-txid tx))))
+                      (error (e) (note-dispute node id "confiscation not yet: ~a" e))))
+                   (t (note-dispute node id "armed; another armer proposes first"))))))))))
+
+(defun drive-disputes (node)
+  (loop for rec in (loop for r being the hash-values of (node-ledgers node)
+                         when (and (record-fork-p r) (record-owned-p r)) collect r)
+        do (handler-case (drive-dispute node rec)
+             (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))))
+
 (defun start-expiry-watch (node &key (interval 60))
-  (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (dispute-expired-quorums node)))) :name "cld-expiry"))
+  (bt:make-thread (lambda () (loop (sleep interval)
+                                   (ignore-errors (dispute-expired-quorums node))
+                                   (ignore-errors (drive-disputes node))))
+                  :name "cld-expiry"))
 
 (defun start-invoice-poller (node &key (interval 3))
   (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (credit-paid-invoices node)))) :name "cld-invoices"))
@@ -1764,8 +1864,17 @@
         (when u (return-from pledge-collateral (list (getf u :txid) (getf u :vout) (getf u :sats))))
         (remhash (first mine) (node-pledges node))))           ; spent or gone: pledge afresh
     (let* ((need (required-replacement-sats (or (find-record node id-hex) (fail "unknown ledger"))))
-           (free (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
-                                            (gethash (outpoint-key (getf u :txid) (getf u :vout)) (node-pledges node))))
+           ;; Anything we declared in a DisputeArmed is taken, recorded or not (an arm
+           ;; made by hand on the control socket, or before pledges were kept).
+           (declared (loop for r being the hash-values of (node-ledgers node)
+                           when (and (record-fork-p r) (record-owned-p r))
+                             append (loop for u in (record-history r)
+                                          for o = (op:decode-operation (up:update-message u))
+                                          when (and (eq (op:operation-type o) :dispute-armed) (op:field o :replacement-collateral-txid))
+                                            collect (outpoint-key (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)))))
+           (free (remove-if (lambda (u) (let ((k (outpoint-key (getf u :txid) (getf u :vout))))
+                                          (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
+                                              (gethash k (node-pledges node)) (member k declared :test #'equal))))
                             utxos))
            (fits (sort (remove-if (lambda (u) (< (getf u :sats) need)) free) #'< :key (lambda (u) (getf u :sats)))))
       (cond (fits

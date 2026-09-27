@@ -101,6 +101,9 @@
         (:arm (let ((fork (or (nd:find-fork node (arg form :ledger) (nd:node-pubkey node)) (error "no fork; :dispute-enter first")))
                     ;; Optional replacement collateral: an outpoint we control (see :address), DEP-06.
                     (replacement (and (arg form :txid) (list (txid-bytes (arg form :txid)) (arg form :vout 0) (arg form :sats)))))
+                (when replacement   ; the collateral wallet must not pledge it again
+                  (setf (gethash (nd:outpoint-key (first replacement) (second replacement)) (nd:node-pledges node)) (arg form :ledger))
+                  (nd:save-pledges node))
                 (ok :commitment (bytes->hex (cl-deposits.lottery:commitment-of (nd:arm-dispute node fork :replacement replacement)))
                     :replacement (and replacement t))))
         (:address (ok :address (nd::our-target-address node)))   ; the node key's P2TR key-path address: collateral, lottery target
