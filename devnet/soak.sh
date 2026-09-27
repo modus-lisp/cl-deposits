@@ -86,6 +86,12 @@ setup() {
       wcli sendtoaddress "$CA" 0.01 >/dev/null
     done; mine 1; touch "$SOAK/.collateral-funded"
   fi
+  if [ ! -f "$SOAK/.cl-collateral-funded" ]; then   # coins at each cl node's key-path address: its collateral wallet pledges from these
+    for n in $(cld_names); do
+      CA=$(sx "$(cld_ctl "$n" '(:address)')" ":ADDRESS"); [ -n "$CA" ] || fail "$n address"
+      for i in $(seq 1 "${SOAK_CL_COLLATERAL_COINS:-8}"); do wcli sendtoaddress "$CA" 0.01 >/dev/null; done
+    done; mine 1; touch "$SOAK/.cl-collateral-funded"
+  fi
   for spec in $LEDGER_PLAN; do IFS=: read -r name op members <<<"$spec"; form_ledger "$name" "$op" "$members"; done
   echo "== deposits: $SOAK_REF_DEPOSITS reference bots per ledger + $SOAK_CL_WALLETS cl wallets on every ledger, $SOAK_CREDIT_MSAT msat each"
   touch "$SOAK/deposits.tsv"; local n=0
@@ -131,6 +137,6 @@ status() {
 }
 case "${1:-}" in
   setup) setup;; start) start;; stop) stop;; status) status;;
-  reset) stop; rm -f "$ENV" "$SOAK/ledgers.tsv" "$SOAK/deposits.tsv" "$SOAK/.collateral-funded"; echo "reset (ledgers on the nodes are untouched)";;
+  reset) stop; rm -f "$ENV" "$SOAK/ledgers.tsv" "$SOAK/deposits.tsv" "$SOAK/.collateral-funded" "$SOAK/.cl-collateral-funded"; echo "reset (ledgers on the nodes are untouched)";;
   *) sed -n '2,19p' "$0"; exit 2;;
 esac
