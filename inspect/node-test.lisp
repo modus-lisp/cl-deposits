@@ -689,6 +689,10 @@
         (dolist (m (list b c d))
           (dolist (f (nd::forks-of m id)) (setf (nd::record-confiscation f) nil (nd::record-lottery f) nil)))
         (check "after a restart the confiscation still rebuilds" (nd::confiscation-on-chain c id))
+        (let* ((conf (nd::confiscation-on-chain c id)) (bytes (u:hex->bytes (nd::unsigned-tx-hex conf))))
+          (check "an unsigned tx goes out without the segwit marker (BIP-144)" (/= 0 (aref bytes 4)))
+          (check "and parses back to the same txid"
+                 (equalp (btx:tx-txid (btx:parse-tx (cl-consensus.wire:make-reader bytes))) (btx:tx-txid conf))))
         (loop repeat 3 do (dolist (m (list b c d)) (nd:drive-disputes m)))
         (check "every member revealed" (= 3 (length (nd:reveals-of b id))))
         (let ((acquired (count-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-acquire)) (list b c d)))

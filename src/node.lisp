@@ -1246,7 +1246,7 @@
       (unless (member me voters :test #'equalp) (fail "not a recovery voter"))
       (when (> threshold 1)
         (dolist (r (send-request node id-hex "lottery_recovery_sign"
-                                 (w:json-object "sighash" (bytes->hex sighash) "unsigned_tx" (bytes->hex (btx:serialize-tx tx)))
+                                 (w:json-object "sighash" (bytes->hex sighash) "unsigned_tx" (unsigned-tx-hex tx))
                                  :want (1- threshold) :timeout 20 :successes-only t))
           (let ((res (w:jget r "result")))
             (when (and (w:jget r "success") res)
@@ -1734,6 +1734,14 @@
                                               :witnesses (list nil)))))))
         (values tx lottery (vector (cons sats (rs:reserves-spk reserves))) reserves tier-index)))))
 
+(defun unsigned-tx-hex (tx)
+  "An unsigned transaction as we send it to other signers: the legacy form.
+   BIP-144 serializes a transaction without witness data without the segwit
+   marker and flag; rust-bitcoin refuses the marker with empty witnesses, which
+   is how we used to send confiscation_sign and lottery_recovery_sign requests.
+   Neither the txid nor any sighash depends on the form."
+  (bytes->hex (btx:serialize-tx tx :witness nil)))
+
 (defun confiscation-sighash (tx prevouts reserves &optional (tier-index 0))
   (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves reserves))))
 
@@ -1750,7 +1758,7 @@
                                     ;; The reference's field names: sighash, unsigned_tx, last_valid_sequence.
                                     (w:json-object "sighash" (bytes->hex sighash) "respectful" (and respectful t) "fee_sats" fee
                                                    "tier_index" tier-index
-                                                   "unsigned_tx" (bytes->hex (btx:serialize-tx tx))
+                                                   "unsigned_tx" (unsigned-tx-hex tx)
                                                    "last_valid_sequence" (lg:ledger-sequence (record-ledger (or (find-fork node id-hex (node-pubkey node)) (find-record node id-hex)))))
                                     :want (1- (rs:tier-threshold tier)) :timeout 20 :successes-only t)))
       (dolist (r responses)
