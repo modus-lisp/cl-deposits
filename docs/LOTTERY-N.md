@@ -1,7 +1,7 @@
 # The custody lottery's N is decided after it is committed to
 
-*Red-team finding, 2026-09-27. Status: documented; both implementations left as the spec and
-reference have them. See docs/REDTEAM.md.*
+*Red-team finding, 2026-09-27. Status: protocol unchanged (a change needs a wider audience);
+mitigated in cl-deposits (c3cd4cd), see "Mitigation" below. See docs/REDTEAM.md.*
 
 ## Summary
 
@@ -89,3 +89,24 @@ this soak produced within a day: one member's tooling couldn't arm. Until then, 
 (ours, the reference's) should treat a lottery that cannot be claimed as recoverable, not
 pending: sweep through the recovery leaf once its CSV passes, rather than waiting on a claim that
 can never verify.
+
+## Mitigation (cl-deposits c3cd4cd, protocol unchanged)
+
+- **Make it rare.** The dispute driver does not confiscate while fewer than Q recovery voters
+  have armed, for 720 blocks past the arm window (the reference's own auto-dispute hold-off). In
+  the normal case every member arms, k = Q, and the lottery is always claimable.
+- **Make it recoverable.** Once any revealed preimage is longer than 16 + k, the lottery is
+  treated as unclaimable. When its output is 144 blocks deep, a recovery voter sweeps it through
+  the CSV-144 recovery leaf to the original operator's P2WPKH, the destination DEP-06 names for
+  lottery-recovery funds and where the respectful confiscation's change already went. The fee is
+  fixed so every voter rebuilds the same sweep; a `lottery_recovery_sign` request gathers the
+  threshold. A voter signs only a lottery it also finds unclaimable, past the CSV, and only the
+  exact sweep it rebuilds. Members that see the sweep yield and release their pledges.
+- **On the devnet:** F's lottery was swept by cld1 with cld4's signature in
+  174bea4ffe70900b054582a4b72c35eb265ff355c27aaf7314da123eeb3da3e7: 478,407 sats to
+  tb1q7nz5…, the address of F's confiscation change. Both members concluded.
+
+The reference implementation neither waits for full arming nor sweeps an unclaimable lottery.
+`lottery_recovery_sign` is a cl request it does not answer, so a lottery whose recovery threshold
+needs a reference voter still waits for the lower-threshold leaves (1008, 4032, 8064).
+

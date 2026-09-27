@@ -229,9 +229,9 @@ dispatch arm).  Decision (2026-09-27): keep the spec for now; an unbiased fix (c
 
 ### Open (2026-09-27)
 
-- **F's lottery** cannot be claimed (organic #6); sweep it through the recovery leaf once
-  CSV 144 passes (height 7810).  Neither driver does that yet.  The organic #5 rotation fix still
-  has not been exercised on the devnet.
+- **F's lottery** could not be claimed (organic #6); mitigated (c3cd4cd) and swept to the
+  operator by cld1 + cld4 in 174bea4f….  The reference does neither mitigation.  The organic #5
+  rotation fix still has not been exercised on the devnet.
 - **B**: reserves spent by the stranded rotation, so nothing to confiscate; the driver says so
   and does not arm.  The funds sit in tb1p6q0j… until someone recovers that vault.
 - **catch-up stopped on INSUFFICIENT-BALANCE replaying D** (cl operator, cl replica) — a fold
