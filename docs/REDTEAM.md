@@ -124,12 +124,50 @@ says so explicitly), so it now anchors the prepared hash; what is checked instea
 staged members still match the prepared reserves.  Gate: inspect/node-test.lisp "rotation: a
 ledger that moves between prepare and begin still rotates".  D rotated under traffic 13:06.
 
-### Open (2026-09-26)
+### 2026-09-26 — organic #4: a frozen reference ledger (F), a lost publish, and a pager that could not see past its own heal
 
-- **B cannot rotate: reference spends an already-spent reserves UTXO.**  Consents now complete;
-  the rotation then fails `bad-txns-inputs-missingorspent` every cycle and members answer
-  rotation_sign "reserves UTXO not found on-chain (already spent?)".  ref2 launches rotations of
-  ~8 ledgers from one wallet at the same instant.  B expires at 6674.
-- **F frozen, not expired** (expiry 6719): ref2 logs `Non-conforming-cosig: failed to arm dispute
-  on 74bde8be… cannot determine lottery N (Q)` — organic #1's shape again, with a second defect in
-  the arming path.
+F froze at 03:39Z not because of expiry but because its tip was never published.  ref3
+committed seq 141513 at 03:39:36; `persist_ledger_to_disk` had just spent 21 s rewriting the
+2.1 GB ledger log on the runtime, the relay's pings went unanswered, and the connection dropped
+at 03:39:36.537 — with the update's publish.  Nothing republishes a failed publish, so the cl
+members sat at 141512 refusing every later cosign ("expected seq 141513").
+
+The net for that is heal, and heal could not see it: its backward created_at pager ended at the
+first second holding a full page (a previous heal batch), so it saw 22,891 of 141,514 updates
+and re-published the "missing" 118k oldest-first, 500 a pass — building the next wall — with the
+real gap 118k entries down the queue.  The same truncated view is behind ref2's "cannot determine
+lottery N" when arming a dispute on F.  Fixed in deposits-rust (step past a no-new-events second);
+the next pass saw 141,513 of 141,514, re-published the tip, and F moved within seconds.
+
+Also fixed on the way: consent took its 40-update prefix by parsing the whole 2.1 GB log (20 s
+per attempt, synchronously); it now streams the head.  ref3 wedged once for 33 min (0% CPU,
+every thread parked) right after such an attempt — suspected, not proven (no ptrace here).
+
+### 2026-09-26 — organic #5: a rotation broadcast but never committed strands the reserves
+
+B's rotation tx (c17b93e7…) spent its vault at 16:30:53Z; ref2 was restarted during the
+confirmation wait.  The refresh path persisted the new vault only after the QuorumBegin
+committed, so the restart lost the only record of it, and every retry rebuilt a rotation from
+the spent vault (`bad-txns-inputs-missingorspent`) until B expired at 6674.  The funds are safe
+in tb1p6q0j… (spendable by the staged quorum); no QuorumBegin points at it.  Fixed in
+deposits-rust: persist at broadcast; on an Active ledger a recorded vault that is not the
+committed `reserves_key` is resumed, not rebuilt.  Not yet exercised on the devnet (no reference
+ledger has been inside its refresh window since the deploy).  B itself is left expired, as a
+live test of claim #4.
+
+### 2026-09-27 — claim #4, first observation: nobody disputes B's expiry
+
+Hours past B's quorum_expiry: no fork on either cl member (cld2, cld3), and nothing from the
+reference member (ref3) — though the references do auto-dispute other expired ledgers.  On our
+side `check-expired-quorums` exists only as a control command; no poller runs it, so a cl member
+never notices an expired quorum by itself.  B keeps committing post-expiry-allowed updates,
+which may be why the reference does not treat it as dead.  Next: a periodic expiry check in the
+cl node, and why the reference skips B.
+
+### Open (2026-09-27)
+
+- **F expired too** (6719) while frozen; it moves again, but needs a rotation — the first real
+  exercise of the organic #5 fix.
+- **cl operators need restarting to take e5d7f63** (the prepared-hash anchor): C failed four
+  rotations on the old code last night and rotated at 23:07 only after cld2 was restarted.
+  cld1 still runs the old code (A is not due until ~10.7k).
