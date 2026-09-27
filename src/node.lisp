@@ -487,6 +487,7 @@
            (funcall (gethash action (extra-actions node)) event params))
           ((string= action "cosign_update") (handle-cosign node event params))
           ((string= action "confiscation_sign") (handle-confiscation-sign node event params))
+          ((string= action "lottery_recovery_sign") (handle-lottery-recovery-sign node event params))
           ((string= action "lottery_reveal") (handle-lottery-reveal-request node event params))
           ((string= action "consent_request") (handle-consent node event params))
           ((string= action "cosign_invoice") (handle-cosign-invoice node event params))
@@ -1171,6 +1172,119 @@
       (or (and known (funcall (node-chain-fn node) (btx:tx-txid known) 0) known)
           (first (rebuild-confiscation-on-chain node id-hex))))))
 
+;;; An unclaimable lottery (docs/LOTTERY-N.md): armers commit preimages under
+;;; N = Q (the recovery voters) but the claim leaf is built for the k who armed,
+;;; so with k < Q a revealed preimage longer than 16 + k locks the claim leaf for
+;;; good.  Two mitigations until the protocol settles it: do not confiscate with
+;;; k < Q while the others may still arm, and sweep a lottery that cannot be
+;;; claimed through its CSV-144 recovery leaf, to the original operator's key —
+;;; the destination DEP-06 names for lottery-recovery funds, as the respectful
+;;; confiscation's change.
+
+(defparameter *full-arming-wait-blocks* 720
+  "Blocks past the arm window a driver waits for every recovery voter to arm
+   before confiscating with fewer: the reference's own auto-dispute hold-off.")
+(defparameter *lottery-recovery-fee* 500
+  "Fixed, so every recovery voter rebuilds the same sweep.")
+(defconstant +lottery-recovery-csv+ 144)
+
+(defun lottery-claimable (node id-hex lottery)
+  "NIL when a revealed preimage is out of the claim leaf's bounds (it can never
+   be claimed), T when every participant revealed within them, else :UNKNOWN."
+  (let* ((ps (lot:lottery-participants lottery)) (k (length ps)) (reveals (reveals-of node id-hex))
+         (pre (mapcar (lambda (p) (cdr (find (lot:participant-pubkey p) reveals :key (lambda (r) (up:x-only (car r))) :test #'equalp)))
+                      ps)))
+    (cond ((some (lambda (x) (and x (> (length x) (+ 16 k)))) pre) nil)
+          ((every #'identity pre) t)
+          (t :unknown))))
+
+(defun build-lottery-recovery (node id-hex conf lottery)
+  "The CSV-144 recovery sweep of CONF's lottery output to the original operator:
+   (values tx prevouts leaf).  Deterministic, so every voter rebuilds it."
+  (let* ((operator (nth-value 4 (disputed-reserves node (find-record node id-hex))))
+         (amount (btx:txout-value (first (btx:tx-outputs conf))))
+         (tx (btx:parse-tx (bw:make-reader
+                            (btx:serialize-tx
+                             (btx:make-tx :version 2 :locktime 0 :segwit-p t
+                                          :inputs (list (btx:make-txin :prev-hash (btx:tx-txid conf) :prev-index 0 :script (octets)
+                                                                       :sequence +lottery-recovery-csv+))
+                                          :outputs (list (btx:make-txout :value (- amount *lottery-recovery-fee*)
+                                                                         :script (cat (octets 0 20) (cl-consensus.wire:hash160 operator))))
+                                          :witnesses (list nil))))))
+         (leaf (nth (lot::recovery-leaf-index lottery 0) (lot:lottery-leaves lottery))))
+    (values tx (vector (cons amount (lot:lottery-spk lottery))) leaf)))
+
+(defun confiscated-lottery (node id-hex)
+  "The confiscation of ID-HEX that is on chain, rebuilt from public state:
+   (values tx lottery state), STATE :PENDING while its lottery output is unspent,
+   :RECOVERED once our recovery sweep of it is; NIL if neither is found."
+  (when (node-chain-fn node)
+    (loop for respectful in '(t nil)
+          do (loop for ti below (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))
+                   for built = (ignore-errors (multiple-value-list (build-confiscation node id-hex :tier-index ti :respectful respectful)))
+                   when built
+                     do (destructuring-bind (tx lottery &rest rest) built
+                          (declare (ignore rest))
+                          (when (funcall (node-chain-fn node) (btx:tx-txid tx) 0)
+                            (return-from confiscated-lottery (values tx lottery :pending)))
+                          (when (funcall (node-chain-fn node) (btx:tx-txid (build-lottery-recovery node id-hex tx lottery)) 0)
+                            (return-from confiscated-lottery (values tx lottery :recovered))))))))
+
+(defun lottery-recovery-open-p (node conf)
+  (let ((info (funcall (node-chain-fn node) (btx:tx-txid conf) 0)))
+    (and info (>= (getf info :confirmations) +lottery-recovery-csv+))))
+
+(defun sweep-lottery (node id-hex conf lottery)
+  "Gather the recovery threshold's signatures (ours, then lottery_recovery_sign)
+   and broadcast the sweep.  Returns the signed tx."
+  (multiple-value-bind (tx prevouts leaf) (build-lottery-recovery node id-hex conf lottery)
+    (let* ((sighash (rot:tier-sighash tx 0 prevouts leaf))
+           (voters (lot::sorted-keys (lot:lottery-recovery-voters lottery)))
+           (threshold (lot:lottery-recovery-threshold lottery))
+           (me (up:x-only (node-pubkey node)))
+           (sigs (list (cons me (schnorr:schnorr-sign (node-priv node) sighash (random-aux))))))
+      (unless (member me voters :test #'equalp) (fail "not a recovery voter"))
+      (when (> threshold 1)
+        (dolist (r (send-request node id-hex "lottery_recovery_sign"
+                                 (w:json-object "sighash" (bytes->hex sighash) "unsigned_tx" (bytes->hex (btx:serialize-tx tx)))
+                                 :want (1- threshold) :timeout 20 :successes-only t))
+          (let ((res (w:jget r "result")))
+            (when (and (w:jget r "success") res)
+              (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
+                (when (and (member pk voters :test #'equalp) (schnorr:schnorr-verify pk sighash sig) (not (assoc pk sigs :test #'equalp)))
+                  (push (cons pk sig) sigs)))))))
+      (when (< (length sigs) threshold) (fail "only ~a of ~a recovery signatures" (length sigs) threshold))
+      (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) voters))
+             (signed (btx:parse-tx (bw:make-reader
+                                    (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs (btx:tx-inputs tx)
+                                                                   :outputs (btx:tx-outputs tx)
+                                                                   :witnesses (list (lot:recovery-witness lottery 0 ordered))))))))
+        (unless (rot:verify-spend signed 0 prevouts) (fail "assembled lottery recovery does not verify"))
+        (broadcast node signed)
+        signed))))
+
+(defun handle-lottery-recovery-sign (node event params)
+  "A recovery voter: sign the sweep only of a lottery that can never be claimed,
+   once its CSV has passed, and only the exact sweep we rebuild ourselves."
+  (let ((id (w:event-ledger-id event)))
+    (unless (find-fork node id (node-pubkey node)) (return-from handle-lottery-recovery-sign nil))
+    (handler-case
+        (multiple-value-bind (conf lottery state) (confiscated-lottery node id)
+          (unless (eq state :pending) (fail "no pending lottery on chain"))
+          (unless (null (lottery-claimable node id lottery)) (fail "the lottery can still be claimed"))
+          (unless (lottery-recovery-open-p node conf) (fail "recovery leaf not open yet (CSV ~a)" +lottery-recovery-csv+))
+          (multiple-value-bind (tx prevouts leaf) (build-lottery-recovery node id conf lottery)
+            (declare (ignore tx))
+            (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (w:jget params "unsigned_tx")))))
+                   (ours (rot:tier-sighash proposed 0 prevouts leaf)))
+              (unless (and (equalp ours (hex->bytes (w:jget params "sighash")))
+                           (equalp (btx:tx-txid proposed) (btx:tx-txid (build-lottery-recovery node id conf lottery))))
+                (fail "not the sweep we expect"))
+              (log! node "signed lottery recovery of ~a proposed by ~a" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8))
+              (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
+                                                           "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) ours (random-aux))))))))
+      (error (e) (log! node "refused lottery_recovery_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
+
 (defun note-dispute (node id-hex fmt &rest args)
   "Log a dispute's state only when it changes: a stuck dispute is retried every
    pass and would otherwise fill the log."
@@ -1183,56 +1297,90 @@
   "A DisputeEnter for a lapsed quorum, in either spelling we ever wrote."
   (and (stringp reason) (string= (substitute #\_ #\- reason) "quorum_expired")))
 
+(defun fork-lottery (node id-hex)
+  "(values confiscation lottery state) for ID-HEX, STATE :PENDING, :RECOVERED or
+   :SPENT (claimed), or NIL.  Found once by rebuilding (CONFISCATED-LOTTERY),
+   then kept on our forks so a pass costs a couple of UTXO lookups."
+  (let ((f (find-if (lambda (f) (and (record-confiscation f) (record-lottery f))) (forks-of node id-hex))))
+    (if f
+        (let ((tx (record-confiscation f)) (l (record-lottery f)))
+          (cond ((not (node-chain-fn node)) (values tx l :pending))
+                ((funcall (node-chain-fn node) (btx:tx-txid tx) 0) (values tx l :pending))
+                ((funcall (node-chain-fn node) (btx:tx-txid (build-lottery-recovery node id-hex tx l)) 0) (values tx l :recovered))
+                (t (values tx l :spent))))
+        (multiple-value-bind (tx l state) (confiscated-lottery node id-hex)
+          (when tx (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) tx (record-lottery f) l)))
+          (values tx l state)))))
+
 (defun drive-dispute (node fork)
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (h (height node)))
     (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
       (unless (and base enter) (return-from drive-dispute nil))
-      (when (or (fork-op fork :dispute-acquire) (fork-op fork :dispute-yield))
-        (when (loop for v being the hash-values of (node-pledges node) thereis (equal v id)) (release-pledges node id))
-        (return-from drive-dispute (note-dispute node id "concluded")))
-      ;; A quorum_expired dispute whose operator has since re-established the quorum
-      ;; (or that we opened on a stale replica): stand down, unless it is already
-      ;; confiscated.
-      (let ((expiry (lg:ledger-quorum-expiry (record-ledger base))))
-        (when (and (expiry-reason-p (op:field enter-op :reason)) expiry (<= h (+ expiry *expiry-grace-blocks*))
-                   (not (confiscation-on-chain node id)))
-          (commit-update node fork (new-update node fork (list :type :dispute-yield)))
-          (release-pledges node id)
-          (return-from drive-dispute (note-dispute node id "quorum re-established (expiry ~a); yielded" expiry))))
-      (let ((conf (confiscation-on-chain node id))
-            (reserves-spent (multiple-value-bind (r txid vout) (disputed-reserves node base)
-                              (declare (ignore r))
-                              (and (node-chain-fn node) (null (funcall (node-chain-fn node) txid vout))))))
-        (cond
-          ;; Nothing left to confiscate (a stranded rotation spent it): arming would
-          ;; only tie up a pledge.
-          ((and reserves-spent (not conf))
-           (note-dispute node id "reserves spent, but not by a confiscation we can rebuild"))
-          ((null (fork-op fork :dispute-armed))
-           (let ((p (pledge-collateral node id)))
-             (if p
-                 (progn (arm-dispute node fork :replacement p)
-                        (note-dispute node id "armed, pledging ~a:~a (~a sats)" (txid-hex (first p)) (second p) (third p)))
-                 (note-dispute node id "waiting for collateral (~a sats)" (required-replacement-sats base)))))
-          (conf
-           (if (not (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
-               (progn (publish-reveal node id)
+      (flet ((conclude (fmt &rest args)
+               (commit-update node fork (new-update node fork (list :type :dispute-yield)))
+               (release-pledges node id)
+               (return-from drive-dispute (apply #'note-dispute node id fmt args))))
+        (when (or (fork-op fork :dispute-acquire) (fork-op fork :dispute-yield))
+          (when (loop for v being the hash-values of (node-pledges node) thereis (equal v id)) (release-pledges node id))
+          (return-from drive-dispute (note-dispute node id "concluded")))
+        (multiple-value-bind (conf lottery lstate) (fork-lottery node id)
+          ;; A quorum_expired dispute whose operator has since re-established the
+          ;; quorum (or that we opened on a stale replica): stand down, unless it
+          ;; is already confiscated.
+          (let ((expiry (lg:ledger-quorum-expiry (record-ledger base))))
+            (when (and (expiry-reason-p (op:field enter-op :reason)) expiry (<= h (+ expiry *expiry-grace-blocks*)) (null conf))
+              (conclude "quorum re-established (expiry ~a); yielded" expiry)))
+          (when (eq lstate :recovered)
+            (conclude "lottery could not be claimed; recovered to the operator (sweep of ~a)" (txid-hex (btx:tx-txid conf))))
+          (let ((reserves-spent (multiple-value-bind (r txid vout) (disputed-reserves node base)
+                                  (declare (ignore r))
+                                  (and (node-chain-fn node) (null (funcall (node-chain-fn node) txid vout))))))
+            (cond
+              ;; Nothing left to confiscate (a stranded rotation spent it): arming
+              ;; would only tie up a pledge.
+              ((and reserves-spent (null conf))
+               (note-dispute node id "reserves spent, but not by a confiscation we can rebuild"))
+              ((null (fork-op fork :dispute-armed))
+               (let ((p (pledge-collateral node id)))
+                 (if p
+                     (progn (arm-dispute node fork :replacement p)
+                            (note-dispute node id "armed, pledging ~a:~a (~a sats)" (txid-hex (first p)) (second p) (third p)))
+                     (note-dispute node id "waiting for collateral (~a sats)" (required-replacement-sats base)))))
+              ((eq lstate :pending)
+               (cond ((not (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
+                      (publish-reveal node id)
                       (note-dispute node id "confiscation ~a on chain; revealed" (txid-hex (btx:tx-txid conf))))
-               (handler-case (let ((outcome (claim-or-yield node id :confiscation-txid (btx:tx-txid conf))))
-                               (release-pledges node id)
-                               (note-dispute node id "lottery: ~(~a~)" outcome))
-                 (error (e) (note-dispute node id "waiting to claim: ~a" e)))))
-          (t
-           (let ((closes (dispute-arm-closes node base))
-                 (armers (sort (mapcar #'first (armers-of node id)) #'bytes<)))
-             (cond ((< (length armers) 2) (note-dispute node id "armed; waiting for a second armer"))
-                   ((< h closes) (note-dispute node id "armed; arm window closes at ~a" closes))
-                   ((or (equalp (first armers) (node-pubkey node)) (>= h (+ closes *proposer-grace-blocks*)))
-                    (handler-case
-                        (let ((tx (confiscate node id :respectful (expiry-reason-p (op:field enter-op :reason)))))
-                          (note-dispute node id "proposed confiscation ~a" (txid-hex (btx:tx-txid tx))))
-                      (error (e) (note-dispute node id "confiscation not yet: ~a" e))))
-                   (t (note-dispute node id "armed; another armer proposes first"))))))))))
+                     ((null (lottery-claimable node id lottery))
+                      (if (lottery-recovery-open-p node conf)
+                          (handler-case (let ((tx (sweep-lottery node id conf lottery)))
+                                          (note-dispute node id "lottery cannot be claimed; swept to the operator (~a)" (txid-hex (btx:tx-txid tx))))
+                            (error (e) (note-dispute node id "lottery cannot be claimed; recovery not yet: ~a" e)))
+                          (note-dispute node id "lottery cannot be claimed (a preimage is out of the claim leaf's bounds); ~
+                                                 its recovery leaf opens after ~a confirmations" +lottery-recovery-csv+)))
+                     (t (handler-case (let ((outcome (claim-or-yield node id :confiscation-txid (btx:tx-txid conf))))
+                                        (release-pledges node id)
+                                        (note-dispute node id "lottery: ~(~a~)" outcome))
+                          (error (e) (note-dispute node id "waiting to claim: ~a" e))))))
+              (conf (note-dispute node id "lottery output spent"))
+              (t
+               (let* ((closes (dispute-arm-closes node base))
+                      (armers (sort (mapcar #'first (armers-of node id)) #'bytes<))
+                      (q (dispute-lottery-n base)) (k (length armers)))
+                 (cond ((< k 2) (note-dispute node id "armed; waiting for a second armer"))
+                       ((< h closes) (note-dispute node id "armed; arm window closes at ~a" closes))
+                       ;; Fewer than Q armed: the preimages were committed under Q, the
+                       ;; claim leaf will be built for k, and only (k/Q)^k of such
+                       ;; lotteries can be claimed (docs/LOTTERY-N.md).  Give the others
+                       ;; until the deadline before confiscating without them.
+                       ((and (< k q) (< h (+ closes *full-arming-wait-blocks*)))
+                        (note-dispute node id "~a of ~a armed; waiting for the rest until ~a" k q (+ closes *full-arming-wait-blocks*)))
+                       ((or (equalp (first armers) (node-pubkey node)) (>= h (+ closes *proposer-grace-blocks*)))
+                        (handler-case
+                            (let ((tx (confiscate node id :respectful (expiry-reason-p (op:field enter-op :reason)))))
+                              (note-dispute node id "proposed confiscation ~a~@[ with ~a of ~a armed~]" (txid-hex (btx:tx-txid tx))
+                                            (and (< k q) k) q))
+                          (error (e) (note-dispute node id "confiscation not yet: ~a" e))))
+                       (t (note-dispute node id "armed; another armer proposes first"))))))))))))
 
 (defun drive-disputes (node)
   (loop for rec in (loop for r being the hash-values of (node-ledgers node)
