@@ -164,10 +164,26 @@ never notices an expired quorum by itself.  B keeps committing post-expiry-allow
 which may be why the reference does not treat it as dead.  Next: a periodic expiry check in the
 cl node, and why the reference skips B.
 
+### 2026-09-27 — claim #4, second observation: the cl members now dispute; nobody arms
+
+Why the reference member did not dispute B: it waits `quorum_expiry + 720` before auto-disputing
+(`DEFAULT_GRACE_BLOCKS`, "give the operator a window to re-establish").  DEP-05 §Lifecycle row 3
+gives cosigners majority confiscation *at* quorum_expiry ("cosigners get majority confiscation
+immediately at expiry because they were trusted to keep the quorum healthy"), with operator
+re-establishment racing it — so the 720-block hold-off is reference policy, stricter than the
+spec.  The cl expiry watch (5ec1801) uses a 3-block grace and catches each replica up from the
+relay before judging it (cld2's replica of B was 5,600 updates behind on restart).
+
+Rolled out 23:40–23:56: cld2 and cld3 disputed B at 7207/7210, cld1 and cld4 disputed F, and the
+cl members disputed ~15 of ref2's small ledgers that expired after the same failed rotations.
+Every fork stops at DisputeEnter: on our side arming (DisputeArmed with replacement collateral)
+and confiscation are control-socket commands only, so custody does not move.  Next for claim #4:
+automatic arming and majority QuorumExpired confiscation in the cl member, then watch the
+reference members join at +720 (B: 7394; F: 7439).
+
 ### Open (2026-09-27)
 
-- **F expired too** (6719) while frozen; it moves again, but needs a rotation — the first real
-  exercise of the organic #5 fix.
-- **cl operators need restarting to take e5d7f63** (the prepared-hash anchor): C failed four
-  rotations on the old code last night and rotated at 23:07 only after cld2 was restarted.
-  cld1 still runs the old code (A is not due until ~10.7k).
+- **F expired too** (6719) while frozen, and is now disputed by cld1 and cld4 — so the organic
+  #5 rotation fix still has not been exercised on the devnet.
+- all four cl nodes now run e5d7f63 (anchor) and 5ec1801 (expiry watch); C rotated at 23:07
+  only after cld2 was restarted onto the anchor fix.
