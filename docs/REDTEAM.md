@@ -254,6 +254,30 @@ the honest minority is following it.  After one expiry dispute, the reference me
 Next: rerun on a ledger whose reference member is current (checked first), and in deposits-rust,
 stand down from an expiry dispute once the quorum is re-established and resume following.
 
+### 2026-09-27 — organic #8: the reference loses updates from its own ledger files
+
+Root-caused while fixing #7 (deposits-rust 713dd7e):
+
+- **ref3's saved copy of C is missing seqs 53,330 (TransferLock) and 60,353 (TransferComplete).**
+  The relay has both.  Replaying the file gives exactly the 497 `Insufficient deposit balance`
+  errors ref3 logs at every restart since 09-25, and rejects C's valid 67,860 with the logged
+  numbers.  With the two updates restored, 0 failures and 67,860 onward apply.  So ref3's
+  "NON-CONFORMING COSIGNED update … seq 67860" and its fork (reason `auto_dispute`) were a
+  **false accusation from a corrupt replica**, not an expiry dispute.  #7's blindness follows
+  from it.
+- **ref2's saved copy of A is missing seq 97,173** (0–100,130 held, A is at 132k).  A second
+  damaged file on a second node: the loss is systematic.  It is later than organic #1's fork at
+  81,027, so it does not prove #1 was the same cause, but #1 ("forked A on an unnamed rule";
+  the replica "held a different balance") has exactly this shape.
+- **Likely mechanism (unproven):** `compact_ledger` resets the persisted count to the trimmed
+  in-memory length, so an update added to memory but not yet written is counted as persisted and
+  never written.  Both of ref3's holes coincide with compaction events (`RAM 51008→50000`).  It can
+  hit any node holding more than ~50k updates of a ledger.
+- Also fixed in 713dd7e: the relay catch-up's early stop fired on any sequence at or below our
+  tip, which a heal burst of old updates triggers, so every catch-up began past the gap and
+  applied nothing; the expiry watch now judges only a current replica and stands down from a
+  quorum_expired dispute whose quorum returned.
+
 ### Open (2026-09-27)
 
 - **F's lottery** could not be claimed (organic #6); mitigated (c3cd4cd) and swept to the
