@@ -43,6 +43,7 @@
     (unless (cl-deposits.nostr-bus:wait-for-bus bus :seconds 20) (format t "~&relay not connected after 20 s; catching up later on demand~%"))
     (cl-deposits.node:catch-up-all node)   ; replicas may have missed updates while we were down
     (cl-deposits.node:start-transfer-timeout-poller node)   ; DEP-11: TransferFail past timeout_height
+    (cl-deposits.node:start-expiry-watch node)   ; DEP-19: dispute a quorum its operator let lapse
     (dolist (line (reverse (cl-deposits.node:node-log node))) (when (search "caught up" line) (format t "~&~a~%" line)))
     (format t "~&cl-deposits ~a on ~{~a~^,~}~%" (cl-deposits.node:node-pubkey-hex node) relays)
     (let ((cp (env "CLD_CONTROL_PORT")))

@@ -44,7 +44,8 @@
            #:node-height-of-block #:equivocate
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
-           #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary))
+           #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
+           #:dispute-expired-quorums #:start-expiry-watch #:*expiry-grace-blocks*))
 (in-package #:cl-deposits.node)
 
 (define-condition node-error (error)
@@ -1074,6 +1075,32 @@
 (defun start-transfer-timeout-poller (node &key (interval 30))
   (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (fail-expired-transfers node)))) :name "cld-timeouts"))
 
+;;; DEP-19 / DEP-11: a quorum member disputes an operator who let the quorum
+;;; lapse.  CHECK-EXPIRED-QUORUMS was only reachable from the control socket,
+;;; so no cl member ever noticed an expired quorum by itself: on the soak a
+;;; reference-operated ledger sat hours past quorum_expiry, still appending,
+;;; with no dispute from either implementation (docs/REDTEAM.md claim #4).
+(defparameter *expiry-grace-blocks* 3
+  "Blocks past quorum_expiry before a member disputes: room for a QuorumBegin
+   still propagating, so a rotation that just made it is not mistaken for a lapse.")
+
+(defun dispute-expired-quorums (node &key (grace *expiry-grace-blocks*))
+  "Catch every candidate replica up from the relay first (one that missed its
+   QuorumBegin would show the old expiry and accuse an operator who rotated),
+   then dispute what is still expired.  Returns the ledger ids disputed."
+  (let ((h (height node)))
+    (when (plusp h)
+      (loop for rec being the hash-values of (node-ledgers node)
+            when (expired-quorum-p node rec h grace)
+              do (ignore-errors (catch-up node rec)))
+      (let ((disputed (check-expired-quorums node :grace grace
+                                                  :anchor-block-hash (and (node-block-hash-fn node) (funcall (node-block-hash-fn node) h)))))
+        (dolist (id disputed) (log! node "quorum expired on ~a at height ~a: disputed" (subseq id 0 8) h))
+        disputed))))
+
+(defun start-expiry-watch (node &key (interval 60))
+  (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (dispute-expired-quorums node)))) :name "cld-expiry"))
+
 (defun start-invoice-poller (node &key (interval 3))
   (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (credit-paid-invoices node)))) :name "cld-invoices"))
 
@@ -1589,16 +1616,22 @@
 
 ;;; Respectful disputes: the quorum expired and the operator has not rotated.
 
-(defun check-expired-quorums (node &key anchor-block-hash)
-  "For every ledger we cosign whose quorum_expiry is behind the chain tip,
-   publish a QuorumExpired proof and open a dispute fork.  Returns the ledger ids disputed."
+(defun expired-quorum-p (node rec h grace)
+  "REC is a ledger we cosign whose quorum_expiry is more than GRACE blocks behind H."
+  (let ((ledger (record-ledger rec)))
+    (and (not (record-owned-p rec)) (not (record-fork-p rec))
+         (lg:ledger-quorum-expiry ledger) (> h (+ (lg:ledger-quorum-expiry ledger) grace))
+         (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
+         (not (find-fork node (record-id-hex rec) (node-pubkey node))))))
+
+(defun check-expired-quorums (node &key anchor-block-hash (grace 0))
+  "For every ledger we cosign whose quorum_expiry is more than GRACE blocks behind
+   the chain tip, publish a QuorumExpired proof and open a dispute fork.  Returns
+   the ledger ids disputed."
   (let ((h (height node)) (disputed '()))
     (loop for rec being the hash-values of (node-ledgers node)
           for ledger = (record-ledger rec)
-          when (and (not (record-owned-p rec)) (not (record-fork-p rec))
-                    (lg:ledger-quorum-expiry ledger) (> h (lg:ledger-quorum-expiry ledger))
-                    (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
-                    (not (find-fork node (record-id-hex rec) (node-pubkey node))))
+          when (expired-quorum-p node rec h grace)
             do (let ((proof (fr:make-quorum-expired-proof (lg:ledger-operator-key ledger) (hex->bytes (record-id-hex rec))
                                                           (or anchor-block-hash (make-array 32 :element-type '(unsigned-byte 8)))
                                                           (lg:ledger-quorum-expiry ledger))))
