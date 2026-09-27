@@ -216,10 +216,22 @@ Found on the way:
   an expiry dispute of ours was unrecognisable to it, and to our own driver (which would have
   confiscated without respect).  Fixed in the same commit.
 
+### 2026-09-27 — organic #6: the custody lottery's N is decided after it is committed to
+
+Details and options in **docs/LOTTERY-N.md**.  Both implementations commit preimages under
+N = Q (quorum members) but build the claim leaf with N = k (members who armed).  With k < Q the
+claim is possible only with probability (k/Q)^k — F (Q = 3, k = 2) drew a 19-byte preimage
+against an 18-byte bound and its lottery output (478,907 sats, confiscation ab2202be…) cannot
+be claimed; it is recoverable through the CSV-144 recovery leaf from height 7810.  The spec's
+partial-reveal leaves carry the same bounds-vs-modulus mismatch (sums above k² / k(k+1) have no
+dispatch arm).  Decision (2026-09-27): keep the spec for now; an unbiased fix (contributions in
+1..lcm(2..Q)) is written up there.
+
 ### Open (2026-09-27)
 
-- **F's lottery**: reveals out; the claim needs every armer's reveal.  The organic #5 rotation
-  fix still has not been exercised on the devnet.
+- **F's lottery** cannot be claimed (organic #6); sweep it through the recovery leaf once
+  CSV 144 passes (height 7810).  Neither driver does that yet.  The organic #5 rotation fix still
+  has not been exercised on the devnet.
 - **B**: reserves spent by the stranded rotation, so nothing to confiscate; the driver says so
   and does not arm.  The funds sit in tb1p6q0j… until someone recovers that vault.
 - **catch-up stopped on INSUFFICIENT-BALANCE replaying D** (cl operator, cl replica) — a fold
