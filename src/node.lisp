@@ -1401,9 +1401,24 @@
             (floor (+ (op:field qb :amount) (op:field qb :collateral-amount)) 1000)
             operator)))
 
-(defun build-confiscation (node id-hex &key respectful (fee 1000))
+(defun confiscation-tier (reserves h)
+  "The reserves tier a confiscation signs at height H: the lowest threshold whose
+   CLTV has passed, never the operator's tie-breaker tier.  DEP-06 §Phase 2: a
+   strict majority at Tier 0, a minority from quorum_expiry + 720, one member
+   from + 4032.  Always signing Tier 0 meant a quorum short of a majority of
+   armers could not confiscate even after the minority leaf opened."
+  (let ((best 0))
+    (loop for tier in (rs:reserves-tiers reserves) for i from 0
+          when (and (not (rs:tier-tie-breaker-p tier)) (<= (rs:tier-locktime tier) h)
+                    (< (rs:tier-threshold tier) (rs:tier-threshold (nth best (rs:reserves-tiers reserves)))))
+            do (setf best i))
+    best))
+
+(defun build-confiscation (node id-hex &key respectful (fee 1000) tier-index)
   "The confiscation transaction for a disputed ledger, from public state only,
-   so every cosigner rebuilds the same one.  Returns (values tx lottery prevouts reserves)."
+   so every cosigner rebuilds the same one.  It spends the reserves through
+   TIER-INDEX (default: the tier open at our height), its nLockTime that tier's
+   CLTV.  Returns (values tx lottery prevouts reserves tier-index)."
   (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
          (armers (sort (copy-list (armers-of node id-hex)) #'bytes< :key #'first))
          (voters (recovery-voters base))
@@ -1413,34 +1428,38 @@
     (when (< (length participants) 2) (fail "fewer than two armers"))
     (check-armer-collateral node base armers)
     (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node base)
-      (let* ((outs (lot:confiscation-outputs (lot:lottery-spk lottery) sats fee :respectful respectful
+      (let* ((tier-index (or tier-index (confiscation-tier reserves (height node))))
+             (locktime (rs:tier-locktime (nth tier-index (rs:reserves-tiers reserves))))
+             (outs (lot:confiscation-outputs (lot:lottery-spk lottery) sats fee :respectful respectful
                                              :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
                                              :operator-pubkey33 operator))
              (tx (btx:parse-tx (bw:make-reader
                                 (btx:serialize-tx
-                                 (btx:make-tx :version 2 :locktime 0 :segwit-p t
+                                 (btx:make-tx :version 2 :locktime locktime :segwit-p t
                                               :inputs (list (btx:make-txin :prev-hash txid :prev-index vout :script (octets) :sequence rot:+sequence-rbf+))
                                               :outputs (loop for (spk . v) in outs collect (btx:make-txout :value v :script spk))
                                               :witnesses (list nil)))))))
-        (values tx lottery (vector (cons sats (rs:reserves-spk reserves))) reserves)))))
+        (values tx lottery (vector (cons sats (rs:reserves-spk reserves))) reserves tier-index)))))
 
-(defun confiscation-sighash (tx prevouts reserves) (rot:tier-sighash tx 0 prevouts (first (rs:reserves-leaves reserves))))
+(defun confiscation-sighash (tx prevouts reserves &optional (tier-index 0))
+  (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves reserves))))
 
 (defun confiscate (node id-hex &key respectful (fee 1000))
   "Build the confiscation, gather the recovery quorum's tier-0 signatures over
    the relay (confiscation_sign), assemble, and broadcast.  Returns (values tx lottery)."
-  (multiple-value-bind (tx lottery prevouts reserves) (build-confiscation node id-hex :respectful respectful :fee fee)
-    (let* ((sighash (confiscation-sighash tx prevouts reserves))
-           (tier (first (rs:reserves-tiers reserves)))
+  (multiple-value-bind (tx lottery prevouts reserves tier-index) (build-confiscation node id-hex :respectful respectful :fee fee)
+    (let* ((sighash (confiscation-sighash tx prevouts reserves tier-index))
+           (tier (nth tier-index (rs:reserves-tiers reserves)))
            (keys (rs:tier-keys tier))
            (ours (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))
            (sigs (list (cons (up:x-only (node-pubkey node)) ours)))
            (responses (send-request node id-hex "confiscation_sign"
                                     ;; The reference's field names: sighash, unsigned_tx, last_valid_sequence.
                                     (w:json-object "sighash" (bytes->hex sighash) "respectful" (and respectful t) "fee_sats" fee
+                                                   "tier_index" tier-index
                                                    "unsigned_tx" (bytes->hex (btx:serialize-tx tx))
                                                    "last_valid_sequence" (lg:ledger-sequence (record-ledger (or (find-fork node id-hex (node-pubkey node)) (find-record node id-hex)))))
-                                    :want (1- (rs:tier-threshold (first (rs:reserves-tiers reserves)))) :timeout 20 :successes-only t)))
+                                    :want (1- (rs:tier-threshold tier)) :timeout 20 :successes-only t)))
       (dolist (r responses)
         (let ((res (w:jget r "result")))
           (unless (w:jget r "success") (log! node "confiscation_sign refused: ~a" (w:jget r "error")))
@@ -1451,7 +1470,7 @@
                 (push (cons pk sig) sigs))))))
       (when (< (length sigs) (rs:tier-threshold tier)) (fail "only ~a of ~a confiscation signatures" (length sigs) (rs:tier-threshold tier)))
       (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
-             (signed (rot:attach-tier-witness tx 0 reserves 0 ordered)))
+             (signed (rot:attach-tier-witness tx 0 reserves tier-index ordered)))
         (unless (rot:verify-spend signed 0 prevouts) (fail "assembled confiscation does not verify"))
         (broadcast node signed)
         (dolist (fork (forks-of node id-hex)) (setf (record-lottery fork) lottery (record-confiscation fork) signed))
@@ -1475,9 +1494,20 @@
                (fee (or (w:jget params "fee_sats")
                         (- (nth-value 3 (disputed-reserves node (or (find-record node id) (fail "unknown ledger")))) outputs-total)))
                (respectful (let ((r (w:jget params "respectful"))) (if (eq r nil) (> (length (btx:tx-outputs proposed)) 1) r))))
-          (multiple-value-bind (tx lottery prevouts reserves)
-              (build-confiscation node id :respectful respectful :fee fee)
-            (let ((expected (confiscation-sighash proposed prevouts reserves)))
+          (multiple-value-bind (tx lottery prevouts reserves tier-index)
+              ;; The proposer names its tier (the reference's `tier_index`; else the
+              ;; one whose CLTV is the proposed nLockTime).  It must be open at our height.
+              (let* ((reserves (disputed-reserves node (or (find-record node id) (fail "unknown ledger"))))
+                     (tiers (rs:reserves-tiers reserves))
+                     (ti (or (w:jget params "tier_index")
+                             (position (btx:tx-locktime proposed) tiers :key #'rs:tier-locktime)
+                             (fail "no tier has CLTV ~a" (btx:tx-locktime proposed)))))
+                (unless (and (integerp ti) (< -1 ti (length tiers))) (fail "tier_index ~a out of range" ti))
+                (when (rs:tier-tie-breaker-p (nth ti tiers)) (fail "the operator's tier is not a confiscation tier"))
+                (when (> (rs:tier-locktime (nth ti tiers)) (height node))
+                  (fail "tier ~a opens at ~a, we are at ~a" ti (rs:tier-locktime (nth ti tiers)) (height node)))
+                (build-confiscation node id :respectful respectful :fee fee :tier-index ti))
+            (let ((expected (confiscation-sighash proposed prevouts reserves tier-index)))
               (unless (equalp expected (hex->bytes (w:jget params "sighash")))
                 (fail "sighash is not for the confiscation we expect (ours: sats ~a, reserves spk ~a, base seq ~a, outputs ~a)"
                       (car (aref prevouts 0)) (subseq (bytes->hex (cdr (aref prevouts 0))) 0 16)
@@ -1553,10 +1583,20 @@
    (values :won-or-:yielded claim-tx)."
   (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork")))
          (lottery (or (record-lottery fork)
-                      ;; After a restart: rebuild from public state (the unsigned tx has the claim's txid).
-                      (multiple-value-bind (tx l) (build-confiscation node id-hex)
-                        (setf (record-lottery fork) l (record-confiscation fork) tx)
-                        l)))
+                      ;; After a restart: rebuild from public state (the unsigned tx has the claim's
+                      ;; txid).  Its nLockTime is its tier's CLTV, so take the tier whose rebuild is
+                      ;; the one on chain; without a chain view, the tier open now.
+                      (let ((n (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))))
+                        (destructuring-bind (tx l &rest rest)
+                            (or (and (node-chain-fn node)
+                                     (loop for ti below n
+                                           for built = (ignore-errors (multiple-value-list (build-confiscation node id-hex :tier-index ti)))
+                                           when (and built (funcall (node-chain-fn node) (btx:tx-txid (first built)) 0))
+                                             return built))
+                                (multiple-value-list (build-confiscation node id-hex)))
+                          (declare (ignore rest))
+                          (setf (record-lottery fork) l (record-confiscation fork) tx)
+                          l))))
          (participants (lot:lottery-participants lottery))
          (reveals (reveals-of node id-hex))
          (preimages (mapcar (lambda (p) (or (cdr (find (lot:participant-pubkey p) reveals :key (lambda (r) (up:x-only (car r))) :test #'equalp))

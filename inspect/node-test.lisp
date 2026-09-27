@@ -563,4 +563,30 @@
         (check-equal "and does not dispute twice" (nd:dispute-expired-quorums b :grace 3) '())
         (check-equal "the operator never disputes its own ledger" (nd:dispute-expired-quorums a :grace 3) '())))))
 
+(with-gate ("confiscation signs the tier open at the height: a minority past expiry + 720")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:ac" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00dc")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
+    (let* ((expiry (lg:ledger-quorum-expiry (nd:record-ledger la)))
+           (reserves (nd::disputed-reserves b (nd:find-record b id))))
+      (check-equal "just past expiry: Tier 0 (majority)" (nd::confiscation-tier reserves (+ expiry 1)) 0)
+      (check-equal "at expiry + 720: Tier 1 (minority)" (nd::confiscation-tier reserves (+ expiry 720)) 1)
+      (check "the operator's tie-breaker tier is never chosen"
+             (not (rs:tier-tie-breaker-p (nth (nd::confiscation-tier reserves (+ expiry 9000)) (rs:reserves-tiers reserves)))))
+      (let ((*height* (+ expiry 721)))
+        ;; Only b and c dispute and arm; d stays out.  A majority of four voters is
+        ;; out of reach, the Tier-1 minority (one) is not.
+        (dolist (m (list b c)) (nd:dispute-expired-quorums m :grace 3) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m))))
+        (multiple-value-bind (ctx lottery) (nd:confiscate b id :respectful t)
+          (declare (ignore lottery))
+          (check-equal "nLockTime is Tier 1's CLTV" (btx:tx-locktime ctx) (+ expiry 720))
+          (check "the one-signature Tier-1 spend verifies"
+                 (rot:verify-spend ctx 0 (vector (cons (floor (+ 15600000 23400000) 1000) (rs:reserves-spk reserves))))))))))
+
 (report)
