@@ -30,10 +30,16 @@ expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "$1";; esac; }
 refwallet() { local dir=$1; shift; WALLET_DATA_DIR="$dir" timeout 180 "$REF_WALLET_BIN" "$@" --relay "$RELAY_URL" --network "$CLD_CHAIN" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -vE '^\S*(INFO|WARN|ERROR)|^\[' ; }
 dep_id() { python3 -c "import json,sys; print([d['deposit_id'] for d in json.load(open('$1/deposits.json')) if d['alias']=='$2'][0])"; }
 ref_members() { ref_cli "$1" quorum list | awk -v l="$(echo "$2" | cut -c1-16)" '/^  [0-9a-f]{16}/ { inblk = index($1, l) == 1; next } inblk && /^    [0-9a-f]/ { print }'; }
-retry_add() { local i; for i in 1 2 3 4; do ref_cli "$1" quorum add "$2" "$3" "$4" >/dev/null 2>&1 || true; ref_members "$1" "$2" | grep -q "$(echo "$3" | cut -c1-16)" && return 0; sleep 5; done; return 1; }
-pubkey_of() { case "$1" in cld*) cld_pubkey "$1";; ref*) ref_pubkey "$1";; esac; }
+retry_add() { local i; [ -n "$3" ] && [ -n "$4" ] || return 1; for i in 1 2 3 4; do ref_cli "$1" quorum add "$2" "$3" "$4" >/dev/null 2>&1 || true; ref_members "$1" "$2" | grep -q "$(echo "$3" | cut -c1-16)" && return 0; sleep 5; done; return 1; }
+pubkey_of() {   # the reference CLI's show-identity can come back empty while its daemon is busy: an
+               # empty key once matched every member in retry_add and reached add-member as ""
+  local i k; for i in 1 2 3 4 5 6; do
+    k=$(case "$1" in cld*) cld_pubkey "$1";; ref*) ref_pubkey "$1";; esac)
+    [ -n "$k" ] && { echo "$k"; return 0; }; sleep 5
+  done; fail "no pubkey for $1"; }
 own_ledger() {   # own_ledger NODE — the (quorum-less) ledger a node cites when it joins another's quorum; opened once, kept in env
   local var; case "$1" in cld*) var="L${1#cld}";; ref*) var="RL${1#ref}";; esac
+  [ -f "$ENV" ] && source "$ENV"   # called inside $(...): what an earlier call recorded lives only in the file
   if [ -z "${!var:-}" ]; then
     local id; case "$1" in
       cld*) id=$(sx "$(cld_ctl "$1" "(:open-ledger :reserves-id \"genesis:$1:soak:$RANDOM\")")" ":LEDGER");;
