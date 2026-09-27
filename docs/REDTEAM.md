@@ -227,6 +227,33 @@ partial-reveal leaves carry the same bounds-vs-modulus mismatch (sums above k² 
 dispatch arm).  Decision (2026-09-27): keep the spec for now; an unbiased fix (contributions in
 1..lcm(2..Q)) is written up there.
 
+### 2026-09-27 — attack #1 run, and organic #7: a reference member that disputed stays blind
+
+**Attack #1** (`redteam/attack1-invalid-credit.sh`, ledger C: cld2 operates; cld3, cld4, ref3
+cosign), a credit of twice the reserves:
+
+- **Honest arm: pass for the cl cosigners.** Both refused on the merits: `OVER-OBLIGATION (credit
+  40000000000 would take obligations 480000000 over reserves 20000000000)`.  Nothing committed.
+  ref3 never evaluated it: it dropped every request as `stale_cosign` (age 2–11 s; its loop is
+  seconds behind).
+- **Collude arm.**  The first run tested nothing: the operator's own commit refused its
+  invalid update, so nothing was published.  After 22bf055 the colluding operator publishes it
+  (seq 101369, cosigned by cld3 and cld4).  **ref3, the honest minority, did not detect it within
+  600 s.**
+
+**Why (organic #7):** ref3's replica of C has been frozen at seq 67,860 since 2026-09-26 07:45.
+It forked C at 67,859 when C had expired during the relay outage; cld2 re-established the quorum
+at 07:41 and C has run for a day since, but ref3 never followed the canonical chain again.  Every
+update is a "gap", its reimport fetches 35k updates and applies none, and it re-fires
+`Auto-dispute: ledger 2b01cc1a is past quorum_expiry` every minute from the stale replica: a
+false accusation, the reference-side twin of cl's D bug (fixed on our side in 7913002 by judging
+only a current replica and standing down when the quorum returns).
+
+**Claim #1 on the devnet as it stands:** a strict-majority cosign protects the ledger only while
+the honest minority is following it.  After one expiry dispute, the reference member was not.
+Next: rerun on a ledger whose reference member is current (checked first), and in deposits-rust,
+stand down from an expiry dispute once the quorum is re-established and resume following.
+
 ### Open (2026-09-27)
 
 - **F's lottery** could not be claimed (organic #6); mitigated (c3cd4cd) and swept to the
