@@ -561,7 +561,25 @@
         (check-equal "past the grace, member b disputes on its own" (nd:dispute-expired-quorums b :grace 3) (list id))
         (check "b forked" (nd:find-fork b id (nd:node-pubkey b)))
         (check-equal "and does not dispute twice" (nd:dispute-expired-quorums b :grace 3) '())
-        (check-equal "the operator never disputes its own ledger" (nd:dispute-expired-quorums a :grace 3) '())))))
+        (check-equal "the operator never disputes its own ledger" (nd:dispute-expired-quorums a :grace 3) '())
+        ;; c's replica is behind the relay (it missed the tail): it must not judge.
+        (let* ((rec (nd:find-record c id))
+               (stale (nd::make-record :id-hex id :ledger (lg:replay (reverse (rest (nd::record-history rec))))
+                                       :history (rest (nd::record-history rec)))))
+          (setf (gethash id (nd:node-ledgers c)) stale)
+          (check-equal "a replica behind the relay does not judge" (nd:dispute-expired-quorums c :grace 3) '())
+          (setf (gethash id (nd:node-ledgers c)) rec))
+        ;; The operator re-establishes (establishment ops stay cosignable past expiry):
+        ;; b, which disputed, stands down.
+        (let ((*height* (+ expiry 5)))
+          (dolist (m (list c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+          (nd:add-member a la (nd:node-pubkey b) :member-ledger-id (nd::node-member-ledger-hex b))
+          (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00dbb")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+          (check "the quorum was re-established" (> (lg:ledger-quorum-expiry (nd:record-ledger (nd:find-record b id))) *height*))
+          (nd:drive-disputes b)
+          (check-equal "the DisputeEnter reason is the reference's" 
+                       (op:field (nth-value 1 (nd::fork-op (nd:find-fork b id (nd:node-pubkey b)) :dispute-enter)) :reason) "quorum_expired")
+          (check "b yielded its now-baseless dispute" (nd::fork-op (nd:find-fork b id (nd:node-pubkey b)) :dispute-yield)))))))
 
 (with-gate ("confiscation signs the tier open at the height: a minority past expiry + 720")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))

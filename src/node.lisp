@@ -1089,17 +1089,33 @@
   "Blocks past quorum_expiry before a member disputes: room for a QuorumBegin
    still propagating, so a rotation that just made it is not mistaken for a lapse.")
 
+(defun relay-tip-seq (node id-hex operator33)
+  "The highest sequence among the newest updates the relays hold for ID-HEX from
+   its OPERATOR33 (members' forks share the ledger's tag), or NIL."
+  (loop for e in (bus:bus-fetch (node-bus node)
+                                (flt:make-filter :kinds (list w:+kind-update+) :limit 20
+                                                 :tags (list (cons "d" (list (subseq id-hex 0 16))))))
+        for u = (ignore-errors (w:event->update e))
+        when (and u (string= (bytes->hex (up:update-ledger-id u)) id-hex) (equalp (up:update-operator-id u) operator33))
+          maximize (up:update-seq u)))
+
 (defun dispute-expired-quorums (node &key (grace *expiry-grace-blocks*))
-  "Catch every candidate replica up from the relay first (one that missed its
-   QuorumBegin would show the old expiry and accuse an operator who rotated),
-   then dispute what is still expired.  Returns the ledger ids disputed."
+  "Dispute every quorum we sit on that is past expiry — judged only on a replica
+   that is current.  One that missed its QuorumBegin shows the old expiry and
+   would accuse an operator who rotated: on the soak cld1, just restarted, held
+   ledger D at 127572 of 138728, a rotation at 128928 never reached, and
+   disputed it.  A replica behind the relay is left alone (the replica lane
+   catches it up; catching up here raced that lane).  Returns the ids disputed."
   (let ((h (height node)))
     (when (plusp h)
-      (loop for rec being the hash-values of (node-ledgers node)
-            when (expired-quorum-p node rec h grace)
-              do (ignore-errors (catch-up node rec)))
-      (let ((disputed (check-expired-quorums node :grace grace
-                                                  :anchor-block-hash (and (node-block-hash-fn node) (funcall (node-block-hash-fn node) h)))))
+      (let* ((stale (loop for rec being the hash-values of (node-ledgers node)
+                          when (expired-quorum-p node rec h grace)
+                            when (let ((tip (ignore-errors (relay-tip-seq node (record-id-hex rec) (lg:ledger-operator-key (record-ledger rec))))))
+                                   (and tip (> tip (lg:ledger-sequence (record-ledger rec)))))
+                              collect (record-id-hex rec)))
+             (disputed (check-expired-quorums node :grace grace :skip stale
+                                                   :anchor-block-hash (and (node-block-hash-fn node) (funcall (node-block-hash-fn node) h)))))
+        (dolist (id stale) (note-dispute node id "quorum looks expired but our replica is behind the relay: not judging"))
         (dolist (id disputed) (log! node "quorum expired on ~a at height ~a: disputed" (subseq id 0 8) h))
         disputed))))
 
@@ -1150,6 +1166,10 @@
       (setf (gethash id-hex (node-dispute-notes node)) line)
       (log! node "dispute ~a: ~a" (subseq id-hex 0 8) line))))
 
+(defun expiry-reason-p (reason)
+  "A DisputeEnter for a lapsed quorum, in either spelling we ever wrote."
+  (and (stringp reason) (string= (substitute #\_ #\- reason) "quorum_expired")))
+
 (defun drive-dispute (node fork)
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (h (height node)))
     (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
@@ -1157,6 +1177,15 @@
       (when (or (fork-op fork :dispute-acquire) (fork-op fork :dispute-yield))
         (when (loop for v being the hash-values of (node-pledges node) thereis (equal v id)) (release-pledges node id))
         (return-from drive-dispute (note-dispute node id "concluded")))
+      ;; A quorum_expired dispute whose operator has since re-established the quorum
+      ;; (or that we opened on a stale replica): stand down, unless it is already
+      ;; confiscated.
+      (let ((expiry (lg:ledger-quorum-expiry (record-ledger base))))
+        (when (and (expiry-reason-p (op:field enter-op :reason)) expiry (<= h (+ expiry *expiry-grace-blocks*))
+                   (not (confiscation-on-chain node id)))
+          (commit-update node fork (new-update node fork (list :type :dispute-yield)))
+          (release-pledges node id)
+          (return-from drive-dispute (note-dispute node id "quorum re-established (expiry ~a); yielded" expiry))))
       (let ((conf (confiscation-on-chain node id))
             (reserves-spent (multiple-value-bind (r txid vout) (disputed-reserves node base)
                               (declare (ignore r))
@@ -1187,7 +1216,7 @@
                    ((< h closes) (note-dispute node id "armed; arm window closes at ~a" closes))
                    ((or (equalp (first armers) (node-pubkey node)) (>= h (+ closes *proposer-grace-blocks*)))
                     (handler-case
-                        (let ((tx (confiscate node id :respectful (equal (op:field enter-op :reason) "quorum_expired"))))
+                        (let ((tx (confiscate node id :respectful (expiry-reason-p (op:field enter-op :reason)))))
                           (note-dispute node id "proposed confiscation ~a" (txid-hex (btx:tx-txid tx))))
                       (error (e) (note-dispute node id "confiscation not yet: ~a" e))))
                    (t (note-dispute node id "armed; another armer proposes first"))))))))))
@@ -1767,14 +1796,14 @@
          (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
          (not (find-fork node (record-id-hex rec) (node-pubkey node))))))
 
-(defun check-expired-quorums (node &key anchor-block-hash (grace 0))
+(defun check-expired-quorums (node &key anchor-block-hash (grace 0) skip)
   "For every ledger we cosign whose quorum_expiry is more than GRACE blocks behind
-   the chain tip, publish a QuorumExpired proof and open a dispute fork.  Returns
-   the ledger ids disputed."
+   the chain tip (and whose id is not in SKIP), publish a QuorumExpired proof and
+   open a dispute fork.  Returns the ledger ids disputed."
   (let ((h (height node)) (disputed '()))
     (loop for rec being the hash-values of (node-ledgers node)
           for ledger = (record-ledger rec)
-          when (expired-quorum-p node rec h grace)
+          when (and (expired-quorum-p node rec h grace) (not (member (record-id-hex rec) skip :test #'equal)))
             do (let ((proof (fr:make-quorum-expired-proof (lg:ledger-operator-key ledger) (hex->bytes (record-id-hex rec))
                                                           (or anchor-block-hash (make-array 32 :element-type '(unsigned-byte 8)))
                                                           (lg:ledger-quorum-expiry ledger))))
@@ -1926,7 +1955,11 @@
                                      ((:equivocation :non-conforming-update) (1- (getf (getf proof :evidence) (if (eq (getf proof :type) :equivocation) :sequence :fault-sequence))))
                                      (t (lg:ledger-sequence (record-ledger rec)))))))
               (log! node "fraud proof ~a on ~a verified: disputing from seq ~a" (getf proof :type) (subseq id 0 8) last-valid)
-              (enter-dispute node rec last-valid :reason (string-downcase (symbol-name (getf proof :type)))))
+              (enter-dispute node rec last-valid
+                             ;; snake_case, as the reference writes and matches it
+                             ;; ("quorum_expired", dispute.rs); "quorum-expired" made our
+                             ;; expiry disputes unrecognisable, to it and to our own driver.
+                             :reason (substitute #\_ #\- (string-downcase (symbol-name (getf proof :type))))))
             (log! node "fraud proof rejected: ~a" why))))))
 
 ;;; ---------------------------------------------------------------------------
