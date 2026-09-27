@@ -269,6 +269,10 @@ Root-caused while fixing #7 (deposits-rust 713dd7e):
   damaged file on a second node: the loss is systematic.  It is later than organic #1's fork at
   81,027, so it does not prove #1 was the same cause, but #1 ("forked A on an unnamed rule";
   the replica "held a different balance") has exactly this shape.
+- **Sweep of every reference ledger file over 100 kB:** every large ledger a reference node
+  *replicates* has holes, and neither ledger they *operate* has any — ref2: F 1,002 missing (seq
+  100,033 and a contiguous run from 121,035), D 3, A 1, B (operated) 0; ref3: B 6, E 4, C 2,
+  F (operated) 0.  The loss is on the replica path.
 - **Likely mechanism (unproven):** `compact_ledger` resets the persisted count to the trimmed
   in-memory length, so an update added to memory but not yet written is counted as persisted and
   never written.  Both of ref3's holes coincide with compaction events (`RAM 51008→50000`).  It can
