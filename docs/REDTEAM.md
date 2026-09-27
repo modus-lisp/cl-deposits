@@ -181,9 +181,48 @@ and confiscation are control-socket commands only, so custody does not move.  Ne
 automatic arming and majority QuorumExpired confiscation in the cl member, then watch the
 reference members join at +720 (B: 7394; F: 7439).
 
+### 2026-09-27 — claim #4 holds on chain: a cl member confiscated an expired reference ledger by itself
+
+F (ref3's, expired 6719) was disputed by the cl expiry watch, armed by hand to learn the path,
+then driven by the dispute driver (21be4ed): cld1 proposed the respectful confiscation
+ab2202be… at Tier 1 (legacy ruleset: minority after block 1008) with one signature, and it is on
+chain — 478,907 sats to the lottery (the obligations), 49,519,093 back to the operator.  Both cl
+armers revealed.  What it took, in order:
+
+- **Tier by height (082a602).**  Confiscation always signed Tier 0 (3 of F's 4 voters); the
+  reference member refused ("Not armed"), so 2 of 3 was a dead end.  DEP-06 opens a minority leaf
+  at expiry + 720; cl now signs the tier open at the height and sends the reference's
+  `tier_index`.
+- **A collateral wallet (440ba29).**  A cl node had no view of its own coins.  It now finds UTXOs
+  at its key-path address (scantxoutset), pledges one covering the stricter of our floor and the
+  reference's (ceil(obligations × collateral/reserves) + 5,000 sats), whole and at full value
+  (the claim signs that input for exactly the declared amount), never twice, and consolidates when
+  no single coin fits.
+- **The dispute driver (21be4ed):** arm with a pledge, propose when the arm window closes,
+  reveal once the confiscation is on chain, claim or yield.
+
+Found on the way:
+- **The reference's recovery CLI cannot handle a ledger past 500 updates**: 15 single-page
+  `.limit(500)` fetches in node_cli/recovery.rs, so `recovery dispute` on F failed "No LedgerOpen
+  found (seq 0)".  Its daemon path (auto-arm at expiry + 720) uses the fixed pager.
+- **The reference neither sets nor enforces `dispute_arm_blocks`** (always None); cl uses 6.
+- **DEP-06 §Phase 2's "recovery quorum (quorum members minus the disputants — the disputed
+  operator + non-arming members)" reads either way**; both implementations take it as the armers.
+- **A cl member falsely disputed D** (cl-operated, rotated to 8256): cld1's replica, just
+  restarted, was behind the rotation; the watch's catch-up raced the replica lane and stopped, and
+  the stale replica was judged.  Fixed (7913002): judge only a replica at the relay's tip, never
+  catch up from the watch, and yield a quorum_expired dispute whose quorum has returned.
+- **Our fraud path wrote "quorum-expired"**, the reference writes and matches "quorum_expired";
+  an expiry dispute of ours was unrecognisable to it, and to our own driver (which would have
+  confiscated without respect).  Fixed in the same commit.
+
 ### Open (2026-09-27)
 
-- **F expired too** (6719) while frozen, and is now disputed by cld1 and cld4 — so the organic
-  #5 rotation fix still has not been exercised on the devnet.
+- **F's lottery**: reveals out; the claim needs every armer's reveal.  The organic #5 rotation
+  fix still has not been exercised on the devnet.
+- **B**: reserves spent by the stranded rotation, so nothing to confiscate; the driver says so
+  and does not arm.  The funds sit in tb1p6q0j… until someone recovers that vault.
+- **catch-up stopped on INSUFFICIENT-BALANCE replaying D** (cl operator, cl replica) — a fold
+  or ordering disagreement between two cl nodes; not chased yet.
 - all four cl nodes now run e5d7f63 (anchor) and 5ec1801 (expiry watch); C rotated at 23:07
   only after cld2 was restarted onto the anchor fix.
