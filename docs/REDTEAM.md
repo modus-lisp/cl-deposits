@@ -273,7 +273,17 @@ Root-caused while fixing #7 (deposits-rust 713dd7e):
   *replicates* has holes, and neither ledger they *operate* has any — ref2: F 1,002 missing (seq
   100,033 and a contiguous run from 121,035), D 3, A 1, B (operated) 0; ref3: B 6, E 4, C 2,
   F (operated) 0.  The loss is on the replica path.
-- **Likely mechanism (unproven):** `compact_ledger` resets the persisted count to the trimmed
+- **Mechanism, confirmed and fixed (deposits-rust 4cdf348):** the persisted cursor was an index
+  into the in-memory history, reset by compaction, which ran while replica updates were applied
+  from three places (ledger actor, relay reimport, event-store catch-up).  Two losses, each
+  reproduced by a test that failed before the fix: compaction between an apply and its save
+  (single holes; a whole reimport batch if unsaved), and compaction *during* a save, whose stale
+  length then skipped ~1,000 updates — ref2's log shows `compact_ledger: RAM 51001→50000` then
+  `persist_ledger_to_disk: 51001 entries (+1)` for F, which lost 121,035–122,035.  The cursor is now
+  a sequence, only advanced; trims drop only persisted updates; saves per ledger are serialised;
+  files with holes are detected at load, repaired from the relay when the fill chains exactly,
+  and otherwise kept out of dispute judgments.
+- **Earlier guess:** `compact_ledger` resets the persisted count to the trimmed
   in-memory length, so an update added to memory but not yet written is counted as persisted and
   never written.  Both of ref3's holes coincide with compaction events (`RAM 51008→50000`).  It can
   hit any node holding more than ~50k updates of a ledger.
