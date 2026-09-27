@@ -1149,6 +1149,19 @@
                   (if named (reduce #'max named) *default-dispute-arm-blocks*))))
     (and entered (+ entered window))))
 
+(defun rebuild-confiscation-on-chain (node id-hex)
+  "Rebuild ID-HEX's confiscation from public state as the one whose lottery
+   output is in the UTXO set: (tx lottery prevouts reserves tier), or NIL.  Its
+   txid depends on the tier (nLockTime) and on whether it was respectful (the
+   operator's change output), so both are tried; a rebuild with the defaults
+   (non-respectful) never matched a respectful confiscation after a restart."
+  (when (node-chain-fn node)
+    (loop for respectful in '(t nil)
+          thereis (loop for ti below (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))
+                        for built = (ignore-errors (multiple-value-list (build-confiscation node id-hex :tier-index ti :respectful respectful)))
+                        when (and built (first built) (funcall (node-chain-fn node) (btx:tx-txid (first built)) 0))
+                          return built))))
+
 (defun confiscation-on-chain (node id-hex)
   "The confiscation of ID-HEX whose lottery output is in the UTXO set (we
    proposed or signed it, or it rebuilds from public state), or NIL.  Reserves
@@ -1156,9 +1169,7 @@
   (when (node-chain-fn node)
     (let ((known (loop for f in (forks-of node id-hex) thereis (record-confiscation f))))
       (or (and known (funcall (node-chain-fn node) (btx:tx-txid known) 0) known)
-          (loop for ti below (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))
-                for tx = (ignore-errors (build-confiscation node id-hex :tier-index ti))
-                when (and tx (funcall (node-chain-fn node) (btx:tx-txid tx) 0)) return tx)))))
+          (first (rebuild-confiscation-on-chain node id-hex))))))
 
 (defun note-dispute (node id-hex fmt &rest args)
   "Log a dispute's state only when it changes: a stuck dispute is retried every
@@ -1720,17 +1731,12 @@
                       ;; After a restart: rebuild from public state (the unsigned tx has the claim's
                       ;; txid).  Its nLockTime is its tier's CLTV, so take the tier whose rebuild is
                       ;; the one on chain; without a chain view, the tier open now.
-                      (let ((n (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))))
-                        (destructuring-bind (tx l &rest rest)
-                            (or (and (node-chain-fn node)
-                                     (loop for ti below n
-                                           for built = (ignore-errors (multiple-value-list (build-confiscation node id-hex :tier-index ti)))
-                                           when (and built (funcall (node-chain-fn node) (btx:tx-txid (first built)) 0))
-                                             return built))
-                                (multiple-value-list (build-confiscation node id-hex)))
-                          (declare (ignore rest))
-                          (setf (record-lottery fork) l (record-confiscation fork) tx)
-                          l))))
+                      (destructuring-bind (tx l &rest rest)
+                          (or (rebuild-confiscation-on-chain node id-hex)
+                              (multiple-value-list (build-confiscation node id-hex)))
+                        (declare (ignore rest))
+                        (setf (record-lottery fork) l (record-confiscation fork) tx)
+                        l)))
          (participants (lot:lottery-participants lottery))
          (reveals (reveals-of node id-hex))
          (preimages (mapcar (lambda (p) (or (cdr (find (lot:participant-pubkey p) reveals :key (lambda (r) (up:x-only (car r))) :test #'equalp))

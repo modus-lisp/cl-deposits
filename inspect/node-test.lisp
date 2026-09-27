@@ -682,8 +682,14 @@
         (dolist (m (list b c d)) (nd:drive-disputes m))
         (check "nobody confiscates inside the arm window" (gethash (cons (coerce (u:sha256 (hx "f00de")) 'list) 0) chain)))
       (let ((*height* (+ (nd:dispute-arm-closes b (nd:find-record b id)) 1)))
-        (loop repeat 4 do (dolist (m (list b c d)) (nd:drive-disputes m)))
+        (dolist (m (list b c d)) (nd:drive-disputes m))
         (check "the reserves were confiscated" (null (gethash (cons (coerce (u:sha256 (hx "f00de")) 'list) 0) chain)))
+        ;; A restart forgets the confiscation and lottery: each member must rebuild
+        ;; the (respectful, tiered) transaction from public state to reveal and claim.
+        (dolist (m (list b c d))
+          (dolist (f (nd::forks-of m id)) (setf (nd::record-confiscation f) nil (nd::record-lottery f) nil)))
+        (check "after a restart the confiscation still rebuilds" (nd::confiscation-on-chain c id))
+        (loop repeat 3 do (dolist (m (list b c d)) (nd:drive-disputes m)))
         (check "every member revealed" (= 3 (length (nd:reveals-of b id))))
         (let ((acquired (count-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-acquire)) (list b c d)))
               (yielded (count-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-yield)) (list b c d))))
