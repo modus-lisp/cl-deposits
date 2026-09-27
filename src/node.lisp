@@ -611,6 +611,8 @@
     (and o (member (node-pubkey node) (op:field o :quorum-members) :test #'equalp) t)))
 
 (defvar *deferred-saves* nil "When a list, SAVE-RECORD queues the record here instead of writing.")
+(defvar *verify-on-load* (let ((v (uiop:getenv "CLD_VERIFY_ON_LOAD"))) (and v (plusp (length v)) (not (string= v "0"))))
+  "Re-verify every signature when loading our own data dir (default: trust it).")
 
 (defun refollow-if-member (node id-hex)
   "Rebuild ID-HEX from the relay if its quorum names us; else remember it as not
@@ -2032,16 +2034,28 @@
     ;; An entry that does not chain (a gap or a bad update mid-file, from a
     ;; rewrite of a history that was itself loaded past damage) ends the load
     ;; there, like a damaged tail: keep the prefix, rewrite, catch up.
-    (dolist (u updates)
-      (when (> (up:update-seq u) (lg:ledger-sequence (record-ledger rec)))
+    ;;
+    ;; Our own data dir holds only what we validated before persisting it, so by
+    ;; default a load re-applies without re-verifying signatures (CLD_VERIFY_ON_LOAD
+    ;; restores the full check) and never writes: ACCEPT-UPDATE's SAVE-RECORD
+    ;; rewrote the file being loaded from its first entry and then appended every
+    ;; other one, one open-seek-write each.  With a million updates across the
+    ;; soak's replicas and forks, that and ~2M Schnorr verifications made a
+    ;; restart take 20 minutes.
+    (let ((*deferred-saves* (list nil)))
+     (dolist (u updates)
+      (when (> (up:update-seq u) (lg:ledger-sequence (record-ledger rec)))   ; a fork file's inherited prefix: skipped
         (handler-case
-            (if (and (record-owned-p rec) (not fork-p))
-                (progn (lg:apply-update (record-ledger rec) u) (push u (record-history rec)))
-                (accept-update node rec u))
+            (cond ((and (record-owned-p rec) (not fork-p))
+                   (lg:apply-update (record-ledger rec) u) (push u (record-history rec)))
+                  (*verify-on-load* (accept-update node rec u))
+                  (t (when (and fork-p (not (equalp (up:update-operator-id u) (record-fork-operator rec))))
+                       (fail "fork update not signed by the fork's operator"))
+                     (lg:apply-update (record-ledger rec) u) (push u (record-history rec))))
           (error (e)
             (log! node "~a: entry at seq ~a does not apply (~a); keeping ~a entries"
                   (file-namestring path) (up:update-seq u) e (length (record-history rec)))
-            (setf clean nil) (return)))))
+            (setf clean nil) (return))))))
     (unless fork-p (setf (gethash (record-id-hex rec) (node-ledgers node)) rec))
     (setf (record-persisted rec) (if clean (length (record-history rec)) 0))   ; a damaged file is rewritten whole on the next save
     (unless clean (log! node "~a: damaged after seq ~a; will rewrite, catch-up refills the rest" (file-namestring path) (lg:ledger-sequence (record-ledger rec))))
@@ -2059,17 +2073,26 @@
 
 (defun load-data-dir (node &key (log-fn (lambda (fmt &rest args) (apply #'log! node fmt args))))
   "Reload everything we knew: our ledgers, the ones we cosign, forks, reveals."
-  (let ((dir (node-data-dir node)))
-    (dolist (f (sort (directory (merge-pathnames "ledger_*.json" dir)) #'string< :key #'file-namestring)) ; bases before forks
-      (handler-case
-          (let* ((first (with-open-file (in f) (read-line in)))
-                 (u (up:decode-update (base64-decode (string-trim '(#\[ #\" #\, #\Space) first))))
-                 (owned (equalp (up:update-operator-id u) (node-pubkey node)))
-                 (fork-op (let ((i (search "_fork_" (file-namestring f)))) (and i (subseq (file-namestring f) (+ i 6) (+ i 22)))))
-                 (rec (load-record node f :owned-p owned)))
-            (funcall log-fn "loaded ~a (~a)" (file-namestring f)
-                     (cond ((and fork-op (record-owned-p rec)) "our fork") (fork-op "their fork") (owned "ours") (t "replica"))))
-        (error (e) (funcall log-fn "could not load ~a: ~a" f e))))
+  (let* ((dir (node-data-dir node))
+         (log-lock (bt:make-lock "load-log"))
+         (files (directory (merge-pathnames "ledger_*.json" dir))))
+    (flet ((load-one (f)
+             (handler-case
+                 (let* ((first (with-open-file (in f) (read-line in)))
+                        (u (up:decode-update (base64-decode (string-trim '(#\[ #\" #\, #\Space) first))))
+                        (owned (equalp (up:update-operator-id u) (node-pubkey node)))
+                        (fork-op (let ((i (search "_fork_" (file-namestring f)))) (and i (subseq (file-namestring f) (+ i 6) (+ i 22)))))
+                        (rec (load-record node f :owned-p owned)))
+                   (bt:with-lock-held (log-lock)
+                     (funcall log-fn "loaded ~a (~a)" (file-namestring f)
+                              (cond ((and fork-op (record-owned-p rec)) "our fork") (fork-op "their fork") (owned "ours") (t "replica")))))
+               (error (e) (bt:with-lock-held (log-lock) (funcall log-fn "could not load ~a: ~a" f e))))))
+      ;; Bases, then forks (a fork is built from its base), each set in parallel:
+      ;; the files are independent and a restart waited on them one at a time.
+      (dolist (set (list (remove-if (lambda (f) (search "_fork_" (file-namestring f))) files)
+                         (remove-if-not (lambda (f) (search "_fork_" (file-namestring f))) files)))
+        (mapc #'bt:join-thread
+              (mapcar (lambda (f) (bt:make-thread (lambda () (load-one f)) :name "cld-load")) set))))
     (dolist (f (directory (merge-pathnames "reveals_*.json" dir)))
       (let* ((prefix (subseq (pathname-name f) 8))
              (id (loop for k being the hash-keys of (node-ledgers node) when (and (>= (length k) 16) (string= prefix (subseq k 0 16))) return k)))
