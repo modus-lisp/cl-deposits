@@ -798,6 +798,12 @@
         (check-equal "for non-conformance, in the reference's words"
                      (op:field (nth-value 1 (nd::fork-op fork :dispute-enter)) :reason) "non_conforming_update")
         (check-equal "from the last valid sequence" (lg:ledger-sequence (nd:record-ledger fork)) (1+ before)))
+      (let ((logged (lambda () (count-if (lambda (l) (search "stopped at seq" l)) (nd::node-log d)))))
+        (nd:catch-up d (nd:find-record d id))
+        (let ((once (funcall logged)))
+          (nd:catch-up d (nd:find-record d id)) (nd:catch-up d (nd:find-record d id))
+          (check-equal "the refusal is logged once" once 1)
+          (check "catch-up does not retry an update the rules rejected" (= once (funcall logged)))))
       (check "so did the colluders' own replicas (their validation is honest)"
              (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c)))
       ;; 9c: the proof of it is self-evident — it goes out with no embedding at all.

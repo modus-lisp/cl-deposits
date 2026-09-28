@@ -104,6 +104,7 @@
   (utxos-fn nil)                               ; (lambda (address)) -> list of plists :txid :vout :sats :confirmations
   (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
   (dispute-notes (make-hash-table :test #'equal))   ; ledger id -> the last dispute-driver state we logged
+  (refused (make-hash-table :test #'equal :synchronized t))   ; ledger id -> seq whose update the rules rejected
   (min-confs 1)
   (member-ledger-hex nil))                     ; our own ledger used for QuorumJoin / member_ledger_hash
 
@@ -592,6 +593,11 @@
    apply another: every later one fails 'expected seq N'.  Fetch the operator's
    chain past our sequence and apply it in order.  Returns how many applied."
   (let ((ledger (record-ledger rec)) (n 0) (from (lg:ledger-sequence (record-ledger rec))) (window 200))
+    ;; The operator's next update was already refused by the rules (reported and
+    ;; disputed then): nothing past it can chain onto our tip.  Every later update
+    ;; showed a gap and sent us back into the same refusal, logged each time.
+    (when (eql (gethash (record-id-hex rec) (node-refused node)) (1+ (lg:ledger-sequence ledger)))
+      (return-from catch-up 0))
     ;; Windows of WINDOW sequences past our tip, until a window adds nothing.
     (loop
       (let* ((lo (1+ (lg:ledger-sequence ledger))) (hi (+ lo window -1)) (applied 0)
@@ -601,6 +607,11 @@
           (when (and (= (up:update-seq u) (1+ (lg:ledger-sequence ledger)))
                      (equalp (up:update-operator-id u) (lg:ledger-operator-key ledger)))
             (handler-case (when (eq (accept-update node rec u) :applied) (incf n) (incf applied))
+              (lg:ledger-error (e)
+                (setf (gethash (record-id-hex rec) (node-refused node)) (up:update-seq u))
+                (log! node "catch-up on ~a stopped at seq ~a, which the rules reject: ~a (not retried)"
+                      (subseq (record-id-hex rec) 0 8) (up:update-seq u) e)
+                (return))
               (error (e) (log! node "catch-up on ~a stopped at seq ~a: ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq u) e)
                 (return)))))
         (when (zerop applied) (return))))
