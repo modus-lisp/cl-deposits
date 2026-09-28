@@ -800,6 +800,13 @@
         (check-equal "from the last valid sequence" (lg:ledger-sequence (nd:record-ledger fork)) (1+ before)))
       (check "so did the colluders' own replicas (their validation is honest)"
              (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c)))
+      ;; 9c: the proof of it is self-evident — it goes out with no embedding at all.
+      (let* ((fault (first (nd::record-history la)))
+             (proof (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) fault)))
+        (check "a self-evident proof is broadcast without an embedding"
+               (null (nth-value 1 (gethash "embedding" (fr:broadcast->json proof)))))
+        (check "an off-ledger proof still carries one"
+               (nth-value 1 (gethash "embedding" (fr:broadcast->json (list :type :uncredited-onchain-payment :accused "00" :ledger-id id :evidence '()))))))
       ;; Finding 10: one armer pledges, one declares nothing — no confiscation is built.
       (nd:arm-dispute d (nd:find-fork d id (nd:node-pubkey d)) :replacement (list (u:sha256 (hx "b1d0")) 0 10000000))
       (nd:arm-dispute b (nd:find-fork b id (nd:node-pubkey b)))

@@ -13,7 +13,7 @@
                     (#:w #:cl-deposits.wire))
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
-           #:proof->json #:json->proof #:broadcast->json #:json->broadcast #:make-equivocation-proof
+           #:proof->json #:json->proof #:requires-embedding-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:verify-censorship))
 (in-package #:cl-deposits.fraud)
 
@@ -168,9 +168,23 @@
                  (setf ev (append ev (list kk (if (and (member kk +hex-fields+) (stringp v)) (hex->bytes v) v)))))))
     (list :type type :accused (w:jget j "accused") :ledger-id (w:jget j "ledger_id") :evidence ev)))
 
+(defun requires-embedding-p (type)
+  "DEP-06 (Embedding): only a proof whose evidence is off the ledger or depends on
+   when something was known needs its hash embedded and causally chained.  A proof
+   that is itself cryptographic evidence of non-conformity (a non-conforming update,
+   an equivocation, a stale or non-conforming co-signature, a winner collateral
+   deviation, an expired quorum) needs neither, and verifiers must not require one.
+   The reference classifies the same way (FraudProofType::requires_embedding)."
+  (member type '(:uncredited-onchain-payment :uncredited-lightning-payment :dispute-dereliction)))
+
 (defun broadcast->json (proof &key embedding (causal-chain '()))
+  "A self-evident proof goes out with no embedding key at all.  It used to carry a
+   placeholder (sequence 0, field \"inline\"), which the reference rejected as
+   'proof_hash not embedded' (docs/REDTEAM.md 9c)."
   (w:json-object "proof" (proof->json proof)
-                 "embedding" (or embedding (w:json-object "ledger_id" (getf proof :ledger-id) "sequence" 0 "update_hash" "" "field" "inline"))
+                 "embedding" (or embedding
+                                 (and (requires-embedding-p (getf proof :type))
+                                      (w:json-object "ledger_id" (getf proof :ledger-id) "sequence" 0 "update_hash" "" "field" "inline")))
                  "causal_chain" (coerce causal-chain 'vector)))
 
 (defun json->broadcast (j) (values (json->proof (w:jget j "proof")) (w:jget j "embedding") (w:jget j "causal_chain")))
