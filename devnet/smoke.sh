@@ -99,7 +99,11 @@ step "11 dispute: cld1 equivocates; members fork, arm, confiscate the reserves o
 cld_ctl cld1 "(:equivocate :ledger \"$L1\")" >/dev/null; sleep 3
 for n in cld2 cld3 cld4; do F=$(cld_ctl $n "(:forks :ledger \"$L1\")"); [[ "$F" == *":STATE :DISPUTED"* ]] || fail "$n did not fork: $F"; done
 echo "   members detected the equivocation and forked"
-for n in cld2 cld3 cld4; do expect "$(cld_ctl $n "(:arm :ledger \"$L1\")")"; done; sleep 2
+for n in cld2 cld3 cld4; do   # each armer pledges replacement collateral from its own wallet (DEP-06)
+  CA=$(sx "$(cld_ctl $n "(:address)")" ":ADDRESS"); CTX=$(wcli sendtoaddress "$CA" 0.01); mine 1
+  CV=$(bcli getrawtransaction "$CTX" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$CA'][0])")
+  expect "$(cld_ctl $n "(:arm :ledger \"$L1\" :txid \"$CTX\" :vout $CV :sats 1000000)")"
+done; sleep 2
 CONF=$(cld_ctl cld2 "(:confiscate :ledger \"$L1\" :fee 1000)"); expect "$CONF"; CTXID=$(sx "$CONF" ":TXID"); LOTTERY=$(sx "$CONF" ":LOTTERY")
 mine 1; C=$(bcli gettxout "$CTXID" 0 | python3 -c "import json,sys; j=json.load(sys.stdin); print(j['confirmations'], j['scriptPubKey']['address'])"); [[ "$C" == "1 $LOTTERY" ]] || fail "confiscation not confirmed to the lottery output: $C"
 echo "   confiscation $CTXID confirmed into lottery output $LOTTERY"
