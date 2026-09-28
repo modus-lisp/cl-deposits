@@ -12,7 +12,7 @@
   (:local-nicknames (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation) (#:lg #:cl-deposits.ledger)
                     (#:w #:cl-deposits.wire))
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
-           #:verify-equivocation #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
+           #:verify-equivocation #:update-binds-to-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
            #:proof->json #:json->proof #:requires-embedding-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:verify-censorship))
 (in-package #:cl-deposits.fraud)
@@ -77,11 +77,44 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Verification.  Each returns (values ok reason).
 
-(defun verify-equivocation (proof)
-  "Two updates, same ledger / sequence / operator, both validly signed, different content."
+;;; Binding an update to a ledger.  An update's ledger_id is covered by neither its
+;;; content hash nor its operator signature (DEP-02 §Signing: the operator signs
+;;; sequence, previous_hash, message and the cosignatures), and one key operates
+;;; several ledgers: every cl node signs the ledger it operates and its own
+;;; member ledger with its node key.  So an honest update of ledger X, relabelled
+;;; Y, carries a valid signature on Y.  What binds it is what was signed: a seq-0
+;;; LedgerOpen derives the ledger id, and a later update's previous_hash names
+;;; the update it follows.  (The reference's bedabe0 and f581dba, fraud.rs.)
+
+(defun update-opens-ledger-p (u ledger-id)
+  "U is a seq-0 LedgerOpen, by its own signer, that derives LEDGER-ID."
+  (and (zerop (up:update-seq u))
+       (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+         (and o (eq (op:operation-type o) :ledger-open)
+              (equalp (op:field o :operator-id) (up:update-operator-id u))
+              (equalp (op:compute-ledger-id (op:field o :operator-id) (op:field o :reserves-id) (op:field o :genesis-block))
+                      ledger-id)))))
+
+(defun bound-hashes (history)
+  "chain hash -> sequence, for every update in HISTORY (a ledger's own chain)."
+  (let ((h (make-hash-table :test #'equalp)))
+    (dolist (u history h) (setf (gethash (up:chain-hash u) h) (up:update-seq u)))))
+
+(defun update-binds-to-ledger-p (u ledger-id bound)
+  "U opens LEDGER-ID, or follows an update in BOUND (see BOUND-HASHES)."
+  (if (zerop (up:update-seq u))
+      (update-opens-ledger-p u ledger-id)
+      (nth-value 1 (gethash (up:update-prev-hash u) bound))))
+
+(defun verify-equivocation (proof history)
+  "Two updates, same ledger / sequence / operator, both validly signed, different
+   content, and both bound to the ledger through HISTORY (its chain): a pair of
+   the operator's honest updates from two of its ledgers, one relabelled, is not
+   an equivocation."
   (handler-case
       (let* ((a (up:decode-update (hex->bytes (e proof :update-a-hex))))
-             (b (up:decode-update (hex->bytes (e proof :update-b-hex)))))
+             (b (up:decode-update (hex->bytes (e proof :update-b-hex))))
+             (bound (bound-hashes history)))
         (cond ((not (= (up:update-seq a) (up:update-seq b) (e proof :sequence))) (values nil "sequences differ"))
               ((not (equalp (up:update-ledger-id a) (up:update-ledger-id b))) (values nil "ledgers differ"))
               ((not (equalp (up:update-operator-id a) (up:update-operator-id b))) (values nil "operators differ"))
@@ -89,6 +122,10 @@
               ((not (string= (bytes->hex (up:update-ledger-id a)) (getf proof :ledger-id))) (values nil "ledger id mismatch"))
               ((equalp (up:content-hash a) (up:content-hash b)) (values nil "same content: not an equivocation"))
               ((not (and (up:verify-operator-signature a) (up:verify-operator-signature b))) (values nil "a signature does not verify"))
+              ((not (update-binds-to-ledger-p a (up:update-ledger-id a) bound))
+               (values nil "update_a follows no update of this ledger: nothing binds it here (ledger_id is unsigned)"))
+              ((not (update-binds-to-ledger-p b (up:update-ledger-id a) bound))
+               (values nil "update_b follows no update of this ledger: nothing binds it here (ledger_id is unsigned)"))
               (t (values t nil))))
     (error (c) (values nil (princ-to-string c)))))
 
@@ -108,29 +145,37 @@
           (t (values t nil)))))
 
 (defun verify-non-conforming-update (proof history)
-  "Replay HISTORY (the canonical chain) up to the fault's predecessor; the
-   fault update must be signed by the accused, chain onto that tip, and fail
-   to apply — or fail to chain at all."
+  "HISTORY is the ledger's canonical chain.  The fault update must be signed by
+   the accused and bound to this ledger (it opens it, or its previous_hash names
+   one of its updates), and then either follow an update other than its
+   predecessor (a rewind or a skip) or chain onto the predecessor and fail to
+   apply.  A previous_hash that names nothing here is not proof: it may be an
+   honest update of another ledger the same key operates, relabelled."
   (handler-case
       (let* ((fault (up:decode-update (hex->bytes (e proof :fault-update-hex))))
              (seq (up:update-seq fault))
+             (id (up:update-ledger-id fault))
+             (bound (bound-hashes history))
              (prefix (sort (remove-if-not (lambda (u) (< (up:update-seq u) seq)) (copy-list history)) #'< :key #'up:update-seq)))
         (cond ((not (string= (bytes->hex (up:update-operator-id fault)) (getf proof :accused)))
                (values nil "accused is not the signer"))
+              ((not (string= (bytes->hex id) (getf proof :ledger-id))) (values nil "ledger id mismatch"))
               ((not (up:verify-operator-signature fault)) (values nil "fault update is not validly signed"))
               ((/= seq (e proof :fault-sequence)) (values nil "sequence mismatch"))
+              ((not (update-binds-to-ledger-p fault id bound))
+               (values nil "fault follows no update of this ledger: nothing binds it here (ledger_id is unsigned)"))
               ((/= (length prefix) seq) (values nil "history does not reach the fault's predecessor"))
+              ((and (plusp seq) (/= (gethash (up:update-prev-hash fault) bound) (1- seq)))
+               (values t (format nil "fault at seq ~a follows seq ~a" seq (gethash (up:update-prev-hash fault) bound))))
               (t
-               (let ((l (lg:replay prefix)))
-                 (if (not (equalp (up:update-prev-hash fault) (lg:ledger-chain-tip l)))
-                     (values t "fault does not chain onto the canonical tip")
-                     (handler-case (progn (lg:apply-update l fault) (values nil "fault update applies cleanly: conforming"))
-                       (lg:ledger-error (c) (values t (princ-to-string c)))))))))
+               ;; It chains onto its predecessor, so it must break a rule.
+               (handler-case (progn (lg:apply-update (lg:replay prefix) fault) (values nil "fault update applies cleanly: conforming"))
+                 (lg:ledger-error (c) (values t (princ-to-string c)))))))
     (error (c) (values nil (princ-to-string c)))))
 
 (defun verify-proof (proof &key history height-of-block)
   (case (getf proof :type)
-    (:equivocation (verify-equivocation proof))
+    (:equivocation (verify-equivocation proof history))
     (:quorum-expired (verify-quorum-expired proof history height-of-block))
     (:non-conforming-update (verify-non-conforming-update proof history))
     (t (values nil (format nil "cannot verify ~a here" (getf proof :type))))))

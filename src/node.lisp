@@ -543,7 +543,11 @@
       (let ((ours (find (up:update-seq update) (record-history rec) :key #'up:update-seq)))
         (when (and ours (not (record-fork-p rec))
                    (not (equalp (up:content-hash ours) (up:content-hash update)))
-                   (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp))
+                   (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
+                   ;; ...and it follows this ledger's chain.  ledger_id is unsigned and the
+                   ;; operator signs its other ledgers with the same key: one of their
+                   ;; updates, relabelled with this ledger's id, is not an equivocation.
+                   (fr:update-binds-to-ledger-p update (up:update-ledger-id ours) (fr:bound-hashes (record-history rec))))
           (log! node "EQUIVOCATION on ~a at seq ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq update))
           (broadcast-fraud node (fr:make-equivocation-proof (up:update-operator-id update) (up:update-ledger-id update) ours update))))
       (return-from accept-update :echo))

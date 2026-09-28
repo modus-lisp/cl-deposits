@@ -157,8 +157,8 @@
                      (up:sign-operator u (nd::node-priv a)) u)))
              (u1 (funcall mk 1)) (u2 (funcall mk 2))
              (proof (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) u1 u2)))
-        (check "equivocation proof verifies" (fr:verify-equivocation proof))
-        (check "a same-content pair is not an equivocation" (not (fr:verify-equivocation (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) u1 u1))))
+        (check "equivocation proof verifies" (fr:verify-equivocation proof (reverse (nd:record-history la))))
+        (check "a same-content pair is not an equivocation" (not (fr:verify-equivocation (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) u1 u1) (reverse (nd:record-history la)))))
         (check-bytes "proof hash survives the JSON round trip" (fr:proof-hash (fr:json->proof (fr:proof->json proof))) (fr:proof-hash proof))
         (check-equal "proof discriminant" (fr:proof-discriminant :equivocation) 8)
         ;; A non-conforming update: crediting beyond... (a DepositClose on a funded deposit)
@@ -172,6 +172,34 @@
           (check "a conforming update is not a valid proof"
                  (not (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) u1)
                                                        (reverse (nd:record-history la))))))
+        ;; --- Relabelling (red team, the reference's bedabe0/f581dba): ledger_id is signed by
+        ;; no one and A signs its other ledger with the same key, so any of that ledger's
+        ;; updates carries a valid signature under this ledger's id.  None of them is proof.
+        (let* ((lx (nd:open-ledger a :reserves-id "genesis:a2-other"))
+               (history (reverse (nd:record-history la)))
+               (relabel (lambda (u) (let ((c (up:decode-update (up:encode-update u)))) (setf (up:update-ledger-id c) (u:hex->bytes id)) c)))
+               (x0 (funcall relabel (first (last (nd:record-history lx)))))
+               (a0 (first history))
+               (stray (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id) :seq seq
+                                                      :prev-hash (u:sha256 (hx "e15e")) ; another ledger's tip
+                                                      :message (op:encode-operation (list :type :deposit-close :deposit-id d1)))))
+                        (up:sign-operator u (nd::node-priv a)) u))
+               (rewind (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id) :seq seq
+                                                       :prev-hash (up:chain-hash (nth (- seq 3) history))
+                                                       :message (op:encode-operation (list :type :deposit-close :deposit-id d1)))))
+                         (up:sign-operator u (nd::node-priv a)) u)))
+          (check "a relabelled update still carries a valid operator signature" (up:verify-operator-signature x0))
+          (check "the other ledger's genesis, relabelled, is not an equivocation with this one's"
+                 (not (fr:verify-equivocation (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) a0 x0) history)))
+          (check "an update following nothing in this ledger is not a non-conforming proof"
+                 (not (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) stray) history)))
+          (check "an update that rewinds this ledger's chain is a non-conforming proof"
+                 (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) rewind) history))
+          (check "the other ledger's genesis, relabelled, is not a non-conforming seq-0 proof"
+                 (not (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) x0) history)))
+          (nd::accept-update b (nd:find-record b id) x0)
+          (check "a member handed a relabelled update does not cry equivocation"
+                 (notany (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c d))))
         ;; --- Broadcast the proof: every member verifies it and forks.
         (nd:broadcast-fraud b proof)
         (check "all three members opened dispute forks"
