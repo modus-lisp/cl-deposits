@@ -329,7 +329,23 @@ The dispute that follows exposes the next layer:
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
 
-### 2026-09-28 — the first fraud-to-confiscation run completes; the winner has yet to claim
+### 2026-09-28 — fraud to custody, end to end (and an unbonded custodian)
+
+After deposits-rust ed1e469 (the winner read reveals only from ephemeral kind-20101 requests,
+which relays do not store; it now reads the durable Kind 9106 reveals too, publishes its own as
+9106, and fetches 7 events instead of paging the ledger), ref3 claimed at 06:52:13 —
+`We won the lottery … Claim TX broadcast: 755480b8… DisputeAcquire published! We are now the
+operator.`  **Claim #1 end to end:** an invalid majority-cosigned update, detected by the honest
+minority and by the colluders' own replicas, disputed, armed by all three, confiscated punitively
+(C's 49,999,600 sats), drawn fairly (k = Q), and claimed by the winner who took custody.
+
+**Finding 10 — cl signs a confiscation for an armer that declared no replacement collateral.**
+The claim has one input: ref3's arm predates the 9a fix and declared none, so the new custodian
+is unbonded.  DEP-06: "legacy events without it cause strict cosigners to refuse confiscation";
+the reference is strict (it refused cld3's proposal for exactly that), cl's `check-armer-collateral`
+checks only armers that did declare, so cl's two signatures carried ref3's confiscation.
+
+### 2026-09-28 — the first fraud-to-confiscation run (as it stood before the claim)
 
 With 9a/9b fixed (deposits-rust e3b266e, 1cc610f) and cl's stale-proposal fix (724551b):
 ref3 published its fork's 4 own updates, saw all 3 participants armed, and proposed the
