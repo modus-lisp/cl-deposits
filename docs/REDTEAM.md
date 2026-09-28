@@ -329,6 +329,23 @@ The dispute that follows exposes the next layer:
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
 
+### 2026-09-28 — the first fraud-to-confiscation run completes; the winner has yet to claim
+
+With 9a/9b fixed (deposits-rust e3b266e, 1cc610f) and cl's stale-proposal fix (724551b):
+ref3 published its fork's 4 own updates, saw all 3 participants armed, and proposed the
+confiscation of C.  It confirmed at Tier 0, **punitive**: d042411c…, one output of 49,999,600 sats
+(C's reserves + collateral) to the lottery tb1pmvek2z….  All three revealed (cld3 18 B, cld4 17 B,
+ref3 18 B → sum 5 mod 3 = 2): **ref3 won**; cld3 and cld4 yielded.  Every preimage is in bounds
+(k = Q = 3), so the claim is valid — but ref3 has not attempted it (no claim line in 30+ minutes;
+its `auto_confiscate` / `auto_collect_fees` tasks time out at 10 s).  Queued for deposits-rust.
+
+Along the way (cl, 724551b): a signer keeps every proposal it signs, and cld3's driver took its
+cached, never-broadcast proposal for a spent lottery; a cached transaction neither pending nor swept
+is now dropped and the chain asked again, and a member that revealed but finds the lottery gone
+concludes that the winner claimed it.  The fixed reference also re-published ref3's *old* arm
+(declared no collateral), so ref3 refused cld3's competing proposal over its own arm; its own
+proposal went through.
+
 ### Open (2026-09-27)
 
 - **F's lottery** could not be claimed (organic #6); mitigated (c3cd4cd) and swept to the
