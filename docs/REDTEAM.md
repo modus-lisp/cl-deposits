@@ -322,8 +322,19 @@ The dispute that follows exposes the next layer:
   loss.  The prefix need not be re-sent at all (it is on the relay under the operator's events).
   Not a cl bug; queued for deposits-rust.
 - **9c — the reference rejects cl's fraud proofs:** `Fraud proof rejected: proof_hash … not
-  embedded at seq 0 on ledger …` — the reference expects the prover to embed the proof's hash in its
-  own ledger first; cl broadcasts without embedding.  Harmless here (ref3 found the fraud itself).
+  embedded at seq 0 on ledger …`.  cl sends a placeholder embedding (seq 0, field "inline"); the
+  reference's `verify_fraud_broadcast` requires the proof hash to sit in a TransferLock nonce or a
+  DeliveryEmbed at the stated sequence, and an embedding off the accused ledger to carry at least
+  one causal link: a *cosigned update on the accused ledger* whose `member_ledger_hash` comes from
+  the embedding ledger.  **For a quorum member reporting fraud by its own operator, after the fraud,
+  that is unsatisfiable:** the accused chain now contains the invalid update, honest members never
+  cosign past it, so no link can exist; and a direct embedding needs the fraudster to sign the
+  reporter's hash.  The reference daemon does not build fraud broadcasts at all — its members
+  detect independently (ref3 did, in 7 s).  For NonConformingUpdate and Equivocation the evidence is
+  self-contained signed updates, so causal ordering adds nothing.  **A spec question** (with the
+  lottery-N one): embedding should be required for proofs whose timing matters (censorship,
+  uncredited deposits), not for self-evident ones — or member-to-member proofs need another anchor.
+  Harmless here.
 - **cl retries catch-up into a known-invalid update forever** (`catch-up on eff80500 stopped at
   seq 17840: OVER-OBLIGATION`, every pass): noisy, and should stop once the fork is open.
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
