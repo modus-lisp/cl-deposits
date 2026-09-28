@@ -347,6 +347,50 @@ The dispute that follows exposes the next layer:
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
 
+### 2026-09-28 — attack: relabelled updates (ledger_id is signed by no one)
+
+An update's `ledger_id` is covered by neither its content hash nor its operator signature
+(DEP-02 §Signing), and an operator signs all its ledgers with one key. On the devnet every cl node
+signs the ledger it operates and its own member ledger with its node key. So anyone can
+republish an operator's honest update from one ledger tagged with another's id, and the signature
+still verifies. The reference closed this in its verifiers (deposits-rust bedabe0, f581dba).
+cl had the same exposure in five places:
+
+| where | what the relabelled update did |
+|---|---|
+| `verify-equivocation` | two same-seq updates, signed, different: verified, although one was another ledger's |
+| `verify-non-conforming-update` | "does not chain onto the canonical tip" counted as proof |
+| live detector in `accept-update` | a member broadcast an equivocation proof, and every member forked the honest operator's ledger |
+| `follow-ledger` (a follower, or a member rebuilding a lost replica) | a relabelled genesis became the genesis: the rebuild became the other ledger, or aborted |
+| `catch-up` | a relabelled update at the next seq failed the chain check, was taken for a rule break, and the replica never caught up again |
+
+**Fixed (a24ec2c, ae2dbd5).** An update is bound to a ledger when it is a seq-0 LedgerOpen that
+derives the ledger id, or when its `previous_hash` names one of that ledger's updates. Both
+equivocating updates and a non-conforming fault must be bound. A fault following an update other
+than its predecessor (rewind or skip) is still proof; one following nothing here is not. Rebuild
+and catch-up take only updates that continue the chain. The node-test checks fail on the old code.
+
+**Live, `redteam/attack-relabel.sh`:** cld1's own ledger 09b1dc41 (seq 0–5) republished from a
+throwaway key as A (cld1's, seq 80k). cld2, cld3 and cld4 each logged all six as ignored: no
+equivocation, no proof, no fork. ref2 and ref3 logged nothing either. Before the fix, each member
+would have seen six equivocations and forked A. The six events stay on the relay under A's tag.
+
+**Found on the way (72600ae).** After the deploy, cld4 broadcast four bogus EQUIVOCATION proofs
+on C at 17840 and failed to rebuild C. None of the three causes was new:
+
+- The node subscribes to the relay before loading its data dir. A cosign request in that
+  window found no record for C, took it for a lost replica, and rebuilt 80k updates from the relay,
+  racing the load. The worker lanes now wait for the load.
+- The rebuild took dispute forks' updates, which share the ledger's tag, into the base. It now
+  builds only the operator's chain.
+- The live detector did not check the two updates had one signer. It took a fork member's
+  DisputeEnter for the operator equivocating. Other nodes refused the proofs ("operators differ").
+
+**Open:** the reference's gap repair already follows the chain through duplicates (ledger_repair.rs
+`fill_gap`). Its paginated catch-up and the recovery CLI have not been checked against the relabelled
+updates now on the relay. `quorum-names-us-p` (cl) reads the newest QuorumBegin by tag with limit 1,
+so a relabelled QuorumBegin can make a member skip rebuilding a lost replica for six hours.
+
 ### 2026-09-28 — fraud to custody, end to end (and an unbonded custodian)
 
 After deposits-rust ed1e469 (the winner read reveals only from ephemeral kind-20101 requests,
