@@ -52,7 +52,7 @@
       (check "settles after the equivocation" (settled bus))
       (check "every member forked" (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c d)))
       (check "every member sees three forks" (every (lambda (m) (= 3 (length (nd:forks-of m id)))) (list b c d)))
-      (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m))))
+      (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 0 10000000)))
       (check "settles after arming" (settled bus))
       (check "everyone sees three armers" (every (lambda (m) (= 3 (length (nd:armers-of m id)))) (list b c d)))
       (multiple-value-bind (ctx lottery) (handler-case (nd:confiscate b id)

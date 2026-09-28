@@ -1687,12 +1687,17 @@
     (+ (ceiling (* obligations ratio)) claim-fee)))
 
 (defun check-armer-collateral (node base armers)
-  "Every armer that declared replacement collateral must have declared enough,
-   and (when we have a chain view) it must exist, be unspent and confirmed."
+  "Every armer must have declared replacement collateral (DEP-06: \"legacy events
+   without it cause strict cosigners to refuse confiscation\"), enough of it, and
+   (when we have a chain view) it must exist, be unspent and confirmed.  We used
+   to check only those that declared one: on the soak cl's two signatures carried
+   a confiscation for an armer that declared none, and the winner took custody
+   of the ledger with no bond behind it (docs/REDTEAM.md finding 10)."
   (let ((floor-sats (collateral-floor-sats base)))
     (loop for entry in armers
           for pk = (first entry) for coll = (fourth entry)
-          do (when coll
+          do (unless coll (fail "armer ~a declared no replacement collateral" (subseq (bytes->hex pk) 0 8)))
+             (when coll
                (destructuring-bind (txid vout sats) coll
                  (when (< sats floor-sats) (fail "armer ~a declared ~a sats, below the floor ~a" (subseq (bytes->hex pk) 0 8) sats floor-sats))
                  (when (node-chain-fn node)

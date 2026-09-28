@@ -68,7 +68,7 @@
                              (up:sign-operator u (nd::node-priv a)) u)))
                      (proof (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) (funcall mk 1) (funcall mk 2))))
                 (nd:broadcast-fraud b proof)
-                (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m))))
+                (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 0 10000000)))
                 (check-equal "three armers before the restart" (mapcar (lambda (m) (length (nd:armers-of m id))) (list b c d)) '(3 3 3))
                 (nd:stop-node a)                          ; the operator is gone for good
                 (destructuring-bind (b c d) (restart-all (list b c d) (list pb pc pd) bus hf)

@@ -180,7 +180,7 @@
                (every (lambda (m) (= 3 (length (nd:forks-of m id)))) (list b c d)))
         (check-equal "fork state is disputed" (lg:ledger-dispute-state (nd:record-ledger (nd:find-fork b id (nd:node-pubkey b)))) :disputed)
         ;; --- Arm.
-        (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m))))
+        (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 0 10000000)))
         (check-equal "three armers visible to everyone" (mapcar (lambda (m) (length (nd:armers-of m id))) (list b c d)) '(3 3 3))
         ;; --- Confiscation, built by b, signed by the recovery quorum over the relay.
         (multiple-value-bind (ctx lottery)
@@ -400,7 +400,7 @@
                (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list c d)))
         (check "respectful proof type" (fr:respectful-p (fr:make-quorum-expired-proof (nd:node-pubkey a) (u:hex->bytes id) (make-array 32) expiry)))
         ;; Run the lottery through (respectful: obligations to the lottery, change back to the operator).
-        (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m))))
+        (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 0 10000000)))
         (multiple-value-bind (ctx lottery) (nd:confiscate b id :respectful t)
           (declare (ignore lottery))
           (check-equal "respectful confiscation: lottery output + operator change" (length (btx:tx-outputs ctx)) 2)
@@ -600,7 +600,7 @@
       (let ((*height* (+ expiry 721)))
         ;; Only b and c dispute and arm; d stays out.  A majority of four voters is
         ;; out of reach, the Tier-1 minority (one) is not.
-        (dolist (m (list b c)) (nd:dispute-expired-quorums m :grace 3) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m))))
+        (dolist (m (list b c)) (nd:dispute-expired-quorums m :grace 3) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 0 10000000)))
         (multiple-value-bind (ctx lottery) (nd:confiscate b id :respectful t)
           (declare (ignore lottery))
           (check-equal "nLockTime is Tier 1's CLTV" (btx:tx-locktime ctx) (+ expiry 720))
@@ -799,6 +799,11 @@
                      (op:field (nth-value 1 (nd::fork-op fork :dispute-enter)) :reason) "non_conforming_update")
         (check-equal "from the last valid sequence" (lg:ledger-sequence (nd:record-ledger fork)) (1+ before)))
       (check "so did the colluders' own replicas (their validation is honest)"
-             (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c))))))
+             (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c)))
+      ;; Finding 10: one armer pledges, one declares nothing — no confiscation is built.
+      (nd:arm-dispute d (nd:find-fork d id (nd:node-pubkey d)) :replacement (list (u:sha256 (hx "b1d0")) 0 10000000))
+      (nd:arm-dispute b (nd:find-fork b id (nd:node-pubkey b)))
+      (check-signals "an armer with no replacement collateral blocks the confiscation" nd:node-error
+        (nd:build-confiscation d id)))))
 
 (report)
