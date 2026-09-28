@@ -40,7 +40,9 @@ run_mutant sequence-check-off           $L 's/\(unless \(= \(up:update-seq updat
 run_mutant chain-check-off              $L 's/\(unless \(equalp \(up:update-prev-hash update\) \(ledger-chain-tip ledger\)\)/(unless t/'
 run_mutant content-hash-no-cosigs       $U 's/collect \(cat \(cosig-member-ledger-hash c\) \(cosig-signature c\)\)\)\)\)\)/collect (octets))))))/'
 run_mutant chain-hash-no-opsig          $U 's/\(sha256 \(cat \(content-hash u\) \(update-operator-sig u\)\)\)\)/(sha256 (content-hash u)))/'
-run_mutant cosign-digest-no-len         $U 's/\(int->le \(length \(update-message u\)\) 4\) \(update-message u\)$/(update-message u)/'
+run_mutant cosign-data-no-len           $U 's/\(int->le \(length \(update-message u\)\) 4\) \(update-message u\)\)\)\)$/(update-message u))))/'
+run_mutant ledger-id-unsigned           $U 's/\(cat \(int->le \(update-seq u\) 8\) \(update-ledger-id u\)$/(cat (int->le (update-seq u) 8)/'
+run_mutant block-height-unsigned        $U 's/^         \(int->le \(update-block-height u\) 4\)$/         (octets)/'
 run_mutant operator-digest-no-count     $U 's/\(int->le \(length sigs\) 2\) sigs\)\)/sigs))/'
 run_mutant cosigs-unsorted              $U "s/\(sort \(copy-list \(update-cosignatures update\)\) #'bytes< :key #'cosig-pubkey\)/(copy-list (update-cosignatures update))/"
 run_mutant cosig-len-unchecked          $U 's/\(unless \(= len 129\)/(unless (= len 0)/'
@@ -48,5 +50,5 @@ run_mutant duplicate-cosigner-allowed   $U 's/\(return-from verify-cosignatures 
 run_mutant threshold-off-by-one         $U 's/\(if \(< \(length seen\) threshold\)/(if (< (1+ (length seen)) threshold)/'
 run_mutant xonly-wrong-slice            $U 's/\(defun x-only \(pubkey33\) \(subseq pubkey33 1 33\)\)/(defun x-only (pubkey33) (subseq pubkey33 0 32))/'
 run_mutant seq-encoded-le               $U 's/\(cons \+t-seq\+ \(int->be \(update-seq u\) 8\)\)/(cons +t-seq+ (int->le (update-seq u) 8))/'
-run_mutant operator-sig-not-verified    $U 's/when \(secp:schnorr-verify pk \(operator-digest u :version v\) sig\)/when t/'
+run_mutant operator-sig-not-verified    $U 's/\(and \(secp:schnorr-verify \(x-only \(update-operator-id u\)\) \(operator-digest u\) \(update-operator-sig u\)\) t\)/t/'
 echo "=== summary ==="; grep -c SURVIVED "$OUT"; grep -c killed "$OUT"

@@ -1,9 +1,10 @@
-;;;; inspect/update-test.lisp — DEP-02 against a real ledger.
+;;;; inspect/update-test.lisp — DEP-02 signed updates, v2 signing.
 ;;;;
-;;;; The vector is the reference implementation's audit fixture: 372 published
-;;;; copies of 52 distinct updates (sequence 0..51) of one ledger, including
-;;;; republications carrying grown cosignature sets.  Every claim about the hash
-;;;; chain and the signatures below is checked against it.
+;;;; The cross-implementation vector, inspect/vectors/dep02-signing-v2.json, is
+;;;; the spec's (deposits vectors/dep02-signing-v2.json): one update with two
+;;;; cosigners, built and signed by the reference.  We rebuild it from the same
+;;;; inputs and must match every digest, signature and hash byte for byte.
+;;;; The v1 audit fixture (a real reference ledger) retired with v1 signing.
 
 (in-package #:cl-deposits.test)
 
@@ -19,88 +20,136 @@
   (check-bytes "encode sorts" (tlv:encode `((2 . ,(hx "abcd")) (0 . ,(hx "01")))) (hx "000101 0202abcd"))
   (check-bytes "base64 roundtrip" (u:base64-decode (u:base64-encode (hx "00ff10"))) (hx "00ff10")))
 
-(defvar *raw* (read-json-string-array (vector-path "ledger_57f60e1dbef339e2.json")))
-(defvar *updates* (mapcar (lambda (s) (up:decode-update (u:base64-decode s))) *raw*))
 
-(with-gate ("signed-update: decode and re-encode")
-  (check-equal "372 published copies" (length *updates*) 372)
-  (check "one ledger" (every (lambda (x) (equalp (up:update-ledger-id x) (up:update-ledger-id (first *updates*)))) *updates*))
-  (check "one operator" (every (lambda (x) (equalp (up:update-operator-id x) (up:update-operator-id (first *updates*)))) *updates*))
-  (check-equal "sequences 0..51" (sort (remove-duplicates (mapcar #'up:update-seq *updates*)) #'<)
-               (loop for i to 51 collect i))
-  (check-equal "re-encode is byte-identical (all 372)"
-               (loop for raw in *raw* for x in *updates*
-                     count (not (equalp (u:base64-decode raw) (up:encode-update x))))
-               0)
-  (check-equal "cosignature counts" (sort (remove-duplicates (mapcar (lambda (x) (length (up:update-cosignatures x))) *updates*)) #'<)
-               '(0 2 3))
-  (check "cosignatures arrive sorted by pubkey"
-         (every (lambda (x) (equalp (up:update-cosignatures x) (up:sorted-cosignatures x))) *updates*)))
+;;; The vector's inputs (DEP-02 §Signing, test vector).
+(defun vector-update ()
+  (let* ((key (lambda (b) (u:be->int (make-array 32 :element-type '(unsigned-byte 8) :initial-element b))))
+         (fill (lambda (b) (make-array 32 :element-type '(unsigned-byte 8) :initial-element b)))
+         (aux (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (u (up:make-signed-update :operator-id (up:compressed-pubkey (funcall key #x11)) :ledger-id (funcall fill #xaa)
+                                   :seq 7 :block-height 850000 :block-hash (funcall fill #xbb)
+                                   :prev-hash (funcall fill #xcc) :message (hx "00012a"))))
+    (setf (up:update-cosignatures u)
+          (list (up:sign-cosignature u (funcall key #x22) (up:compressed-pubkey (funcall key #x22)) (funcall fill #x01) :aux aux)
+                (up:sign-cosignature u (funcall key #x33) (up:compressed-pubkey (funcall key #x33)) (funcall fill #x02) :aux aux)))
+    (setf (up:update-cosignatures u) (up:sorted-cosignatures u))
+    (up:sign-operator u (funcall key #x11) :aux aux)
+    u))
 
-(with-gate ("signed-update: hash chain")
-  (let ((tips (make-hash-table :test #'equalp)))
-    (dolist (x *updates*) (setf (gethash (up:chain-hash x) tips) x))
-    (let ((genesis (remove-if-not (lambda (x) (u:zero-bytes-p (up:update-prev-hash x))) *updates*))
-          (unresolved (remove-if (lambda (x) (or (u:zero-bytes-p (up:update-prev-hash x))
-                                                 (gethash (up:update-prev-hash x) tips)))
-                                 *updates*)))
-      (check "genesis copies are all sequence 0" (every (lambda (x) (zerop (up:update-seq x))) genesis))
-      (check-equal "14 genesis copies" (length genesis) 14)
-      (check-equal "every non-genesis prev_hash resolves to a published chain_hash" (length unresolved) 0)
-      (check "each resolves to sequence n-1"
-             (every (lambda (x) (or (zerop (up:update-seq x))
-                                    (= (up:update-seq (gethash (up:update-prev-hash x) tips)) (1- (up:update-seq x)))))
-                    *updates*))
-      (check-equal "52 distinct updates among the 372 copies"
-                   (length (remove-duplicates *raw* :test #'string=)) 52))))
+(defun pget (plist key) (second (member key plist :test #'equal)))
 
-(with-gate ("signed-update: signatures")
-  (let ((versions (make-hash-table)) (cosig-versions (make-hash-table)) (bad-cosigs 0))
-    (dolist (x *updates*)
-      (incf (gethash (up:verify-operator-signature x) versions 0))
-      (dolist (c (up:update-cosignatures x))
-        (let ((v (up:verify-cosignature x c)))
-          (incf (gethash v cosig-versions 0))
-          (unless v (incf bad-cosigs)))))
-    (check-equal "every operator signature verifies" (gethash nil versions 0) 0)
-    (format t "      operator digest versions: ~{~a=~a~^ ~}~%"
-            (loop for k being the hash-keys of versions using (hash-value v) append (list k v)))
-    (check-equal "every cosignature verifies" bad-cosigs 0)
-    (format t "      cosign digest versions: ~{~a=~a~^ ~}~%"
-            (loop for k being the hash-keys of cosig-versions using (hash-value v) append (list k v)))
-    (check "verify-cosignatures accepts each update" (every (lambda (x) (up:verify-cosignatures x)) *updates*))
-    ;; Mutations must be caught.
-    (let* ((x (find-if (lambda (x) (= 2 (length (up:update-cosignatures x)))) *updates*))
-           (y (up:decode-update (up:encode-update x))))
-      (setf (aref (up:update-message y) 3) (logxor 1 (aref (up:update-message y) 3)))
-      (check "flipped message bit breaks operator signature" (null (up:verify-operator-signature y)))
-      (check "flipped message bit breaks cosignatures" (not (up:verify-cosignatures y)))
-      (let ((z (up:decode-update (up:encode-update x))))
-        (setf (up:update-cosignatures z) (list (first (up:update-cosignatures z)) (first (up:update-cosignatures z))))
-        (check "duplicate cosigner rejected" (not (up:verify-cosignatures z))))
-      (check "threshold enforced" (not (up:verify-cosignatures x :threshold 3)))
-      (check "quorum membership enforced"
-             (not (up:verify-cosignatures x :quorum (list (up:update-operator-id x))))))))
+(defun vector-json (u)
+  "The vector's fields, as the spec's JSON names them."
+  (let ((h #'u:bytes->hex))
+    (list "cosign_data" (funcall h (up::cosign-data u))
+          "cosigners" (loop for c in (up:update-cosignatures u)
+                            collect (list "pubkey" (funcall h (up:cosig-pubkey c))
+                                          "member_ledger_hash" (funcall h (up:cosig-member-ledger-hash c))
+                                          "digest" (funcall h (up:cosign-digest u (up:cosig-member-ledger-hash c)))
+                                          "signature" (funcall h (up:cosig-signature c))))
+          "operator_digest" (funcall h (up:operator-digest u))
+          "operator_signature" (funcall h (up:update-operator-sig u))
+          "current_hash" (funcall h (up:content-hash u))
+          "chain_hash" (funcall h (up:chain-hash u))
+          "update_tlv" (funcall h (up:encode-update u)))))
 
-(with-gate ("signed-update: signing round trip")
-  (let* ((op-priv 12345678901234567890) (co-priv 98765432109876543210)
-         (op-pub (up:compressed-pubkey op-priv))
-         (co-pub (up:compressed-pubkey co-priv))
-         (u (up:make-signed-update :operator-id op-pub :ledger-id (u:sha256 (hx "01")) :seq 7
-                                   :prev-hash (u:sha256 (hx "02")) :message (hx "00010c")))
-         (mlh (u:sha256 (hx "03"))))
-    (push (up:sign-cosignature u co-priv co-pub mlh) (up:update-cosignatures u))
-    (up:sign-operator u op-priv)
-    (check-equal "cosignature verifies as v1" (up:verify-cosignature u (first (up:update-cosignatures u))) :v1)
-    (check-equal "operator signature verifies as v1" (up:verify-operator-signature u) :v1)
+(with-gate ("signed-update: the v2 cross-implementation vector")
+  (let* ((u (vector-update)) (ours (vector-json u))
+         (path (vector-path "dep02-signing-v2.json")))
+    (check "the vector update's signatures verify" (and (up:verify-operator-signature u) (up:verify-cosignatures u :threshold 2)))
+    (check-bytes "cosign_data layout: seq, ledger_id, height, block_hash, prev, len, message"
+                 (up::cosign-data u)
+                 (hx (concatenate 'string "0700000000000000" (make-string 64 :initial-element #\a) "50f80c00"
+                                  (make-string 64 :initial-element #\b) (make-string 64 :initial-element #\c) "03000000" "00012a")))
     (let ((back (up:decode-update (up:encode-update u))))
-      (check-bytes "round trip preserves chain hash" (up:chain-hash back) (up:chain-hash u)))))
+      (check-bytes "decode/encode round trip preserves the chain hash" (up:chain-hash back) (up:chain-hash u)))
+    (if (probe-file path)
+        (let ((theirs (com.inuoe.jzon:parse (uiop:read-file-string path))))
+          (dolist (k '("cosign_data" "operator_digest" "operator_signature" "current_hash" "chain_hash" "update_tlv"))
+            (check-equal (format nil "~a matches the reference" k) (pget ours k) (gethash k theirs)))
+          (loop for c in (pget ours "cosigners") for tc across (gethash "cosigners" theirs) for i from 1
+                do (dolist (k '("pubkey" "member_ledger_hash" "digest" "signature"))
+                     (check-equal (format nil "cosigner ~a ~a matches the reference" i k) (pget c k) (gethash k tc)))))
+        (progn (format t "      no ~a yet: ours is~%" path)
+               (format t "~a~%" (com.inuoe.jzon:stringify
+                                 (let ((h (make-hash-table :test #'equal)))
+                                   (loop for (k v) on ours by #'cddr
+                                         do (setf (gethash k h)
+                                                  (if (listp v)
+                                                      (map 'vector (lambda (c) (let ((hh (make-hash-table :test #'equal)))
+                                                                                 (loop for (a b) on c by #'cddr do (setf (gethash a hh) b)) hh))
+                                                           v)
+                                                      v)))
+                                   h)))))))
 
+(with-gate ("signed-update: every field but the signatures is signed")
+  (let ((u (vector-update)))
+    (flet ((tampered (setter)
+             (let ((c (up:decode-update (up:encode-update u)))) (funcall setter c) c)))
+      (dolist (case (list (list "ledger_id (relabelled)" (lambda (c) (setf (up:update-ledger-id c) (u:sha256 (hx "0f")))))
+                          (list "block_height (re-dated)" (lambda (c) (setf (up:update-block-height c) 850001)))
+                          (list "block_hash" (lambda (c) (setf (up:update-block-hash c) (u:sha256 (hx "0e")))))
+                          (list "sequence" (lambda (c) (setf (up:update-seq c) 8)))
+                          (list "previous_hash" (lambda (c) (setf (up:update-prev-hash c) (u:sha256 (hx "0d")))))
+                          (list "message" (lambda (c) (setf (up:update-message c) (hx "00012b"))))))
+        (destructuring-bind (what setter) case
+          (let ((c (tampered setter)))
+            (check (format nil "changing ~a breaks the operator signature" what) (not (up:verify-operator-signature c)))
+            (check (format nil "changing ~a breaks every cosignature" what)
+                   (notany (lambda (s) (up:verify-cosignature c s)) (up:update-cosignatures c)))
+            (check (format nil "changing ~a changes the content hash" what)
+                   (not (equalp (up:content-hash c) (up:content-hash u))))))))
+    (let ((z (up:decode-update (up:encode-update u))))
+      (setf (up:update-cosignatures z) (list (first (up:update-cosignatures z)) (first (up:update-cosignatures z))))
+      (check "duplicate cosigner rejected" (not (up:verify-cosignatures z))))
+    (check "threshold enforced" (not (up:verify-cosignatures u :threshold 3)))
+    (check "quorum membership enforced" (not (up:verify-cosignatures u :quorum (list (up:update-operator-id u)))))))
+
+(with-gate ("signed-update: one encoding per update")
+  (let* ((u (vector-update))
+         (fields (tlv:decode (up:encode-update u)))
+         (with (lambda (type value) (tlv:encode (cons (cons type value) (remove type fields :key #'car))))))
+    (check-signals "an explicit zero block_height is refused" tlv:tlv-error
+                   (up:decode-update (funcall with 10 (hx "00000000"))))
+    (check-signals "an explicit zero block_hash is refused" tlv:tlv-error
+                   (up:decode-update (funcall with 12 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))))
+    (dolist (tag '(14 16 18))
+      (check-signals (format nil "retired single-cosignature tag ~a is refused" tag) tlv:tlv-error
+                     (up:decode-update (funcall with tag (hx "00")))))
+    (let ((bare (up:make-signed-update :operator-id (up:update-operator-id u) :ledger-id (up:update-ledger-id u)
+                                       :seq 0 :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                       :message (hx "00012a") :operator-sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element 1))))
+      (check "zero block fields are omitted, not written"
+             (null (intersection '(10 12) (mapcar #'car (tlv:decode (up:encode-update bare))))))
+      (check-bytes "an absent block_hash is signed as zero"
+                   (subseq (up::cosign-data (up:decode-update (up:encode-update bare))) 44 76)
+                   (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))))
+
+(with-gate ("signed-update: a signed chain")
+  ;; 52 updates, cosignature sets of 0, 2 and 3, each chaining on the last.
+  (let* ((op 12345678901234567890) (cos (list 98765432109876543210 1111111111111111111 2222222222222222222))
+         (lid (u:sha256 (hx "01"))) (prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (chain (loop for seq below 52
+                      collect (let ((x (up:make-signed-update :operator-id (up:compressed-pubkey op) :ledger-id lid :seq seq
+                                                              :prev-hash prev :message (hx (format nil "0001~2,'0x" seq))
+                                                              :block-height (+ 800000 seq))))
+                                (dolist (c (subseq cos 0 (case (mod seq 3) (0 0) (1 2) (t 3))))
+                                  (push (up:sign-cosignature x c (up:compressed-pubkey c) (u:sha256 (u:int->be seq 4))) (up:update-cosignatures x)))
+                                (up:sign-operator x op)
+                                (setf prev (up:chain-hash x))
+                                x))))
+    (check "every update round-trips byte for byte"
+           (every (lambda (x) (equalp (up:encode-update (up:decode-update (up:encode-update x))) (up:encode-update x))) chain))
+    (check "every prev_hash is the chain hash of the update before"
+           (loop for (a b) on chain while b always (equalp (up:update-prev-hash b) (up:chain-hash a))))
+    (check "every operator signature and cosignature verifies"
+           (every (lambda (x) (and (up:verify-operator-signature x) (up:verify-cosignatures x))) chain))
+    (defparameter *chain* chain)))
 
 (with-gate ("signed-update: signatures verify under concurrent threads")
   ;; A relay reader and a ledger worker verify at the same time in a daemon;
   ;; secp256k1-fast's scratch buffers must be per-thread for that to be sound.
-  (let* ((sample (subseq (remove-duplicates *updates* :test #'equalp :key #'up:encode-update) 0 40))
+  (let* ((sample (subseq *chain* 0 40))
          (failures (make-array 4 :initial-element 0))
          (threads (loop for i below 4
                         collect (let ((i i))

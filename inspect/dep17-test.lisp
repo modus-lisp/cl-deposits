@@ -44,7 +44,7 @@
                   (w (op:field o :script-witness)))
              (incf hashlocks)
              (unless (and h w (= (length w) 1) (equalp (u:sha256 (first w)) h)) (incf bad-hashlocks)))))
-        (lg:apply-update ledger x)))
+        (lg:apply-update ledger x :check-chain nil)))   ; the v1 fixture: see *distinct*
     (format t "      ~{~a~^ ~}~%" (loop for k being the hash-keys of results using (hash-value v) collect (format nil "~a=~a" k v)))
     (check-equal "InvoiceLock signatures all verify" (gethash '(:invoice-lock :ok) results 0) 10)
     (check-equal "TransferLock signatures all verify" (gethash '(:transfer-lock :ok) results 0) 4)
@@ -55,7 +55,7 @@
     (let* ((x (find-if (lambda (x) (eq (op:operation-type (op:decode-operation (up:update-message x))) :invoice-lock)) chain))
            (o (op:decode-operation (up:update-message x)))
            (fresh (lg:make-ledger)))
-      (dolist (y chain) (when (< (up:update-seq y) (up:update-seq x)) (lg:apply-update fresh y)))
+      (dolist (y chain) (when (< (up:update-seq y) (up:update-seq x)) (lg:apply-update fresh y :check-chain nil)))
       (let ((desc (lg:deposit-descriptor (lg:find-deposit fresh (op:field o :deposit-id)))))
         (check-equal "baseline verifies" (d17:verify-operation-witness o desc (op:field o :witness)) :ok)
         (dolist (field '(:amount :nonce :expiry))

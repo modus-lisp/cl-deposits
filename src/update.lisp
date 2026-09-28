@@ -5,20 +5,26 @@
 ;;;; operator.  This file knows nothing about what the operation MEANS — only
 ;;;; its bytes, its place in the chain, and who vouched for it.
 ;;;;
-;;;; Hash chain (verified byte-for-byte against the reference implementation's
-;;;; audit fixture, inspect/vectors/ledger_57f60e1dbef339e2.json):
+;;;; Signing and the hash chain, v2 (DEP-02 §Signing, §Hash Chain):
 ;;;;
-;;;;   content_hash = SHA256(seq_le8 || prev_hash || message
+;;;;   cosign_data  = seq_le8 || ledger_id || block_height_le4 || block_hash
+;;;;                  || prev_hash || len(message)_le4 || message
+;;;;   cosign       = tagged("deposits/cosign/v2", cosign_data || member_ledger_hash)
+;;;;   operator     = tagged("deposits/operator-update/v2", cosign_data || n_le2 || sigs)
+;;;;   content_hash = tagged("deposits/update/v2", cosign_data || n_le2
 ;;;;                         || for each cosignature, sorted by pubkey:
 ;;;;                              member_ledger_hash || cosign_signature)
 ;;;;   chain_hash   = SHA256(content_hash || operator_signature)
 ;;;;
-;;;; and the next update's prev_hash is this one's chain_hash.  Note the
-;;;; consequence: the cosignature SET is part of the chain.  An operator who
-;;;; republishes an update with more cosignatures has not changed its
-;;;; successor's prev_hash — the successor chains to whichever set the operator
-;;;; hashed at publish time — so a verifier must resolve prev_hash against the
-;;;; copy it actually chains to, not "the latest copy of sequence n".
+;;;; Every field but the signatures is signed.  Before v2, ledger_id and the
+;;;; block fields were not: an update could be relabelled onto another ledger
+;;;; its operator's key runs, or re-dated past quorum_expiry.  The next update's
+;;;; prev_hash is this one's chain_hash.  Note the consequence: the cosignature
+;;;; SET is part of the chain.  An operator who republishes an update with more
+;;;; cosignatures has not changed its successor's prev_hash — the successor
+;;;; chains to whichever set the operator hashed at publish time — so a verifier
+;;;; must resolve prev_hash against the copy it actually chains to, not "the
+;;;; latest copy of sequence n".
 
 (defpackage #:cl-deposits.update
   (:use #:cl #:cl-deposits.util)
@@ -46,14 +52,13 @@
 (defconstant +t-message+ 8)
 (defconstant +t-block-height+ 10)
 (defconstant +t-block-hash+ 12)
-(defconstant +t-cosigner-pubkey+ 14)     ; legacy single cosigner
-(defconstant +t-member-ledger-hash+ 16)  ; legacy
-(defconstant +t-cosign-signature+ 18)    ; legacy
+(defparameter +t-retired+ '(14 16 18))    ; the pre-majority single-cosignature format
 (defconstant +t-operator-signature+ 20)
 (defconstant +t-cosignatures+ 22)
 
-(defparameter +cosign-tag+ "deposits/cosign/v1")
-(defparameter +operator-tag+ "deposits/operator-update/v1")
+(defparameter +cosign-tag+ "deposits/cosign/v2")
+(defparameter +operator-tag+ "deposits/operator-update/v2")
+(defparameter +update-tag+ "deposits/update/v2")
 
 (defstruct (cosignature (:conc-name cosig-))
   (pubkey nil :type (or null octets))             ; 33-byte compressed
@@ -110,27 +115,30 @@
                                   (cosig-member-ledger-hash c)))))
 
 (defun decode-update (bytes)
+  "One encoding per update: a zero block_height or block_hash is omitted, never
+   written (both are signed as zero when absent), and the retired single-cosig
+   tags are refused."
   (let* ((a (tlv:decode bytes))
          (f (lambda (type) (tlv:field a type)))
          (cosigs (funcall f +t-cosignatures+))
-         (legacy-sig (funcall f +t-cosign-signature+)))
+         (height (funcall f +t-block-height+))
+         (hash (funcall f +t-block-hash+)))
+    (dolist (tag +t-retired+)
+      (when (funcall f tag) (error 'tlv:tlv-error :detail (format nil "retired single-cosignature tag ~a" tag))))
+    (when (and height (zerop (be->int (%expect height 4 "block_height"))))
+      (error 'tlv:tlv-error :detail "explicit zero block_height"))
+    (when (and hash (zero-bytes-p (%expect hash 32 "block_hash")))
+      (error 'tlv:tlv-error :detail "explicit zero block_hash"))
     (make-signed-update
      :operator-id (%expect (funcall f +t-operator-id+) 33 "operator_id")
      :ledger-id (%expect (funcall f +t-ledger-id+) 32 "ledger_id")
      :seq (be->int (%expect (funcall f +t-seq+) 8 "sequence_number"))
      :prev-hash (%expect (funcall f +t-prev-hash+) 32 "previous_hash")
      :message (or (funcall f +t-message+) (error 'tlv:tlv-error :detail "no message"))
-     :block-height (let ((h (funcall f +t-block-height+))) (if h (be->int (%expect h 4 "block_height")) 0))
-     :block-hash (let ((h (funcall f +t-block-hash+))) (if h (%expect h 32 "block_hash") (make-array 32 :element-type '(unsigned-byte 8))))
+     :block-height (if height (be->int height) 0)
+     :block-hash (or hash (make-array 32 :element-type '(unsigned-byte 8)))
      :operator-sig (%expect (funcall f +t-operator-signature+) 64 "operator_signature")
-     :cosignatures (cond (cosigs (decode-cosignatures cosigs))
-                         ((and legacy-sig (not (zero-bytes-p legacy-sig)))
-                          (list (make-cosignature
-                                 :pubkey (funcall f +t-cosigner-pubkey+)
-                                 :signature legacy-sig
-                                 :member-ledger-hash (or (funcall f +t-member-ledger-hash+)
-                                                         (make-array 32 :element-type '(unsigned-byte 8))))))
-                         (t '())))))
+     :cosignatures (and cosigs (decode-cosignatures cosigs)))))
 
 (defun encode-update (u)
   "The canonical bytes, as the reference encoder writes them: block fields
@@ -152,64 +160,40 @@
       (list (cons +t-cosignatures+ (encode-cosignatures (sorted-cosignatures u))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Hash chain
+;;; Signing data and the hash chain (v2; see the header)
+
+(defun cosign-data (u)
+  (let ((hash (update-block-hash u)))
+    (cat (int->le (update-seq u) 8) (update-ledger-id u)
+         (int->le (update-block-height u) 4)
+         (if (and hash (= (length hash) 32)) hash (make-array 32 :element-type '(unsigned-byte 8)))
+         (update-prev-hash u)
+         (int->le (length (update-message u)) 4) (update-message u))))
 
 (defun content-hash (u)
-  (sha256 (apply #'cat (int->le (update-seq u) 8) (update-prev-hash u) (update-message u)
-                 (loop for c in (sorted-cosignatures u)
-                       collect (cat (cosig-member-ledger-hash c) (cosig-signature c))))))
+  (let ((cs (sorted-cosignatures u)))
+    (apply #'tagged-hash +update-tag+ (cosign-data u) (int->le (length cs) 2)
+           (loop for c in cs collect (cat (cosig-member-ledger-hash c) (cosig-signature c))))))
 
 (defun chain-hash (u)
   "What the NEXT update's prev_hash must equal."
   (sha256 (cat (content-hash u) (update-operator-sig u))))
 
-;;; ---------------------------------------------------------------------------
-;;; Signing digests
-;;;
-;;; Two generations exist in the wild.  v1 is the canonical one going forward:
-;;; a tagged hash with a length-prefixed message.  The legacy forms are what
-;;; older reference nodes signed; verification accepts them, signing never
-;;; produces them.
+(defun cosign-digest (u member-ledger-hash)
+  (tagged-hash +cosign-tag+ (cosign-data u) member-ledger-hash))
 
-(defun cosign-data (u)
-  (cat (int->le (update-seq u) 8) (update-prev-hash u) (update-message u)))
-
-(defun cosign-digest (u member-ledger-hash &key (version :v1))
-  (ecase version
-    (:v1 (tagged-hash +cosign-tag+
-                      (int->le (update-seq u) 8) (update-prev-hash u)
-                      (int->le (length (update-message u)) 4) (update-message u)
-                      member-ledger-hash))
-    (:legacy (tagged-hash "deposits/cosign" (cosign-data u) member-ledger-hash))))
-
-(defun operator-digest (u &key (version :v1))
+(defun operator-digest (u)
   (let ((sigs (mapcar #'cosig-signature (sorted-cosignatures u))))
-    (ecase version
-      (:v1 (apply #'tagged-hash +operator-tag+
-                  (int->le (update-seq u) 8) (update-prev-hash u)
-                  (int->le (length (update-message u)) 4) (update-message u)
-                  (int->le (length sigs) 2) sigs))
-      ;; Legacy A: SHA256(cosign_data || each cosign signature)
-      (:legacy-a (sha256 (apply #'cat (cosign-data u)
-                                (or sigs (list (make-array 64 :element-type '(unsigned-byte 8)))))))
-      ;; Legacy B: pre-c57d7e0d genesis form, SHA256(seq_le || prev || content_hash || message)
-      (:legacy-b (sha256 (cat (int->le (update-seq u) 8) (update-prev-hash u)
-                              (content-hash u) (update-message u)))))))
+    (apply #'tagged-hash +operator-tag+ (cosign-data u) (int->le (length sigs) 2) sigs)))
 
 (defun verify-operator-signature (u)
-  "The digest version the operator's signature verifies under, or NIL."
-  (let ((pk (x-only (update-operator-id u))) (sig (update-operator-sig u)))
-    (loop for v in '(:v1 :legacy-a :legacy-b)
-          when (secp:schnorr-verify pk (operator-digest u :version v) sig)
-            return v)))
+  (and (secp:schnorr-verify (x-only (update-operator-id u)) (operator-digest u) (update-operator-sig u)) t))
 
 (defun verify-cosignature (u cosig)
-  "The digest version this cosignature verifies under, or NIL."
-  (let ((pk (x-only (cosig-pubkey cosig))))
-    (loop for v in '(:v1 :legacy)
-          when (secp:schnorr-verify pk (cosign-digest u (cosig-member-ledger-hash cosig) :version v)
-                                    (cosig-signature cosig))
-            return v)))
+  (and (secp:schnorr-verify (x-only (cosig-pubkey cosig))
+                            (cosign-digest u (cosig-member-ledger-hash cosig))
+                            (cosig-signature cosig))
+       t))
 
 (defun verify-cosignatures (u &key quorum (threshold 0))
   "Every cosignature must verify, come from a distinct pubkey, and (when QUORUM
@@ -228,7 +212,7 @@
         (values t nil))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Signing (v1 only)
+;;; Signing
 
 (defun sign-cosignature (u privkey-int pubkey33 member-ledger-hash &key aux)
   (make-cosignature :pubkey pubkey33

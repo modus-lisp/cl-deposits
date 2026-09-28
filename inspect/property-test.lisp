@@ -185,10 +185,12 @@
         (let ((flipped (copy-seq bytes)) (k (rnd (length bytes))))
           (setf (aref flipped k) (logxor 1 (aref flipped k)))
           (handler-case (let* ((f (up:decode-update flipped))
-                               (hashed (lambda (x) (list (up:update-seq x) (up:update-prev-hash x) (up:update-message x) (up:update-operator-sig x)
+                               ;; v2: every field but the keys (operator_id and cosigner pubkeys,
+                               ;; which the signatures cover) is in the chain hash
+                               (hashed (lambda (x) (list (up:update-seq x) (up:update-ledger-id x) (up:update-block-height x) (up:update-block-hash x)
+                                                         (up:update-prev-hash x) (up:update-message x) (up:update-operator-sig x)
                                                          (mapcar (lambda (c) (u:cat (up:cosig-member-ledger-hash c) (up:cosig-signature c))) (up:sorted-cosignatures x)))))
                                (hashed-part-same (equalp (funcall hashed f) (funcall hashed u))))
-                          ;; block_height / block_hash are outside the chain: flipping them must not move it
                           (if hashed-part-same
                               (unless (equalp (up:chain-hash f) (up:chain-hash u)) (incf bad))
                               (when (equalp (up:chain-hash f) (up:chain-hash u)) (incf bad))))

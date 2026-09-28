@@ -100,7 +100,7 @@
         (check-equal "published updates cover the whole chain" (mapcar #'up:update-seq updates)
                      (loop for i to (lg:ledger-sequence (nd:record-ledger la)) collect i))
         (check "every Nostr event signature valid" (every #'cl-nostr.event:valid-event-p events))
-        (check "every operator signature verifies (v1)" (every (lambda (u) (eq :v1 (up:verify-operator-signature u))) updates))
+        (check "every operator signature verifies" (every #'up:verify-operator-signature updates))
         (check "every post-QuorumBegin update has a member majority"
                (loop for u in updates
                      for o = (op:decode-operation (up:update-message u))
@@ -188,7 +188,10 @@
                                                        :prev-hash (up:chain-hash (nth (- seq 3) history))
                                                        :message (op:encode-operation (list :type :deposit-close :deposit-id d1)))))
                          (up:sign-operator u (nd::node-priv a)) u)))
-          (check "a relabelled update still carries a valid operator signature" (up:verify-operator-signature x0))
+          ;; v2 signs ledger_id: the relabelled copy no longer verifies at all.  The
+          ;; chain-binding checks below stay as a second line (STRAY and REWIND are
+          ;; signed as this ledger's, and still must bind to its chain).
+          (check "a relabelled update no longer carries a valid operator signature (v2)" (not (up:verify-operator-signature x0)))
           (check "the other ledger's genesis, relabelled, is not an equivocation with this one's"
                  (not (fr:verify-equivocation (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) a0 x0) history)))
           (check "an update following nothing in this ledger is not a non-conforming proof"
@@ -197,7 +200,7 @@
                  (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) rewind) history))
           (check "the other ledger's genesis, relabelled, is not a non-conforming seq-0 proof"
                  (not (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) x0) history)))
-          (nd::accept-update b (nd:find-record b id) x0)
+          (ignore-errors (nd::accept-update b (nd:find-record b id) x0))   ; refused: bad signature
           (check "a member handed a relabelled update does not cry equivocation"
                  (notany (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c d)))
           ;; The relabelled updates now sit on the relay beside the real ones at the

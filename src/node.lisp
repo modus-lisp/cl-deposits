@@ -274,6 +274,10 @@
   (run-hooks node rec update)
   update)
 
+(defparameter *cosign-height-tolerance* 6
+  "A cosigner refuses an update whose (signed) block_height is further than this
+   from its own chain tip: the height decides the lifecycle tier.")
+
 (defun solicit-cosignatures (node rec update signers required)
   "Ask the quorum; return when REQUIRED valid cosignatures are in the update."
   (let* ((params (w:json-object "sequence_number" (up:update-seq update)
@@ -700,13 +704,15 @@
         ;; updates at seq 0 (one another ledger's, relabelled) made the first one
         ;; the genesis — the rebuilt replica was the operator's other ledger.
         (dolist (u updates)
-          (let ((next (1+ (lg:ledger-sequence (record-ledger rec)))))
-            ;; ...and the operator's chain: the relay also holds every dispute
-            ;; fork's updates under this id, chaining onto the fork point.
-            (when (and (or (zerop (up:update-seq u))
-                           (equalp (up:update-operator-id u) (lg:ledger-operator-key (record-ledger rec))))
-                       (or (< (up:update-seq u) next) (and (= (up:update-seq u) next) (chains-on-p rec u))))
-              (accept-update node rec u))))
+          ;; ...and the operator's chain: the relay also holds every dispute
+          ;; fork's updates under this id, chaining onto the fork point.  Only the
+          ;; next link is taken; whatever else sits at a sequence is not ours to judge.
+          (when (and (= (up:update-seq u) (1+ (lg:ledger-sequence (record-ledger rec))))
+                     (or (zerop (up:update-seq u))
+                         (equalp (up:update-operator-id u) (lg:ledger-operator-key (record-ledger rec))))
+                     (chains-on-p rec u)
+                     (up:verify-operator-signature u))
+            (accept-update node rec u)))
         (setf (gethash id-hex (node-ledgers node)) rec)
         rec)))
 
@@ -736,15 +742,26 @@
               (or (member (node-pubkey node) (lg:ledger-quorum-members l) :key #'lg:member-pubkey :test #'equalp)
                   (member (node-pubkey node) (lg:ledger-next-quorum-members l) :key #'lg:member-pubkey :test #'equalp))))
        nil)
-      ((< (length data) 40) (respond node event nil :error "malformed cosign_data"))
+      ((not (and (>= (length data) 112) (= (length data) (+ 112 (le->int (subseq data 108 112))))))
+       (respond node event nil :error "malformed cosign_data"))
       (t
+       ;; DEP-02 v2 cosign_data: seq8 || ledger_id32 || height4 || block_hash32 || prev32 || len4 || message.
+       ;; We sign exactly these, so we check what they claim.
        (let* ((ledger (record-ledger rec))
-              (prev (subseq data 8 40)) (message (subseq data 40))
-              (candidate (up:make-signed-update :operator-id (lg:ledger-operator-key ledger)
-                                                :ledger-id (hex->bytes (record-id-hex rec))
-                                                :seq seq :prev-hash prev :message message)))
+              (ledger-id (subseq data 8 40)) (block-height (le->int (subseq data 40 44)))
+              (block-hash (subseq data 44 76)) (prev (subseq data 76 108)) (message (subseq data 112))
+              (candidate (up:make-signed-update :operator-id (lg:ledger-operator-key ledger) :ledger-id ledger-id
+                                                :seq seq :prev-hash prev :message message
+                                                :block-height block-height :block-hash block-hash)))
          (handler-case
              (progn
+               (unless (equalp ledger-id (hex->bytes (record-id-hex rec))) (fail "ledger_id mismatch"))
+               (let ((ours (height node)))
+                 (when (and (plusp ours) (> (abs (- block-height ours)) *cosign-height-tolerance*))
+                   (fail "block_height ~a is not near our tip ~a" block-height ours))
+                 (when (and (not (zero-bytes-p block-hash)) (node-block-hash-fn node))
+                   (let ((h (ignore-errors (funcall (node-block-hash-fn node) block-height))))
+                     (when (and h (not (equalp h block-hash))) (fail "block_hash is not our chain's at ~a" block-height)))))
                (when (and (> seq (1+ (lg:ledger-sequence ledger))) (not (record-fork-p rec)))
                  (catch-up node rec))
                (unless (= seq (1+ (lg:ledger-sequence ledger)))
