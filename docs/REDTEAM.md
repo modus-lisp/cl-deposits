@@ -330,8 +330,18 @@ The dispute that follows exposes the next layer:
   non-conforming co-signature, winner collateral deviation, unauthorised vault spend, expired
   quorum) needs neither, and verifiers must not require them.  For a member reporting its own
   operator after the fraud they are unsatisfiable anyway (no honest member co-signs past the
-  fraud, so no causal link forms).  DEP-06 clarified on branch `dep06-embedding-scope` (774b9c7);
-  the reference verifier and cl's broadcasts follow.
+  fraud, so no causal link forms).  DEP-06 clarified on branch `dep06-embedding-scope` (774b9c7).
+  **Closed (2026-09-28):** deposits-rust 982de7a (embedding required only for off-ledger types;
+  optional on the wire) and a76a049 (NonConformingUpdate proved by replaying the linked history
+  and applying the fault — the old verifier proved only chain breaks, so C's fault, which chains,
+  was "conforming"); cl f41b87b omits the embedding for self-evident proofs.  Live: a cl-built
+  proof of C's seq 17,840, no embedding, `Fraud proof VERIFIED … (self-evident, no embedding)` on
+  ref2 and ref3.
+  Follow-ups found on the way (deposits-rust, not fixed): NonConformingCosignature's verifier
+  runs conformance with `DenyAll`, so an honest cosigned withdrawal would "prove" fraud; a
+  chain-break proof could be relabelled across ledgers if an operator reused a key (an update's
+  `ledger_id` is not covered by its hash); and the reference disputes from its *replica's* tip
+  (`last_valid_seq=20181` for a fault at 17,840) because its base keeps applying flagged updates.
 - **cl retries catch-up into a known-invalid update forever** (`catch-up on eff80500 stopped at
   seq 17840: OVER-OBLIGATION`, every pass): noisy, and should stop once the fork is open.
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
