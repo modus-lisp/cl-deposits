@@ -313,8 +313,14 @@ The dispute that follows exposes the next layer:
   None`.  DEP-06 sizes it from obligations at `last_valid_sequence` (480M msat → ~725k sats, what
   cl computed and pledged); 61.4M sats is the credit's 40.48B msat.  The fraud inflates the bond an
   honest member needs to dispute it, and ref3 armed without collateral.
-- **9b — cl does not see ref3's fork.**  cld3/cld4 list only their own two forks and count "2 of
-  3 armed"; ref3 logged `Published DisputeArmed on fork`.  Not yet diagnosed.
+- **9b — ref3's fork never reached the relay.**  cld3/cld4 list only their own two forks and
+  count "2 of 3 armed"; ref3 logged `Published DisputeArmed on fork`.  The reference publishes a
+  fork by re-broadcasting the whole chain from genesis in one burst (17,840 kind-9100 events under
+  its Nostr key 0472774f…); the relay received exactly the first 9,978 (seq 0–9,977, within one
+  second) and nothing after — so the fork's own DisputeEnter and DisputeArmed, at the tail, were
+  lost.  Nothing on the relay side dropped them and ref3 logged no error: a silent client-side
+  loss.  The prefix need not be re-sent at all (it is on the relay under the operator's events).
+  Not a cl bug; queued for deposits-rust.
 - **9c — the reference rejects cl's fraud proofs:** `Fraud proof rejected: proof_hash … not
   embedded at seq 0 on ledger …` — the reference expects the prover to embed the proof's hash in its
   own ledger first; cl broadcasts without embedding.  Harmless here (ref3 found the fraud itself).
