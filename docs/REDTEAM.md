@@ -292,6 +292,37 @@ Root-caused while fixing #7 (deposits-rust 713dd7e):
   applied nothing; the expiry watch now judges only a current replica and stands down from a
   quorum_expired dispute whose quorum returned.
 
+### 2026-09-28 — attack #1 on the fresh soak: claim #1 holds in both implementations
+
+After the mulligan (every replica current, ledger C at seq ~17.8k: cld2 operates; cld3, cld4,
+ref3 cosign):
+
+- **Honest arm — pass, all three on the merits.**  cld3/cld4: `OVER-OBLIGATION (credit
+  40000000000 would take obligations 480000000 over reserves 20000000000)`; ref3: `Cosign refused:
+  conformance violations [InsufficientReserves { reserves: 20000000000, obligations: 40480000000 },
+  ExceedsCollateral …]`.  0 of 2 cosignatures; nothing published.
+- **Collude arm — pass.**  The colluding operator published seq 17,840 with cld3's and cld4's
+  blind cosignatures.  **ref3 detected it in 7 s** (`NON-CONFORMING COSIGNED update … seq 17840`)
+  and forked at 17,839; cld3 and cld4, whose validation stays honest, rejected it on apply and
+  disputed too (35b3354); cld3 published a NonConformingUpdate proof.
+
+The dispute that follows exposes the next layer:
+
+- **9a — the reference sizes replacement collateral from the fraudulent obligations.**  ref3:
+  `Auto-arm: operator-key P2WPKH UTXO has only 1000000 sats, required ≥ 61445000 — declaring
+  None`.  DEP-06 sizes it from obligations at `last_valid_sequence` (480M msat → ~725k sats, what
+  cl computed and pledged); 61.4M sats is the credit's 40.48B msat.  The fraud inflates the bond an
+  honest member needs to dispute it, and ref3 armed without collateral.
+- **9b — cl does not see ref3's fork.**  cld3/cld4 list only their own two forks and count "2 of
+  3 armed"; ref3 logged `Published DisputeArmed on fork`.  Not yet diagnosed.
+- **9c — the reference rejects cl's fraud proofs:** `Fraud proof rejected: proof_hash … not
+  embedded at seq 0 on ledger …` — the reference expects the prover to embed the proof's hash in its
+  own ledger first; cl broadcasts without embedding.  Harmless here (ref3 found the fraud itself).
+- **cl retries catch-up into a known-invalid update forever** (`catch-up on eff80500 stopped at
+  seq 17840: OVER-OBLIGATION`, every pass): noisy, and should stop once the fork is open.
+- With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
+  armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
+
 ### Open (2026-09-27)
 
 - **F's lottery** could not be claimed (organic #6); mitigated (c3cd4cd) and swept to the
