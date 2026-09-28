@@ -53,7 +53,7 @@
   max-descriptor-bytes compensation-bps compensation-deposit-id compensation-frequency-blocks
   member-response)
 
-(defstruct (ledger (:constructor %make-ledger))
+(defstruct (ledger (:constructor %make-ledger) (:copier nil))   ; COPY-LEDGER is the deep copy below
   id (genesis-block 0) operator-key (reserves-key "")
   (reserves-amount 0) (collateral-amount 0)
   (quorum-state :pre-quorum) (quorum-members '()) (next-quorum-members '()) quorum-expiry
