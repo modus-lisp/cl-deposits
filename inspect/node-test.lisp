@@ -199,7 +199,26 @@
                  (not (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) x0) history)))
           (nd::accept-update b (nd:find-record b id) x0)
           (check "a member handed a relabelled update does not cry equivocation"
-                 (notany (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c d))))
+                 (notany (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c d)))
+          ;; The relabelled updates now sit on the relay beside the real ones at the
+          ;; same sequences.  Rebuilding the ledger from the relay must follow the chain.
+          (let* ((k (- seq 3))
+                 (stray-k (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id) :seq k
+                                                          :prev-hash (u:sha256 (hx "e15e"))
+                                                          :message (op:encode-operation (list :type :deposit-close :deposit-id d1)))))
+                            (up:sign-operator u (nd::node-priv a)) u))
+                 (e (nd:make-node :priv 66666666666666666666 :bus bus :height-fn hf)))
+            (bus:bus-publish bus (w:update-event (nd::node-keypair a) x0))
+            (bus:bus-publish bus (w:update-event (nd::node-keypair a) stray-k))
+            (let ((f (nd::follow-ledger e id)))
+              (check-equal "a follower rebuilds the ledger itself past a relabelled genesis"
+                           (list (nd:record-id-hex f) (lg:ledger-sequence (nd:record-ledger f)))
+                           (list id (lg:ledger-sequence (nd:record-ledger la)))))
+            (let* ((prefix (subseq history 0 k))
+                   (behind (nd::make-record :id-hex id :ledger (lg:replay prefix) :history (reverse prefix))))
+              (nd::catch-up e behind)
+              (check-equal "catch-up steps over a relabelled update at its next sequence"
+                           (lg:ledger-sequence (nd:record-ledger behind)) (lg:ledger-sequence (nd:record-ledger la))))))
         ;; --- Broadcast the proof: every member verifies it and forks.
         (nd:broadcast-fraud b proof)
         (check "all three members opened dispute forks"

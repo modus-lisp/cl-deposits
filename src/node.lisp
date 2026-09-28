@@ -543,13 +543,15 @@
       (let ((ours (find (up:update-seq update) (record-history rec) :key #'up:update-seq)))
         (when (and ours (not (record-fork-p rec))
                    (not (equalp (up:content-hash ours) (up:content-hash update)))
-                   (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
-                   ;; ...and it follows this ledger's chain.  ledger_id is unsigned and the
-                   ;; operator signs its other ledgers with the same key: one of their
-                   ;; updates, relabelled with this ledger's id, is not an equivocation.
-                   (fr:update-binds-to-ledger-p update (up:update-ledger-id ours) (fr:bound-hashes (record-history rec))))
-          (log! node "EQUIVOCATION on ~a at seq ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq update))
-          (broadcast-fraud node (fr:make-equivocation-proof (up:update-operator-id update) (up:update-ledger-id update) ours update))))
+                   (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp))
+          ;; ...and only if it follows this ledger's chain.  ledger_id is unsigned and
+          ;; the operator signs its other ledgers with the same key: one of their
+          ;; updates, relabelled with this ledger's id, is not an equivocation.
+          (if (fr:update-binds-to-ledger-p update (up:update-ledger-id ours) (fr:bound-hashes (record-history rec)))
+              (progn (log! node "EQUIVOCATION on ~a at seq ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq update))
+                     (broadcast-fraud node (fr:make-equivocation-proof (up:update-operator-id update) (up:update-ledger-id update) ours update)))
+              (log! node "ignored an update on ~a at seq ~a that follows nothing in its chain: another ledger's, relabelled"
+                    (subseq (record-id-hex rec) 0 8) (up:update-seq update)))))
       (return-from accept-update :echo))
     (multiple-value-bind (required signers tier operator-alone allowed)
         (lg:cosign-requirement ledger op (up:update-block-height update))
@@ -592,6 +594,15 @@
             (setf (gethash k seen) t) (push u out))))
       (sort out #'< :key #'up:update-seq))))
 
+(defun chains-on-p (rec u)
+  "U continues REC's chain: the LedgerOpen that derives its id, or an update
+   whose previous_hash is its tip.  The relays hold whatever anyone tags with
+   the ledger's id, and ledger_id is signed by no one: the operator's updates of
+   its other ledgers, relabelled, sit beside the real ones at the same sequences."
+  (if (zerop (up:update-seq u))
+      (fr:update-opens-ledger-p u (hex->bytes (record-id-hex rec)))
+      (equalp (up:update-prev-hash u) (lg:ledger-chain-tip (record-ledger rec)))))
+
 (defun catch-up (node rec)
   "A replica that missed an update (a restart, a relay that dropped us) can never
    apply another: every later one fails 'expected seq N'.  Fetch the operator's
@@ -609,7 +620,11 @@
                         (error (e) (log! node "catch-up on ~a: fetch failed: ~a" (subseq (record-id-hex rec) 0 8) e) '()))))
         (dolist (u updates)
           (when (and (= (up:update-seq u) (1+ (lg:ledger-sequence ledger)))
-                     (equalp (up:update-operator-id u) (lg:ledger-operator-key ledger)))
+                     (equalp (up:update-operator-id u) (lg:ledger-operator-key ledger))
+                     ;; Not one that follows something else: a relabelled update here
+                     ;; failed the chain check, was taken for a rule the operator broke,
+                     ;; and stopped this replica's catch-up for good.
+                     (chains-on-p rec u))
             (handler-case (when (eq (accept-update node rec u) :applied) (incf n) (incf applied))
               (lg:ledger-error (e)
                 (setf (gethash (record-id-hex rec) (node-refused node)) (up:update-seq u))
@@ -672,7 +687,13 @@
   (or (find-record node id-hex)
       (let* ((updates (ledger-updates-from-relays node id-hex))
              (rec (make-record :id-hex id-hex :ledger (lg:make-ledger))))
-        (dolist (u updates) (accept-update node rec u))
+        ;; Build the chain, not whatever the relays hold at each sequence: two
+        ;; updates at seq 0 (one another ledger's, relabelled) made the first one
+        ;; the genesis — the rebuilt replica was the operator's other ledger.
+        (dolist (u updates)
+          (let ((next (1+ (lg:ledger-sequence (record-ledger rec)))))
+            (when (or (< (up:update-seq u) next) (and (= (up:update-seq u) next) (chains-on-p rec u)))
+              (accept-update node rec u))))
         (setf (gethash id-hex (node-ledgers node)) rec)
         rec)))
 

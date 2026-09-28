@@ -12,7 +12,7 @@
   (:local-nicknames (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation) (#:lg #:cl-deposits.ledger)
                     (#:w #:cl-deposits.wire))
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
-           #:verify-equivocation #:update-binds-to-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
+           #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
            #:proof->json #:json->proof #:requires-embedding-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:verify-censorship))
 (in-package #:cl-deposits.fraud)
