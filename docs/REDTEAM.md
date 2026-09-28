@@ -386,6 +386,16 @@ on C at 17840 and failed to rebuild C. None of the three causes was new:
 - The live detector did not check the two updates had one signer. It took a fork member's
   DisputeEnter for the operator equivocating. Other nodes refused the proofs ("operators differ").
 
+**Closed in the protocol (2026-09-28): DEP-02 v2 signing.** `ledger_id`, `block_height` and
+`block_hash` are now part of `cosign_data`, so the operator signature, every cosignature and the
+hash chain cover them (spec branch `dep02-signed-header` a23cf09, deposits-rust `signed-header-v2`,
+cl b1f6106). A relabelled or re-dated update no longer verifies at all. `block_height` was the
+sharper half: it decides the lifecycle tier, and anyone could move an honest update past
+`quorum_expiry`. The chain-binding checks above stay as a second line. It was a clean break: the v1
+digests and single-cosignature tags are retired, and the devnet was archived
+(`deposits-soak2-2026-09-28.tar.gz`) and brought up fresh. `vectors/dep02-signing-v2.json` is
+produced independently by both implementations and matches byte for byte.
+
 **Open:** the reference's gap repair already follows the chain through duplicates (ledger_repair.rs
 `fill_gap`). Its paginated catch-up and the recovery CLI have not been checked against the relabelled
 updates now on the relay. `quorum-names-us-p` (cl) reads the newest QuorumBegin by tag with limit 1,
