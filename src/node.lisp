@@ -89,6 +89,7 @@
   (subscription nil)                           ; our bus handler, so STOP-NODE can remove it
   (seen (make-hash-table :test #'equal)) (seen-order '())   ; event ids already handled (relays redeliver)
   (not-ours (make-hash-table :test #'equal :synchronized t))   ; ledger id -> retry-after, for refollow-if-member
+  (loading nil)                                ; T until LOAD-DATA-DIR has run: the worker lanes wait
   (ln nil)                                     ; a cl-deposits.lightning backend, or NIL
   (broadcast-fn nil)                           ; (lambda (tx-bytes)) -> txid or NIL; NIL = collect only
   (broadcasts '())                             ; what we would have broadcast (newest first)
@@ -128,7 +129,12 @@
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
                            :chain-fn chain-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
-                           :broadcast-fn broadcast-fn :height-of-block height-of-block :block-hash-fn block-hash-fn)))
+                           :broadcast-fn broadcast-fn :height-of-block height-of-block :block-hash-fn block-hash-fn
+                           ;; We subscribe below, before the caller loads the data dir.  A
+                           ;; cosign request handled then found no record, took the ledger
+                           ;; for a replica we had lost, and rebuilt it from the relay: 80k
+                           ;; updates, racing the load, through every fork's updates too.
+                           :loading (and data-dir t))))
     ;; On a real relay, events arrive on the reader thread.  Responses are
     ;; consumed inline (they only wake a waiter); requests and updates go to a
     ;; worker, because handling a request may itself wait for responses.
@@ -170,6 +176,7 @@
     (bt:condition-notify (node-inbox-cv node))))
 
 (defun worker-loop (node)
+  (loop while (node-loading node) do (sleep 0.1))   ; see make-node
   (loop
     (let ((event (bt:with-lock-held ((node-inbox-lock node))
                    (loop until (node-inbox node) do (bt:condition-wait (node-inbox-cv node) (node-inbox-lock node)))
@@ -185,6 +192,7 @@
 (defun fast-worker-loop (node)
   ;; Replicas are applied and read here only; the main worker mutates owned
   ;; records.  What the two share (the seen table, the ledgers table) is locked.
+  (loop while (node-loading node) do (sleep 0.1))   ; see make-node
   (loop
     (let ((event (bt:with-lock-held ((node-fast-lock node))
                    (loop until (node-fast-inbox node) do (bt:condition-wait (node-fast-cv node) (node-fast-lock node)))
@@ -542,6 +550,7 @@
       ;; Same sequence, different content, validly signed by the operator: equivocation.
       (let ((ours (find (up:update-seq update) (record-history rec) :key #'up:update-seq)))
         (when (and ours (not (record-fork-p rec))
+                   (equalp (up:update-operator-id ours) (up:update-operator-id update))   ; a fork's is not the operator's
                    (not (equalp (up:content-hash ours) (up:content-hash update)))
                    (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp))
           ;; ...and only if it follows this ledger's chain.  ledger_id is unsigned and
@@ -550,7 +559,7 @@
           (if (fr:update-binds-to-ledger-p update (up:update-ledger-id ours) (fr:bound-hashes (record-history rec)))
               (progn (log! node "EQUIVOCATION on ~a at seq ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq update))
                      (broadcast-fraud node (fr:make-equivocation-proof (up:update-operator-id update) (up:update-ledger-id update) ours update)))
-              (log! node "ignored an update on ~a at seq ~a that follows nothing in its chain: another ledger's, relabelled"
+              (log! node "ignored an update on ~a at seq ~a that is not on its chain (another ledger's, relabelled?)"
                     (subseq (record-id-hex rec) 0 8) (up:update-seq update)))))
       (return-from accept-update :echo))
     (multiple-value-bind (required signers tier operator-alone allowed)
@@ -692,7 +701,11 @@
         ;; the genesis — the rebuilt replica was the operator's other ledger.
         (dolist (u updates)
           (let ((next (1+ (lg:ledger-sequence (record-ledger rec)))))
-            (when (or (< (up:update-seq u) next) (and (= (up:update-seq u) next) (chains-on-p rec u)))
+            ;; ...and the operator's chain: the relay also holds every dispute
+            ;; fork's updates under this id, chaining onto the fork point.
+            (when (and (or (zerop (up:update-seq u))
+                           (equalp (up:update-operator-id u) (lg:ledger-operator-key (record-ledger rec))))
+                       (or (< (up:update-seq u) next) (and (= (up:update-seq u) next) (chains-on-p rec u))))
               (accept-update node rec u))))
         (setf (gethash id-hex (node-ledgers node)) rec)
         rec)))
@@ -2316,8 +2329,13 @@
                 (log! node "fork ~a: armed with a preimage we cannot re-derive" (subseq id-hex 0 8)))))))
     rec))
 
-(defun load-data-dir (node &key (log-fn (lambda (fmt &rest args) (apply #'log! node fmt args))))
-  "Reload everything we knew: our ledgers, the ones we cosign, forks, reveals."
+(defun load-data-dir (node &rest args)
+  "Reload everything we knew: our ledgers, the ones we cosign, forks, reveals.
+   Then release the worker lanes (see make-node)."
+  (unwind-protect (apply #'%load-data-dir node args)
+    (setf (node-loading node) nil)))
+
+(defun %load-data-dir (node &key (log-fn (lambda (fmt &rest args) (apply #'log! node fmt args))))
   (let* ((dir (node-data-dir node))
          (log-lock (bt:make-lock "load-log"))
          (files (directory (merge-pathnames "ledger_*.json" dir))))

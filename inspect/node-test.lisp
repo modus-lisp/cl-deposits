@@ -225,6 +225,9 @@
                (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c d)))
         (check "members replicate each other's forks"
                (every (lambda (m) (= 3 (length (nd:forks-of m id)))) (list b c d)))
+        (let ((f (nd::follow-ledger (nd:make-node :priv 77777777777777777777 :bus bus :height-fn hf) id)))
+          (check-equal "rebuilding from the relay follows the operator's chain, not the forks' updates beside it"
+                       (lg:ledger-sequence (nd:record-ledger f)) (lg:ledger-sequence (nd:record-ledger la))))
         (check-equal "fork state is disputed" (lg:ledger-dispute-state (nd:record-ledger (nd:find-fork b id (nd:node-pubkey b)))) :disputed)
         ;; --- Arm.
         (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 0 10000000)))
