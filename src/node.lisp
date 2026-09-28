@@ -1313,19 +1313,25 @@
   (and (stringp reason) (string= (substitute #\_ #\- reason) "quorum_expired")))
 
 (defun fork-lottery (node id-hex)
-  "(values confiscation lottery state) for ID-HEX, STATE :PENDING, :RECOVERED or
-   :SPENT (claimed), or NIL.  Found once by rebuilding (CONFISCATED-LOTTERY),
-   then kept on our forks so a pass costs a couple of UTXO lookups."
-  (let ((f (find-if (lambda (f) (and (record-confiscation f) (record-lottery f))) (forks-of node id-hex))))
-    (if f
+  "(values confiscation lottery state) for ID-HEX, STATE :PENDING or :RECOVERED,
+   or NIL.  Found once by rebuilding (CONFISCATED-LOTTERY), then kept on our
+   forks so a pass costs a couple of UTXO lookups.  A kept transaction that is
+   neither pending nor swept is not evidence of anything: a signer keeps every
+   proposal it signs, and the one that confirmed may be another proposer's
+   (on the soak cld3 signed a proposal that never went out, while ref3's did,
+   and took its own for spent) — so it is dropped and the chain asked again."
+  (flet ((forget () (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) nil (record-lottery f) nil))))
+    (let ((f (find-if (lambda (f) (and (record-confiscation f) (record-lottery f))) (forks-of node id-hex))))
+      (when f
         (let ((tx (record-confiscation f)) (l (record-lottery f)))
-          (cond ((not (node-chain-fn node)) (values tx l :pending))
-                ((funcall (node-chain-fn node) (btx:tx-txid tx) 0) (values tx l :pending))
-                ((funcall (node-chain-fn node) (btx:tx-txid (build-lottery-recovery node id-hex tx l)) 0) (values tx l :recovered))
-                (t (values tx l :spent))))
-        (multiple-value-bind (tx l state) (confiscated-lottery node id-hex)
-          (when tx (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) tx (record-lottery f) l)))
-          (values tx l state)))))
+          (cond ((not (node-chain-fn node)) (return-from fork-lottery (values tx l :pending)))
+                ((funcall (node-chain-fn node) (btx:tx-txid tx) 0) (return-from fork-lottery (values tx l :pending)))
+                ((funcall (node-chain-fn node) (btx:tx-txid (build-lottery-recovery node id-hex tx l)) 0)
+                 (return-from fork-lottery (values tx l :recovered)))
+                (t (forget)))))
+      (multiple-value-bind (tx l state) (confiscated-lottery node id-hex)
+        (when tx (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) tx (record-lottery f) l)))
+        (values tx l state)))))
 
 (defun drive-dispute (node fork)
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (h (height node)))
@@ -1353,6 +1359,10 @@
             (cond
               ;; Nothing left to confiscate (a stranded rotation spent it): arming
               ;; would only tie up a pledge.
+              ((and reserves-spent (null conf) (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
+               ;; We revealed, so a confiscation was on chain; its lottery output is gone
+               ;; and not by our recovery sweep: the winner claimed it.
+               (conclude "lottery claimed by its winner; yielded"))
               ((and reserves-spent (null conf))
                (note-dispute node id "reserves spent, but not by a confiscation we can rebuild"))
               ((null (fork-op fork :dispute-armed))
@@ -1376,7 +1386,6 @@
                                         (release-pledges node id)
                                         (note-dispute node id "lottery: ~(~a~)" outcome))
                           (error (e) (note-dispute node id "waiting to claim: ~a" e))))))
-              (conf (note-dispute node id "lottery output spent"))
               (t
                (let* ((closes (dispute-arm-closes node base))
                       (armers (sort (mapcar #'first (armers-of node id)) #'bytes<))

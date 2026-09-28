@@ -689,6 +689,14 @@
         (dolist (m (list b c d))
           (dolist (f (nd::forks-of m id)) (setf (nd::record-confiscation f) nil (nd::record-lottery f) nil)))
         (check "after a restart the confiscation still rebuilds" (nd::confiscation-on-chain c id))
+        ;; A signer keeps every proposal it signed; one that never confirmed must not
+        ;; hide the one that did.
+        (multiple-value-bind (stale sl) (nd:build-confiscation d id :tier-index 1 :respectful t)
+          (dolist (f (nd::forks-of d id)) (setf (nd::record-confiscation f) stale (nd::record-lottery f) sl))
+          (multiple-value-bind (tx l state) (nd::fork-lottery d id)
+            (declare (ignore l))
+            (check "a stale cached proposal is dropped for the confiscation on chain"
+                   (and (eq state :pending) (equalp (btx:tx-txid tx) (btx:tx-txid (nd::confiscation-on-chain c id)))))))
         (let* ((conf (nd::confiscation-on-chain c id)) (bytes (u:hex->bytes (nd::unsigned-tx-hex conf))))
           (check "an unsigned tx goes out without the segwit marker (BIP-144)" (/= 0 (aref bytes 4)))
           (check "and parses back to the same txid"
