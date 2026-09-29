@@ -10,7 +10,7 @@
 (defpackage #:cl-deposits.fraud
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation) (#:lg #:cl-deposits.ledger)
-                    (#:w #:cl-deposits.wire))
+                    (#:w #:cl-deposits.wire) (#:cf #:cl-deposits.conformance))
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
            #:proof->json #:json->proof #:requires-embedding-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
@@ -168,9 +168,14 @@
               ((and (plusp seq) (/= (gethash (up:update-prev-hash fault) bound) (1- seq)))
                (values t (format nil "fault at seq ~a follows seq ~a" seq (gethash (up:update-prev-hash fault) bound))))
               (t
-               ;; It chains onto its predecessor, so it must break a rule.
-               (handler-case (progn (lg:apply-update (lg:replay prefix) fault) (values nil "fault update applies cleanly: conforming"))
-                 (lg:ledger-error (c) (values t (princ-to-string c)))))))
+               ;; It chains onto its predecessor, so it must break a rule: the fold's,
+               ;; or the depositor's (authorization, nonce window, expiry).
+               (let* ((l (lg:replay prefix))
+                      (v (cf:violation l (op:decode-operation (up:update-message fault)) (up:update-block-height fault))))
+                 (if v
+                     (values t v)
+                     (handler-case (progn (lg:apply-update l fault) (values nil "fault update applies cleanly: conforming"))
+                       (lg:ledger-error (c) (values t (princ-to-string c)))))))))
     (error (c) (values nil (princ-to-string c)))))
 
 (defun verify-proof (proof &key history height-of-block)

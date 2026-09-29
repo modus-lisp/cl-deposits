@@ -872,4 +872,61 @@
       (check-signals "an armer with no replacement collateral blocks the confiscation" nd:node-error
         (nd:build-confiscation d id)))))
 
+
+(with-gate ("red team: an operator cannot spend a depositor's funds without its authorization")
+  ;; Depositor authorization (the witness), the nonce window and the operation's
+  ;; expiry are ledger rules (DEP-16), not operator courtesy: cosigners refuse an
+  ;; update that breaks them.  A (operator) plays the adversary: it builds updates
+  ;; straight through APPEND-OPERATION, skipping its own request checks.
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111171 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222272 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333373 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444474 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a7" :reserves 15600000 :collateral 23400000))
+         (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+    (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d7")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((w1 (nd:make-wallet :priv 55555555555555555575 :bus bus)) (w2 (nd:make-wallet :priv 66666666666666666676 :bus bus))
+           (d1 (nd:wallet-open-deposit w1 id)) (d2 (nd:wallet-open-deposit w2 id))
+           (balance (lambda () (lg:deposit-balance (lg:find-deposit (nd:record-ledger la) d1)))))
+      (nd:credit-onchain a la d1 100000 :txid (u:sha256 (hx "c0ffee7")))
+      ;; 1. No witness at all.
+      (let ((forged (list :type :transfer-lock :transfer-nonce (u:sha256 (hx "a1")) :source-deposit-id d1 :destination-deposit-id d2
+                          :amount 50000 :fee 0 :completion-script "sha256(00)" :timeout-height (+ *height* 100)
+                          :transfer-id (u:sha256 (hx "a2")) :nonce 424242 :expiry (+ *height* 144) :witness '())))
+        (check-signals "a TransferLock without the depositor's witness is refused" nd:node-error (nd:append-operation a la forged))
+        (check-equal "the depositor's balance is untouched" (funcall balance) 100000))
+      ;; 2. Replay the depositor's own, validly signed TransferLock.
+      (multiple-value-bind (tid pre) (nd:wallet-transfer w1 id d1 d2 30000 :height *height*)
+        (nd:wallet-complete-transfer w1 id tid pre))
+      (check-equal "the genuine transfer settled" (funcall balance) 70000)
+      (let ((signed (find-if (lambda (u) (eq :transfer-lock (op:operation-type (op:decode-operation (up:update-message u)))))
+                             (nd:record-history la))))
+        (check-signals "a replay of the depositor's signed TransferLock is refused" nd:node-error
+                       (nd:append-operation a la (op:decode-operation (up:update-message signed))))
+        (check-equal "the replay moved nothing" (funcall balance) 70000))
+      ;; 3. A validly signed lock whose expiry has passed.
+      (let ((*height* (- *height* 300)))   ; the wallet signs expiry = its height + 144
+        (handler-case (nd:wallet-transfer w1 id d1 d2 1000 :height *height*) (error () nil)))
+      (check-equal "an expired signed operation moved nothing" (funcall balance) 70000)
+      ;; 4. A colluding majority (B, C cosign blind) commits a lock with no witness.
+      ;;    The honest replica (D) must prove it and dispute.
+      (dolist (m (list b c)) (setf (getf (nd::node-adversary m) :cosign-blind) t))
+      (let ((forged (list :type :transfer-lock :transfer-nonce (u:sha256 (hx "b1")) :source-deposit-id d1 :destination-deposit-id d2
+                          :amount 60000 :fee 0 :completion-script "sha256(00)" :timeout-height (+ *height* 100)
+                          :transfer-id (u:sha256 (hx "b2")) :nonce 515151 :expiry (+ *height* 144) :witness '())))
+        (let ((u (nd:append-operation a la forged)))
+          (dolist (m (list b c)) (setf (getf (nd::node-adversary m) :cosign-blind) nil))
+          (check "the colluding majority committed it" (and u (= (up:update-seq u) (lg:ledger-sequence (nd:record-ledger la)))))
+          (check "the honest replica disputes the ledger" (nd:find-fork d id (nd:node-pubkey d)))
+          (check "a NonConformingUpdate proof of it verifies on the history before it"
+                 (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) u)
+                                                  (remove u (reverse (nd:record-history la)))))
+          (check "the same update, signed by the depositor, would not be proof"
+                 (not (fr:verify-non-conforming-update
+                       (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) (find-if (lambda (x) (eq :transfer-lock (op:operation-type (op:decode-operation (up:update-message x))))) (nd:record-history la) :from-end t))
+                       (reverse (nd:record-history la))))))))))
+
 (report)

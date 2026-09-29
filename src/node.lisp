@@ -21,7 +21,7 @@
 
 (defpackage #:cl-deposits.node
   (:use #:cl #:cl-deposits.util)
-  (:local-nicknames (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation)
+  (:local-nicknames (#:cf #:cl-deposits.conformance) (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation)
                     (#:lg #:cl-deposits.ledger) (#:d17 #:cl-deposits.dep17)
                     (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:ev #:cl-nostr.event) (#:flt #:cl-nostr.filter)
@@ -574,7 +574,9 @@
         (multiple-value-bind (ok why)
             (up:verify-cosignatures update :quorum (mapcar #'lg:member-pubkey signers) :threshold required)
           (unless ok (fail "seq ~a: ~a" (up:update-seq update) why)))))
-    (handler-case (lg:apply-update ledger update)
+    (handler-case (let ((v (cf:violation ledger op (up:update-block-height update))))
+                    (when v (lg::fail :non-conforming v))
+                    (lg:apply-update ledger update))
       (lg:ledger-error (e)
         ;; Signed by the operator, cosigned by the threshold, the next sequence —
         ;; and the rules reject it.  That is provable fraud, not a glitch to retry.
@@ -771,6 +773,8 @@
                  ;; Speculative apply on a fresh replica: the op must be valid on our state.
                  ;; ADVERSARY :cosign-blind — a member that signs whatever chains (red team #1).
                  (unless (getf (node-adversary node) :cosign-blind)
+                   ;; Depositor authorization, nonce window, expiry: at the height we sign.
+                   (let ((v (cf:violation (record-ledger rec) o block-height))) (when v (fail "~a" v)))
                    (lg:apply-operation (lg:copy-ledger (record-ledger rec)) o))
                  (multiple-value-bind (required signers tier operator-alone allowed)
                      (lg:cosign-requirement ledger o (height node))
@@ -957,17 +961,12 @@
     ))
 
 (defun authorized-p (node rec o d witness)
-  "Does deposit D's descriptor authorize operation O with WITNESS (a stack)?"
-  (let ((desc (lg:deposit-descriptor d)))
-    (if (d17:descriptor-key desc)
-        (eq :ok (d17:verify-operation-witness o desc witness))
-        (multiple-value-bind (id type args nonce expiry) (d17:operation->dep16 o)
-          (and id
-               (let ((descriptor (d16:parse-descriptor desc))
-                     (op (d16:make-operation :deposit-id id :op-type type :args args :nonce nonce :expiry expiry)))
-                 (handler-case (d16:evaluate descriptor op (deposit-snapshot node (record-ledger rec) d)
-                                             (d16:witness-from-stack witness descriptor op))
-                   (d16:eval-error (e) (log! node "descriptor evaluation: ~a" e) nil))))))))
+  "Does deposit D's descriptor authorize operation O with WITNESS (a stack)?
+   (The rule itself, with the nonce window and expiry, is CF:VIOLATION: cosigners
+   and replicas apply it too.)"
+  (declare (ignore rec))
+  (let ((o (if (equal witness (op:field o :witness)) o (list* :witness witness (copy-list o)))))
+    (cf:authorized-p o d (height node))))
 
 ;;; Requests in the reference wallet's shape (field by field, signature = witness)
 
