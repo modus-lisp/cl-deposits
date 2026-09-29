@@ -245,7 +245,15 @@
           (check "other members rebuilt the same lottery" (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey m)))) (and (nd:record-lottery f) (equalp (lot:lottery-spk (nd:record-lottery f)) (lot:lottery-spk lottery))))) (list c d)))
           (check "signers kept the unsigned confiscation (same txid as the broadcast one)"
                  (every (lambda (m) (equalp (btx:tx-txid (nd:record-confiscation (nd:find-fork m id (nd:node-pubkey m)))) (btx:tx-txid ctx))) (list c d)))
-          ;; --- Reveal.
+          ;; --- Reveal.  Red team #7: once B has revealed, D publishes B's preimage as its
+          ;; own (signed by D).  It opens B's commitment, not D's; honest nodes must not
+          ;; count it, or D could pick, after seeing every reveal, the copy that makes it win.
+          (nd:publish-reveal b id)
+          (let* ((pre-b (nd:record-preimage (nd:find-fork b id (nd:node-pubkey b))))
+                 (sig (secp:schnorr-sign (nd::node-priv d) (w:reveal-message id pre-b) (u:sha256 (hx "00")))))
+            (bus:bus-publish bus (w:reveal-event (nd::node-keypair d) (nd:node-pubkey-hex d) id pre-b sig))
+            (check "a member's copy of another's preimage is not its reveal"
+                   (notany (lambda (m) (equalp (cdr (assoc (nd:node-pubkey d) (nd:reveals-of m id) :test #'equalp)) pre-b)) (list b c))))
           (dolist (m (list b c d)) (nd:publish-reveal m id))
           (check-equal "every member holds all three reveals" (mapcar (lambda (m) (length (nd:reveals-of m id))) (list b c d)) '(3 3 3))
           ;; --- Claim or yield.

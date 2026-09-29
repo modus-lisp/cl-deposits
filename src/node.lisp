@@ -1967,7 +1967,11 @@
          (preimage (hex->bytes (w:jget j "preimage_hex"))) (sig (hex->bytes (w:jget j "signature"))))
     (when (and (find-record node id)
                (schnorr:schnorr-verify (up:x-only member) (w:reveal-message id preimage) sig)
-               (find (lot:commitment-of preimage) (armers-of node id) :key #'second :test #'equalp))
+               ;; The preimage must open the SIGNER's commitment.  Any armer's would do
+               ;; before: a member waited for the others' reveals and published, as its
+               ;; own, whichever copy made it the winner, never opening its own.
+               (find-if (lambda (a) (and (equalp (first a) member) (equalp (second a) (lot:commitment-of preimage))))
+                        (armers-of node id)))
       (note-reveal node id member preimage))))
 
 (defun reveals-of (node id-hex) (gethash id-hex (node-reveals node)))
