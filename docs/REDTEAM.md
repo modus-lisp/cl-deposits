@@ -14,7 +14,7 @@ Every attack states its pass condition as what the HONEST side must do.
 | 4 | inactivity moves custody (DEP-19 §1–3) | operator silent past inactivity_blocks; majority attestation; respectful custody | |
 | 5 | co-sign refusal provable; withholding majority is the stated limit (DEP-19 §9) | cosigner answers all but the clock-satisfying update | |
 | 6 | fraud proofs cannot be forged or replayed (DEP-06 §Verification) | malformed / stale / wrong-ledger / replayed proofs; cross-implementation acceptance rules | wrong-ledger: relabelling (closed, v2); self-accusing member: Finding 12 (fixed); malformed, stale open |
-| 7 | lottery fair and spendable (DEP-03 §Custody Lottery) | out-of-range preimage; withheld reveal (partial leaf); commit≠reveal | |
+| 7 | lottery fair and spendable (DEP-03 §Custody Lottery) | out-of-range preimage; withheld reveal (partial leaf); commit≠reveal | N mismatch: organic #6 (mitigated); commit≠reveal: Finding 14 (cl fixed); withheld reveal open |
 | 8 | transport outside the trust model | censoring / delaying relay; replayed ephemeral requests vs nonce+expiry | replay led to Finding 11 (fixed); relay censorship open |
 | 9 | stated limitation: majority can spend an honest vault at Tier 0 (DEP-05 §120) | measure cost and footprint, not disprove | |
 
@@ -346,6 +346,20 @@ The dispute that follows exposes the next layer:
   seq 17840: OVER-OBLIGATION`, every pass): noisy, and should stop once the fork is open.
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
+
+### 2026-09-29 — Finding 14: a member could reveal another's preimage as its own (cl)
+
+Attack #7 (commit ≠ reveal). cl's Kind 9106 handler checked that a reveal was signed by the member it
+names and that the preimage opened *some* armer's commitment, but not that member's. A member could
+wait for the others' reveals and publish, as its own, whichever copy made the off-chain winner
+calculation name it. Only one reveal is kept per member, so its genuine reveal was then ignored. It
+could not claim on chain (the script checks each preimage against its owner's commitment), but the
+honest winner, believing it had lost, yielded, and the lottery went unclaimed.
+
+**Fixed (cl 557722e):** a signed reveal must open the signer's own commitment. node-test: D
+publishes B's preimage signed by D; no member counts it, and the lottery still gives exactly one
+script-selected winner. **The reference was never exposed:** it attributes every revealed preimage
+by `HASH160(preimage) == commitment`, whoever published it (`a_preimage_matches_only_its_own_commitment`).
 
 ### 2026-09-29 — Finding 13: the reference cannot verify a proof of a forged witness
 
