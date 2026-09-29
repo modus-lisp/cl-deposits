@@ -15,7 +15,7 @@ Every attack states its pass condition as what the HONEST side must do.
 | 5 | co-sign refusal provable; withholding majority is the stated limit (DEP-19 §9) | cosigner answers all but the clock-satisfying update | |
 | 6 | fraud proofs cannot be forged or replayed (DEP-06 §Verification) | malformed / stale / wrong-ledger / replayed proofs; cross-implementation acceptance rules | |
 | 7 | lottery fair and spendable (DEP-03 §Custody Lottery) | out-of-range preimage; withheld reveal (partial leaf); commit≠reveal | |
-| 8 | transport outside the trust model | censoring / delaying relay; replayed ephemeral requests vs nonce+expiry | |
+| 8 | transport outside the trust model | censoring / delaying relay; replayed ephemeral requests vs nonce+expiry | replay led to Finding 11 (fixed); relay censorship open |
 | 9 | stated limitation: majority can spend an honest vault at Tier 0 (DEP-05 §120) | measure cost and footprint, not disprove | |
 
 ## Capital efficiency vs security: the axis every attack is measured on
@@ -346,6 +346,38 @@ The dispute that follows exposes the next layer:
   seq 17840: OVER-OBLIGATION`, every pass): noisy, and should stop once the fork is open.
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
+
+### 2026-09-29 — Finding 11: cl cosigners and replicas did not check the depositor's authorization
+
+Found while looking for replayed wallet requests (attack #8). cl checked a depositor's witness,
+the operation's expiry and the nonce window only in the operator's request handlers. The fold
+recorded nonces but never refused one, and cosigners and replicas ran none of the three rules.
+A cl operator could lock a deposit with **no witness at all**, or replay a depositor's signed lock
+(the completion preimage is public after the first), and its cl members cosigned it. On the
+devnet two of every cl ledger's three cosigners are cl nodes, so only the reference member stood
+in the way. That is a depositor's funds at the mercy of the operator: the property the quorum
+exists to remove.
+
+**Fixed (cl b85f7f6).** `src/conformance.lisp` states the rules as the reference's
+`check_conformance` does: ExpiryPassed, NonceReplay (a seen nonce whose expiry is still at or
+above the height) and Unauthorized (the witness does not satisfy the descriptor), for the
+operations a depositor signs. The cosigner applies them at the height it signs; a replica
+applies them before the fold and disputes a violation like any non-conforming update; and a
+NonConformingUpdate proof verifies on them. The node-test red-team gate builds each attack
+through `append-operation`, as a malicious operator would. Before the fix, the witness-less
+lock was cosigned and committed.
+
+**Live, `redteam/attack-forge-lock.sh`** on A (cld1 operates; cld2, cld3 and ref2 cosign), a
+5,000,000 msat lock from a cl wallet's deposit with an empty witness:
+- **honest:** every cosigner refused (cld2 and cld3 `Unauthorized`, ref2 `InvalidWitness`), 0 of 2
+  cosignatures, nothing committed, and the balance was untouched.
+- **collude** (cld2 and cld3 cosign blind): seq 6969 committed at 19:55:29. ref2 flagged it
+  `NON-CONFORMING COSIGNED … InvalidWitness` at 19:55:30 and forked at 6968 at 19:55:31. The
+  colluders' own replicas disputed it too: every member of A is armed. A is frozen and in the
+  dispute drivers' hands (confiscation, lottery), as in attack #1.
+
+**No false positives:** over the first minutes after the deploy, each cl node cosigned 650–750
+updates from both implementations' wallets, refusing only on ordinary sequence races.
 
 ### 2026-09-29 — the v2 devnet: first observations
 
