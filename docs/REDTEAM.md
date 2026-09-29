@@ -14,7 +14,7 @@ Every attack states its pass condition as what the HONEST side must do.
 | 4 | inactivity moves custody (DEP-19 §1–3) | operator silent past inactivity_blocks; majority attestation; respectful custody | |
 | 5 | co-sign refusal provable; withholding majority is the stated limit (DEP-19 §9) | cosigner answers all but the clock-satisfying update | |
 | 6 | fraud proofs cannot be forged or replayed (DEP-06 §Verification) | malformed / stale / wrong-ledger / replayed proofs; cross-implementation acceptance rules | wrong-ledger: relabelling (closed, v2); self-accusing member: Finding 12 (fixed); malformed, stale open |
-| 7 | lottery fair and spendable (DEP-03 §Custody Lottery) | out-of-range preimage; withheld reveal (partial leaf); commit≠reveal | N mismatch: organic #6 (mitigated); commit≠reveal: Finding 14 (cl fixed); withheld reveal open |
+| 7 | lottery fair and spendable (DEP-03 §Custody Lottery) | out-of-range preimage; withheld reveal (partial leaf); commit≠reveal | N mismatch: organic #6 (mitigated); commit≠reveal: Finding 14 (cl fixed); withheld reveal: priced by the armer share (analysis) |
 | 8 | transport outside the trust model | censoring / delaying relay; replayed ephemeral requests vs nonce+expiry | replay led to Finding 11 (fixed); relay censorship open |
 | 9 | stated limitation: majority can spend an honest vault at Tier 0 (DEP-05 §120) | measure cost and footprint, not disprove | |
 
@@ -346,6 +346,18 @@ The dispute that follows exposes the next layer:
   seq 17840: OVER-OBLIGATION`, every pass): noisy, and should stop once the fork is open.
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
+
+### 2026-09-29 — analysis: the withheld reveal is priced, not prevented
+
+Attack #7 (withheld reveal). Commit-reveal lets the last revealer see every other contribution first.
+DEP-06 gives the missing disputant's index a partial-reveal leaf (a sub-lottery of the others, CSV 72)
+and makes withholding cost the withholder its armer share, which falls to the sweep and is paid pro
+rata to revealers (§"abort option"). So it is priced, not prevented. At Q = 3, a colluding pair
+wins custody with probability 2/3 if both reveal. If the last revealer withholds whenever the honest
+member would win (1/3), the sub-lottery gives the other colluder 1/2: **5/6** in all, at one armer
+share per use. Whether that price is enough depends on the share against the value of custody (the
+ledger's fees, and its reserves as collateral for future fraud). That is a protocol-economics
+question for the capital-efficiency table above, not an implementation bug. Not run on the devnet.
 
 ### 2026-09-29 — Finding 14: a member could reveal another's preimage as its own (cl)
 
