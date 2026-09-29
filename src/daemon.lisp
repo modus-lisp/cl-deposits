@@ -46,6 +46,15 @@
          (loop for (k v) on (cdr (member :set form)) by #'cddr
                do (setf (getf (nd:node-adversary node) k) v))
          (ok :adversary (nd:node-adversary node)))
+        (:forge-lock   ; red team: (:forge-lock :ledger L :from DEP :to DEP :msat N) — as operator, lock a
+                       ; deposit with NO depositor witness, straight to the cosigners (docs/REDTEAM.md)
+         (let* ((rec (rec! node form)) (h (nd:height node))
+                (o (list :type :transfer-lock :transfer-nonce (cl-deposits.node::random-aux)
+                         :source-deposit-id (hex->bytes (arg form :from)) :destination-deposit-id (hex->bytes (arg form :to))
+                         :amount (arg form :msat) :fee 0 :completion-script "sha256(00)" :timeout-height (+ h 100)
+                         :transfer-id (cl-deposits.node::random-aux) :nonce (get-universal-time) :expiry (+ h 144) :witness '()))
+                (u (nd:append-operation node rec o)))
+           (ok :seq (cl-deposits.update:update-seq u))))
         (:threads   ; a backtrace of every thread, for a node that is busy and silent
          (ok :threads (mapcar (lambda (th)
                                 (let ((out (make-string-output-stream)) (done (sb-thread:make-semaphore)))
