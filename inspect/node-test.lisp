@@ -929,4 +929,50 @@
                        (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) (find-if (lambda (x) (eq :transfer-lock (op:operation-type (op:decode-operation (up:update-message x))))) (nd:record-history la) :from-end t))
                        (reverse (nd:record-history la))))))))))
 
+
+(with-gate ("red team: a member cannot freeze an honest ledger by 'equivocating' itself")
+  ;; B, a quorum member of A's ledger, signs two different updates at the next
+  ;; sequence, chained onto A's tip and carrying A's id, and broadcasts an
+  ;; equivocation proof accusing itself.  Only the operator's equivocation is
+  ;; fraud on a ledger: C and D must not dispute A.
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111181 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222282 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333383 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444484 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a8" :reserves 15600000 :collateral 23400000))
+         (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+    (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d8")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((tip (first (nd:record-history la)))
+           (mk (lambda (tag)
+                 (let ((u (up:make-signed-update :operator-id (nd:node-pubkey b) :ledger-id (u:hex->bytes id)
+                                                 :seq (1+ (up:update-seq tip)) :prev-hash (up:chain-hash tip) :block-height *height*
+                                                 :message (op:encode-operation (list :type :deposit-close :deposit-id (subseq (u:sha256 (hx tag)) 0 16))))))
+                   (up:sign-operator u (nd::node-priv b)) u)))
+           (proof (fr:make-equivocation-proof (nd:node-pubkey b) (u:hex->bytes id) (funcall mk "01") (funcall mk "02"))))
+      (check "the pair is two different, validly signed updates by B on A's chain"
+             (and (up:verify-operator-signature (funcall mk "01")) (not (equalp (up:content-hash (funcall mk "01")) (up:content-hash (funcall mk "02"))))))
+      (check "the proof does not verify: B is not A's operator"
+             (not (fr:verify-equivocation proof (reverse (nd:record-history la)))))
+      ;; The same with a non-conforming update: B signs one that breaks the rules.
+      (let* ((bad (funcall mk "03"))
+             (nc (fr:make-non-conforming-update-proof (nd:node-pubkey b) (u:hex->bytes id) bad)))
+        (check "a non-conforming update signed by a member is not proof against the ledger"
+               (not (fr:verify-non-conforming-update nc (reverse (nd:record-history la)))))
+        (nd:broadcast-fraud b nc))
+      (nd:broadcast-fraud b proof)
+      (check "no honest member disputes A" (notany (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list c d)))
+      ;; And the operator's own equivocation still is.
+      (let* ((mk-a (lambda (tag)
+                     (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id)
+                                                     :seq (1+ (up:update-seq tip)) :prev-hash (up:chain-hash tip) :block-height *height*
+                                                     :message (op:encode-operation (list :type :deposit-close :deposit-id (subseq (u:sha256 (hx tag)) 0 16))))))
+                       (up:sign-operator u (nd::node-priv a)) u))))
+        (check "the operator's equivocation still verifies"
+               (fr:verify-equivocation (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) (funcall mk-a "01") (funcall mk-a "02"))
+                                       (reverse (nd:record-history la))))))))
+
+
 (report)

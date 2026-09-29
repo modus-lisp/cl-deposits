@@ -106,6 +106,22 @@
       (update-opens-ledger-p u ledger-id)
       (nth-value 1 (gethash (up:update-prev-hash u) bound))))
 
+(defun operator-at (history seq)
+  "The key that operates the ledger at sequence SEQ: the fold of HISTORY's
+   updates before SEQ (custody can change hands), or NIL when HISTORY does not
+   reach SEQ.  For SEQ 0, whoever the genesis LedgerOpen names."
+  (let ((prefix (sort (remove-if-not (lambda (u) (< (up:update-seq u) seq)) (copy-list history)) #'< :key #'up:update-seq)))
+    (cond ((zerop seq) :genesis)
+          ((/= (length prefix) seq) nil)
+          (t (ignore-errors (lg:ledger-operator-key (lg:replay prefix)))))))
+
+(defun accused-operates-p (accused-hex history seq)
+  "Only the ledger's operator's equivocation or non-conforming update is fraud on
+   the ledger.  A quorum member can sign anything under the ledger's id, chained
+   onto its tip; accusing itself, it froze an honest operator's ledger."
+  (let ((key (operator-at history seq)))
+    (or (eq key :genesis) (and key (string= (bytes->hex key) accused-hex)))))
+
 (defun verify-equivocation (proof history)
   "Two updates, same ledger / sequence / operator, both validly signed, different
    content, and both bound to the ledger through HISTORY (its chain): a pair of
@@ -122,6 +138,8 @@
               ((not (string= (bytes->hex (up:update-ledger-id a)) (getf proof :ledger-id))) (values nil "ledger id mismatch"))
               ((equalp (up:content-hash a) (up:content-hash b)) (values nil "same content: not an equivocation"))
               ((not (and (up:verify-operator-signature a) (up:verify-operator-signature b))) (values nil "a signature does not verify"))
+              ((not (accused-operates-p (getf proof :accused) history (up:update-seq a)))
+               (values nil "the accused does not operate the ledger at that sequence"))
               ((not (update-binds-to-ledger-p a (up:update-ledger-id a) bound))
                (values nil "update_a follows no update of this ledger: nothing binds it here (ledger_id is unsigned)"))
               ((not (update-binds-to-ledger-p b (up:update-ledger-id a) bound))
@@ -161,6 +179,8 @@
                (values nil "accused is not the signer"))
               ((not (string= (bytes->hex id) (getf proof :ledger-id))) (values nil "ledger id mismatch"))
               ((not (up:verify-operator-signature fault)) (values nil "fault update is not validly signed"))
+              ((not (accused-operates-p (getf proof :accused) history seq))
+               (values nil "the accused does not operate the ledger at that sequence"))
               ((/= seq (e proof :fault-sequence)) (values nil "sequence mismatch"))
               ((not (update-binds-to-ledger-p fault id bound))
                (values nil "fault follows no update of this ledger: nothing binds it here (ledger_id is unsigned)"))
