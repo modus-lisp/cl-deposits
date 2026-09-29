@@ -347,6 +347,28 @@ The dispute that follows exposes the next layer:
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
 
+### 2026-09-29 — Finding 13: the reference cannot verify a proof of a forged witness
+
+Replaying A's stored NonConformingUpdate proof (cld1's witness-less lock at seq 6969, Finding 11)
+from a throwaway key, to test stale-proof replay after custody moved to cld3:
+- **cl:** did nothing. A proof only enters a dispute on the base record, for a base member
+  without a fork of its own, and every base member already has one.
+- **ref2 and ref3 rejected it:** "fault update at seq 6969 chains onto its predecessor and
+  applies cleanly with no conformance violations". Yet at 19:55:30 ref2's own replica had flagged the
+  same update `InvalidWitness`.
+
+The reference's proof verifiers run conformance with `AllowAll`. `deposits-protocol` has no
+descriptor evaluator, and `DenyAll` would condemn honest withdrawals, so a fault whose only defect
+is its witness is unprovable. A reference member that did not watch the update land (offline,
+joined late, catching up from the relay) would reject a valid proof of a forged spend. The same
+code excludes ExpiryPassed and NonceReplay as proof because `block_height` "is signed by no one".
+DEP-02 v2 made that false.
+
+**Fix in progress (deposits-rust):** thread the real dep16 verifier into the proof verifiers; count
+height-dependent violations as proof under v2; and state the Finding 12 operator rule explicitly.
+The stale replay did no harm here, but in the reference only because of this bug: it should be
+re-run once the verifier can see the witness.
+
 ### 2026-09-29 — malformed fraud proofs: both implementations hold
 
 `redteam/fuzz-proofs.lisp` sent 15 Kind 9101 events under D's tag from a throwaway key: not JSON,
