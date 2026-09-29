@@ -360,14 +360,16 @@ The devnet was brought up fresh on DEP-02 v2 signing. All six mixed ledgers form
 - **Relabel attack rerun:** the relabelled copies no longer verify (`SIGNATURE-VERIFIES NIL`),
   and cld2 and cld3 reject each as a bad operator signature. ref2's `LedgerActor` still logs
   "equivocation at seq N" for them: it compares content at a sequence before any signature is
-  checked. It refuses to apply them and raises no proof, but the log is misleading (reference,
-  open).
+  checked. It refuses to apply them and raises no proof, but the log is misleading. **Closed**
+  (deposits-rust f3508c9): only an update whose operator signature verifies is called one. The rerun
+  logs none.
 - **Not a fold disagreement:** ref2 refused A's seq 63 (a TransferLock) as
   `InsufficientDepositBalance { available: 2038365, required: 36828898 }`. The deposit's balance is
   38,867,263 in both implementations, and the gap is exactly this lock's amount plus fee. After a
   6.5 s stall, ref2 answered the request against a state that already held the same lock.
-  cld2 and cld3 made the majority. The reference cosigner should recognise a request for an
-  update it already holds (open, noise only).
+  cld2 and cld3 made the majority. **Closed** (deposits-rust f3508c9): the gate already allowed an
+  idempotent re-sign of a committed update, but it was then re-validated against the state it had
+  produced. That step is now skipped for it.
 
 ### 2026-09-28 — attack: relabelled updates (ledger_id is signed by no one)
 
