@@ -347,6 +347,16 @@ The dispute that follows exposes the next layer:
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
 
+### 2026-09-29 — malformed fraud proofs: both implementations hold
+
+`redteam/fuzz-proofs.lisp` sent 15 Kind 9101 events under D's tag from a throwaway key: not JSON,
+`{}`, `null`, wrong types, an unknown proof type, update hex that isn't hex, a 1 MB hex field, a
+negative sequence, 2^80, a string sequence, a short ledger id, a non-hex accused key, arrays nested
+10,000 deep, and a 50,000-entry `causal_chain`. Every node stayed up and answered in milliseconds;
+nobody disputed D; every proof was rejected with a reason (cl: TLV and operator errors; ref2:
+TLV decode errors, unknown ledger). One lever: a proof naming a ledger ref2 does not hold made it
+try a relay gap-fill for it, so each bogus proof costs a relay query (open, minor).
+
 ### 2026-09-29 — Finding 12: a quorum member could freeze an honest ledger by accusing itself
 
 Attack #6 (forged proofs). cl's `verify-equivocation` checked that two same-sequence updates shared a
