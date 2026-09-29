@@ -13,7 +13,7 @@ Every attack states its pass condition as what the HONEST side must do.
 | 3 | censorship provable (DEP-11, DEP-12) | operator ignores a signed request; DeliveryEmbed; clock; censorship proof; dispute | |
 | 4 | inactivity moves custody (DEP-19 §1–3) | operator silent past inactivity_blocks; majority attestation; respectful custody | |
 | 5 | co-sign refusal provable; withholding majority is the stated limit (DEP-19 §9) | cosigner answers all but the clock-satisfying update | |
-| 6 | fraud proofs cannot be forged or replayed (DEP-06 §Verification) | malformed / stale / wrong-ledger / replayed proofs; cross-implementation acceptance rules | |
+| 6 | fraud proofs cannot be forged or replayed (DEP-06 §Verification) | malformed / stale / wrong-ledger / replayed proofs; cross-implementation acceptance rules | wrong-ledger: relabelling (closed, v2); self-accusing member: Finding 12 (fixed); malformed, stale open |
 | 7 | lottery fair and spendable (DEP-03 §Custody Lottery) | out-of-range preimage; withheld reveal (partial leaf); commit≠reveal | |
 | 8 | transport outside the trust model | censoring / delaying relay; replayed ephemeral requests vs nonce+expiry | replay led to Finding 11 (fixed); relay censorship open |
 | 9 | stated limitation: majority can spend an honest vault at Tier 0 (DEP-05 §120) | measure cost and footprint, not disprove | |
@@ -346,6 +346,30 @@ The dispute that follows exposes the next layer:
   seq 17840: OVER-OBLIGATION`, every pass): noisy, and should stop once the fork is open.
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
+
+### 2026-09-29 — Finding 12: a quorum member could freeze an honest ledger by accusing itself
+
+Attack #6 (forged proofs). cl's `verify-equivocation` checked that two same-sequence updates shared a
+signer, that the signer was the accused, and that both bound to the ledger's chain. It never checked
+that the accused **operates** the ledger, and `verify-non-conforming-update` didn't either. A quorum
+member holds a key too. It could sign two different updates at the next sequence (or one that breaks
+the rules), chained onto the tip under the ledger's id, and broadcast a proof accusing itself. Every
+honest cl member verified it and disputed an honest operator's ledger. That's any ledger frozen by
+any one of its members, at no cost.
+
+**Fixed (cl a2bbe3b):** the accused must be the ledger's operator at that sequence. That comes from
+the fold of the history before it, so custody changing hands is followed. The node-test gate shows
+both proofs failing and nobody disputing, while the operator's real equivocation still verifies.
+
+**Live, `redteam/member-equivocate.lisp`** on D (cld3 operates; cld1, cld4 and ref2 are members),
+cld1 as the attacker:
+- **Equivocation proof:** cld1 and cld4 reject it ("the accused does not operate the ledger at
+  that sequence").
+- **Non-conforming-update proof:** the same.
+- **ref2 rejects both**, as "does not follow an update of this ledger" / "follows an update that is
+  not in this ledger's history". Its binding indexes only the accused's updates in the history, and
+  a member has none on another operator's chain. The reference is safe by construction, not by a
+  stated rule. Worth making explicit there (open).
 
 ### 2026-09-29 — Finding 11: cl cosigners and replicas did not check the depositor's authorization
 
