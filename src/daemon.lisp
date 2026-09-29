@@ -186,10 +186,13 @@
   (lambda (bytes) (run-cli cli "sendrawtransaction" (bytes->hex bytes))))
 
 (defun bitcoin-cli-block-hash-fn (cli)
-  "Height -> block hash (32 bytes), or NIL."
+  "Height -> block hash (32 bytes, internal byte order), or NIL.  getblockhash prints
+   the reversed display order; the hash as DEP-02 signs it and as HEIGHT-OF-BLOCK reads it
+   is the internal one.  Decoding the display hex made every stamped or anchored hash
+   the reverse of the reference's, and of our own height-of-block's."
   (lambda (height)
     (let ((out (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string height)))))
-      (and (= (length out) 64) (hex->bytes out)))))
+      (and (= (length out) 64) (txid-bytes out)))))
 
 (defun bitcoin-cli-utxos-fn (cli &key (retries 5))
   "Address -> its confirmed UTXOs, via scantxoutset (no bitcoind wallet needed):

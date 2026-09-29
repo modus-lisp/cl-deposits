@@ -33,9 +33,12 @@ ref_members() { ref_cli "$1" quorum list | awk -v l="$(echo "$2" | cut -c1-16)" 
 retry_add() { local i; [ -n "$3" ] && [ -n "$4" ] || return 1; for i in 1 2 3 4; do ref_cli "$1" quorum add "$2" "$3" "$4" >/dev/null 2>&1 || true; ref_members "$1" "$2" | grep -q "$(echo "$3" | cut -c1-16)" && return 0; sleep 5; done; return 1; }
 pubkey_of() {   # the reference CLI's show-identity can come back empty while its daemon is busy: an
                # empty key once matched every member in retry_add and reached add-member as ""
-  local i k; for i in 1 2 3 4 5 6; do
+  # A key never changes, so the first one read is kept ($SOAK/pubkey.NODE); a busy daemon
+  # came back empty for 30 s at a time during setup.
+  local i k c="$SOAK/pubkey.$1"; [ -s "$c" ] && { cat "$c"; return 0; }
+  for i in $(seq 1 24); do
     k=$(case "$1" in cld*) cld_pubkey "$1";; ref*) ref_pubkey "$1";; esac)
-    [ -n "$k" ] && { echo "$k"; return 0; }; sleep 5
+    [ -n "$k" ] && { echo "$k" > "$c"; echo "$k"; return 0; }; sleep 5
   done; fail "no pubkey for $1"; }
 own_ledger() {   # own_ledger NODE — the (quorum-less) ledger a node cites when it joins another's quorum; opened once, kept in env
   local var; case "$1" in cld*) var="L${1#cld}";; ref*) var="RL${1#ref}";; esac
