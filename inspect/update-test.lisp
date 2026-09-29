@@ -162,3 +162,36 @@
                                            (incf (aref failures i)))))))))))
     (mapc #'bt:join-thread threads)
     (check-equal "4 threads x 3 rounds x 40 updates: no false rejections" (reduce #'+ failures) 0)))
+
+;;; A real v2 ledger: the first 52 updates of the devnet's ledger B as the relay
+;;; held them (ref2 operates; cld2, cld3 and ref3 cosign), captured 2026-09-29.
+(defvar *v2-raw* (read-json-string-array (vector-path "ledger_038353902675b77b.json")))
+(defvar *v2* (mapcar (lambda (s) (up:decode-update (u:base64-decode s))) *v2-raw*))
+
+(with-gate ("signed-update: a reference-built v2 ledger")
+  (check-equal "52 updates" (length *v2*) 52)
+  (check-equal "re-encode is byte-identical"
+               (loop for raw in *v2-raw* for x in *v2* count (not (equalp (u:base64-decode raw) (up:encode-update x)))) 0)
+  (let* ((tips (make-hash-table :test #'equalp))
+         (chain (progn (dolist (x *v2*) (setf (gethash (up:update-prev-hash x) tips) x))
+                       (loop for x = (gethash (make-array 32 :element-type '(unsigned-byte 8)) tips)
+                               then (gethash (up:chain-hash x) tips)
+                             while x collect x))))
+    (check-equal "the hash chain walks all 52 from genesis" (mapcar #'up:update-seq chain) (loop for i below 52 collect i))
+    (check "every operator signature verifies" (every #'up:verify-operator-signature *v2*))
+    (check "every cosignature verifies" (every #'up:verify-cosignatures *v2*))
+    (check "every update carries the ledger's id" (every (lambda (x) (equalp (up:update-ledger-id x) (up:update-ledger-id (first chain)))) *v2*))
+    (check "past the genesis LedgerOpen, every update is stamped with a height and a block hash"
+           (every (lambda (x) (and (plusp (up:update-block-height x)) (notevery #'zerop (up:update-block-hash x)))) (rest chain)))
+    (let ((replay (lg:make-ledger)) (violations '()) (seen-begin nil))
+      (dolist (x chain)
+        (let ((o (op:decode-operation (up:update-message x))))
+          (when (and seen-begin (not (eq (op:operation-type o) :quorum-begin)))
+            (let ((members (mapcar #'lg:member-pubkey (lg:ledger-quorum-members replay))))
+              (multiple-value-bind (ok why) (up:verify-cosignatures x :quorum members :threshold (lg:majority-threshold (length members)))
+                (unless ok (push (format nil "seq ~a: ~a" (up:update-seq x) why) violations)))))
+          (lg:apply-update replay x)
+          (when (eq (op:operation-type o) :quorum-begin) (setf seen-begin t))))
+      (check "a QuorumBegin is in the first 52" seen-begin)
+      (check-equal "after QuorumBegin, every update carries a member majority" (reverse violations) '())
+      (check-bytes "the fold's tip is the chain's" (lg:ledger-chain-tip replay) (up:chain-hash (car (last chain)))))))
