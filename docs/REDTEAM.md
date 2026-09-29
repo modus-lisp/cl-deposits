@@ -390,10 +390,21 @@ joined late, catching up from the relay) would reject a valid proof of a forged 
 code excludes ExpiryPassed and NonceReplay as proof because `block_height` "is signed by no one".
 DEP-02 v2 made that false.
 
-**Fix in progress (deposits-rust):** thread the real dep16 verifier into the proof verifiers; count
-height-dependent violations as proof under v2; and state the Finding 12 operator rule explicitly.
-The stale replay did no harm here, but in the reference only because of this bug: it should be
-re-run once the verifier can see the witness.
+**Fixed (deposits-rust ab15a4f, 06088e9, 3167885):**
+- Every node-side proof verifier gets the real dep16 authorizer. `AllowAll` is left only in
+  deposits-protocol's own tests.
+- ExpiryPassed, NonceReplay and the two fee-cadence violations count as proof again: their
+  heights are signed under v2.
+- The Finding 12 operator rule is explicit: the accused must be the operator at the fault's
+  sequence, and that follows DisputeAcquire, so a successor's own faults are provable too.
+- A verified proof disputes only if it accuses the replica's current operator.
+
+**Re-run live:** the replayed proof now **verifies** on ref2 and ref3 (`Fraud proof VERIFIED …
+NonConformingUpdate`). ref3 is not a member and skips it. ref2 logs "INITIATING DISPUTE", finds its
+existing fork, DisputeEnter and DisputeArmed, changes no state, and re-publishes its old dispute
+announcement. The stale rule did not fire: a member that yielded never applies the winner's
+DisputeAcquire, so its replica still names cld1. So there's no harm, but each replay makes a yielded
+reference member re-announce its dispute (open, noise).
 
 ### 2026-09-29 — malformed fraud proofs: both implementations hold
 
@@ -426,8 +437,8 @@ cld1 as the attacker:
 - **Non-conforming-update proof:** the same.
 - **ref2 rejects both**, as "does not follow an update of this ledger" / "follows an update that is
   not in this ledger's history". Its binding indexes only the accused's updates in the history, and
-  a member has none on another operator's chain. The reference is safe by construction, not by a
-  stated rule. Worth making explicit there (open).
+  a member has none on another operator's chain. The reference was safe by construction; the rule is
+  now explicit (deposits-rust 06088e9).
 
 ### 2026-09-29 — Finding 11: cl cosigners and replicas did not check the depositor's authorization
 
