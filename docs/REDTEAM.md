@@ -347,6 +347,28 @@ The dispute that follows exposes the next layer:
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
 
+### 2026-09-29 — the v2 devnet: first observations
+
+The devnet was brought up fresh on DEP-02 v2 signing. All six mixed ledgers formed and moved
+~600 updates each in the first ten minutes, with replicas agreeing to within one update.
+
+- **Block hash byte order (cl, fixed in 926b129).** Every cl cosigner refused ref2's first
+  QuorumBegin on B ("block_hash is not our chain's"). cl read `getblockhash`'s display order,
+  while the reference, and cl's own `height-of-block`, use internal order. cl operators never
+  stamp a block hash, so the cl-only regtest smoke could not see it. DEP-02 now names the
+  order.
+- **Relabel attack rerun:** the relabelled copies no longer verify (`SIGNATURE-VERIFIES NIL`),
+  and cld2 and cld3 reject each as a bad operator signature. ref2's `LedgerActor` still logs
+  "equivocation at seq N" for them: it compares content at a sequence before any signature is
+  checked. It refuses to apply them and raises no proof, but the log is misleading (reference,
+  open).
+- **Not a fold disagreement:** ref2 refused A's seq 63 (a TransferLock) as
+  `InsufficientDepositBalance { available: 2038365, required: 36828898 }`. The deposit's balance is
+  38,867,263 in both implementations, and the gap is exactly this lock's amount plus fee. After a
+  6.5 s stall, ref2 answered the request against a state that already held the same lock.
+  cld2 and cld3 made the majority. The reference cosigner should recognise a request for an
+  update it already holds (open, noise only).
+
 ### 2026-09-28 — attack: relabelled updates (ledger_id is signed by no one)
 
 An update's `ledger_id` is covered by neither its content hash nor its operator signature
