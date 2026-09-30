@@ -1734,7 +1734,16 @@
     preimage))
 
 (defun armers-of (node id-hex)
-  "Every DisputeArmed we have seen on any fork of the ledger: (pubkey33 commitment target)."
+  "Each armer's latest DisputeArmed on any fork of the ledger: (pubkey33 commitment
+   target collateral).  A member may re-arm to add the replacement collateral its
+   first arm lacked (DEP-03; the reference does after losing a scantxoutset race).
+   Counting every arm listed it twice: once in the lottery's participants and its N,
+   and once as an armer without collateral that check-armer-collateral refused."
+  (let ((all (%all-arms node id-hex)) (seen '()))
+    (remove-if (lambda (a) (if (member (first a) seen :test #'equalp) t (progn (push (first a) seen) nil))) all)))
+
+(defun %all-arms (node id-hex)
+  "Every DisputeArmed on every fork of the ledger, newest first within each fork."
   (loop for fork in (forks-of node id-hex)
         append (loop for u in (record-history fork)
                      for o = (op:decode-operation (up:update-message u))

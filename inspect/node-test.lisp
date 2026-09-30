@@ -235,6 +235,11 @@
         ;; --- Arm.
         (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 0 10000000)))
         (check-equal "three armers visible to everyone" (mapcar (lambda (m) (length (nd:armers-of m id))) (list b c d)) '(3 3 3))
+        ;; A re-arm (the same commitment, new collateral) replaces the first arm; it is not a fourth armer.
+        (nd:arm-dispute b (nd:find-fork b id (nd:node-pubkey b)) :replacement (list (u:sha256 (hx "be")) 1 12000000))
+        (check-equal "a re-arm is still three armers" (mapcar (lambda (m) (length (nd:armers-of m id))) (list b c d)) '(3 3 3))
+        (check-equal "and the re-armed member's latest collateral counts"
+                     (third (fourth (find (nd:node-pubkey b) (nd:armers-of c id) :key #'first :test #'equalp))) 12000000)
         ;; --- Confiscation, built by b, signed by the recovery quorum over the relay.
         (multiple-value-bind (ctx lottery)
             (handler-case (nd:confiscate b id)
