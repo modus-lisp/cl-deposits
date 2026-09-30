@@ -9,7 +9,7 @@ Every attack states its pass condition as what the HONEST side must do.
 | # | claim (where) | attack | status |
 |---|---|---|---|
 | 1 | strict-majority cosign, independent validation (DEP-05 §63, whitepaper) | operator + colluding majority sign an invalid update; honest minority must refuse and dispute | |
-| 2 | equivocation caught and punished (DEP-06) | equivocate with a colluding cosigner on both branches; double-spend across forks; colluder's slashing share excluded | operator caught; the colluder is not penalised (protocol gap, open) |
+| 2 | equivocation caught and punished (DEP-06) | equivocate with a colluding cosigner on both branches; double-spend across forks; colluder's slashing share excluded | operator caught; double cosignatures are not attributable (honest retries), collateral is the backstop (analysis) |
 | 3 | censorship provable (DEP-11, DEP-12) | operator ignores a signed request; DeliveryEmbed; clock; censorship proof; dispute | |
 | 4 | inactivity moves custody (DEP-19 §1–3) | operator silent past inactivity_blocks; majority attestation; respectful custody | |
 | 5 | co-sign refusal provable; withholding majority is the stated limit (DEP-19 §9) | cosigner answers all but the clock-satisfying update | |
@@ -347,24 +347,32 @@ The dispute that follows exposes the next layer:
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
 
-### 2026-09-29 — protocol gap: a cosigner who signs both branches is not penalised
+### 2026-09-29 — analysis: equivocation needs no colluder, and double cosignatures prove nothing
 
-Attack #2 (equivocation with a colluding cosigner), analysed rather than run. The spec has no rule for
-a quorum member who cosigns two different updates at one sequence. DEP-03's punitive types cover the
-operator's faults, stale cosignatures and dispute dereliction. When an operator equivocates with one
-colluding cosigner signing both branches (each branch then has a majority), honest members see both on
-the relay, prove the operator's equivocation, and roll the ledger back to the last valid update: no
-branch survives. But the colluder then arms like any honest member, takes an equal chance at custody
-and an armer share. It profits from the fraud it enabled, although its guilt is self-evident: under
-v2, its two cosignatures sign different content at the same sequence of the same ledger.
+Attack #2 (equivocation with a colluding cosigner), analysed rather than run. First reading: the spec
+has no penalty for a cosigner who signs both branches, so a colluder arms and shares the payout. But
+**re-signing a sequence is required for liveness.** When a round fails to reach a majority (members
+slow, offline, or the chain has moved on; under v2 a later height changes the signed bytes), the
+operator must be able to ask again at the same sequence. Both implementations allow it: a cosigner
+signs any update at its next sequence that chains onto its tip, and refuses a different update only at
+a sequence it has already committed.
 
-Options (a protocol decision, not yet made):
-1. **Exclude the double-signer:** a proof holding one member's cosignatures on two different
-   updates at one sequence makes it ineligible to arm or claim on that dispute, and its armer share
-   falls to the sweep. Self-contained evidence; fits the existing arm/sweep rules.
-2. **A punitive proof type** that also confiscates the colluder's collateral on its own ledger:
-   stronger, and cross-ledger.
-3. **Document it** as a limitation next to #9 (a colluding majority).
+So the operator needs **no** colluder. At Q = 3: B and C cosign X in round 1; the operator keeps X,
+claims a timeout, and B and C cosign Y in round 2. Two fully cosigned branches, from honest retries.
+The honest and colluding cases produce identical evidence, so no rule can penalise "cosigned both"
+without punishing honest members. The first-reading options (excluding the double-signer, or a new
+punitive type for it) are withdrawn.
+
+What the protocol relies on is detection (both branches get published; any member holding both proves
+equivocation, and the ledger rolls back to the last valid update) plus punitive confiscation of the
+operator. Open questions (for the user):
+- **What survives the rollback:** effects outside the ledger (an on-chain withdrawal, a Lightning
+  payment) made on one branch before detection. The real bound is that operator collateral must
+  exceed what can be extracted within the detection window, a capital-efficiency parameter.
+- **Accountable rounds:** a round-2 request could carry the operator's signed abandonment of round 1.
+  That gives honest cosigners cover and doubles the proof against the operator, but a colluder can get
+  one too, so it adds accountability, not exclusion. Any such rule must keep a stuck round
+  recoverable.
 
 ### 2026-09-29 — analysis: the withheld reveal is priced, not prevented
 
