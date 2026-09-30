@@ -104,6 +104,25 @@ DEP-19 §10 residual), unequal vaults (the "pyramid"), several ledgers per opera
 punishment failing (members offline, contagion not implemented: today, only the reference's
 cosigner-side `fault_ledger_id` evidence exists), and deposits concentrating on honest ledgers.
 
+### 2b. Q = 7 on the devnet (2026-09-30)
+
+The devnet runs §2a's sweet spot: 12 nodes (6 cl, 6 reference), 12 ledgers, Q = 7, R = 0.5, each
+quorum split 4–3 by implementation with the operator's implementation in the minority
+(`soak_plan`). All twelve formed first time with 144 deposits.
+
+- **The cost of Q = 7 is cosign fan-out, not consensus.** The first run showed reference-operated
+  ledgers at a fifth of the others' rate. The cause: every cl cosign forked `bitcoin-cli` from a
+  multi-gigabyte heap, ~175 ms each, two or three times per request, which capped a cl node at 2–3
+  cosigns a second against ~6 asked by its seven quorums. Reference-operated quorums are
+  cl-majority, so they waited on the slowest cl answer. Caching the chain height and block hashes
+  (cl 08b86af) cut cl answers from a 6–20 s median to **21 ms** (p90 40–80 ms). Reference members
+  answer in ~10 ms.
+- **Throughput after the fix:** 227–290 updates per ledger per 5 minutes, evenly across operators
+  and implementations (the bots' request rate is now the limit), with zero refusals and no
+  non-conforming flags.
+- **Operational load per node:** each serves 7 quorums. At ~50 updates a minute per ledger that is
+  ~6 cosign requests a second per node, which is comfortable once a cosign costs milliseconds.
+
 ## 3. Trust heuristics for a wallet choosing a ledger
 
 Observable from public data (relay + chain), roughly in order of what the findings say matters:
