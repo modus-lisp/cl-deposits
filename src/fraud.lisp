@@ -261,7 +261,11 @@
 
 ;;; ---------------------------------------------------------------------------
 ;;; DEP-12: provable censorship.  Not a DEP-06 proof type yet in the reference;
-;;; this is the verification the spec describes, over public ledger data.
+;;; this is the verification the spec describes, over public ledger data.  Nothing
+;;; acts on it yet (docs/REDTEAM.md, claims #3 and #5).  It does not check that the
+;;; request is one the operator could have served (validly signed, within the
+;;; rules): the spec gives an operator no signed way to refuse a request, so an
+;;; unservable request embedded by a member would read as censorship.
 
 (defun verify-censorship (request-content embed-update member-history operator-history
                           &key (service-response-blocks 72) processed-p)
@@ -288,9 +292,12 @@
                              operator-history))
               (deadline (+ embed-height service-response-blocks))
               (breach (find-if (lambda (u) (>= (up:update-block-height u) deadline)) operator-history))
+              ;; An answer anywhere in the operator's history counts.  Only answers from
+              ;; the causal link on were counted: an operator that served the request
+              ;; before the member next cosigned was still "proven" to censor it.
               (answered (and processed-p
                              (some (lambda (u) (funcall processed-p (op:decode-operation (up:update-message u))))
-                                   (remove-if (lambda (u) (or (null link) (< (up:update-seq u) (up:update-seq link)))) operator-history)))))
+                                   operator-history))))
          (cond ((null link) (values nil "no causal link: the member has not cosigned past the embed"))
                ((null breach) (values nil "deadline not reached"))
                (answered (values nil "the operator processed the request"))

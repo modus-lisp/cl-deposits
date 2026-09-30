@@ -328,6 +328,9 @@
             (check "past the service deadline with no answer: censorship proven"
                    (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))
                                          :processed-p (lambda (o) (eq (op:operation-type o) :transfer-lock))))
+            (check "not censorship if the operator answered before the member's causal link"
+                   (not (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))
+                                              :processed-p (lambda (o) (eq (op:operation-type o) :deposit-open)))))
             (check "not censorship if the operator answered"
                    (not (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))
                                               :processed-p (lambda (o) (eq (op:operation-type o) :onchain-credit))))))))
