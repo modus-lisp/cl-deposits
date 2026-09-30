@@ -123,6 +123,28 @@ quorum split 4–3 by implementation with the operator's implementation in the m
 - **Operational load per node:** each serves 7 quorums. At ~50 updates a minute per ledger that is
   ~6 cosign requests a second per node, which is comfortable once a cosign costs milliseconds.
 
+### 2c. Contagion on the devnet (2026-09-30)
+
+Implemented cosigner contagion (DEP-19 §5): cl d4614e7 (produce and act) and deposits-rust efe4143
+(produce; it already acted). `redteam/attack-collude-q7.sh`:
+- **Three of seven collude** on A (cld2–cld4 cosign blind, cld1 forges a lock): 3 of the 4 cosignatures
+  needed; every reference member refused (`InvalidWitness`); nothing committed.
+- **Four of seven collude** on test ledger M (cld1 operates; cld2–cld5 cosign blind): the forged lock
+  commits. Then:
+  - M is disputed by its honest members within seconds; C, E, G and I (the colluders' own ledgers,
+    each Q = 7 with an honest majority) within ~36 s, by members acting on cl-built proofs. The
+    reference acted on them unchanged.
+  - **All five vaults were confiscated punitively on chain** (M, C, E, G, I: 0.499996 BTC each,
+    15–16 confirmations). M's lottery went to cld6; C, E, G and I to honest reference members.
+  - The coalition's tally: nothing gained (the lock rolled back with M); collateral lost on five vaults
+    (1.25 BTC at R = 0.5).
+- **Gap: operator contagion.** cld1, the forging operator, lost M but kept A (0.5 BTC, untouched). A
+  NonConformingUpdate on one ledger is not yet presented against the operator's other ledgers, in
+  either implementation.
+- **Not yet tested: the theft §2a models.** A colluding majority spending an honest operator's vault
+  at Tier 0 is on-chain, not a ledger update. It needs DEP-06 type 7 (unauthorised vault spend) and
+  contagion on its witness signers.
+
 ## 3. Trust heuristics for a wallet choosing a ledger
 
 Observable from public data (relay + chain), roughly in order of what the findings say matters:
