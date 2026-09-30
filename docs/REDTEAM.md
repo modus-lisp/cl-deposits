@@ -361,11 +361,15 @@ Nothing to attack live.
 Reviewing cl's verifier for when it is wired in:
 - **Fixed (cl, this commit):** it credited the operator only for answers after the member's
   causal-link cosignature, so a request served promptly still read as censored.
-- **Protocol question (open, the user's):** the proof does not establish that the request was one
-  the operator *could* serve (validly signed, within the rules). A member, or a wallet colluding with
-  one, could embed an unservable request and "prove" an honest operator censored it. The spec needs
-  either a conformance check on the embedded request, or a signed on-ledger way for an operator to
-  refuse a request, which it lacks today.
+- **Servability (decided 2026-09-29):** censorship proofs are to cover only inter-ledger
+  transfers, which are always satisfiable when valid, and the censored request must still be valid
+  at the deadline. So a depositor who double-spends before the deadline, or a member who escalates an
+  unservable request, proves nothing. **Implemented in cl:** the request's operation, replayed onto
+  the operator's chain up to the breach update, must conform and apply there. Tested with a real
+  signed TransferLock, a double spend before the deadline, and a request with no operation. Open: the
+  inter-ledger restriction in the spec text; the fee-collection interaction (an operator's fee could
+  push a balance below the request, within the fee-cadence bounds); and wiring any of this into
+  disputes, in both implementations.
 
 ### 2026-09-29 — analysis: equivocation needs no colluder, and double cosignatures prove nothing
 
