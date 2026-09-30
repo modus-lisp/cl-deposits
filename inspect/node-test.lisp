@@ -302,7 +302,14 @@
       (nd:credit-onchain e le ke 800000 :txid (u:sha256 (hx "02")))
       ;; --- DEP-12: A ignores w1's transfer; w1 escalates through member b.
       (setf (nd:node-ignore-actions a) '("transfer_lock"))
-      (let* ((params (w:json-object "operation" "AAAA"))   ; content of the ignored request (any signed request)
+      (let* ((sign-lock (lambda (amount)   ; w1's signed TransferLock from d1 to the courier's deposit on A
+                          (let ((o (list :type :transfer-lock :transfer-nonce (u:sha256 (u:int->be amount 8)) :source-deposit-id d1
+                                         :destination-deposit-id ka :amount amount :fee 0 :completion-script "sha256(00)"
+                                         :timeout-height (+ *height* 400) :transfer-id (u:sha256 (u:cat (u:int->be amount 8) d1))
+                                         :nonce (+ 7000 amount) :expiry (+ *height* 400) :witness '())))
+                            (setf (getf o :witness) (d17:sign-operation o (nd::wallet-priv w1)))
+                            o)))
+             (params (w:json-object "operation" (u:base64-encode (op:encode-operation (funcall sign-lock 100000)))))
              (h (nd:wallet-request-hash w1 ida "transfer_lock" params)))
         (multiple-value-bind (ok res err rh) (nd:wallet-request w1 ida "transfer_lock" params :timeout 1)
           (declare (ignore res))
@@ -333,7 +340,32 @@
                                               :processed-p (lambda (o) (eq (op:operation-type o) :deposit-open)))))
             (check "not censorship if the operator answered"
                    (not (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))
-                                              :processed-p (lambda (o) (eq (op:operation-type o) :onchain-credit))))))))
+                                              :processed-p (lambda (o) (eq (op:operation-type o) :onchain-credit)))))
+            ;; A double spend: w3 escalates a 400000 lock, then spends 150000 (of 500000)
+            ;; through the operator before the deadline.  At the deadline the escalated
+            ;; lock can no longer be served, so it is not censorship.
+            (let* ((w3 (nd:make-wallet :priv 88888888888888888888 :bus bus))
+                   (d3 (nd:wallet-open-deposit w3 ida))
+                   (o4 (list :type :transfer-lock :transfer-nonce (u:sha256 (hx "d4")) :source-deposit-id d3
+                             :destination-deposit-id ka :amount 400000 :fee 0 :completion-script "sha256(00)"
+                             :timeout-height (+ *height* 400) :transfer-id (u:sha256 (hx "d5"))
+                             :nonce 9400 :expiry (+ *height* 400) :witness '())))
+              (setf (getf o4 :witness) (d17:sign-operation o4 (nd::wallet-priv w3)))
+              (nd:credit-onchain a la d3 500000 :txid (u:sha256 (hx "d3")))
+              (let* ((p4 (w:json-object "operation" (u:base64-encode (op:encode-operation o4))))
+                     (h4 (nd:wallet-request-hash w3 ida "transfer_lock" p4)))
+                (nd:wallet-escalate w3 (nd:record-id-hex lb) h4 ida (nd:node-pubkey-hex a))
+                (let ((embed4 (first (nd:record-history lb))))
+                  (nd:wallet-transfer w3 ida d3 ka 150000 :height *height*)
+                  (let ((*height* (+ *height* 100)))
+                    (nd:credit-onchain a la d3 1 :txid (u:sha256 (hx "d6")))
+                    (multiple-value-bind (ok why)
+                        (fr:verify-censorship (w:json p4) embed4 (reverse (nd:record-history lb)) (reverse (nd:record-history la))
+                                              :processed-p (lambda (o) (declare (ignore o)) nil))
+                      (check "a request the depositor double-spent before the deadline is not censorship"
+                             (and (not ok) (search "not servable" why)) why))))))
+            (check "a request with no operation proves nothing"
+                   (not (fr:verify-censorship (w:json (w:json-object "operation" "AAAA")) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))))))))
       ;; --- DEP-13: w1 (ledger A) pays w2 (ledger E) through courier k.
       (let ((k (cr:make-courier kn)))
         (cr:courier-serve k ida ka kwa) (cr:courier-serve k ide ke kwe)

@@ -262,10 +262,14 @@
 ;;; ---------------------------------------------------------------------------
 ;;; DEP-12: provable censorship.  Not a DEP-06 proof type yet in the reference;
 ;;; this is the verification the spec describes, over public ledger data.  Nothing
-;;; acts on it yet (docs/REDTEAM.md, claims #3 and #5).  It does not check that the
-;;; request is one the operator could have served (validly signed, within the
-;;; rules): the spec gives an operator no signed way to refuse a request, so an
-;;; unservable request embedded by a member would read as censorship.
+;;; acts on it yet (docs/REDTEAM.md, claims #3 and #5).
+;;;
+;;; The request must still have been servable when the deadline passed: its
+;;; operation, replayed onto the operator's chain up to the breach, conforms
+;;; (witness, nonce window, expiry at the breach height) and applies (balance).
+;;; Otherwise a depositor could escalate a transfer, spend the same funds some
+;;; other way before the deadline, and "prove" the first was censored; or a
+;;; member could escalate a request no operator could serve.
 
 (defun verify-censorship (request-content embed-update member-history operator-history
                           &key (service-response-blocks 72) processed-p)
@@ -301,4 +305,21 @@
          (cond ((null link) (values nil "no causal link: the member has not cosigned past the embed"))
                ((null breach) (values nil "deadline not reached"))
                (answered (values nil "the operator processed the request"))
-               (t (values t nil))))))))
+               (t (let ((why (unservable-at request-content operator-history breach)))
+                    (if why (values nil why) (values t nil))))))))))
+
+(defun unservable-at (request-content operator-history breach)
+  "NIL when the request's operation could have been served just before BREACH (the
+   operator update that crosses the deadline), else why not."
+  (let ((o (ignore-errors (op:decode-operation (base64-decode (w:jget (w:parse-json request-content) "operation"))))))
+    (if (null o)
+        "the request carries no operation to judge"
+        (let ((state (ignore-errors (lg:replay (sort (remove-if-not (lambda (u) (< (up:update-seq u) (up:update-seq breach)))
+                                                                    (copy-list operator-history))
+                                                     #'< :key #'up:update-seq))))
+              (height (up:update-block-height breach)))
+          (cond ((null state) "the operator's chain up to the deadline does not replay")
+                ((cf:violation state o height)
+                 (format nil "the request was not servable at the deadline: ~a" (cf:violation state o height)))
+                ((handler-case (let ((lg:*block-height* height)) (lg:apply-operation (lg:copy-ledger state) o) nil)
+                   (lg:ledger-error (e) (format nil "the request was not servable at the deadline: ~a" e)))))))))
