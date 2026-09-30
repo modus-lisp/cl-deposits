@@ -31,7 +31,8 @@ refwallet() { local dir=$1; shift; WALLET_DATA_DIR="$dir" timeout 180 "$REF_WALL
 dep_id() { python3 -c "import json,sys; print([d['deposit_id'] for d in json.load(open('$1/deposits.json')) if d['alias']=='$2'][0])"; }
 ref_members() { ref_cli "$1" quorum list | awk -v l="$(echo "$2" | cut -c1-16)" '/^  [0-9a-f]{16}/ { inblk = index($1, l) == 1; next } inblk && /^    [0-9a-f]/ { print }'; }
 retry_add() { local i; [ -n "$3" ] && [ -n "$4" ] || return 1; for i in 1 2 3 4; do ref_cli "$1" quorum add "$2" "$3" "$4" >/dev/null 2>&1 || true; ref_members "$1" "$2" | grep -q "$(echo "$3" | cut -c1-16)" && return 0; sleep 5; done; return 1; }
-pubkey_of() {   # the reference CLI's show-identity can come back empty while its daemon is busy: an
+pubkey_of() {   # the reference CLI's show-identity prints no pubkey until the node has a ledger (own_ledger
+               # first), and can come back empty while its daemon is busy: an
                # empty key once matched every member in retry_add and reached add-member as ""
   # A key never changes, so the first one read is kept ($SOAK/pubkey.NODE); a busy daemon
   # came back empty for 30 s at a time during setup.
@@ -59,7 +60,7 @@ form_ledger() {   # form_ledger NAME OPERATOR "m1,m2,m3"
   case "$op" in
     cld*)
       id=$(sx "$(cld_ctl "$op" "(:open-ledger :reserves-id \"genesis:$op:soak:$name:$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER"); [ -n "$id" ] || fail "open $name"
-      for m in ${members//,/ }; do mp=$(pubkey_of "$m"); ml=$(own_ledger "$m"); expect "$(cld_ctl "$op" "(:add-member :ledger \"$id\" :member \"$mp\" :member-ledger \"$ml\")")"; done
+      for m in ${members//,/ }; do ml=$(own_ledger "$m"); mp=$(pubkey_of "$m"); expect "$(cld_ctl "$op" "(:add-member :ledger \"$id\" :member \"$mp\" :member-ledger \"$ml\")")"; done
       local prep addr txid vout; prep=$(cld_ctl "$op" "(:prepare-quorum :ledger \"$id\" :expiry-blocks 4320)"); expect "$prep"; addr=$(sx "$prep" ":ADDRESS")
       txid=$(wcli sendtoaddress "$addr" 0.5); mine 3
       vout=$(bcli getrawtransaction "$txid" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$addr'][0])")
@@ -69,7 +70,7 @@ form_ledger() {   # form_ledger NAME OPERATOR "m1,m2,m3"
       printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$id" "$op" "$txid" "$vout" >>"$SOAK/ledgers.tsv";;
     ref*)
       id=$(ref_cli "$op" ledger open --collateral-ratio 0.5 | sed -nE 's/.*Ledger ID: ([0-9a-f]{64}).*/\1/p'); [ -n "$id" ] || fail "$op ledger open"
-      for m in ${members//,/ }; do mp=$(pubkey_of "$m"); ml=$(own_ledger "$m"); retry_add "$op" "$id" "$mp" "$ml" || fail "add $m to $name"; done
+      for m in ${members//,/ }; do ml=$(own_ledger "$m"); mp=$(pubkey_of "$m"); retry_add "$op" "$id" "$mp" "$ml" || fail "add $m to $name"; done
       ref_begin_quorum "$op" "$id" 0.5 || fail "quorum begin on $name"; sleep 8
       ref_cli "$op" ledger advertise "$id" >/dev/null 2>&1 || true
       printf '%s\t%s\t%s\t-\t-\n' "$name" "$id" "$op" >>"$SOAK/ledgers.tsv";;
