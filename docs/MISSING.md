@@ -75,3 +75,56 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   - the rollback depth when every honest replica is offline at the fraud;
   - off-ledger extraction through a courier leg;
   - a colluding majority against an honest minority before `quorum_expiry + 720`.
+
+## Concerns: what might happen
+
+Risks we are worried about, given what exists and what doesn't.
+
+**Loss of funds**
+- A colluding majority of a quorum spends an honest operator's vault at Tier 0. Today nothing
+  notices, the colluders keep their own vaults, and the victim ledger's depositors lose their funds.
+- Even when theft is punished by contagion, the victims are not made whole: confiscated colluder
+  vaults go to the lottery winners on the colluders' own ledgers, not to the depositors robbed.
+- An operator equivocates using honest retries alone (no colluder needed) and extracts value off the
+  ledger before detection: a courier leg paid against a lock that later rolls back, or a swap
+  counterparty paid out. The rollback does not reach effects outside the ledger.
+- One implementation bug shared by a quorum majority is a network-wide failure. Findings 11–14 were
+  each an honest node verifying too little. With two implementations, one always holds a majority
+  of a seven-member quorum.
+
+**Detection failing**
+- Every honest replica of a ledger is offline when the fraud happens. The fraud stands until one
+  returns, and honest activity after it is rolled back with it.
+- A colluding majority is detected at once but cannot be punished on the attacked ledger until
+  `quorum_expiry + 720` (minority confiscation). Meanwhile it can already spend the vault.
+- Quorum capture is likelier than the simulation assumes: a coalition seats its keys on each other's
+  quorums (DEP-19 §10's residual), rather than being drawn at random.
+- A member guarding many quorums with a small vault offers little bite per ledger. Security
+  concentrates in the largest operators (the "pyramid").
+
+**Held funds**
+- An operator ignores a depositor's transfer or exit request with no consequence, until its quorum
+  expires. The "cannot hold deposits hostage" guarantee is unenforced.
+- An operator's own fee collection pushes a balance below an escalated request, so the request is no
+  longer servable at the deadline.
+- The custody lottery goes unclaimed: the committed N differs from the armed count (lottery N), or
+  a last revealer withholds. Custody then waits for recovery leaves while no one operates the ledger.
+
+**Honest parties punished**
+- DEP-19 §5 implemented as written would slash honest members for re-signing a round that did not
+  commit.
+- A censorship proof built on an unservable request (a depositor's double spend, or a bad request
+  embedded by a member) frames an honest operator. The servability rule exists in cl only, and
+  nothing acts on censorship proofs yet.
+- A replayed or stale proof re-announces disputes; bogus proofs naming unknown ledgers each cost a
+  relay query.
+
+**Operations**
+- The relay is a single point: a relay that censors, delays or drops ephemeral events stalls
+  cosigning, reveals and confiscation signing.
+- A confiscated operator keeps operating its old ledger. Wallets that don't notice may keep sending
+  it requests, or fund its old reserves address.
+- A reorg near the tip changes the block hash an update signed. Cosigners that check it refuse, and
+  signing can stall until heights settle.
+- A slow implementation drags every quorum where it holds the deciding votes. At Q = 7 cl's
+  per-cosign cost set the pace for half the ledgers until it was fixed.
