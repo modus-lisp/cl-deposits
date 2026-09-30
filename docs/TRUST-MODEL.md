@@ -138,9 +138,20 @@ Implemented cosigner contagion (DEP-19 §5): cl d4614e7 (produce and act) and de
     15–16 confirmations). M's lottery went to cld6; C, E, G and I to honest reference members.
   - The coalition's tally: nothing gained (the lock rolled back with M); collateral lost on five vaults
     (1.25 BTC at R = 0.5).
-- **Gap: operator contagion.** cld1, the forging operator, lost M but kept A (0.5 BTC, untouched). A
-  NonConformingUpdate on one ledger is not yet presented against the operator's other ledgers, in
-  either implementation.
+- **Operator contagion (added: cl 62b69bb, deposits-rust 56efa41).** The first run left cld1, the forging
+  operator, with its other ledger A untouched. The same NonConformingCosignature evidence now accepts the
+  fault's operator as the accused, and is presented against every other ledger it operates. **Re-run on a
+  fresh ledger M2:** M2 was disputed within 9 s, and **A, cld1's other ledger, by all four of its honest
+  members (ref2–ref5) within 26 s.** The ledgers confiscated from the colluders in the first run now have
+  new custodians and were not disputed again; the reference found its existing forks. Loose end: a
+  confiscated cl operator keeps operating its old ledger, and its members refuse every cosign ("in dispute
+  state"). That's noise, not harm; it should stand down.
+- **So running more ledgers, and serving on more quorums, is more exposure, and exposure is the signal.**
+  An operator's every vault is at stake for fraud on any of its ledgers, slashable by each ledger's own
+  quorum. A member's own vault is at stake for every quorum it serves, but slashed once (DEP-19 §10.1), so
+  its bite per ledger guarded is its collateral divided by the number it guards. §3's heuristics should
+  score both: operator collateral summed across its ledgers, and member coverage (own collateral against
+  the collateral it guards).
 - **Not yet tested: the theft §2a models.** A colluding majority spending an honest operator's vault
   at Tier 0 is on-chain, not a ledger update. It needs DEP-06 type 7 (unauthorised vault spend) and
   contagion on its witness signers.
