@@ -1024,6 +1024,8 @@
 
 
 
+(defvar *l3* nil "The contagion gate's second ledger of the attacking operator.")
+
 (with-gate ("contagion: a colluding cosigner is disputed on the ledger it operates (DEP-19 §5-6)")
   ;; L1: A operates; B, C, D cosign.  L2: B operates; C, D, E cosign (honest majority D, E).
   ;; B and C cosign blind, so A's witness-less lock on L1 commits.  D (an honest
@@ -1044,6 +1046,10 @@
     (nd:begin-quorum a l1 :funding-txid (u:sha256 (hx "c1")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
     (dolist (m (list c d e)) (nd:add-member b l2 (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
     (nd:begin-quorum b l2 :funding-txid (u:sha256 (hx "c2")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
+    ;; L3: A's second ledger (C, D, E cosign; honest majority D, E).  Operator contagion.
+    (setf *l3* (nd:open-ledger a :reserves-id "genesis:c6" :reserves 15600000 :collateral 15600000))
+    (dolist (m (list c d e)) (nd:add-member a *l3* (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a *l3* :funding-txid (u:sha256 (hx "c7")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
     (let* ((w (nd:make-wallet :priv 66666666666666666696 :bus bus)) (w2 (nd:make-wallet :priv 77777777777777777797 :bus bus))
            (d1 (nd:wallet-open-deposit w id1)) (d2 (nd:wallet-open-deposit w2 id1)))
       (nd:credit-onchain a l1 d1 100000 :txid (u:sha256 (hx "c3")))
@@ -1058,10 +1064,16 @@
           (check "the honest replica D disputes L1" (nd:find-fork d id1 (nd:node-pubkey d)))
           (check "contagion: D disputes L2, the ledger B operates" (nd:find-fork d id2 (nd:node-pubkey d)))
           (check "contagion: E, with no replica of L1, disputes L2 too" (nd:find-fork e id2 (nd:node-pubkey e)))
+          (check "operator contagion: D and E dispute L3, the operator A's other ledger"
+                 (every (lambda (m) (nd:find-fork m (nd:record-id-hex *l3*) (nd:node-pubkey m))) (list d e)))
+          (check "and L1 itself keeps its own dispute, from before the fault"
+                 (= (lg:ledger-sequence (nd:record-ledger (nd:find-fork d id1 (nd:node-pubkey d)))) (1+ (1- (up:update-seq u)))))
           (let* ((prefix (remove u (reverse (nd:record-history l1))))
                  (qb (nd::governing-quorum-begin-seq l1 (up:update-seq u))))
             (check "the proof against B verifies"
                    (fr:verify-non-conforming-cosignature (fr:make-non-conforming-cosignature-proof (nd:node-pubkey b) (u:hex->bytes id2) u qb) prefix))
+            (check "the proof against A, its operator, presented on L3, verifies"
+                   (fr:verify-non-conforming-cosignature (fr:make-non-conforming-cosignature-proof (nd:node-pubkey a) (u:hex->bytes (nd:record-id-hex *l3*)) u qb) prefix))
             (check "a proof against D, who did not cosign it, does not"
                    (not (fr:verify-non-conforming-cosignature (fr:make-non-conforming-cosignature-proof (nd:node-pubkey d) (u:hex->bytes id2) u qb) prefix)))
             (check "nor one against a conforming update B cosigned"

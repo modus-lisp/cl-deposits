@@ -209,11 +209,12 @@
     (error (c) (values nil (princ-to-string c)))))
 
 (defun verify-non-conforming-cosignature (proof fault-history)
-  "FAULT-HISTORY is the fault ledger's chain before the fault.  The accused holds a
-   valid cosignature on the fault update; the governing QuorumBegin (at or before
-   the fault) names it a member; and the fault breaks the rules, judged as a
-   NonConformingUpdate of the fault ledger's operator (binding, operator,
-   conformance and fold)."
+  "FAULT-HISTORY is the fault ledger's chain before the fault.  The accused signed
+   the fault update: as its operator (DEP-19 §5: the accused 'MUST appear on the
+   update as operator_id or in cosignatures'; operator contagion), or with a valid
+   cosignature as a member the governing QuorumBegin names.  And the fault breaks
+   the rules, judged as a NonConformingUpdate of the fault ledger's operator
+   (binding, operator, conformance and fold)."
   (handler-case
       (let* ((fault (up:decode-update (hex->bytes (e proof :fault-update-hex))))
              (accused (hex->bytes (getf proof :accused)))
@@ -221,9 +222,15 @@
              (qb-seq (e proof :governing-quorumbegin-seq))
              (qb (find qb-seq fault-history :key #'up:update-seq))
              (qb-op (and qb (ignore-errors (op:decode-operation (up:update-message qb)))))
-             (cosig (find accused (up:update-cosignatures fault) :key #'up:cosig-pubkey :test #'equalp)))
+             (cosig (find accused (up:update-cosignatures fault) :key #'up:cosig-pubkey :test #'equalp))
+             (operator-p (equalp accused (up:update-operator-id fault))))
         (cond ((not (string= (bytes->hex (up:update-ledger-id fault)) (e proof :fault-ledger-id))) (values nil "fault update is not on the named fault ledger"))
               ((/= seq (e proof :fault-sequence)) (values nil "fault sequence mismatch"))
+              ;; The operator: its own signature is the evidence (checked by the
+              ;; NonConformingUpdate judgement below).
+              (operator-p (verify-non-conforming-update
+                           (make-non-conforming-update-proof (up:update-operator-id fault) (up:update-ledger-id fault) fault)
+                           fault-history))
               ((null cosig) (values nil "the accused did not cosign the fault"))
               ((not (up:verify-cosignature fault cosig)) (values nil "the accused's cosignature does not verify"))
               ((not (and qb-op (eq (op:operation-type qb-op) :quorum-begin) (<= qb-seq seq)))

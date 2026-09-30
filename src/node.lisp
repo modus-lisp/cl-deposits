@@ -2249,14 +2249,16 @@
     (and qb (up:update-seq qb))))
 
 (defun broadcast-cosigner-contagion (node rec update)
-  "Every cosigner of the non-conforming UPDATE on REC, against every ledger it operates."
+  "Everyone who signed the non-conforming UPDATE on REC, against every other ledger
+   they operate: each cosigner, and the operator (DEP-19 §5; operator contagion
+   puts the operator's whole collateral at stake, not just this ledger's)."
   (let ((qb (governing-quorum-begin-seq rec (up:update-seq update))))
     (when qb
-      (dolist (c (up:update-cosignatures update))
-        (dolist (target (ledgers-operated-by node (up:cosig-pubkey c)))
-          (log! node "contagion: ~a cosigned the fault on ~a; proof against its ledger ~a"
-                (subseq (bytes->hex (up:cosig-pubkey c)) 0 8) (subseq (record-id-hex rec) 0 8) (subseq target 0 8))
-          (broadcast-fraud node (fr:make-non-conforming-cosignature-proof (up:cosig-pubkey c) (hex->bytes target) update qb)))))))
+      (dolist (signer (cons (up:update-operator-id update) (mapcar #'up:cosig-pubkey (up:update-cosignatures update))))
+        (dolist (target (remove (record-id-hex rec) (ledgers-operated-by node signer) :test #'string=))
+          (log! node "contagion: ~a signed the fault on ~a; proof against its ledger ~a"
+                (subseq (bytes->hex signer) 0 8) (subseq (record-id-hex rec) 0 8) (subseq target 0 8))
+          (broadcast-fraud node (fr:make-non-conforming-cosignature-proof signer (hex->bytes target) update qb)))))))
 
 (defun fault-prefix (node fault-id-hex fault)
   "The fault ledger's updates before FAULT, as FAULT's signed previous_hash pins them:
@@ -2276,6 +2278,8 @@
   (let* ((accused (hex->bytes (getf proof :accused)))
          (targets (loop for rec being the hash-values of (node-ledgers node)
                         when (and (not (record-owned-p rec)) (not (record-fork-p rec))
+                                  ;; the fault ledger itself is judged by its own proof, from before the fault
+                                  (not (string= (record-id-hex rec) (getf (getf proof :evidence) :fault-ledger-id)))
                                   (equalp (lg:ledger-operator-key (record-ledger rec)) accused)
                                   (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
                                   (not (find-fork node (record-id-hex rec) (node-pubkey node))))
