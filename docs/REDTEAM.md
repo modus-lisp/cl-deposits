@@ -10,9 +10,9 @@ Every attack states its pass condition as what the HONEST side must do.
 |---|---|---|---|
 | 1 | strict-majority cosign, independent validation (DEP-05 §63, whitepaper) | operator + colluding majority sign an invalid update; honest minority must refuse and dispute | |
 | 2 | equivocation caught and punished (DEP-06) | equivocate with a colluding cosigner on both branches; double-spend across forks; colluder's slashing share excluded | operator caught; double cosignatures are not attributable (honest retries), collateral is the backstop (analysis) |
-| 3 | censorship provable (DEP-11, DEP-12) | operator ignores a signed request; DeliveryEmbed; clock; censorship proof; dispute | |
+| 3 | censorship provable (DEP-11, DEP-12) | operator ignores a signed request; DeliveryEmbed; clock; censorship proof; dispute | not enforced in either implementation (open) |
 | 4 | inactivity moves custody (DEP-19 §1–3) | operator silent past inactivity_blocks; majority attestation; respectful custody | |
-| 5 | co-sign refusal provable; withholding majority is the stated limit (DEP-19 §9) | cosigner answers all but the clock-satisfying update | |
+| 5 | co-sign refusal provable; withholding majority is the stated limit (DEP-19 §9) | cosigner answers all but the clock-satisfying update | not implemented in either (open) |
 | 6 | fraud proofs cannot be forged or replayed (DEP-06 §Verification) | malformed / stale / wrong-ledger / replayed proofs; cross-implementation acceptance rules | wrong-ledger: relabelling (closed, v2); self-accusing member: Finding 12 (fixed); malformed, stale open |
 | 7 | lottery fair and spendable (DEP-03 §Custody Lottery) | out-of-range preimage; withheld reveal (partial leaf); commit≠reveal | N mismatch: organic #6 (mitigated); commit≠reveal: Finding 14 (cl fixed); withheld reveal: priced by the armer share (analysis) |
 | 8 | transport outside the trust model | censoring / delaying relay; replayed ephemeral requests vs nonce+expiry | replay led to Finding 11 (fixed); relay censorship open |
@@ -346,6 +346,26 @@ The dispute that follows exposes the next layer:
   seq 17840: OVER-OBLIGATION`, every pass): noisy, and should stop once the fork is open.
 - With ref3 short of collateral and not visible to cl, the cl drivers wait (to 9191) for the third
   armer, and C's Tier-0 confiscation needs ref3's signature: likely to stall.
+
+### 2026-09-29 — claims #3 and #5 are not enforced in either implementation
+
+Censorship (#3, DEP-11/12) and cosign refusal (#5, DEP-19 §9) are specified, but nothing acts on them.
+cl has the DEP-12 escalation (a member anchors a DeliveryEmbed) and `verify-censorship`, but no caller
+outside its test. The reference has the DeliveryEmbed operation and CLI, but the wallet-to-member
+channel is "not yet plumbed" (DEP-12) and censorship or refusal appear only in test models and
+wishlists. DEP-19's signed proposals (Kind 9108) exist in neither. So **an operator can ignore a
+depositor's request with no consequence** short of letting its quorum expire: the "cannot hold
+deposits hostage" guarantee (DEP-11 §Transfer and Exit-Request Processing) holds on paper only.
+Nothing to attack live.
+
+Reviewing cl's verifier for when it is wired in:
+- **Fixed (cl, this commit):** it credited the operator only for answers after the member's
+  causal-link cosignature, so a request served promptly still read as censored.
+- **Protocol question (open, the user's):** the proof does not establish that the request was one
+  the operator *could* serve (validly signed, within the rules). A member, or a wallet colluding with
+  one, could embed an unservable request and "prove" an honest operator censored it. The spec needs
+  either a conformance check on the embedded request, or a signed on-ledger way for an operator to
+  refuse a request, which it lacks today.
 
 ### 2026-09-29 — analysis: equivocation needs no colluder, and double cosignatures prove nothing
 
