@@ -49,6 +49,24 @@
           ((string= action "complete")
            (cl-deposits.node:wallet-complete-transfer wal ledger (funcall hx (first rest)) (funcall hx (second rest)))
            (format t "~s~%" (list :status :ok)))
+          ((string= action "escalate")   ; DEP-12: anchor an unanswered transfer through a member
+           ;; escalate FROM TO MSAT MEMBER-LEDGER OPERATOR-HEX — computes the request
+           ;; hash of a transfer_lock request (the same fields wallet-transfer sends)
+           ;; and asks the member to embed it.  The red-team script passes the member
+           ;; ledger and the operator's pubkey explicitly.
+           (let* ((from (funcall hx (first rest))) (to (funcall hx (second rest)))
+                  (amount (parse-integer (third rest)))
+                  (member-ledger (or (fourth rest) (error "escalate: MEMBER-LEDGER required")))
+                  (operator (or (fifth rest) (error "escalate: OPERATOR-HEX required")))
+                  (params (cl-deposits.wire:json-object "operation" "" "transfer_nonce" ""
+                                                         "source_deposit_id" (funcall hex from)
+                                                         "destination_deposit_id" (funcall hex to)
+                                                         "amount" amount "fee" 0
+                                                         "completion_script" "" "timeout_height" 0 "transfer_id" ""
+                                                         "op_nonce" 0 "op_expiry" 0 "signature" ""))
+                  (h (funcall hex (cl-deposits.node:wallet-request-hash wal ledger "transfer_lock" params)))
+                  (res (cl-deposits.node:wallet-escalate wal member-ledger (funcall hx h) ledger operator)))
+             (format t "~s~%" (list :status :ok :request-hash h :reply res))))
           (t (error "unknown action ~a" action)))
       (error (e) (format t "~s~%" (list :status :error :message (princ-to-string e)))))
     (when bus (ignore-errors (cl-deposits.nostr-bus:close-nostr-bus bus)))

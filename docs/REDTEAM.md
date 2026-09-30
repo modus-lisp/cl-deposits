@@ -645,3 +645,55 @@ proposal went through.
   or ordering disagreement between two cl nodes; not chased yet.
 - all four cl nodes now run e5d7f63 (anchor) and 5ec1801 (expiry watch); C rotated at 23:07
   only after cld2 was restarted onto the anchor fix.
+
+### 2026-09-30 — claim #9, demonstrated: a colluding majority spends an honest vault at Tier 0, and nothing reacts
+
+`redteam/attack-vault-spend.sh` on the live soak.  Ledger V (5-of-8: cld1
+operator, cld2–cld6 + ref6 + ref7 members, 0.5 BTC reserves).  The thieves:
+cld1 + cld2 + cld3 + cld4 + cld5 — exactly the threshold, no more.  The
+facility: `(:vault-spend :ledger V :address DEST)` on the daemon builds the
+tier-0 spend of the reserves outpoint from public state (the same shape a
+confiscation uses, but to the colluders' address), signs it, and collects the
+other four signatures over the relay with a `theft_sign` request that only
+answers on nodes armed with `(:adversary :set :theft-sign t)`.
+
+Result (tx a21854c7…, 5 signatures, 0.49999822 BTC to cld2's address):
+
+- the spend assembled, verified, and broadcast; the output is live on chain;
+- 120 s of watching the honest minority (cld6, ref6, ref7): zero log lines,
+  zero disputes, zero forks on V.  No watch on the reserves outpoint exists
+  in either implementation — the honest side cannot even see the theft, let
+  alone prove it.  This is DEP-05 §120's stated limitation, now measured:
+  the attack costs a threshold of colluding seats and takes one relay round
+  (~20 s under soak load); the exposure is the entire vault.
+
+The same run with the relay's new fault injection armed
+(`relay.jsonl.faults.json`: drop kind 20101, author cld1, action theft_sign)
+collects 1 of 5 signatures and fails — the relay can now censor any request
+by kind/author/action/to, which is the transport attack of claim #8 made
+controllable.  (Fixing that found a bug: the relay's action matcher read
+`content["action"]`, but requests carry the action as a tag — corrected.)
+
+### 2026-09-30 — the red-team facilities, and what is still unrun
+
+Built today (all in `redteam/`, all against the live soak):
+
+- `attack-vault-spend.sh` — above; **run, PASS** (the gap is the finding).
+- `attack-censor-hold.sh` — DEP-12: operator ignores a wallet transfer
+  (`:ignore-requests`), wallet escalates through a member (`escalate` action
+  on the wallet CLI → `delivery_embed`); honest arm = the transfer lands,
+  censor arm = the embed lands but nothing acts on it.  **Written, not yet
+  run.**
+- `attack-withhold-reveal.sh` — the last revealer holds the lottery hostage
+  (`:withhold-reveal`): confiscation lands, the preimage never does, custody
+  waits.  **Written, not yet run.**
+- `attack-rollback-depth.sh` — every honest replica offline during the fraud;
+  measures how long it stands and how deep the rollback reaches when they
+  return.  **Written, not yet run.**
+- relay fault injection (`devnet/relay.py`): drop/delay rules by
+  kind/author/action/to, re-read from `relay.jsonl.faults.json` on every
+  EVENT.  **Run** (the drop above); delay untested on the devnet relay.
+
+The adversary switches (`:ignore-requests`, `:withhold-reveal`,
+`:theft-sign`, `:vault-spend`) are all disarmed after each run; the soak
+continues underneath.

@@ -117,6 +117,11 @@
            (ok :seq (lg:ledger-sequence (nd:record-ledger rec)) :tip (bytes->hex (lg:ledger-chain-tip (nd:record-ledger rec)))
                :history (length (nd:record-history rec)))))
         (:equivocate (nd:equivocate node (rec! node form)) (ok :warning "published a conflicting update at the tip sequence"))
+        (:vault-spend   ; red team: (:vault-spend :ledger L :address "tb1..." [:tier N]) — spend the
+                        ; vault outside any rotation or dispute (docs/MISSING.md, DEP-06 type 7 gap)
+         (multiple-value-bind (tx n) (nd:vault-spend node (arg form :ledger) (arg form :address)
+                                                     :tier-index (arg form :tier 0))
+           (ok :txid (txid-hex (cl-consensus.tx:tx-txid tx)) :sigs n :warning "unauthorised vault spend broadcast")))
         (:forks (ok :forks (mapcar (lambda (f) (list :operator (subseq (bytes->hex (nd::record-fork-operator f)) 0 16) :seq (lg:ledger-sequence (nd:record-ledger f))
                                                      :state (lg:ledger-dispute-state (nd:record-ledger f)) :armed (and (nd:record-preimage f) t)))
                                    (nd:forks-of node (arg form :ledger)))))

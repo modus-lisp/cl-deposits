@@ -47,7 +47,8 @@
            #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
            #:dispute-expired-quorums #:start-expiry-watch #:*expiry-grace-blocks*
            #:required-replacement-sats #:pledge-collateral #:release-pledges #:our-utxos #:node-pledges
-           #:drive-disputes #:dispute-arm-closes #:outpoint-key #:save-pledges))
+           #:drive-disputes #:dispute-arm-closes #:outpoint-key #:save-pledges
+           #:vault-spend #:build-vault-theft))
 (in-package #:cl-deposits.node)
 
 (define-condition node-error (error)
@@ -510,6 +511,7 @@
            (funcall (gethash action (extra-actions node)) event params))
           ((string= action "cosign_update") (handle-cosign node event params))
           ((string= action "confiscation_sign") (handle-confiscation-sign node event params))
+          ((string= action "theft_sign") (handle-theft-sign node event params))
           ((string= action "lottery_recovery_sign") (handle-lottery-recovery-sign node event params))
           ((string= action "lottery_reveal") (handle-lottery-reveal-request node event params))
           ((string= action "consent_request") (handle-consent node event params))
@@ -888,6 +890,12 @@
 (defun handle-wallet-request (node rec event action params)
   (when (member action (node-ignore-actions node) :test #'string=)
     (log! node "ignoring ~a (test switch)" action)
+    (return-from handle-wallet-request nil))
+  ;; ADVERSARY :ignore-requests — an operator that answers nothing, with no
+  ;; error either: the wallet's request times out and nothing on the ledger
+  ;; records why (red team: DEP-12 censorship, the escalation path's start).
+  (when (getf (node-adversary node) :ignore-requests)
+    (log! node "ADVERSARY: dropping wallet request ~a on ~a" action (subseq (record-id-hex rec) 0 8))
     (return-from handle-wallet-request nil))
   (handler-case
       (cond
@@ -1438,8 +1446,13 @@
                      (note-dispute node id "waiting for collateral (~a sats)" (required-replacement-sats base)))))
               ((eq lstate :pending)
                (cond ((not (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
-                      (publish-reveal node id)
-                      (note-dispute node id "confiscation ~a on chain; revealed" (txid-hex (btx:tx-txid conf))))
+                      ;; ADVERSARY :withhold-reveal — an armer that never publishes its
+                      ;; preimage: the lottery cannot be claimed, custody waits (red team:
+                      ;; the last revealer holds the funds hostage; DEP-06 §Phase 4).
+                      (if (getf (node-adversary node) :withhold-reveal)
+                          (note-dispute node id "ADVERSARY: confiscation ~a on chain; withholding our reveal" (txid-hex (btx:tx-txid conf)))
+                          (progn (publish-reveal node id)
+                                 (note-dispute node id "confiscation ~a on chain; revealed" (txid-hex (btx:tx-txid conf))))))
                      ((null (lottery-claimable node id lottery))
                       (if (lottery-recovery-open-p node conf)
                           (handler-case (let ((tx (sweep-lottery node id conf lottery)))
@@ -1883,6 +1896,95 @@
 (defun broadcast (node tx)
   (push tx (node-broadcasts node))
   (when (node-broadcast-fn node) (funcall (node-broadcast-fn node) (btx:serialize-tx tx))))
+
+;;; ---------------------------------------------------------------------------
+;;; Red team: unauthorised vault spend (DEP-06 type 7, the gap docs/MISSING.md
+;;; opens with).  A colluding majority of a ledger's quorum spends the reserves
+;;; outpoint at Tier 0 to an address of theirs — no dispute, no rotation, no
+;;; confiscation: nothing in either implementation watches for it.  This is the
+;;; theft the contagion simulation models, made concrete on the devnet.
+
+(defun build-vault-theft (node id-hex destination-address &key (tier-index 0))
+  "The theft transaction: the reserves outpoint spent through TIER-INDEX (default
+   Tier 0, the majority leaf, open at any height) to DESTINATION-ADDRESS.  Built
+   from public state only, like build-confiscation, so every colluder rebuilds
+   the same one.  Returns (values tx prevouts reserves tier-index)."
+  (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
+         (network (intern (string-upcase (node-network node)) :keyword)))
+    (multiple-value-bind (reserves txid vout sats) (disputed-reserves node base)
+      (let* ((tier (nth tier-index (rs:reserves-tiers reserves)))
+             (locktime (rs:tier-locktime tier))
+             (spk (multiple-value-bind (witver program)
+                      (cl-consensus.encoding:segwit-decode destination-address (rs:hrp-for network))
+                    (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
+             (prevouts (vector (cons sats (rs:reserves-spk reserves))))
+             (tx (rot:build-spend :prev-txid txid :prev-vout vout :reserves-amount sats
+                                  :destination-spk spk :fee-rate 1 :locktime locktime)))
+        (values tx prevouts reserves tier-index)))))
+
+(defun vault-spend (node id-hex destination-address &key (tier-index 0) (broadcast-p t))
+  "Spend a ledger's vault outside any recorded rotation or dispute: build the
+   tier-0 theft, sign with our key, collect the rest of the threshold's
+   signatures from our co-conspirators over the relay (theft_sign), assemble,
+   and broadcast.  Returns (values tx sig-count)."
+  (multiple-value-bind (tx prevouts reserves tier-index) (build-vault-theft node id-hex destination-address :tier-index tier-index)
+    (let* ((sighash (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves reserves))))
+           (tier (nth tier-index (rs:reserves-tiers reserves)))
+           (keys (rs:tier-keys tier))
+           (ours (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))
+           (sigs (list (cons (up:x-only (node-pubkey node)) ours)))
+           (responses (send-request node id-hex "theft_sign"
+                                    (w:json-object "sighash" (bytes->hex sighash) "tier_index" tier-index
+                                                   "unsigned_tx" (unsigned-tx-hex tx))
+                                    :want (1- (rs:tier-threshold tier)) :timeout 90 :successes-only t)))
+      (log! node "vault-spend: ~a of ~a theft_sign responses in time"
+            (count-if (lambda (r) (w:jget r "success")) responses) (rs:tier-threshold tier))
+      (dolist (r responses)
+        (let ((res (w:jget r "result")))
+          (when (and (w:jget r "success") res)
+            (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
+              (when (and (member pk keys :test #'equalp) (schnorr:schnorr-verify pk sighash sig)
+                         (not (assoc pk sigs :test #'equalp)))
+                (push (cons pk sig) sigs))))))
+      (when (< (length sigs) (rs:tier-threshold tier))
+        (fail "only ~a of ~a theft signatures" (length sigs) (rs:tier-threshold tier)))
+      (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
+             (signed (rot:attach-tier-witness tx 0 reserves tier-index ordered)))
+        (unless (rot:verify-spend signed 0 prevouts) (fail "assembled theft does not verify"))
+        (when broadcast-p (broadcast node signed))
+        (values signed (length sigs))))))
+
+(defun handle-theft-sign (node event params)
+  "A co-conspirator: rebuild the theft from public state and sign the proposer's
+   sighash.  Gated on the ADVERSARY switch :theft-sign — an honest node never
+   answers, which is the point: the theft needs colluders, and the switch is
+   what makes a node one."
+  (unless (getf (node-adversary node) :theft-sign)
+    (return-from handle-theft-sign nil))
+  (let ((id (w:event-ledger-id event)))
+    (handler-case
+        (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (fail "no unsigned_tx"))))))
+               (tier-index (or (w:jget params "tier_index") 0))
+               (destination (arg-theft-destination node proposed)))
+          (multiple-value-bind (tx prevouts reserves tier-index)
+              (build-vault-theft node id destination :tier-index tier-index)
+            (declare (ignore tx))
+            (let ((expected (rot:tier-sighash proposed 0 prevouts (nth tier-index (rs:reserves-leaves reserves)))))
+              (unless (equalp expected (hex->bytes (w:jget params "sighash")))
+                (fail "sighash is not for the theft we expect"))
+              (log! node "ADVERSARY: signing vault theft of ~a proposed by ~a" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8))
+              (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
+                                                           "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))))
+      (error (e) (log! node "refused theft_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
+
+(defun arg-theft-destination (node tx)
+  "The destination address of a theft tx: its single output's spk, re-encoded as
+   an address.  The conspirators rebuild the same tx from the same public state,
+   so this is only a cross-check that the proposer's tx is the one we would build."
+  (let* ((spk (btx:txout-script (first (btx:tx-outputs tx))))
+         (witver (aref spk 0)) (program (subseq spk (if (>= witver #x50) 2 1))))
+    (cl-consensus.encoding:segwit-encode (rs:hrp-for (intern (string-upcase (node-network node)) :keyword))
+                                         (if (>= witver #x50) (- witver #x50) witver) program)))
 
 (defun handle-confiscation-sign (node event params)
   "A recovery-quorum member: rebuild the confiscation from public state, sign

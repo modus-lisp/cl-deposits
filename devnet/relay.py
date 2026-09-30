@@ -33,6 +33,54 @@ RECENT_TTL = 600
 subs = {}            # websocket -> {subid: [filters]}
 TRACE = None         # file: every REQ with its peer, filters, result count and time.  kill -USR1 toggles it
 TRACE_PATH = os.environ.get("RELAY_TRACE", STORE + ".trace")
+FAULTS = os.environ.get("RELAY_FAULTS", STORE + ".faults.json")
+                     # red team: a JSON file the relay re-reads on every EVENT.  A list of
+                     # rules {"kind": 20101, "author": "hex", "action": "cosign_update",
+                     # "drop": true, "delay": 30, "to": "hex"} — all fields optional, all
+                     # matching rules apply.  drop: never deliver (and never store, for
+                     # stored kinds).  delay: deliver/store that many seconds late.  to:
+                     # only events whose "p" tag names that pubkey.  action: the request
+                     # action, read from the JSON content of kinds 20101/20102.
+                     # An empty file or absent file means no faults.
+faults_mtime = [0.0]
+
+def load_faults():
+    try:
+        if os.path.getmtime(FAULTS) != faults_mtime[0]:
+            faults_mtime[0] = os.path.getmtime(FAULTS)
+            with open(FAULTS) as f:
+                globals()["fault_rules"] = json.load(f)
+            print(f"relay: {len(fault_rules)} fault rules loaded", flush=True)
+    except (OSError, ValueError):
+        globals()["fault_rules"] = []
+    return fault_rules
+
+fault_rules = []
+
+def event_action(ev):
+    if ev["kind"] in (20101, 20102):
+        # the action is a TAG on requests ("action" tag); responses carry it in
+        # content only in some clients — check the tag first, then the content.
+        for t in ev.get("tags", []):
+            if len(t) >= 2 and t[0] == "action": return t[1]
+        try: return json.loads(ev.get("content", "{}")).get("action", "")
+        except Exception: return ""
+    return ""
+
+def fault_for(ev):
+    """The (drop, delay) a matching fault rule imposes on EV, or (False, 0)."""
+    drop, delay = False, 0
+    for r in load_faults():
+        if "kind" in r and ev["kind"] != r["kind"]: continue
+        if "author" in r and not ev["pubkey"].startswith(r["author"]): continue
+        if "action" in r and event_action(ev) != r["action"]: continue
+        if "to" in r:
+            to = [t[1] for t in ev.get("tags", []) if len(t) >= 2 and t[0] == "p"]
+            if r["to"] not in to: continue
+        drop = drop or bool(r.get("drop"))
+        delay = max(delay, r.get("delay", 0))
+    return drop, delay
+
 
 def toggle_trace(*_):
     global TRACE
@@ -136,6 +184,14 @@ def deliver(ws, text):
         asyncio.ensure_future(ws.close(1013, "outbound queue overflow")); return
     q.put_nowait(text)
 
+def publish(ev):
+    "Store (if stored kind) and fan out to every matching subscriber."
+    store(ev)
+    for other, ss in list(subs.items()):
+        for sid, filters in ss.items():
+            if any(matches(f, ev) for f in filters):
+                deliver(other, json.dumps(["EVENT", sid, ev]))
+
 async def handler(ws):
     subs[ws] = {}; outq[ws] = asyncio.Queue(); wtask = asyncio.create_task(writer(ws))
     try:
@@ -145,12 +201,16 @@ async def handler(ws):
             if not isinstance(msg, list) or not msg: continue
             if msg[0] == "EVENT" and len(msg) >= 2:
                 ev = msg[1]
-                store(ev)
+                drop, delay = fault_for(ev)
+                if drop:
+                    deliver(ws, json.dumps(["OK", ev["id"], False, "blocked: policy"]))
+                    continue
+                if delay:
+                    asyncio.get_event_loop().call_later(delay, lambda e=ev: publish(e))
+                    deliver(ws, json.dumps(["OK", ev["id"], True, ""]))
+                    continue
+                publish(ev)
                 deliver(ws, json.dumps(["OK", ev["id"], True, ""]))
-                for other, ss in list(subs.items()):
-                    for sid, filters in ss.items():
-                        if any(matches(f, ev) for f in filters):
-                            deliver(other, json.dumps(["EVENT", sid, ev]))
             elif msg[0] == "REQ" and len(msg) >= 3:
                 sid, filters = msg[1], msg[2:]; t0 = time.perf_counter()
                 subs[ws][sid] = filters
