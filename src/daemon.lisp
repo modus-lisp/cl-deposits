@@ -179,8 +179,22 @@
   (string-trim '(#\Newline #\Space)
                (uiop:run-program (append (uiop:split-string cli :separator " ") args) :output :string :ignore-error-status t)))
 
+;;; Every run-cli forks this process, and a node's heap is gigabytes: each call
+;;; costs ~175 ms (docs/TRUST-MODEL.md, the Q = 7 soak).  The cosign path asks for
+;;; the height twice and, on reference ledgers, a block hash; at seven quorums per
+;;; node that capped a cl cosigner at 2-3 cosigns a second against ~6 asked, and
+;;; answers queued to 6-20 s.  The height changes once a block, so both are cached.
+
+(defparameter *height-ttl-seconds* 3 "How stale a cached chain height may be.")
+
 (defun bitcoin-cli-height-fn (cli)
-  (lambda () (or (ignore-errors (parse-integer (run-cli cli "getblockcount"))) 0)))
+  (let ((lock (bt:make-lock "height")) (value 0) (at 0))
+    (lambda ()
+      (bt:with-lock-held (lock)
+        (when (> (- (get-universal-time) at) *height-ttl-seconds*)
+          (let ((h (ignore-errors (parse-integer (run-cli cli "getblockcount")))))
+            (when h (setf value h at (get-universal-time)))))
+        value))))
 
 (defun bitcoin-cli-chain-fn (cli)
   "gettxout -> (:value-sats n :confirmations n), or NIL when spent/unknown."
@@ -199,9 +213,19 @@
    the reversed display order; the hash as DEP-02 signs it and as HEIGHT-OF-BLOCK reads it
    is the internal one.  Decoding the display hex made every stamped or anchored hash
    the reverse of the reference's, and of our own height-of-block's."
-  (lambda (height)
-    (let ((out (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string height)))))
-      (and (= (length out) 64) (txid-bytes out)))))
+  (let ((lock (bt:make-lock "block-hash")) (cache (make-hash-table)))   ; height -> (hash . fetched-at)
+    (lambda (height)
+      (bt:with-lock-held (lock)
+        (let ((hit (gethash height cache)))
+          ;; A cached hash is re-read after a minute, so a reorg of a recent block heals.
+          (if (and hit (< (- (get-universal-time) (cdr hit)) 60))
+              (car hit)
+              (let* ((out (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string height))))
+                     (h (and (= (length out) 64) (txid-bytes out))))
+                (when h
+                  (when (> (hash-table-count cache) 4096) (clrhash cache))
+                  (setf (gethash height cache) (cons h (get-universal-time))))
+                h)))))))
 
 (defun bitcoin-cli-utxos-fn (cli &key (retries 5))
   "Address -> its confirmed UTXOs, via scantxoutset (no bitcoind wallet needed):
