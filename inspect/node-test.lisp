@@ -1023,4 +1023,51 @@
                                        (reverse (nd:record-history la))))))))
 
 
+
+(with-gate ("contagion: a colluding cosigner is disputed on the ledger it operates (DEP-19 §5-6)")
+  ;; L1: A operates; B, C, D cosign.  L2: B operates; C, D, E cosign (honest majority D, E).
+  ;; B and C cosign blind, so A's witness-less lock on L1 commits.  D (an honest
+  ;; replica of L1) proves it, and proves B's cosignature against L2: L2's honest
+  ;; members D and E dispute B's own ledger.  E holds no replica of L1: it rebuilds
+  ;; the fault's prefix from the relay.
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111191 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222292 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333393 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444494 :bus bus :height-fn hf))
+         (e (nd:make-node :priv 55555555555555555595 :bus bus :height-fn hf))
+         (l1 (nd:open-ledger a :reserves-id "genesis:c1" :reserves 15600000 :collateral 15600000))
+         (l2 (nd:open-ledger b :reserves-id "genesis:c2" :reserves 15600000 :collateral 15600000))
+         (id1 (nd:record-id-hex l1)) (id2 (nd:record-id-hex l2)))
+    (dolist (m (list c d e)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+    (dolist (m (list b c d)) (nd:add-member a l1 (nd:node-pubkey m) :member-ledger-id (if (eq m b) id2 (nd::node-member-ledger-hex m))))
+    (nd:begin-quorum a l1 :funding-txid (u:sha256 (hx "c1")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
+    (dolist (m (list c d e)) (nd:add-member b l2 (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum b l2 :funding-txid (u:sha256 (hx "c2")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
+    (let* ((w (nd:make-wallet :priv 66666666666666666696 :bus bus)) (w2 (nd:make-wallet :priv 77777777777777777797 :bus bus))
+           (d1 (nd:wallet-open-deposit w id1)) (d2 (nd:wallet-open-deposit w2 id1)))
+      (nd:credit-onchain a l1 d1 100000 :txid (u:sha256 (hx "c3")))
+      (dolist (m (list b c)) (setf (getf (nd::node-adversary m) :cosign-blind) t))
+      (let ((forged (list :type :transfer-lock :transfer-nonce (u:sha256 (hx "c4")) :source-deposit-id d1 :destination-deposit-id d2
+                          :amount 90000 :fee 0 :completion-script "sha256(00)" :timeout-height (+ *height* 100)
+                          :transfer-id (u:sha256 (hx "c5")) :nonce 818181 :expiry (+ *height* 144) :witness '())))
+        (let ((u (nd:append-operation a l1 forged)))
+          (dolist (m (list b c)) (setf (getf (nd::node-adversary m) :cosign-blind) nil))
+          (check "B and C's cosignatures committed the forged lock on L1"
+                 (and u (subsetp (list (nd:node-pubkey b) (nd:node-pubkey c)) (mapcar #'up:cosig-pubkey (up:update-cosignatures u)) :test #'equalp)))
+          (check "the honest replica D disputes L1" (nd:find-fork d id1 (nd:node-pubkey d)))
+          (check "contagion: D disputes L2, the ledger B operates" (nd:find-fork d id2 (nd:node-pubkey d)))
+          (check "contagion: E, with no replica of L1, disputes L2 too" (nd:find-fork e id2 (nd:node-pubkey e)))
+          (let* ((prefix (remove u (reverse (nd:record-history l1))))
+                 (qb (nd::governing-quorum-begin-seq l1 (up:update-seq u))))
+            (check "the proof against B verifies"
+                   (fr:verify-non-conforming-cosignature (fr:make-non-conforming-cosignature-proof (nd:node-pubkey b) (u:hex->bytes id2) u qb) prefix))
+            (check "a proof against D, who did not cosign it, does not"
+                   (not (fr:verify-non-conforming-cosignature (fr:make-non-conforming-cosignature-proof (nd:node-pubkey d) (u:hex->bytes id2) u qb) prefix)))
+            (check "nor one against a conforming update B cosigned"
+                   (not (fr:verify-non-conforming-cosignature
+                         (fr:make-non-conforming-cosignature-proof (nd:node-pubkey b) (u:hex->bytes id2) (second (nd:record-history l1)) qb)
+                         (remove-if (lambda (x) (>= (up:update-seq x) (up:update-seq (second (nd:record-history l1))))) prefix))))))))))
+
+
 (report)

@@ -14,7 +14,8 @@
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
            #:proof->json #:json->proof #:requires-embedding-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
-           #:make-quorum-expired-proof #:make-non-conforming-update-proof #:verify-censorship))
+           #:make-quorum-expired-proof #:make-non-conforming-update-proof #:verify-censorship
+           #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature))
 (in-package #:cl-deposits.fraud)
 
 (defparameter +types+
@@ -69,6 +70,15 @@
 (defun make-quorum-expired-proof (accused33 ledger-id32 anchor-block-hash32 quorum-expiry)
   (list :type :quorum-expired :accused (bytes->hex accused33) :ledger-id (bytes->hex ledger-id32)
         :evidence (list :anchor-block-hash anchor-block-hash32 :quorum-expiry quorum-expiry)))
+
+(defun make-non-conforming-cosignature-proof (accused33 target-ledger-id32 fault-update governing-quorumbegin-seq)
+  "Contagion (DEP-19 §5): ACCUSED cosigned FAULT-UPDATE, a non-conforming update on
+   another ledger; presented against TARGET-LEDGER, one ACCUSED operates."
+  (list :type :non-conforming-cosignature :accused (bytes->hex accused33) :ledger-id (bytes->hex target-ledger-id32)
+        :evidence (list :fault-ledger-id (bytes->hex (up:update-ledger-id fault-update))
+                        :fault-sequence (up:update-seq fault-update)
+                        :governing-quorumbegin-seq governing-quorumbegin-seq
+                        :fault-update-hex (bytes->hex (up:encode-update fault-update)))))
 
 (defun make-non-conforming-update-proof (accused33 ledger-id32 fault-update)
   (list :type :non-conforming-update :accused (bytes->hex accused33) :ledger-id (bytes->hex ledger-id32)
@@ -196,6 +206,33 @@
                      (values t v)
                      (handler-case (progn (lg:apply-update l fault) (values nil "fault update applies cleanly: conforming"))
                        (lg:ledger-error (c) (values t (princ-to-string c)))))))))
+    (error (c) (values nil (princ-to-string c)))))
+
+(defun verify-non-conforming-cosignature (proof fault-history)
+  "FAULT-HISTORY is the fault ledger's chain before the fault.  The accused holds a
+   valid cosignature on the fault update; the governing QuorumBegin (at or before
+   the fault) names it a member; and the fault breaks the rules, judged as a
+   NonConformingUpdate of the fault ledger's operator (binding, operator,
+   conformance and fold)."
+  (handler-case
+      (let* ((fault (up:decode-update (hex->bytes (e proof :fault-update-hex))))
+             (accused (hex->bytes (getf proof :accused)))
+             (seq (up:update-seq fault))
+             (qb-seq (e proof :governing-quorumbegin-seq))
+             (qb (find qb-seq fault-history :key #'up:update-seq))
+             (qb-op (and qb (ignore-errors (op:decode-operation (up:update-message qb)))))
+             (cosig (find accused (up:update-cosignatures fault) :key #'up:cosig-pubkey :test #'equalp)))
+        (cond ((not (string= (bytes->hex (up:update-ledger-id fault)) (e proof :fault-ledger-id))) (values nil "fault update is not on the named fault ledger"))
+              ((/= seq (e proof :fault-sequence)) (values nil "fault sequence mismatch"))
+              ((null cosig) (values nil "the accused did not cosign the fault"))
+              ((not (up:verify-cosignature fault cosig)) (values nil "the accused's cosignature does not verify"))
+              ((not (and qb-op (eq (op:operation-type qb-op) :quorum-begin) (<= qb-seq seq)))
+               (values nil "no governing QuorumBegin at that sequence"))
+              ((not (member accused (op:field qb-op :quorum-members) :test #'equalp))
+               (values nil "the governing QuorumBegin does not name the accused"))
+              (t (verify-non-conforming-update
+                  (make-non-conforming-update-proof (up:update-operator-id fault) (up:update-ledger-id fault) fault)
+                  fault-history))))
     (error (c) (values nil (princ-to-string c)))))
 
 (defun verify-proof (proof &key history height-of-block)

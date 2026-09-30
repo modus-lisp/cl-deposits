@@ -2219,15 +2219,89 @@
                (not (find-fork node id (node-pubkey node))))
       (log! node "NON-CONFORMING cosigned update on ~a at seq ~a: ~a" (subseq id 0 8) (up:update-seq update) condition)
       (broadcast-fraud node (fr:make-non-conforming-update-proof (up:update-operator-id update) (up:update-ledger-id update) update))
+      (broadcast-cosigner-contagion node rec update)
       (when (and (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
                  (not (find-fork node id (node-pubkey node))))   ; the proof may have looped back and forked us already
         (enter-dispute node rec (lg:ledger-sequence ledger) :reason "non_conforming_update")))))
+
+;;; Contagion (DEP-19 §5-6).  A cosigner of a non-conforming update is slashable on
+;;; every ledger it operates, by that ledger's own quorum.  Without it, signing a
+;;; theft cost a colluder nothing (docs/TRUST-MODEL.md §2a: the difference between
+;;; ~5% and ~30% collusion tolerated at Q = 7).
+
+(defun ledgers-operated-by (node pubkey33)
+  "Ledger ids PUBKEY33 operates: its advertisements (Kind 39100, tag o) and our
+   replicas of ledgers it operates."
+  (let ((ids '()))
+    (dolist (e (ignore-errors (bus:bus-fetch (node-bus node)
+                                             (flt:make-filter :kinds (list w:+kind-advertisement+)
+                                                              :tags (list (cons "o" (list (bytes->hex pubkey33))))))))
+      (let ((d (ev:first-tag-value e "d"))) (when (and d (= (length d) 64)) (pushnew d ids :test #'string=))))
+    (loop for rec being the hash-values of (node-ledgers node)
+          when (and (not (record-fork-p rec)) (equalp (lg:ledger-operator-key (record-ledger rec)) pubkey33))
+            do (pushnew (record-id-hex rec) ids :test #'string=))
+    ids))
+
+(defun governing-quorum-begin-seq (rec seq)
+  (let ((qb (find-if (lambda (u) (and (<= (up:update-seq u) seq)
+                                      (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)))
+                     (record-history rec))))            ; newest first: the latest at or before SEQ
+    (and qb (up:update-seq qb))))
+
+(defun broadcast-cosigner-contagion (node rec update)
+  "Every cosigner of the non-conforming UPDATE on REC, against every ledger it operates."
+  (let ((qb (governing-quorum-begin-seq rec (up:update-seq update))))
+    (when qb
+      (dolist (c (up:update-cosignatures update))
+        (dolist (target (ledgers-operated-by node (up:cosig-pubkey c)))
+          (log! node "contagion: ~a cosigned the fault on ~a; proof against its ledger ~a"
+                (subseq (bytes->hex (up:cosig-pubkey c)) 0 8) (subseq (record-id-hex rec) 0 8) (subseq target 0 8))
+          (broadcast-fraud node (fr:make-non-conforming-cosignature-proof (up:cosig-pubkey c) (hex->bytes target) update qb)))))))
+
+(defun fault-prefix (node fault-id-hex fault)
+  "The fault ledger's updates before FAULT, as FAULT's signed previous_hash pins them:
+   walked back link by link from our replica or the relay.  Oldest first."
+  (let* ((rec (find-record node fault-id-hex))
+         (pool (if (and rec (not (record-fork-p rec))) (record-history rec) (ledger-updates-from-relays node fault-id-hex)))
+         (by-chain (make-hash-table :test #'equalp)) (out '()))
+    (dolist (u pool) (setf (gethash (up:chain-hash u) by-chain) u))
+    (loop for u = (gethash (up:update-prev-hash fault) by-chain) then (gethash (up:update-prev-hash u) by-chain)
+          while u do (push u out)
+          until (zerop (up:update-seq u)))
+    out))
+
+(defun handle-cosigner-fraud (node proof)
+  "A NonConformingCosignature: dispute every ledger we cosign whose operator is the
+   accused, whichever of its ledgers the proof names."
+  (let* ((accused (hex->bytes (getf proof :accused)))
+         (targets (loop for rec being the hash-values of (node-ledgers node)
+                        when (and (not (record-owned-p rec)) (not (record-fork-p rec))
+                                  (equalp (lg:ledger-operator-key (record-ledger rec)) accused)
+                                  (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
+                                  (not (find-fork node (record-id-hex rec) (node-pubkey node))))
+                          collect rec)))
+    (when targets
+      (let* ((fault (up:decode-update (hex->bytes (getf (getf proof :evidence) :fault-update-hex))))
+             (prefix (fault-prefix node (getf (getf proof :evidence) :fault-ledger-id) fault)))
+        (multiple-value-bind (ok why) (fr:verify-non-conforming-cosignature proof prefix)
+          (if (not ok)
+              (log! node "contagion proof against ~a rejected: ~a" (subseq (getf proof :accused) 0 8) why)
+              (dolist (rec targets)
+                (log! node "contagion: ~a cosigned a non-conforming update on ~a; disputing its ledger ~a"
+                      (subseq (getf proof :accused) 0 8) (subseq (getf (getf proof :evidence) :fault-ledger-id) 0 8) (subseq (record-id-hex rec) 0 8))
+                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "non_conforming_cosignature"))))))))
 
 (defun broadcast-fraud (node proof)
   (bus:bus-publish (node-bus node) (w:fraud-event (node-keypair node) (getf proof :ledger-id) (getf proof :accused) (fr:broadcast->json proof))))
 
 (defun handle-fraud (node event)
-  (let* ((proof (fr:json->broadcast (w:parse-json (ev:event-content event))))
+  (let ((proof (fr:json->broadcast (w:parse-json (ev:event-content event)))))
+    (if (eq (getf proof :type) :non-conforming-cosignature)
+        (handle-cosigner-fraud node proof)
+        (handle-operator-fraud node proof))))
+
+(defun handle-operator-fraud (node proof)
+  (let* ((proof proof)
          (id (getf proof :ledger-id))
          (rec (find-record node id)))
     (when (and rec (not (record-owned-p rec))
