@@ -10,7 +10,7 @@ MINER_WALLET="${MINER_WALLET:-miner}"
 case "$CLD_CHAIN" in
   signet)
     RELAY_PORT="${RELAY_PORT:-7777}"
-    CLD_NODES=("cld1:10041" "cld2:10042" "cld3:10043" "cld4:10044")     # name:control-port; cld1 operates, the rest cosign (Q=3)
+    CLD_NODES=("cld1:10041" "cld2:10042" "cld3:10043" "cld4:10044" "cld5:10045" "cld6:10046")   # name:control-port
     CLD_ROOT="${CLD_ROOT:-$SIGNET_ROOT/deposits}"        # data dirs live OUTSIDE the repo
     BITCOIN_DATADIR="$SIGNET_ROOT/bitcoin"
     BITCOIN_CLI="${BITCOIN_CLI:-$SIGNET_ROOT/bin/bitcoin-cli}"
@@ -64,7 +64,7 @@ stop_bitcoind() { bitcoind_running && $BCLI stop >/dev/null 2>&1; }
 # devnet: name:admin-port.  Each has its own data dir (seed.hex, wallet, node.log)
 # and talks to the same relay and bitcoind; its wallet syncs through the Esplora
 # shim.  (ref1 is the hand-run node from the first interop session; left alone.)
-REF_NODES=("ref2:8766" "ref3:8767")
+REF_NODES=("ref2:8766" "ref3:8767" "ref4:8768" "ref5:8769" "ref6:8770" "ref7:8771")
 DEPOSITS_RUST="${DEPOSITS_RUST:-$HOME/workspace/deposits-rust/target/release}"
 REF_NODE_BIN="$DEPOSITS_RUST/deposits-node"; REF_WALLET_BIN="$DEPOSITS_RUST/deposits-wallet"
 ref_names() { for e in "${REF_NODES[@]}"; do echo "${e%%:*}"; done; }
@@ -78,6 +78,23 @@ ref_cli()   { local n=$1; shift; env $(ref_env) RUST_LOG=error "$REF_NODE_BIN" "
 # The protocol identity (operator/cosigner key) is NOT the Nostr key: it is what `quorum show-identity` prints.
 ref_pubkey(){ ref_cli "$1" quorum show-identity | sed -nE 's/^ *pubkey: *([0-9a-f]{66}).*/\1/p' | head -1; }
 ref_ledger(){ ref_cli "$1" quorum show-identity | sed -nE 's/^ *([0-9a-f]{66}):([0-9a-f]{64}).*/\2/p' | head -1; }   # its first own ledger
+# soak_plan — the soak's ledgers as "NAME:operator:m1,...,m7 ...": every node operates one
+# ledger with Q = 7 (docs/TRUST-MODEL.md §2a: ~30% collusion tolerated at R = 0.5).  Nodes
+# are interleaved cl, ref, cl, ref ... and each operator takes the next seven around the
+# ring, so every node serves 7 quorums, every quorum splits 4-3 by implementation, and the
+# operator's own implementation is always the minority of its quorum.  (With two
+# implementations one always holds a majority of 7; a third is needed to avoid that.)
+soak_plan() {
+  local ring=() c r i j names=(A B C D E F G H I J K L M N O P) plan=""
+  local cl=($(cld_names)) rf=($(ref_names))
+  for i in "${!cl[@]}"; do ring+=("${cl[$i]}"); [ -n "${rf[$i]:-}" ] && ring+=("${rf[$i]}"); done
+  local n=${#ring[@]} q=${SOAK_Q:-7}
+  for i in $(seq 0 $((n-1))); do
+    local m=(); for j in $(seq 1 $q); do m+=("${ring[$(( (i+j) % n ))]}"); done
+    plan+="${names[$i]}:${ring[$i]}:$(IFS=,; echo "${m[*]}") "
+  done
+  echo "${plan% }"
+}
 start_ref() {
   local n=$1 dir; dir=$(ref_dir "$n"); mkdir -p "$dir"
   ref_running "$n" && { echo "$n already running"; return 0; }

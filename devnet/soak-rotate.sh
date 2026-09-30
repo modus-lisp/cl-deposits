@@ -15,7 +15,7 @@ source "$(dirname "$0")/_common.sh"; source "$CLD_ROOT/soak/env"
 SOAK="$CLD_ROOT/soak"; EVERY=${SOAK_ROTATE_EVERY:-600}; MARGIN=${SOAK_ROTATE_MARGIN:-300}
 # A rotates to cld4 in place of ref2: ref2 forked A at 81026 (docs/REDTEAM.md
 # organic #1) and has treated A as a gap since, so it never re-consents.
-PLAN=${SOAK_LEDGER_PLAN:-"A:cld1:cld2,cld3,cld4 B:ref2:cld2,cld3,ref3 C:cld2:cld3,cld4,ref3 D:cld3:cld1,cld4,ref2 E:cld4:cld1,cld2,ref3 F:ref3:cld1,cld4,ref2"}
+PLAN=${SOAK_LEDGER_PLAN:-$(soak_plan)}
 pubkey_of() { case "$1" in cld*) cld_pubkey "$1";; ref*) ref_pubkey "$1";; esac; }
 own_ledger_of() { local v; case "$1" in cld*) v="L${1#cld}";; ref*) v="RL${1#ref}";; esac; echo "${!v}"; }
 rotate() {   # rotate NAME ID OPERATOR "m1,m2,m3"

@@ -3,7 +3,7 @@
 # SOAK_CHAOS_NODES (round robin), wait, start it again, and record how long it took to
 # answer.  Operators go down mid-traffic on purpose: the bots must recover on their own.
 source "$(dirname "$0")/_common.sh"
-SOAK="$CLD_ROOT/soak"; EVERY=${SOAK_RESTART_EVERY:-10800}; NODES=(${SOAK_CHAOS_NODES:-cld2 cld3 ref3 cld4 cld1 ref2}); ci=0   # not "i": start_cld uses it
+SOAK="$CLD_ROOT/soak"; EVERY=${SOAK_RESTART_EVERY:-10800}; NODES=(${SOAK_CHAOS_NODES:-$(cld_names) $(ref_names)}); ci=0   # not "i": start_cld uses it
 while true; do
   sleep "$EVERY"
   n=${NODES[$((ci % ${#NODES[@]}))]}; ci=$((ci+1)); t0=$(date +%s)

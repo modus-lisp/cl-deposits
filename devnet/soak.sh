@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # devnet/soak.sh — long-running operation on the whole signet devnet, both
 # implementations on both sides.  Every node operates a ledger with a mixed quorum of
-# three others (one reference member each, see UPSTREAM-NOTES on the scan race);
+# seven others, Q = 7, split 4-3 by implementation (see soak_plan in _common.sh);
 # deposit-bots (deposits-rust) and cl wallets move sats on all of them while blocks
 # tick, a monitor records state, and a chaos loop restarts nodes under traffic.
 #
@@ -19,12 +19,12 @@
 source "$(dirname "$0")/_common.sh"
 SOAK="$CLD_ROOT/soak"; mkdir -p "$SOAK/pids" "$SOAK/log"
 ENV="$SOAK/env"; [ -f "$ENV" ] && source "$ENV"
-SOAK_REF_DEPOSITS=${SOAK_REF_DEPOSITS:-12}; SOAK_CL_WALLETS=${SOAK_CL_WALLETS:-12}; SOAK_CL_WORKERS=${SOAK_CL_WORKERS:-4}
+SOAK_REF_DEPOSITS=${SOAK_REF_DEPOSITS:-6}; SOAK_CL_WALLETS=${SOAK_CL_WALLETS:-6}; SOAK_CL_WORKERS=${SOAK_CL_WORKERS:-4}
 SOAK_CREDIT_MSAT=${SOAK_CREDIT_MSAT:-20000000}; SOAK_BLOCK_EVERY=${SOAK_BLOCK_EVERY:-60}; SOAK_BOT_INTERVAL_MS=${SOAK_BOT_INTERVAL_MS:-10000}
 SOAK_MONITOR_EVERY=${SOAK_MONITOR_EVERY:-300}; SOAK_RESTART_EVERY=${SOAK_RESTART_EVERY:-10800}
-SOAK_CHAOS_NODES=${SOAK_CHAOS_NODES:-"cld2 cld3 ref3 cld4 cld1 ref2"}
+SOAK_CHAOS_NODES=${SOAK_CHAOS_NODES:-"$(cld_names | tr '\n' ' ')$(ref_names | tr '\n' ' ')"}
 # NAME:operator:member,member,member — at most one reference member per quorum.
-LEDGER_PLAN=${SOAK_LEDGER_PLAN:-"A:cld1:cld2,cld3,ref2 B:ref2:cld2,cld3,ref3 C:cld2:cld3,cld4,ref3 D:cld3:cld1,cld4,ref2 E:cld4:cld1,cld2,ref3 F:ref3:cld1,cld4,ref2"}
+LEDGER_PLAN=${SOAK_LEDGER_PLAN:-$(soak_plan)}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "$1";; esac; }
 refwallet() { local dir=$1; shift; WALLET_DATA_DIR="$dir" timeout 180 "$REF_WALLET_BIN" "$@" --relay "$RELAY_URL" --network "$CLD_CHAIN" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -vE '^\S*(INFO|WARN|ERROR)|^\[' ; }
@@ -58,13 +58,13 @@ form_ledger() {   # form_ledger NAME OPERATOR "m1,m2,m3"
   echo "== forming ledger $name ($op operates; ${members//,/ } cosign)"
   case "$op" in
     cld*)
-      id=$(sx "$(cld_ctl "$op" "(:open-ledger :reserves-id \"genesis:$op:soak:$name:$RANDOM\" :reserves-msat 20000000000 :collateral-msat 30000000000)")" ":LEDGER"); [ -n "$id" ] || fail "open $name"
+      id=$(sx "$(cld_ctl "$op" "(:open-ledger :reserves-id \"genesis:$op:soak:$name:$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER"); [ -n "$id" ] || fail "open $name"
       for m in ${members//,/ }; do mp=$(pubkey_of "$m"); ml=$(own_ledger "$m"); expect "$(cld_ctl "$op" "(:add-member :ledger \"$id\" :member \"$mp\" :member-ledger \"$ml\")")"; done
       local prep addr txid vout; prep=$(cld_ctl "$op" "(:prepare-quorum :ledger \"$id\" :expiry-blocks 4320)"); expect "$prep"; addr=$(sx "$prep" ":ADDRESS")
       txid=$(wcli sendtoaddress "$addr" 0.5); mine 3
       vout=$(bcli getrawtransaction "$txid" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$addr'][0])")
       sleep 20   # the reference wallets sync through the shim on a timer
-      expect "$(cld_ctl "$op" "(:begin-quorum :ledger \"$id\" :txid \"$txid\" :vout $vout :sats 20000000 :collateral-sats 30000000)")"
+      expect "$(cld_ctl "$op" "(:begin-quorum :ledger \"$id\" :txid \"$txid\" :vout $vout :sats 25000000 :collateral-sats 25000000)")"
       expect "$(cld_ctl "$op" "(:advertise :ledger \"$id\")")"
       printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$id" "$op" "$txid" "$vout" >>"$SOAK/ledgers.tsv";;
     ref*)
@@ -92,7 +92,7 @@ setup() {
   if [ ! -f "$SOAK/.collateral-funded" ]; then   # replacement collateral at each reference's operator-key address, for disputes
     for n in $(ref_names); do
       CA=$(env $(ref_env) RUST_LOG=error "$REF_NODE_BIN" pubkey-to-p2wpkh --network "$CLD_CHAIN" --seed-file "$(ref_dir "$n")/seed.hex" --data-dir "$(ref_dir "$n")" 2>&1 | grep -oE '(tb1|bcrt1)[0-9a-z]+' | head -1)
-      wcli sendtoaddress "$CA" 0.01 >/dev/null
+      for i in $(seq 1 "${SOAK_REF_COLLATERAL_COINS:-8}"); do wcli sendtoaddress "$CA" 0.01 >/dev/null; done   # one per concurrent dispute (Q = 7: 7 quorums each)
     done; mine 1; touch "$SOAK/.collateral-funded"
   fi
   if [ ! -f "$SOAK/.cl-collateral-funded" ]; then   # coins at each cl node's key-path address: its collateral wallet pledges from these
