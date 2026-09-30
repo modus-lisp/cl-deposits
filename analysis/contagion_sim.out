@@ -1,0 +1,14 @@
+max safe coalition fraction p (attack unprofitable in >= 95% of 200 trials, N = 100)
+R = reserves share of the vault = deposit capacity per sat locked
+
+contagion: off
+  Q   R=0.2  R=0.3  R=0.4  R=0.5  R=0.6  R=0.7  R=0.8
+  3    0.01   0.01   0.01   0.02   0.01   0.02   0.01
+  5    0.05   0.04   0.04   0.05   0.04   0.04   0.04
+  7    0.07   0.08   0.07   0.08   0.07   0.08   0.07
+
+contagion: on (DEP-19 §5-6)
+  Q   R=0.2  R=0.3  R=0.4  R=0.5  R=0.6  R=0.7  R=0.8
+  3    0.08   0.09   0.07   0.08   0.01   0.02   0.01
+  5    0.22   0.21   0.20   0.19   0.13   0.04   0.05
+  7    0.28   0.30   0.29   0.30   0.24   0.17   0.08

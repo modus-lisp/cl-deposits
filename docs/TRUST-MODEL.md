@@ -53,6 +53,57 @@ replica is offline, k grows until one returns. So an update is final once an hon
 and a detection cycle has passed. A counterparty that settles off-ledger (courier, swap) should wait
 for that, not merely for the cosignatures.
 
+### 2a. Does contagion deter collusion? (simulation)
+
+`analysis/contagion_sim.py` (output in `analysis/contagion_sim.out`): N = 100 operators, one vault each,
+reserves R fully used, collateral C = 1 − R, quorums of Q drawn at random. A coalition of a fraction p
+spends every vault whose quorum it holds a majority of (Tier 0). It takes the whole vault from honest
+operators and the deposits from its own. With contagion (DEP-19 §5–6), each coalition key that signs
+loses its collateral once, if its own quorum has an honest majority. The attacker picks targets and
+signers greedily for maximum net. The table gives the largest p at which the attack is unprofitable
+in 95% of 200 trials:
+
+| contagion | Q | R = 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 | 0.8 |
+|---|---|---|---|---|---|---|---|---|
+| off | 3 | 0.01 | 0.01 | 0.01 | 0.02 | 0.01 | 0.02 | 0.01 |
+| off | 5 | 0.05 | 0.04 | 0.04 | 0.05 | 0.04 | 0.04 | 0.04 |
+| off | 7 | 0.07 | 0.08 | 0.07 | 0.08 | 0.07 | 0.08 | 0.07 |
+| on | 3 | 0.08 | 0.09 | 0.07 | 0.08 | 0.01 | 0.02 | 0.01 |
+| on | 5 | 0.22 | 0.21 | 0.20 | 0.19 | 0.13 | 0.04 | 0.05 |
+| on | 7 | 0.28 | 0.30 | 0.29 | 0.30 | 0.24 | 0.17 | 0.08 |
+
+**Readings:**
+- **Without contagion the network is safe only while no quorum anywhere is captured:** 1–8% of
+  operators. Signing a theft is free.
+- **Contagion is the security model.** With it, Q = 7 tolerates ~30% colluding operators, Q = 5
+  ~20% and Q = 3 ~8%, at R ≤ 0.5. It deters collusion; it does not prevent it.
+- **Capital-efficiency ceiling, per theft:** a theft of one vault needs `floor(Q/2) + 1` signers,
+  each losing C, so it pays whenever `C < 1 / (floor(Q/2) + 1)`. That's R above 0.5 at Q = 3, above
+  0.67 at Q = 5, above 0.75 at Q = 7. Above the ceiling, contagion stops mattering.
+- **Below the ceiling the limit is key reuse:** a key that signs many thefts is slashed once (DEP-19
+  §10.1 says so), and coalition keys whose own quorum the coalition holds are unslashable. That's why
+  safety plateaus below the ceiling instead of reaching it.
+- **So honest operation at Q = 7 locks ~2 sats per sat of deposits (R = 0.5) for ~30% collusion
+  tolerance.** Going to R = 0.4 buys nothing; going past R = 0.6 loses it fast. DEP-05's table (49% at
+  C ≥ 60%) assumed wallets deposit only on honest operators, and did not let a majority spend an
+  honest vault. This model does both, so it is the harsher bound.
+
+**Two spec problems this exposes:**
+- **DEP-19 §10.1 overstates bite.** "Three signers of a theft of V then hold at least 1.5 V between
+  them on ledgers that can slash them": holding is not losing. Confiscation costs a signer only its
+  collateral; the reserves are owed to its depositors and continue on the winner's fork. Real bite is
+  `need × C × (member vault)`, a factor C of what §10.1 implies.
+- **DEP-19 §5 makes honest retries slashable.** It drops `Equivocation` because two canonical updates
+  at one sequence "imply a member who co-signed both, which is a `NonConforming` fault of that member".
+  But re-signing a sequence that has not committed is required for liveness (REDTEAM attack #2), so
+  honest members would be slashed. The fault is the operator's; a cosigner who signed two rounds cannot
+  be told apart from a colluder.
+
+**Not modelled yet:** strategic quorum joining (the coalition choosing which ledgers to serve on, the
+DEP-19 §10 residual), unequal vaults (the "pyramid"), several ledgers per operator, detection or
+punishment failing (members offline, contagion not implemented: today, only the reference's
+cosigner-side `fault_ledger_id` evidence exists), and deposits concentrating on honest ledgers.
+
 ## 3. Trust heuristics for a wallet choosing a ledger
 
 Observable from public data (relay + chain), roughly in order of what the findings say matters:
@@ -82,7 +133,7 @@ Observable from public data (relay + chain), roughly in order of what the findin
   *Devnet: stop the honest members, commit a fault, restart them, measure k.*
 - **Off-ledger extraction:** a courier leg across two ledgers whose source lock rolls back. Who loses,
   and how much should a courier wait? *node-test plus devnet.*
-- **Re-run the sybil simulation** (DEP-05 table) under the current rules: Q ∈ {3, 5, 7}, tiers,
-  contagion, and implementation diversity as a second axis.
+- **Extend the simulation (§2a):** strategic quorum joining, unequal vaults, several ledgers per
+  operator, and implementation diversity as a second axis.
 - **DEP-05 §Cosignature Threshold** needs rewording: it claims an honest majority prevents equivocation;
   retries mean it is detected and punished instead. A spec decision (see REDTEAM, attack #2).
