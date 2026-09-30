@@ -55,6 +55,22 @@
                          :transfer-id (cl-deposits.node::random-aux) :nonce (get-universal-time) :expiry (+ h 144) :witness '()))
                 (u (nd:append-operation node rec o)))
            (ok :seq (cl-deposits.update:update-seq u))))
+        (:profile   ; (:profile :seconds N :top K) — statistical CPU profile of every thread, for finding hot spots
+         (let ((secs (arg form :seconds 30)) (top (arg form :top 40)))
+           (require :sb-sprof)
+           (let ((sprof (find-package :sb-sprof)))
+             (funcall (intern "RESET" sprof))
+             (funcall (intern "START-PROFILING" sprof) :mode :cpu :sample-interval 0.005 :threads :all)
+             (sleep secs)
+             (funcall (intern "STOP-PROFILING" sprof))
+             (ok :report (with-output-to-string (*standard-output*)
+                           (funcall (intern "REPORT" sprof) :type :flat :max top))))))
+        (:room   ; heap and GC figures
+         (ok :dynamic-usage-mb (round (sb-kernel:dynamic-usage) 1048576)
+             :bytes-consed-between-gcs-mb (round (sb-ext:bytes-consed-between-gcs) 1048576)
+             :gc-run-time-s (float (/ sb-ext:*gc-run-time* internal-time-units-per-second))
+             :total-consed-gb (float (/ (sb-ext:get-bytes-consed) 1073741824))
+             :uptime-s (round (get-internal-real-time) internal-time-units-per-second)))
         (:threads   ; a backtrace of every thread, for a node that is busy and silent
          (ok :threads (mapcar (lambda (th)
                                 (let ((out (make-string-output-stream)) (done (sb-thread:make-semaphore)))
