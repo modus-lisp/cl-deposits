@@ -2433,6 +2433,8 @@
                   (broadcast-fraud node (fr:make-dispute-dereliction-proof
                                          mk (hex->bytes target) original-fraud-hash32 visible-block-hash32 required newest)))))))))))
 
+(defun node-derelict-watch-keys (node) (loop for k being the hash-keys of (node-derelict-watch node) collect k))
+
 (defun drive-dereliction (node)
   "DEP-19 §6: for each ledger we disputed on a fraud proof, report co-members that stayed
    active past dispute_response_blocks without disputing it."

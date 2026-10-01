@@ -71,6 +71,9 @@
              :gc-run-time-s (float (/ sb-ext:*gc-run-time* internal-time-units-per-second))
              :total-consed-gb (float (/ (sb-ext:get-bytes-consed) 1073741824))
              :uptime-s (round (get-internal-real-time) internal-time-units-per-second)))
+        (:derelict-watch
+         (ok :watch (loop for id being the hash-keys of (nd::node-derelict-watch node) collect (subseq id 0 16))
+             :reported (loop for k being the hash-keys of (nd::node-reported-derelict node) collect k)))
         (:threads   ; a backtrace of every thread, for a node that is busy and silent
          (ok :threads (mapcar (lambda (th)
                                 (let ((out (make-string-output-stream)) (done (sb-thread:make-semaphore)))

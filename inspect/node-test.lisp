@@ -1136,4 +1136,52 @@
                    (> (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+)))) before))))))))
 
 
+
+(with-gate ("dereliction: self-detect arms the watch, drive-dereliction produces the proof")
+  (let* ((bus (bus:make-mock-bus))
+         (heights (make-hash-table :test #'equalp))
+         (bhf (lambda (h) (let ((hash (u:sha256 (u:int->be h 4)))) (setf (gethash hash heights) h) hash)))
+         (hob (lambda (hash) (gethash hash heights)))
+         (a (nd:make-node :priv 11111111111111111211 :bus bus :height-fn (lambda () *height*) :height-of-block hob :block-hash-fn bhf))
+         (b (nd:make-node :priv 22222222222222222212 :bus bus :height-fn (lambda () *height*) :height-of-block hob :block-hash-fn bhf))
+         (c (nd:make-node :priv 33333333333333333313 :bus bus :height-fn (lambda () *height*) :height-of-block hob :block-hash-fn bhf))
+         (d (nd:make-node :priv 44444444444444444414 :bus bus :height-fn (lambda () *height*) :height-of-block hob :block-hash-fn bhf))
+         (la (nd:open-ledger a :reserves-id "genesis:dw1" :reserves 15600000 :collateral 15600000))
+         (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+    (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :dispute-response-blocks 5))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "d001")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
+    (let* ((w (nd:make-wallet :priv 55555555555555555515 :bus bus)) (dep (nd:wallet-open-deposit w id)))
+      (nd:credit-onchain a la dep 100000 :txid (u:sha256 (hx "d002")))
+      ;; d keeps operating its own ledger well past the window; b replicates it
+      (let ((dl (nd:own-ledger d)))
+        (let ((*height* (+ *height* 200)))
+          (nd:credit-onchain d dl (nd:wallet-open-deposit (nd:make-wallet :priv 66666666666666666616 :bus bus) (nd:record-id-hex dl)) 1000 :txid (u:sha256 (hx "d003"))))
+        (nd::follow-ledger b (nd:record-id-hex dl))
+        (setf (getf (nd::node-adversary d) :ignore-fraud) t)   ; d ignores the fraud -> derelict
+        ;; b self-detects a forged witness-less lock from a (chains onto b's tip at next seq)
+        (let* ((rec (nd:find-record b id)) (ledger (nd:record-ledger rec))
+               (forged (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id)
+                                                       :seq (1+ (lg:ledger-sequence ledger)) :prev-hash (lg:ledger-chain-tip ledger) :block-height *height*
+                                                       :message (op:encode-operation (list :type :transfer-lock :transfer-nonce (u:sha256 (hx "d004"))
+                                                                                           :source-deposit-id dep :destination-deposit-id dep :amount 10000 :fee 0
+                                                                                           :completion-script "sha256(00)" :timeout-height (+ *height* 100)
+                                                                                           :transfer-id (u:sha256 (hx "d005")) :nonce 7777 :expiry (+ *height* 144) :witness '())))))
+                         (up:sign-operator u (nd::node-priv a)) u)))
+          (check "b has no derelict-watch before the fault" (null (nd::node-derelict-watch-keys b)))
+          (nd::report-non-conforming b rec forged "test: witness-less lock")
+          (check "b disputed la and armed a derelict-watch" (and (nd:find-fork b id (nd:node-pubkey b)) (nd::node-derelict-watch-keys b)))
+          ;; d never disputed la (it ignored the fraud); drive-dereliction reports it
+          (let ((before (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+))))))
+            (nd::drive-dereliction b)
+            (let* ((after (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+))))
+                   (new (subseq after before))
+                   (der (remove-if-not (lambda (e) (eq :dispute-dereliction (getf (fr:json->broadcast (w:parse-json (cl-nostr.event:event-content e))) :type))) new)))
+              (check "drive-dereliction broadcast a DisputeDereliction naming d"
+                     (some (lambda (e) (string= (getf (fr:json->broadcast (w:parse-json (cl-nostr.event:event-content e))) :accused) (nd:node-pubkey-hex d))) der))
+              (check "a second pass does not re-report (dedup)"
+                     (progn (nd::drive-dereliction b)
+                            (= (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+)))) (length after)))))))))))
+
+
 (report)
