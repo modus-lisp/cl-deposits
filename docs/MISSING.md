@@ -10,8 +10,8 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   (proof discriminant 10), a node-wide block scan for spends of every vault outpoint it replicates
   (judged 3 blocks deep, so a rotation's QuorumBegin can arrive first), a verifier that rebuilds the
   tier leaf and sighash and checks each witness signature, and contagion on every signer's operated
-  ledgers. Proven live (`redteam/attack-vault-spend.sh`). Reference: verifier and node verification ported
-  (deposits-rust cc144a2, cross-impl vector passes); the producer (block-scan watch, contagion) is not. **Numbering:** the spec lists vault spend as type 7 and winner collateral as 6, but both
+  ledgers. Proven live (`redteam/attack-vault-spend.sh`). Reference: verifier, node verification and producer ported (bitcoind backend only; not yet run live)
+  (deposits-rust cc144a2 + 5accfdb, cross-impl vector passes). **Numbering:** the spec lists vault spend as type 7 and winner collateral as 6, but both
   implementations number winner collateral 7 (and 5 non-conforming update, 6 quorum expired), so cl
   uses discriminant 10 and the spec/implementation conflict is still open. **Limits:** the verifier
   trusts the verifier's own chain for block existence only (not tx inclusion), a confiscation is
