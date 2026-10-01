@@ -2,7 +2,7 @@
 ;;;;
 ;;;;   (:info)                                   (:log)
 ;;;;   (:open-ledger :reserves-id "s" :reserves-msat N :collateral-msat M)
-;;;;   (:add-member :ledger "hex" :member "pubkey hex" [:membership-blocks N])
+;;;;   (:add-member :ledger "hex" :member "pubkey hex" [:membership-blocks N] [:dispute-response-blocks N])
 ;;;;   (:prepare-quorum :ledger "hex" [:expiry-blocks N] [:ruleset "s"])  -> :address to fund
 ;;;;   (:begin-quorum :ledger "hex" :txid "hex" :vout N :sats N :collateral-sats M)
 ;;;;   (:deposit-open :ledger "hex" :descriptor "pk(...)")
@@ -87,7 +87,8 @@
         (:add-member
          (let ((rec (rec! node form)))
            (nd:add-member node rec (hex->bytes (arg form :member)) :member-ledger-id (arg form :member-ledger)
-                          :membership-blocks (arg form :membership-blocks 4320))
+                          :membership-blocks (arg form :membership-blocks 4320)
+                          :dispute-response-blocks (arg form :dispute-response-blocks))
            (ok :staged (length (lg:ledger-next-quorum-members (nd:record-ledger rec))))))
         (:prepare-quorum
          (let* ((rec (rec! node form))

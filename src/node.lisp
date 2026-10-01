@@ -107,6 +107,8 @@
   (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
   (dispute-notes (make-hash-table :test #'equal))   ; ledger id -> the last dispute-driver state we logged
   (refused (make-hash-table :test #'equal :synchronized t))   ; ledger id -> seq whose update the rules rejected
+  (derelict-watch (make-hash-table :test (quote equal) :synchronized t))
+  (reported-derelict (make-hash-table :test (quote equal) :synchronized t))
   (min-confs 1)
   (member-ledger-hex nil))                     ; our own ledger used for QuorumJoin / member_ledger_hash
 
@@ -361,7 +363,7 @@
   "How much of the history a consent request carries: the reference's nostr client drops any
    event over 70 KB (~70 updates), and it needs LedgerOpen; the rest is gap-filled from the relay.")
 
-(defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) (ruleset "cltv-offset-v2") (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016))
+(defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) (ruleset "cltv-offset-v2") (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016) dispute-response-blocks)
   "Ask MEMBER-PUBKEY to join REC's quorum; on consent, stage them with QuorumAddMember.
    The request is addressed (tag l) to MEMBER-LEDGER-ID — the member's own ledger —
    as the reference does; its nodes only answer requests for ledgers they operate."
@@ -404,6 +406,7 @@
                                       :member-ledger-id (or (w:jget res "member_ledger_id") member-ledger-id "")
                                       :min-fee-bps min-fee-bps :min-fee-fixed min-fee-fixed :max-fee-period max-fee-period
                                       :membership-until (w:jget res "membership_expires")
+                                      :dispute-response-blocks dispute-response-blocks
                                       :member-response (let ((b (w:jget res "member_response"))) (and b (base64-decode b)))
                                       :member-signature (let ((h (w:jget res "member_signature"))) (and h (hex->bytes h)))))))))
 
@@ -1493,7 +1496,8 @@
 (defun start-expiry-watch (node &key (interval 60))
   (bt:make-thread (lambda () (loop (sleep interval)
                                    (ignore-errors (dispute-expired-quorums node))
-                                   (ignore-errors (drive-disputes node))))
+                                   (ignore-errors (drive-disputes node))
+                                   (ignore-errors (drive-dereliction node))))
                   :name "cld-expiry"))
 
 (defun start-invoice-poller (node &key (interval 3))
@@ -2411,18 +2415,31 @@
                (mrec (and (stringp mlid) (= (length mlid) 64) (find-record node mlid)))
                (newest (and mrec (find-if (lambda (u) (equalp (up:update-operator-id u) mk)) (record-history mrec)))))
           (when (and (not (equalp mk (node-pubkey node)))            ; not us
+                     (not (gethash (format nil "~a:~a" id (bytes->hex mk)) (node-reported-derelict node)))
                      (not (find-fork node id mk))                    ; the member never disputed REC
                      newest (equalp (lg:ledger-operator-key (record-ledger mrec)) mk)   ; its own ledger
                      (>= (- (up:update-block-height newest) vh) required))               ; active past the window
+            (setf (gethash (format nil "~a:~a" id (bytes->hex mk)) (node-reported-derelict node)) t)
             (log! node "DERELICTION: ~a kept operating ~a ~a blocks past the fraud without disputing ~a"
                   (subseq (bytes->hex mk) 0 8) (subseq mlid 0 8) (- (up:update-block-height newest) vh) (subseq id 0 8))
             (broadcast-fraud node (fr:make-dispute-dereliction-proof
                                    mk (hex->bytes mlid) original-fraud-hash32 visible-block-hash32 required newest))))))))
 
+(defun drive-dereliction (node)
+  "DEP-19 §6: for each ledger we disputed on a fraud proof, report co-members that stayed
+   active past dispute_response_blocks without disputing it."
+  (loop for id being the hash-keys of (node-derelict-watch node) using (hash-value w)
+        for rec = (find-record node id)
+        when rec do (ignore-errors (report-derelict-members node rec (car w) (cdr w)))))
+
 (defun broadcast-fraud (node proof)
   (bus:bus-publish (node-bus node) (w:fraud-event (node-keypair node) (getf proof :ledger-id) (getf proof :accused) (fr:broadcast->json proof))))
 
 (defun handle-fraud (node event)
+  ;; ADVERSARY :ignore-fraud — a member that drops every fraud proof while it keeps
+  ;; operating its own ledgers.  DEP-19 §6 makes that provable dereliction; the harness
+  ;; redteam/attack-dereliction.sh drives it (docs/REDTEAM.md).
+  (when (getf (node-adversary node) :ignore-fraud) (return-from handle-fraud nil))
   (let ((proof (fr:json->broadcast (w:parse-json (ev:event-content event)))))
     (if (eq (getf proof :type) :non-conforming-cosignature)
         (handle-cosigner-fraud node proof)
@@ -2446,6 +2463,9 @@
                                      ((:equivocation :non-conforming-update) (1- (getf (getf proof :evidence) (if (eq (getf proof :type) :equivocation) :sequence :fault-sequence))))
                                      (t (lg:ledger-sequence (record-ledger rec)))))))
               (log! node "fraud proof ~a on ~a verified: disputing from seq ~a" (getf proof :type) (subseq id 0 8) last-valid)
+              (unless (eq (getf proof :type) :dispute-dereliction)
+                (let ((vh (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) (height node))))))
+                  (when vh (setf (gethash id (node-derelict-watch node)) (cons (fr:proof-hash proof) vh)))))
               (enter-dispute node rec last-valid
                              ;; snake_case, as the reference writes and matches it
                              ;; ("quorum_expired", dispute.rs); "quorum-expired" made our
