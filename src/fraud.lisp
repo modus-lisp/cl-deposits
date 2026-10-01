@@ -15,7 +15,8 @@
            #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
            #:proof->json #:json->proof #:requires-embedding-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:verify-censorship
-           #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature))
+           #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
+           #:make-dispute-dereliction-proof #:verify-dispute-dereliction))
 (in-package #:cl-deposits.fraud)
 
 (defparameter +types+
@@ -70,6 +71,19 @@
 (defun make-quorum-expired-proof (accused33 ledger-id32 anchor-block-hash32 quorum-expiry)
   (list :type :quorum-expired :accused (bytes->hex accused33) :ledger-id (bytes->hex ledger-id32)
         :evidence (list :anchor-block-hash anchor-block-hash32 :quorum-expiry quorum-expiry)))
+
+(defun make-dispute-dereliction-proof (member33 member-ledger-id32 original-fraud-hash32 original-fraud-block-hash32
+                                       required-response-blocks member-active-update)
+  "DEP-19 §6: MEMBER kept operating (MEMBER-ACTIVE-UPDATE, past the window) without acting on
+   the fraud proof ORIGINAL-FRAUD-HASH, embedded at ORIGINAL-FRAUD-BLOCK-HASH.  Presented on
+   the member's own ledger to slash it."
+  (list :type :dispute-dereliction :accused (bytes->hex member33) :ledger-id (bytes->hex member-ledger-id32)
+        :evidence (list :original-fraud-hash (bytes->hex original-fraud-hash32)
+                        :original-fraud-block-hash original-fraud-block-hash32
+                        :required-response-blocks required-response-blocks
+                        :member-ledger-id (bytes->hex member-ledger-id32)
+                        :member-active-sequence (up:update-seq member-active-update)
+                        :member-pubkey (bytes->hex member33))))
 
 (defun make-non-conforming-cosignature-proof (accused33 target-ledger-id32 fault-update governing-quorumbegin-seq)
   "Contagion (DEP-19 §5): ACCUSED cosigned FAULT-UPDATE, a non-conforming update on
@@ -242,11 +256,34 @@
                   fault-history))))
     (error (c) (values nil (princ-to-string c)))))
 
+(defun verify-dispute-dereliction (proof member-history height-of-block)
+  "DEP-19 §6 / DEP-11 §Dispute Participation.  MEMBER-HISTORY is the accused member's own
+   ledger (the one being slashed).  The member kept operating past the response window
+   without acting on a fraud proof: the original proof was embedded at a block the verifier
+   confirms, and the member signed an update of its own whose (v2-signed) block_height is at
+   least REQUIRED-RESPONSE-BLOCKS later.  Matches the reference's verify_inactive_quorum_member
+   (its fields; the extra two are not in the proof hash, see EVIDENCE-BYTES)."
+  (handler-case
+      (let* ((orig-h (funcall height-of-block (e proof :original-fraud-block-hash)))
+             (seq (e proof :member-active-sequence))
+             (member-update (find seq member-history :key #'up:update-seq))
+             (required (e proof :required-response-blocks)))
+        (cond ((null orig-h) (values nil "original-fraud block not in our chain"))
+              ((null member-update) (values nil "member-active update not in the member's history"))
+              ((not (string= (bytes->hex (up:update-operator-id member-update)) (e proof :member-pubkey)))
+               (values nil "member-active update not signed by the accused member"))
+              ((< (- (up:update-block-height member-update) orig-h) required)
+               (values nil (format nil "member-active block only ~a past the original fraud; need ~a"
+                                   (- (up:update-block-height member-update) orig-h) required)))
+              (t (values t nil))))
+    (error (c) (values nil (princ-to-string c)))))
+
 (defun verify-proof (proof &key history height-of-block)
   (case (getf proof :type)
     (:equivocation (verify-equivocation proof history))
     (:quorum-expired (verify-quorum-expired proof history height-of-block))
     (:non-conforming-update (verify-non-conforming-update proof history))
+    (:dispute-dereliction (verify-dispute-dereliction proof history height-of-block))
     (t (values nil (format nil "cannot verify ~a here" (getf proof :type))))))
 
 ;;; ---------------------------------------------------------------------------

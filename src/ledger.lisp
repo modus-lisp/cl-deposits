@@ -22,7 +22,7 @@
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
-           #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until
+           #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
            #:majority-threshold #:+valid-quorum-sizes+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
 (in-package #:cl-deposits.ledger)

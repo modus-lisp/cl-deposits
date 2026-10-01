@@ -1082,4 +1082,58 @@
                          (remove-if (lambda (x) (>= (up:update-seq x) (up:update-seq (second (nd:record-history l1))))) prefix))))))))))
 
 
+
+(with-gate ("dereliction: a member that ignores a fraud proof is provably derelict (DEP-19 §6)")
+  ;; A operates L1 (B, C, D cosign).  A fraud proof on L1 becomes visible at block V.
+  ;; D keeps operating its own ledger well past V + dispute_response_blocks without
+  ;; disputing L1 -> derelict.  C disputes L1 promptly -> not derelict.
+  (let* ((bus (bus:make-mock-bus))
+         (heights (make-hash-table :test #'equalp))        ; block-hash -> height, for height-of-block
+         (hob (lambda (h) (gethash h heights)))
+         (a (nd:make-node :priv 11111111111111111201 :bus bus :height-fn (lambda () *height*) :height-of-block hob))
+         (b (nd:make-node :priv 22222222222222222202 :bus bus :height-fn (lambda () *height*) :height-of-block hob))
+         (c (nd:make-node :priv 33333333333333333303 :bus bus :height-fn (lambda () *height*) :height-of-block hob))
+         (d (nd:make-node :priv 44444444444444444404 :bus bus :height-fn (lambda () *height*) :height-of-block hob))
+         (la (nd:open-ledger a :reserves-id "genesis:dl1" :reserves 15600000 :collateral 15600000))
+         (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+    (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "d100")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
+    ;; the fraud became visible at block V
+    (let* ((v-hash (u:sha256 (hx "deadbeef"))) (v-height 1000) (required 144)
+           (fraud-hash (u:sha256 (hx "f00f"))))
+      (setf (gethash v-hash heights) v-height)
+      ;; D operates its own ledger up to block V + 200 (past the window) without disputing L1
+      (let* ((dl (nd:own-ledger d)))
+        (let ((*height* (+ v-height 200)))
+          (nd:credit-onchain d dl (nd:wallet-open-deposit (nd:make-wallet :priv 55555555555555555505 :bus bus) (nd:record-id-hex dl)) 1000 :txid (u:sha256 (hx "dd"))))
+        (nd::follow-ledger b (nd:record-id-hex dl))              ; b picks up d's own ledger from the bus
+        (let* ((dmrec (nd:find-record b (nd:record-id-hex dl)))
+               (newest (first (nd::record-history dmrec))))
+          (check "b replicates d's own ledger, advanced past the window"
+                 (and dmrec (>= (- (up:update-block-height newest) v-height) required)))
+          (let ((proof (fr:make-dispute-dereliction-proof (nd:node-pubkey d) (u:hex->bytes (nd:record-id-hex dl))
+                                                          fraud-hash v-hash required newest)))
+            (check "a dereliction proof against d verifies"
+                   (fr:verify-dispute-dereliction proof (reverse (nd::record-history dmrec)) hob))
+            (check "its proof hash round-trips through JSON"
+                   (equalp (fr:proof-hash (fr:json->proof (fr:proof->json proof))) (fr:proof-hash proof)))
+            ;; a member still inside the window is not derelict
+            (let ((early (fr:make-dispute-dereliction-proof (nd:node-pubkey d) (u:hex->bytes (nd:record-id-hex dl))
+                                                            fraud-hash (progn (setf (gethash (u:sha256 (hx "bb")) heights) (+ v-height 100)) (u:sha256 (hx "bb")))
+                                                            required newest)))
+              (check "not derelict while inside the response window"
+                     (not (fr:verify-dispute-dereliction early (reverse (nd::record-history dmrec)) hob))))
+            ;; wrong signer: a proof naming c against d's update does not verify
+            (check "the member-active update must be signed by the accused"
+                   (not (fr:verify-dispute-dereliction
+                         (fr:make-dispute-dereliction-proof (nd:node-pubkey c) (u:hex->bytes (nd:record-id-hex dl)) fraud-hash v-hash required newest)
+                         (reverse (nd::record-history dmrec)) hob))))
+          ;; producer: b scans and reports d (who never disputed L1)
+          (let ((before (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+))))))
+            (nd::report-derelict-members b (nd:find-record b id) fraud-hash v-hash)
+            (check "b broadcast a dereliction proof naming d"
+                   (> (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+)))) before))))))))
+
+
 (report)
