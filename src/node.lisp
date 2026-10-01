@@ -776,6 +776,7 @@
          (handler-case
              (progn
                (unless (equalp ledger-id (hex->bytes (record-id-hex rec))) (fail "ledger_id mismatch"))
+               (unless (record-fork-p rec) (check-not-deposed node rec))
                (let ((ours (height node)))
                  (when (and (plusp ours) (> (abs (- block-height ours)) *cosign-height-tolerance*))
                    (fail "block_height ~a is not near our tip ~a" block-height ours))
@@ -1731,6 +1732,23 @@
         for o = (nth-value 1 (fork-op f :dispute-acquire))
         when (and o (not (equalp (op:field o :new-custodian) (node-pubkey node))))
           return (op:field o :new-custodian)))
+
+(defun check-not-deposed (node rec)
+  "A member refuses to extend REC's base chain once its operator is deposed: custody
+   moved by a DisputeAcquire (to anyone, us included), or we, or a majority of the
+   quorum, disputed it since the latest QuorumBegin other than for expiry.  The
+   reference refuses any cosign while its replica's dispute_state is not Normal."
+  (let ((acquired (loop for f in (forks-of node (record-id-hex rec))
+                        for o = (nth-value 1 (fork-op f :dispute-acquire))
+                        when o return (op:field o :new-custodian)))
+        (disputing (disputing-members node rec))
+        (members (lg:ledger-quorum-members (record-ledger rec))))
+    (when acquired
+      (fail "ledger disputed: custody moved to ~a by DisputeAcquire" (subseq (bytes->hex acquired) 0 16)))
+    (when (member (node-pubkey node) disputing :test #'equalp)
+      (fail "ledger disputed: we disputed it; not extending the operator's chain"))
+    (when (> (* 2 (length disputing)) (length members))
+      (fail "ledger disputed: ~a of ~a members forked it" (length disputing) (length members)))))
 
 (defun make-fork (node rec last-valid-seq operator33)
   "A fork of REC's ledger from LAST-VALID-SEQ, operated by OPERATOR33: the

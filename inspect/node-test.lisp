@@ -229,6 +229,10 @@
         (check "members replicate each other's forks"
                (every (lambda (m) (= 3 (length (nd:forks-of m id)))) (list b c d)))
         (check-equal "the operator sees its whole quorum disputing" (length (nd::disputing-members a la)) 3)
+        (check "a disputing member refuses to extend the operator's base chain"
+               (every (lambda (m) (search "ledger disputed" (handler-case (progn (nd::check-not-deposed m (nd:find-record m id)) "")
+                                                                  (error (e) (princ-to-string e)))))
+                      (list b c d)))
         (check "and stands down at once instead of soliciting cosignatures it cannot get"
                (search "ledger disputed" (handler-case (progn (nd:credit-onchain a la (nd:wallet-open-deposit (nd:make-wallet :priv 66666666666666666666 :bus bus) id) 5000 :txid (u:sha256 (hx "c0ffee3"))) "")
                                            (error (e) (princ-to-string e)))))
