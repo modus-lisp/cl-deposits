@@ -13,7 +13,7 @@ ok=0; fail=0; [ -f "$SOAK/clbot-$W.counts" ] && read ok fail <"$SOAK/clbot-$W.co
 # until rotation catches up; a stale-balance race (INSUFFICIENT-BALANCE) is a skip, not a fail.
 declare -A FIXED BPS EXPIRED_UNTIL
 fee_for() {   # fee LEDGERNAME AMOUNT_MSAT
-  if [ -n "${FIXED[$1]}" ]; then echo $(( FIXED[$1] + $2 * BPS[$1] / 10000 )); return; fi
+  if [ -n "${FIXED[$1]:-}" ]; then echo $(( FIXED[$1] + $2 * BPS[$1] / 10000 )); return; fi
   case "$(awk -F'\t' -v n="$1" '$1==n {print $3}' "$SOAK/ledgers.tsv")" in cld*) echo 0;; *) echo $(( 2 + $2 * 20 / 10000 ));; esac
 }
 learn_fee() {   # learn_fee LEDGERNAME MESSAGE — sets EXPECTED if MESSAGE is a fee refusal (no subshell: it updates FIXED/BPS)

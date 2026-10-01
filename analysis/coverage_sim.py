@@ -21,8 +21,12 @@ cheated on.  Toggles:
   - full (operator contagion): a key is slashed on every honest-majority ledger it
     operates — one accusation, every vault it runs at risk.
 
-The attacker is greedy and optimal enough for a bound: it takes every target whose
-loot exceeds the *new* exposure it forces, cheapest signers first.
+The attacker takes the best of three strategies: all-in (every capturable vault),
+the myopic per-target greedy, and repeated cheapest-incremental greedy passes (a key
+exposed by one theft is free for the next).  That is still a lower bound on the
+optimal attack, so every safety number here is an upper bound.  (An earlier version
+used only the myopic greedy, which never paid a key's up-front exposure and so
+overstated safety, most at large L: 0.55 at Q=7, R=0.5, L=5, against ~0.30 here.)
 
 Output per (mode, Q, R): the largest coalition fraction p at which the attack is
 unprofitable in >= SAFE of the trials.  Higher is safer.  L shifts the full-contagion
@@ -30,36 +34,58 @@ column: more ledgers per operator is more collateral at stake per exposed key.
 """
 import random, sys
 
-def trial(n, l, q, p, r, mode, rng):
-    c = 1.0 - r
+def network(n, l, q, p, rng):
     need = q // 2 + 1
     bad = set(rng.sample(range(n), round(p * n)))
-    # ledgers[(o,j)] = quorum (q distinct operators != o)
     others = {o: [x for x in range(n) if x != o] for o in range(n)}
     quorum = {(o, j): rng.sample(others[o], q) for o in range(n) for j in range(l)}
-    honest_majority = {led: sum(1 for m in mem if m not in bad) >= need
-                       for led, mem in quorum.items()}
-    # ledgers each key operates that could slash it (own ledger, honest majority)
-    slash_ledgers = {k: [j for j in range(l) if honest_majority[(k, j)]] for k in bad}
+    hm = {led: sum(1 for m in mem if m not in bad) >= need for led, mem in quorum.items()}
+    return need, bad, quorum, hm
 
+def attack(n, l, need, bad, quorum, hm, r, contagion):
+    """The coalition's best net gain over several strategies (a lower bound on the
+    optimum, so the safety numbers it yields are an upper bound).  A key, once
+    exposed, is free for further thefts: it is slashed once per ledger it runs."""
+    c = 1.0 - r
+    cost_of = {k: (c * sum(1 for j in range(l) if hm[(k, j)]) if contagion else 0.0) for k in bad}
+    targets = []
+    for (o, j), mem in quorum.items():
+        members = [m for m in mem if m in bad]
+        if len(members) >= need:
+            targets.append((r if o in bad else 1.0, members))
+
+    def run(order_key, passes):
+        exposed = set(); gain = 0.0; taken = set()
+        for _ in range(passes):
+            changed = False
+            for idx in sorted(range(len(targets)), key=lambda i: order_key(i, exposed)):
+                if idx in taken: continue
+                loot, members = targets[idx]
+                signers = sorted(members, key=lambda m: (0.0 if m in exposed else cost_of[m]))[:need]
+                inc = sum(cost_of[m] for m in signers if m not in exposed)
+                if loot > inc:
+                    taken.add(idx); gain += loot; exposed.update(signers); changed = True
+            if not changed: break
+        return gain - sum(cost_of[k] for k in exposed)
+
+    def inc_cost(i, exposed):
+        loot, members = targets[i]
+        signers = sorted(members, key=lambda m: (0.0 if m in exposed else cost_of[m]))[:need]
+        return sum(cost_of[m] for m in signers if m not in exposed) - loot
+
+    # all-in: every capturable target, cheapest signers
     exposed = set(); gain = 0.0
-    targets = [(o, j) for o in range(n) for j in range(l)
-               if sum(1 for m in quorum[(o, j)] if m in bad) >= need]
-    for (o, j) in targets:
-        members = [m for m in quorum[(o, j)] if m in bad]
-        members.sort(key=lambda m: (m not in exposed, m))   # reuse already-exposed keys first
-        signers = members[:need]
-        loot = r if o in bad else 1.0
-        if mode == "off":
-            gain += loot; continue
-        new = [m for m in signers if m not in exposed]
-        new_cost = c * sum(len(slash_ledgers.get(m, [])) for m in new)   # type 7 names every signer
-        if loot > new_cost:
-            gain += loot; exposed.update(signers)
-    if mode == "off":
-        return gain
-    cost = c * sum(len(slash_ledgers.get(k, [])) for k in exposed)
-    return gain - cost
+    for loot, members in targets:
+        exposed.update(sorted(members, key=lambda m: (0.0 if m in exposed else cost_of[m]))[:need])
+        gain += loot
+    allin = gain - sum(cost_of[k] for k in exposed)
+    greedy = run(lambda i, e: 0, 1)                 # the original myopic order
+    multipass = run(inc_cost, 20)                   # cheapest-incremental first, repeated
+    return max(allin, greedy, multipass, 0.0)
+
+def trial(n, l, q, p, r, mode, rng):
+    need, bad, quorum, hm = network(n, l, q, p, rng)
+    return attack(n, l, need, bad, quorum, hm, r, mode != "off")
 
 def max_safe_p(n, l, q, r, mode, trials, safe, rng):
     best = 0.0

@@ -152,41 +152,40 @@ Implemented cosigner contagion (DEP-19 §5): cl d4614e7 (produce and act) and de
   its bite per ledger guarded is its collateral divided by the number it guards. §3's heuristics should
   score both: operator collateral summed across its ledgers, and member coverage (own collateral against
   the collateral it guards).
-- **Not yet tested: the theft §2a models.** A colluding majority spending an honest operator's vault
-  at Tier 0 is on-chain, not a ledger update. It needs DEP-06 type 7 (unauthorised vault spend) and
-  contagion on its witness signers.
+- **Tested (2026-10-02): the theft §2a models.** A colluding majority spending an honest operator's
+  vault at Tier 0 is on-chain, not a ledger update. Both implementations now prove it
+  (`UnauthorizedVaultSpend`, DEP-06 list item 7, wire type 10) against every witness signer, on every
+  ledger the signer operates; `redteam/attack-vault-spend.sh` shows the contagion live (REDTEAM.md).
+  Limit: a confiscation is excused only if the verifier knows of it, so a verifier that missed a
+  dispute can wrongly accuse its signers.
 
 ### 2d. Operator contagion quantified: more ledgers, more deterrent (simulation)
 
-*Caveat (2026-10-01): the attacker here is myopic (it never pays a key's up-front exposure). A
-best-of(greedy, all-in) attacker gives ~0.22 / 0.29 / 0.30 at Q=7, R=0.5, L=1 / 3 / 5. Read the table
-as an upper bound; §2e compares design changes under the same attacker.*
-
-`analysis/coverage_sim.py` extends §2a to L ledgers per operator. An on-chain theft (DEP-06 type 7)
-names every signer, so each exposed key loses collateral on **every** ledger it operates with an
-honest majority — one accusation, every vault it runs at risk (the §2c live run). Largest safe
-coalition fraction p (unprofitable in ≥95% of trials, N=60):
+`analysis/coverage_sim.py` extends §2a to L ledgers per operator. An on-chain theft (DEP-06
+`UnauthorizedVaultSpend`) names every signer, so each exposed key loses collateral on **every** ledger
+it operates with an honest majority — one accusation, every vault it runs at risk (the §2c live run).
+The attacker takes the best of all-in, myopic greedy and repeated cheapest-incremental greedy (a key
+exposed once is free for further thefts). Largest safe coalition fraction p (unprofitable in ≥95% of
+150 trials, N=60, random quorums):
 
 | mode | Q=7, R=0.5 | Q=7, R=0.7 | Q=5, R=0.5 | Q=3, R=0.5 |
 |---|---|---|---|---|
 | no contagion | 0.09 | 0.09 | 0.06 | 0.02 |
-| contagion, L=1 | 0.32 | 0.19 | 0.23 | 0.10 |
-| contagion, L=3 | 0.49 | 0.42 | 0.42 | 0.31 |
-| contagion, L=5 | 0.55 | 0.49 | 0.50 | 0.42 |
+| contagion, L=1 | 0.25 | 0.14 | 0.14 | 0.05 |
+| contagion, L=3 | 0.30 | 0.20 | 0.24 | 0.10 |
+| contagion, L=5 | 0.30 | 0.24 | 0.25 | 0.14 |
 
 **Readings:**
-- **L=1 matches §2a** (Q=7,R≤0.5 ≈ 0.30): the model is consistent with the one-ledger sim.
-- **More ledgers, more deterrent.** At Q=7, R=0.5, going 1→5 ledgers lifts tolerance 32%→55%. A
-  key operating L ledgers has L vaults of collateral, all slashable on a single accusation, so each
-  exposed signer costs the coalition ~L×C and theft stops paying at much higher p.
-- **It rescues capital efficiency.** The L=1 cliff above R=0.5 (0.19 at R=0.7) is softened by scale:
-  L=5 holds 0.49 at R=0.7. An operator that runs several ledgers can safely run leaner vaults.
-- **So "runs several ledgers" is a strong, checkable signal** (DEP-04 ads + QuorumBegins): it is
-  exposure, and exposure is the bond. The pyramid DEP-19 §10 describes is the healthy shape — large
-  operators, each with much at stake, anchoring the network.
-- **Caveat (unchanged):** this assumes random quorums and that a key's vaults are real and
-  independent. A coalition that seats its keys on each other's quorums, or fronts thin vaults behind
-  many ledgers, is the §10 residual the heuristics must still price. Full output: analysis/coverage_sim.out.
+- **Contagion triples tolerance** at Q=7 (0.09 → 0.25-0.30): the on-chain proof is what makes a
+  majority theft cost more than it takes.
+- **More ledgers help, then saturate.** 1→3 ledgers lifts Q=7, R=0.5 from 0.25 to 0.30; 3→5 adds
+  nothing there, and more at leaner vaults (R=0.7: 0.14 → 0.24). Against a coordinated attacker the
+  binding cost is the cascade, not per-key exposure, so scale alone stops at ~0.30.
+- **An earlier version of this table read 0.55 at L=5.** Its attacker was myopic (it never paid a
+  key's up-front exposure), which overstated safety, most at large L. These are the corrected numbers.
+- **Random quorums are the floor, not the design.** §2e holds 0.45 at Q=7 against the same attacker
+  by changing *who sits* on quorums (anchors, lot seats, deposits following compliance); that, not
+  scale, is the lever that lifts tolerance above a third. Full output: analysis/coverage_sim.out.
 
 ### 2e. Seating guidance, followed by wallets' deposits (simulation)
 
@@ -235,8 +234,8 @@ these are upper bounds on safety. Largest safe coalition fraction p:
   coalition the signers are shared, so dropping a theft doesn't shrink the cascade. So 2/4/1's 0.45
   (L=3, R=0.5) holds against the smartest attacker built so far, with every dishonest operator in one
   coalition.
-- **§2a and §2d predate both corrections** (no dereliction, myopic attacker); read them as upper bounds
-  on their own settings.
+- **§2d now uses the stronger attacker but not dereliction cascades; §2a predates both.** Read them as
+  upper bounds on their own settings.
 
 ### 2f. Entry cost: stake-blocks, with bonding to bootstrap (design and simulation)
 
