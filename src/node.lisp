@@ -2324,11 +2324,15 @@
                (= (up:update-seq update) (1+ (lg:ledger-sequence ledger)))
                (not (find-fork node id (node-pubkey node))))
       (log! node "NON-CONFORMING cosigned update on ~a at seq ~a: ~a" (subseq id 0 8) (up:update-seq update) condition)
-      (broadcast-fraud node (fr:make-non-conforming-update-proof (up:update-operator-id update) (up:update-ledger-id update) update))
-      (broadcast-cosigner-contagion node rec update)
-      (when (and (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
-                 (not (find-fork node id (node-pubkey node))))   ; the proof may have looped back and forked us already
-        (enter-dispute node rec (lg:ledger-sequence ledger) :reason "non_conforming_update")))))
+      (let ((proof (fr:make-non-conforming-update-proof (up:update-operator-id update) (up:update-ledger-id update) update)))
+        (broadcast-fraud node proof)
+        (broadcast-cosigner-contagion node rec update)
+        (when (and (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
+                   (not (find-fork node id (node-pubkey node))))   ; the proof may have looped back and forked us already
+          ;; DEP-19 §6: watch co-members who ignore this (same as the received-proof path).
+          (let ((vh (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) (height node))))))
+            (when vh (setf (gethash id (node-derelict-watch node)) (cons (fr:proof-hash proof) vh))))
+          (enter-dispute node rec (lg:ledger-sequence ledger) :reason "non_conforming_update"))))))
 
 ;;; Contagion (DEP-19 §5-6).  A cosigner of a non-conforming update is slashable on
 ;;; every ledger it operates, by that ledger's own quorum.  Without it, signing a
