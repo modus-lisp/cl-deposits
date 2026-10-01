@@ -27,7 +27,8 @@ out; the wallet escalates through member cld6, whose DeliveryEmbed lands on its 
 tombstoned forks there are from the earlier forge-lock run, not this), cld6 logs no embed-driven
 action, and the victim's funds stay locked. Confirms docs/MISSING.md: censorship proofs are
 unwired. Side observation: a victim's LOCKED balance climbs run to run as never-completed
-transfers accumulate locks — no auto-expiry of stale locks in cl.
+transfers accumulate locks; these self-heal at each lock's timeout_height
+(fail-expired-transfers, ~144 blocks here), so it is latency, not a stuck-funds bug.
 
 ## Capital efficiency vs security: the axis every attack is measured on
 
