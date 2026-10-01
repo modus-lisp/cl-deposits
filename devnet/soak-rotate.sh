@@ -16,7 +16,8 @@ SOAK="$CLD_ROOT/soak"; EVERY=${SOAK_ROTATE_EVERY:-600}; MARGIN=${SOAK_ROTATE_MAR
 # A rotates to cld4 in place of ref2: ref2 forked A at 81026 (docs/REDTEAM.md
 # organic #1) and has treated A as a gap since, so it never re-consents.
 PLAN=${SOAK_LEDGER_PLAN:-$(soak_plan)}
-pubkey_of() { case "$1" in cld*) cld_pubkey "$1";; ref*) ref_pubkey "$1";; esac; }
+# Cached at soak setup: the reference CLI loads the node's whole data dir to print it (minutes on a soaked node).
+pubkey_of() { [ -s "$SOAK/pubkey.$1" ] && { cat "$SOAK/pubkey.$1"; return; }; case "$1" in cld*) cld_pubkey "$1";; ref*) ref_pubkey "$1";; esac; }
 own_ledger_of() { local v; case "$1" in cld*) v="L${1#cld}";; ref*) v="RL${1#ref}";; esac; echo "${!v}"; }
 rotate() {   # rotate NAME ID OPERATOR "m1,m2,m3"
   local name=$1 id=$2 op=$3 members=$4 m r prep addr txid vout
@@ -40,14 +41,22 @@ open(p,'w').write(''.join('\t'.join(r)+'\n' for r in rows))
 PY
   echo "$(date +%FT%T) $name rotated: $(cld_ctl "$op" "(:info)" | grep -oE "\(:ID \"$id\"[^)]*:MEMBERS [1-9][^)]*" | grep -oE ':SEQ [0-9]+|:EXPIRY [0-9]+' | tr '\n' ' ')"
 }
+declare -A STOOD_DOWN
 while true; do
   h=$(bcli getblockcount 2>/dev/null) || { sleep 60; continue; }
   for spec in $PLAN; do
     IFS=: read -r name op members <<<"$spec"; [[ "$op" == cld* ]] || continue
     id=$(awk -F'\t' -v n="$name" '$1==n {print $2}' "$SOAK/ledgers.tsv"); [ -n "$id" ] || continue
     cld_running "$op" || continue
-    exp=$(cld_ctl "$op" "(:info)" 2>/dev/null | grep -oE "\(:ID \"$id\"[^)]*:MEMBERS [1-9][^)]*" | grep -oE ':EXPIRY [0-9]+' | head -1 | cut -d' ' -f2)
-    [ -n "$exp" ] || continue
+    row=$(cld_ctl "$op" "(:info)" 2>/dev/null | grep -oE "\(:ID \"$id\"[^)]*:MEMBERS [1-9][^)]*" | head -1)
+    exp=$(grep -oE ':EXPIRY [0-9]+' <<<"$row" | cut -d' ' -f2); [ -n "$exp" ] || continue
+    # A quorum majority that forked this ledger has disputed its operator: custody follows the
+    # dispute (DEP-06), the operator stands down, and re-consent can never succeed.
+    nm=$(grep -oE ':MEMBERS [0-9]+' <<<"$row" | cut -d' ' -f2); nd=$(grep -oE ':DISPUTED [0-9]+' <<<"$row" | cut -d' ' -f2)
+    if [ "${nd:-0}" -gt $(( nm - (nm / 2 + 1) )) ] || grep -qE ':CUSTODY-MOVED "' <<<"$row"; then
+      [ -n "${STOOD_DOWN[$name]:-}" ] || echo "$(date +%FT%T) $name: $op stood down ($nd of $nm members disputed it; custody moved: $(grep -oE ':CUSTODY-MOVED [^ ]+' <<<"$row" | cut -d' ' -f2)); not rotating"
+      STOOD_DOWN[$name]=1; continue
+    fi
     if [ $((exp - h)) -le "$MARGIN" ]; then rotate "$name" "$id" "$op" "$members" || echo "$(date +%FT%T) $name rotation FAILED (height $h, expiry $exp)"; fi
   done
   sleep "$EVERY"

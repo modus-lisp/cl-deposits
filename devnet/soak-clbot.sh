@@ -29,7 +29,7 @@ while true; do
   IFS=$'\t' read -r _ w name L D <<<"${CL[$((RANDOM % ${#CL[@]}))]}"
   now=$(date +%s)
   if [ "${EXPIRED_UNTIL[$name]:-0}" -gt "$now" ]; then
-    echo "$(date +%FT%T) skip $w $name quorum expired (rechecking after $(date -d @"${EXPIRED_UNTIL[$name]}" +%T))"
+    echo "$(date +%FT%T) skip $w $name expired or disputed (rechecking after $(date -d @"${EXPIRED_UNTIL[$name]}" +%T))"
     sleep $(( INTERVAL / 4 + 1 )); continue
   fi
   bal=$(sx1 "$("$CLD_SRC/devnet/cld-wallet.sh" "$w" "$L" balance "$D")" ":BALANCE"); bal=${bal:-0}
@@ -51,6 +51,9 @@ while true; do
     elif [[ "$T" == *"TIER0-POST-EXPIRY"* ]]; then
       EXPIRED_UNTIL[$name]=$(( now + ${SOAK_CL_EXPIRED_BACKOFF:-600} ))
       echo "$(date +%FT%T) skip $w $name quorum expired; backing off"
+    elif [[ "$T" == *"ledger disputed"* ]]; then
+      EXPIRED_UNTIL[$name]=$(( now + ${SOAK_CL_DISPUTED_BACKOFF:-3600} ))
+      echo "$(date +%FT%T) skip $w $name operator stood down (its quorum disputed it); backing off"
     elif [[ "$T" == *"INSUFFICIENT-BALANCE"* ]]; then
       echo "$(date +%FT%T) skip $w $name ${D:0:8} balance moved under us: $T"
     else

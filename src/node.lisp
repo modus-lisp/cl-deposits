@@ -340,7 +340,17 @@
           (lg:cosign-requirement (record-ledger rec) op height)
         (declare (ignore operator-alone))
         (unless allowed (fail "~a not cosignable at ~a" (op:operation-type op) tier))
-        (when (plusp required) (solicit-cosignatures node rec update signers required)))
+        (when (plusp required)
+          ;; Members that forked against this quorum refuse every cosign: once too few
+          ;; are left to reach REQUIRED, stand down now instead of timing out each time.
+          (let ((disputing (disputing-members node rec)) (custodian (custody-moved-to node rec)))
+            (when custodian
+              (fail "ledger disputed: custody moved to ~a by DisputeAcquire; this operator stands down"
+                    (subseq (bytes->hex custodian) 0 16)))
+            (when (> required (count-if-not (lambda (m) (member (lg:member-pubkey m) disputing :test #'equalp)) signers))
+              (fail "ledger disputed: ~a of ~a members forked it; ~a cosignatures are out of reach (custody follows the dispute)"
+                    (length disputing) (length signers) required)))
+          (solicit-cosignatures node rec update signers required)))
       (commit-update node rec update))))
 
 (defun open-ledger (node &key reserves-id (genesis-block (height node)) (reserves 0) (collateral 0))
@@ -1694,6 +1704,33 @@
 (defun forks-of (node id-hex)
   (loop for rec being the hash-values of (node-ledgers node)
         when (and (record-fork-p rec) (string= (record-fork-of rec) id-hex)) collect rec))
+
+(defun disputing-members (node rec)
+  "Pubkeys of REC's current quorum members that have disputed it since the quorum
+   began: a fork whose DisputeEnter (other than for a lapsed quorum) is at or after
+   the latest QuorumBegin, whether still open, armed, yielded or acquired."
+  (let* ((qb-seq (or (loop for u in (record-history rec)
+                           when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
+                             return (up:update-seq u))
+                     0))
+         (members (mapcar #'lg:member-pubkey (lg:ledger-quorum-members (record-ledger rec)))))
+    (loop for f in (forks-of node (record-id-hex rec))
+          for o = (nth-value 1 (fork-op f :dispute-enter))
+          when (and o (member (record-fork-operator f) members :test #'equalp)
+                    (>= (or (op:field o :last-valid-sequence) -1) qb-seq)
+                    ;; respectful: the operator re-establishes.  Any other dispute counts in
+                    ;; every state: a loser yields only once the vault is confiscated.
+                    (not (expiry-reason-p (op:field o :reason))))
+            collect (record-fork-operator f) into keys
+          finally (return (remove-duplicates keys :test #'equalp)))))
+
+(defun custody-moved-to (node rec)
+  "The key a DisputeAcquire on any fork of REC's ledger gave custody to, when it is
+   not ours: the ledger's operator from then on (DEP-06)."
+  (loop for f in (forks-of node (record-id-hex rec))
+        for o = (nth-value 1 (fork-op f :dispute-acquire))
+        when (and o (not (equalp (op:field o :new-custodian) (node-pubkey node))))
+          return (op:field o :new-custodian)))
 
 (defun make-fork (node rec last-valid-seq operator33)
   "A fork of REC's ledger from LAST-VALID-SEQ, operated by OPERATOR33: the

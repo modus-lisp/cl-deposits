@@ -228,6 +228,10 @@
                (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list b c d)))
         (check "members replicate each other's forks"
                (every (lambda (m) (= 3 (length (nd:forks-of m id)))) (list b c d)))
+        (check-equal "the operator sees its whole quorum disputing" (length (nd::disputing-members a la)) 3)
+        (check "and stands down at once instead of soliciting cosignatures it cannot get"
+               (search "ledger disputed" (handler-case (progn (nd:credit-onchain a la (nd:wallet-open-deposit (nd:make-wallet :priv 66666666666666666666 :bus bus) id) 5000 :txid (u:sha256 (hx "c0ffee3"))) "")
+                                           (error (e) (princ-to-string e)))))
         (let ((f (nd::follow-ledger (nd:make-node :priv 77777777777777777777 :bus bus :height-fn hf) id)))
           (check-equal "rebuilding from the relay follows the operator's chain, not the forks' updates beside it"
                        (lg:ledger-sequence (nd:record-ledger f)) (lg:ledger-sequence (nd:record-ledger la))))
@@ -280,7 +284,9 @@
               (check "losers' forks tombstoned"
                      (every (lambda (m) (or (eq m winner) (eq :tombstoned (lg:ledger-dispute-state (nd:record-ledger (nd:find-fork m id (nd:node-pubkey m))))))) (list b c d)))
               (check "everyone replicates the winner's DisputeAcquire"
-                     (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey winner)))) (and f (equalp (lg:ledger-operator-key (nd:record-ledger f)) (nd:node-pubkey winner))))) (list b c d))))))))))
+                     (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey winner)))) (and f (equalp (lg:ledger-operator-key (nd:record-ledger f)) (nd:node-pubkey winner))))) (list b c d)))
+              (check "the deposed operator sees custody moved to the winner"
+                     (equalp (nd::custody-moved-to a la) (nd:node-pubkey winner))))))))))
 
 
 

@@ -26,21 +26,25 @@
 (defun rec! (node form) (or (nd:find-record node (arg form :ledger)) (error "no such ledger")))
 (defun ok (&rest plist) (let ((*print-pretty* nil)) (format nil "~s" (list* :status :ok plist))))
 
-(defun ledger-summary (rec)
+(defun ledger-summary (node rec)
   (let ((l (nd:record-ledger rec)))
     (list :id (nd:record-id-hex rec) :owned (nd:record-owned-p rec) :seq (lg:ledger-sequence l)
           :quorum (lg:ledger-quorum-state l) :members (length (lg:ledger-quorum-members l))
           :staged (length (lg:ledger-next-quorum-members l)) :deposits (hash-table-count (lg:ledger-deposits l))
           :obligations (lg:total-obligations l) :reserves (lg:ledger-reserves-amount l)
           :collateral (lg:ledger-collateral-amount l) :reserves-id (lg:ledger-reserves-key l)
-          :expiry (lg:ledger-quorum-expiry l))))
+          :expiry (lg:ledger-quorum-expiry l)
+          :disputed (if (and (nd:record-owned-p rec) (not (nd:record-fork-p rec)))
+                        (length (nd::disputing-members node rec)) 0)
+          :custody-moved (let ((c (and (nd:record-owned-p rec) (not (nd:record-fork-p rec)) (nd::custody-moved-to node rec))))
+                           (and c (subseq (bytes->hex c) 0 16))))))
 
 (defun handle-command (node form)
   (handler-case
       (ecase (car form)
         (:info (ok :pubkey (nd:node-pubkey-hex node) :height (nd:height node)
                    :inbox (getf (nd:inbox-depths node) :inbox) :cosign-inbox (getf (nd:inbox-depths node) :cosign-inbox)
-                   :ledgers (loop for rec being the hash-values of (nd:node-ledgers node) collect (ledger-summary rec))))
+                   :ledgers (loop for rec being the hash-values of (nd:node-ledgers node) collect (ledger-summary node rec))))
         (:log (ok :log (reverse (nd:node-log node))))
         (:adversary   ; (:adversary :set KEY t|nil ...) / (:adversary) — red team switches, docs/REDTEAM.md
          (loop for (k v) on (cdr (member :set form)) by #'cddr
