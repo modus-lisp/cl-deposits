@@ -742,3 +742,21 @@ Built today (all in `redteam/`, all against the live soak):
 The adversary switches (`:ignore-requests`, `:withhold-reveal`,
 `:theft-sign`, `:vault-spend`) are all disarmed after each run; the soak
 continues underneath.
+
+### 2026-10-02 — unauthorised vault spend (DEP-06 type 7) detected, live
+
+The 2026-09-30 run (`attack-vault-spend.sh`, claim #9) showed the gap: a colluding majority spent
+a vault at Tier 0 and no node reacted.  cl now closes it.  Each node scans every new block (once,
+node-wide, `getblock` verbosity 3) for inputs spending any vault outpoint it replicates; a spend
+that is not a txid a recorded QuorumBegin creates, nor the node's known confiscation, and whose
+tier witness verifies to threshold under the QuorumBegin's reserves, is an `UnauthorizedVaultSpend`
+(discriminant 10) against each signer, published on every ledger the signer operates.  A node that
+cosigns such a ledger verifies it against its own replica of the spent ledger and disputes.
+
+Live (6 cl nodes, cl-only 6-voter quorum, theft by cld1 + cld2 cld3 cld4): cld6 logged `VAULT SPEND`
+for the theft, identified 4 signers, and published proofs against the 20 ledgers cld1 operates plus
+the other signers'; the receivers verified and disputed (`contagion: ... signed an unauthorised
+spend of ...'s vault; disputing its ledger ...`).  Found live: `getblock` verbosity 2 has no
+`prevout` (need 3), and a per-ledger scan was minutes per pass, so the scan is node-wide.
+Harness: `redteam/attack-vault-spend.sh` now PASSes on detection (`REFS=""` forms a cl-only quorum;
+the reference members' add-member stalled under this run).

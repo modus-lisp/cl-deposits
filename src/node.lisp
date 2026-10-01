@@ -41,7 +41,7 @@
            #:enter-dispute #:arm-dispute #:fork-key #:find-fork #:forks-of #:armers-of #:disputed-reserves
            #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
-           #:node-height-of-block #:equivocate
+           #:node-height-of-block #:equivocate #:node-spender-fn #:drive-vault-watch #:node-reported-vault-spend
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
            #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
@@ -107,6 +107,9 @@
   (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
   (dispute-notes (make-hash-table :test #'equal))   ; ledger id -> the last dispute-driver state we logged
   (refused (make-hash-table :test #'equal :synchronized t))   ; ledger id -> seq whose update the rules rejected
+  (spender-fn nil)                             ; (lambda (from to outpoints)) -> spend plists (:txid :vout :tx :prevouts :block-hash :height)
+  (vault-scanned nil)                          ; the last block height scanned for vault spends
+  (reported-vault-spend (make-hash-table :test (quote equal) :synchronized t))
   (derelict-watch (make-hash-table :test (quote equal) :synchronized t))
   (reported-derelict (make-hash-table :test (quote equal) :synchronized t))
   (min-confs 1)
@@ -125,13 +128,13 @@
   (let ((o (op:decode-operation (up:update-message update))))
     (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn)
   (let* ((priv (w:even-y-privkey priv))
          (pub (up:compressed-pubkey priv))
          (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
-                           :chain-fn chain-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
+                           :chain-fn chain-fn :spender-fn spender-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
                            :broadcast-fn broadcast-fn :height-of-block height-of-block :block-hash-fn block-hash-fn
                            ;; We subscribe below, before the caller loads the data dir.  A
                            ;; cosign request handled then found no record, took the ledger
@@ -1497,7 +1500,8 @@
   (bt:make-thread (lambda () (loop (sleep interval)
                                    (ignore-errors (dispute-expired-quorums node))
                                    (ignore-errors (drive-disputes node))
-                                   (ignore-errors (drive-dereliction node))))
+                                   (ignore-errors (drive-dereliction node))
+                                   (ignore-errors (drive-vault-watch node))))
                   :name "cld-expiry"))
 
 (defun start-invoice-poller (node &key (interval 3))
@@ -2445,6 +2449,97 @@
         for rec = (find-record node id)
         when rec do (ignore-errors (report-derelict-members node rec (car w) (cdr w)))))
 
+;;; Unauthorised vault spend (DEP-06).  A reserves outpoint is spent by its
+;;; QuorumBegin's rotation, a recorded exit, or a confiscation.  Anything else that
+;;; clears a tier's threshold is a theft by exactly the keys that signed it, and
+;;; every one of them is slashable on every ledger it operates (contagion).
+
+(defun authorised-spend-txids (rec)
+  "The txids that legitimately spend a vault of REC: every rotation it recorded
+   (a QuorumBegin's new outpoint is the previous vault's spender), and our known confiscation."
+  (let ((ids '()))
+    (dolist (u (record-history rec))
+      (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+        (when (and o (eq (op:operation-type o) :quorum-begin)) (push (op:field o :new-outpoint-txid) ids))))
+    (when (record-confiscation rec) (push (btx:tx-txid (record-confiscation rec)) ids))
+    ids))
+
+(defparameter *vault-spend-grace-blocks* 3
+  "A rotation's QuorumBegin may reach us a block or two after the spend confirms, so a
+   spend is judged only once it is this deep.")
+(defparameter *vault-scan-depth* 30 "Blocks before our first scan to look back over.")
+
+(defun drive-vault-watch (node)
+  "Scan the blocks that are now GRACE deep for spends of any vault outpoint we replicate.
+   A spend its ledger's history does not account for gets an UnauthorizedVaultSpend proof
+   against each signer on each ledger that signer operates."
+  (when (node-spender-fn node)
+    (let* ((to (- (height node) *vault-spend-grace-blocks*))
+           (from (or (and (node-vault-scanned node) (1+ (node-vault-scanned node))) (max 0 (- to *vault-scan-depth*))))
+           (watched (make-hash-table :test #'equalp)) (outpoints '()))
+      (when (>= to from)
+        (loop for rec being the hash-values of (node-ledgers node)
+              unless (record-fork-p rec)
+                do (ignore-errors
+                    (multiple-value-bind (reserves txid vout) (disputed-reserves node rec)
+                      (declare (ignore reserves))
+                      (push rec (gethash (cons txid vout) watched))
+                      (pushnew (cons txid vout) outpoints :test #'equalp))))
+        (dolist (spend (funcall (node-spender-fn node) from to outpoints))
+          (dolist (rec (gethash (cons (getf spend :txid) (getf spend :vout)) watched))
+            (unless (gethash (record-id-hex rec) (node-reported-vault-spend node))
+              (handler-case (report-vault-spend node rec spend)
+                (error (e) (log! node "vault watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e))))))
+        (setf (node-vault-scanned node) to)))))
+
+(defun report-vault-spend (node rec spend)
+  (let* ((id (record-id-hex rec))
+         (tx (btx:parse-tx (bw:make-reader (hex->bytes (getf spend :tx)))))
+         (qb (governing-quorum-begin-seq rec (lg:ledger-sequence (record-ledger rec))))
+         (probe (fr:make-unauthorized-vault-spend-proof (node-pubkey node) (hex->bytes id) (hex->bytes id) qb tx
+                                                       (getf spend :prevouts) (getf spend :block-hash))))
+    (multiple-value-bind (reserves vtxid vvout) (disputed-reserves node rec)
+      (let ((signers (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves vtxid vvout)))
+        (when (and signers (not (member (btx:tx-txid tx) (authorised-spend-txids rec) :test #'equalp)))
+          (setf (gethash id (node-reported-vault-spend node)) t)
+          (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"
+                (subseq id 0 8) (subseq (bytes->hex (btx:tx-txid tx)) 0 16) (length signers))
+          (dolist (x signers)
+            ;; x-only key; the operated ledgers are advertised under the full key, either parity
+            (dolist (full (list (cat (octets 2) x) (cat (octets 3) x)))
+              (dolist (target (ledgers-operated-by node full))
+                (log! node "vault spend: ~a signed it; proof against its ledger ~a" (subseq (bytes->hex x) 0 8) (subseq target 0 8))
+                (broadcast-fraud node (fr:make-unauthorized-vault-spend-proof full (hex->bytes target) (hex->bytes id) qb tx
+                                                                              (getf spend :prevouts) (getf spend :block-hash))))))
+          t)))))
+
+(defun handle-vault-spend-fraud (node proof)
+  "An UnauthorizedVaultSpend against a ledger the accused operates: if we cosign it, verify
+   and dispute (the accused signed a theft of someone's vault)."
+  (let* ((ev (getf proof :evidence))
+         (accused (hex->bytes (getf proof :accused)))
+         (spent-id (getf ev :spent-ledger-id))
+         (targets (loop for rec being the hash-values of (node-ledgers node)
+                        when (and (not (record-owned-p rec)) (not (record-fork-p rec))
+                                  (not (string= (record-id-hex rec) spent-id))
+                                  (equalp (lg:ledger-operator-key (record-ledger rec)) accused)
+                                  (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
+                                  (not (find-fork node (record-id-hex rec) (node-pubkey node))))
+                          collect rec)))
+    (when targets
+      (let* ((srec (find-record node spent-id))
+             (history (if (and srec (not (record-fork-p srec))) (record-history srec) (ledger-updates-from-relays node spent-id)))
+             (authorised (if srec (authorised-spend-txids srec) '())))
+        (multiple-value-bind (ok why)
+            (fr:verify-unauthorized-vault-spend proof history (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
+                                                :authorised-txids authorised)
+          (if (not ok)
+              (log! node "vault-spend proof against ~a rejected: ~a" (subseq (getf proof :accused) 0 8) why)
+              (dolist (rec targets)
+                (log! node "contagion: ~a signed an unauthorised spend of ~a's vault; disputing its ledger ~a"
+                      (subseq (getf proof :accused) 0 8) (subseq spent-id 0 8) (subseq (record-id-hex rec) 0 8))
+                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "unauthorized_vault_spend"))))))))
+
 (defun broadcast-fraud (node proof)
   (bus:bus-publish (node-bus node) (w:fraud-event (node-keypair node) (getf proof :ledger-id) (getf proof :accused) (fr:broadcast->json proof))))
 
@@ -2454,9 +2549,10 @@
   ;; redteam/attack-dereliction.sh drives it (docs/REDTEAM.md).
   (when (getf (node-adversary node) :ignore-fraud) (return-from handle-fraud nil))
   (let ((proof (fr:json->broadcast (w:parse-json (ev:event-content event)))))
-    (if (eq (getf proof :type) :non-conforming-cosignature)
-        (handle-cosigner-fraud node proof)
-        (handle-operator-fraud node proof))))
+    (case (getf proof :type)
+      (:non-conforming-cosignature (handle-cosigner-fraud node proof))
+      (:unauthorized-vault-spend (handle-vault-spend-fraud node proof))
+      (t (handle-operator-fraud node proof)))))
 
 (defun handle-operator-fraud (node proof)
   (let* ((proof proof)

@@ -10,26 +10,31 @@
 (defpackage #:cl-deposits.fraud
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation) (#:lg #:cl-deposits.ledger)
-                    (#:w #:cl-deposits.wire) (#:cf #:cl-deposits.conformance))
+                    (#:w #:cl-deposits.wire) (#:cf #:cl-deposits.conformance)
+                    (#:rs #:cl-deposits.reserves) (#:rot #:cl-deposits.rotation)
+                    (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire) (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
            #:proof->json #:json->proof #:requires-embedding-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
-           #:make-dispute-dereliction-proof #:verify-dispute-dereliction))
+           #:make-dispute-dereliction-proof #:verify-dispute-dereliction
+           #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers))
 (in-package #:cl-deposits.fraud)
 
 (defparameter +types+
   '((:uncredited-onchain-payment . 1) (:uncredited-lightning-payment . 2) (:stale-cosignature . 3)
     (:dispute-dereliction . 4) (:non-conforming-update . 5) (:quorum-expired . 6)
-    (:winner-collateral-deviation . 7) (:equivocation . 8) (:non-conforming-cosignature . 9)))
+    (:winner-collateral-deviation . 7) (:equivocation . 8) (:non-conforming-cosignature . 9)
+    (:unauthorized-vault-spend . 10)))
 
 (defparameter +type-names+
   '((:uncredited-onchain-payment . "UncreditedOnchainPayment") (:uncredited-lightning-payment . "UncreditedLightningPayment")
     (:stale-cosignature . "StaleCosignature") (:dispute-dereliction . "DisputeDereliction")
     (:non-conforming-update . "NonConformingUpdate") (:quorum-expired . "QuorumExpired")
     (:winner-collateral-deviation . "WinnerCollateralDeviation") (:equivocation . "Equivocation")
-    (:non-conforming-cosignature . "NonConformingCosignature")))
+    (:non-conforming-cosignature . "NonConformingCosignature")
+    (:unauthorized-vault-spend . "UnauthorizedVaultSpend")))
 
 (defun proof-discriminant (type) (or (cdr (assoc type +types+)) (error "unknown proof type ~s" type)))
 (defun respectful-p (proof) (eq (getf proof :type) :quorum-expired))
@@ -53,6 +58,8 @@
          (cat (s :offer-id) (int->le (getf ev :deadline-block) 4) (s :txid) (int->le (getf ev :vout) 4)
               (int->le (getf ev :amount-sats) 8) (b :confirmed-at-block-hash)))
         (:dispute-dereliction (cat (s :original-fraud-hash) (b :original-fraud-block-hash) (s :member-ledger-id) (s :member-pubkey)))
+        (:unauthorized-vault-spend
+         (cat (s :spent-ledger-id) (int->le (getf ev :governing-quorumbegin-seq) 8) (s :spend-tx-hex) (b :spend-block-hash)))
         (:winner-collateral-deviation (cat (s :winner-armed-update-hex) (s :claim-txid) (b :claim-block-hash)))))))
 
 (defun proof-hash (proof)
@@ -93,6 +100,20 @@
                         :fault-sequence (up:update-seq fault-update)
                         :governing-quorumbegin-seq governing-quorumbegin-seq
                         :fault-update-hex (bytes->hex (up:encode-update fault-update)))))
+
+;; DEP-06 "unauthorised vault spend" (the spec's type 7; see the discriminant note in
+;; docs/MISSING.md: 7 is WinnerCollateralDeviation in both implementations, so this is 10).
+(defun make-unauthorized-vault-spend-proof (signer33 target-ledger-id32 spent-ledger-id32 governing-qb-seq spend-tx prevouts block-hash32)
+  "SIGNER33 signed SPEND-TX, which spent SPENT-LEDGER's reserves outpoint (the one its
+   QuorumBegin at GOVERNING-QB-SEQ names) to outputs no QuorumBegin or confiscation
+   accounts for.  Presented against TARGET-LEDGER, a ledger SIGNER33 operates.  PREVOUTS
+   is the spend's (amount . spk) per input, which a script-path sighash commits to."
+  (list :type :unauthorized-vault-spend :accused (bytes->hex signer33) :ledger-id (bytes->hex target-ledger-id32)
+        :evidence (list :spent-ledger-id (bytes->hex spent-ledger-id32)
+                        :governing-quorumbegin-seq governing-qb-seq
+                        :spend-tx-hex (bytes->hex (btx:serialize-tx spend-tx))
+                        :spend-block-hash block-hash32
+                        :prevouts (mapcar (lambda (pv) (format nil "~a:~a" (car pv) (bytes->hex (cdr pv)))) (coerce prevouts 'list)))))
 
 (defun make-non-conforming-update-proof (accused33 ledger-id32 fault-update)
   (list :type :non-conforming-update :accused (bytes->hex accused33) :ledger-id (bytes->hex ledger-id32)
@@ -278,6 +299,78 @@
               (t (values t nil))))
     (error (c) (values nil (princ-to-string c)))))
 
+;;; Unauthorised vault spend.  Everything is checked from chain data and the spent
+;;; ledger's own history: the signatures are the evidence, so no embedding.
+
+(defun parse-prevouts (strings)
+  (coerce (loop for str in (coerce strings 'list)
+                collect (let ((c (position #\: str)))
+                          (cons (parse-integer str :end c) (hex->bytes (subseq str (1+ c))))))
+          'vector))
+
+(defun spent-vault (history governing-seq)
+  "(values reserves txid vout) for the QuorumBegin at GOVERNING-SEQ in HISTORY (the
+   spent ledger's chain, any order), or NIL."
+  (let ((operator nil) (qb nil))
+    (dolist (u (sort (copy-list history) #'< :key #'up:update-seq))
+      (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+        (when o
+          (case (op:operation-type o)
+            (:ledger-open (setf operator (op:field o :operator-id)))
+            (:quorum-begin (when (= (up:update-seq u) governing-seq) (setf qb o)))))))
+    (when (and qb operator)
+      (values (rs:build-reserves :operator operator :members (op:field qb :quorum-members)
+                                 :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
+                                 :ruleset (or (op:field qb :protocol-version) "cltv-offset-v2"))
+              (op:field qb :new-outpoint-txid) (op:field qb :new-outpoint-vout)))))
+
+(defun vault-spend-signers (tx prevouts reserves txid vout)
+  "Run the witness of the input of TX spending (TXID, VOUT) against RESERVES's tier
+   leaves.  (values signer-xonly-list input-index tier-index): the keys whose Schnorr
+   signature verifies over the script-path sighash, provided at least the tier's
+   threshold did; else NIL."
+  (let* ((idx (position-if (lambda (i) (and (equalp (btx:txin-prev-hash i) txid) (= (btx:txin-prev-index i) vout)))
+                           (btx:tx-inputs tx)))
+         (stack (and idx (nth idx (btx:tx-witnesses tx))))
+         (n (length stack)))
+    (when (and idx (>= n 3))
+      (let* ((leaf (nth (- n 2) stack))
+             (tier-index (position leaf (rs:reserves-leaves reserves) :test #'equalp)))
+        (when (and tier-index (< tier-index (length (rs:reserves-tiers reserves)))
+                   (equalp (nth (1- n) stack) (rs:control-block-for-tier reserves tier-index)))
+          (let* ((tier (nth tier-index (rs:reserves-tiers reserves)))
+                 (keys (if (and (= (rs:tier-threshold tier) 1) (rs:tier-tie-breaker-p tier))
+                           (list (up:x-only (rs:reserves-operator reserves)))
+                           (rs:tier-keys tier)))
+                 (sigs (reverse (subseq stack 0 (- n 2))))
+                 (msg (rot:tier-sighash tx idx prevouts leaf))
+                 (signers (loop for k in keys for sig in sigs
+                                when (and (= (length sig) 64) (schnorr:schnorr-verify k msg sig)) collect k)))
+            (when (>= (length signers) (rs:tier-threshold tier))
+              (values signers idx tier-index))))))))
+
+(defun verify-unauthorized-vault-spend (proof spent-history height-of-block &key authorised-txids)
+  "SPENT-HISTORY is the spent ledger's own chain.  Valid when the accused signed (to
+   threshold) a spend of the vault outpoint its QuorumBegin names, the spend is in a block
+   we confirm, and its txid is none of AUTHORISED-TXIDS (the txids of the ledger's recorded
+   rotations, whichever QuorumBegin created them, and any confiscation the verifier knows)."
+  (handler-case
+      (let* ((ev (getf proof :evidence))
+             (tx (btx:parse-tx (bw:make-reader (hex->bytes (getf ev :spend-tx-hex)))))
+             (txid (btx:tx-txid tx))
+             (prevouts (parse-prevouts (getf ev :prevouts))))
+        (multiple-value-bind (reserves vtxid vvout) (spent-vault spent-history (getf ev :governing-quorumbegin-seq))
+          (cond ((null reserves) (values nil "no such QuorumBegin on the spent ledger"))
+                ((/= (length prevouts) (length (btx:tx-inputs tx))) (values nil "prevouts do not match the inputs"))
+                ((null (funcall height-of-block (getf ev :spend-block-hash))) (values nil "spend block not in our chain"))
+                ((member txid authorised-txids :test #'equalp) (values nil "the spend is a recorded rotation or confiscation"))
+                (t (let ((signers (vault-spend-signers tx prevouts reserves vtxid vvout)))
+                     (cond ((null signers) (values nil "no tier witness on the vault input verifies"))
+                           ((not (member (up:x-only (hex->bytes (getf proof :accused))) signers :test #'equalp))
+                            (values nil "the accused is not among the verified signers"))
+                           (t (values t nil))))))))
+    (error (c) (values nil (princ-to-string c)))))
+
 (defun verify-proof (proof &key history height-of-block)
   (case (getf proof :type)
     (:equivocation (verify-equivocation proof history))
@@ -305,7 +398,7 @@
         (:stale-cosignature "StaleCosign") (:non-conforming-update "NonConformingUpdate")
         (t (cdr (assoc type +type-names+)))))
 
-(defparameter +hex-fields+ '(:anchor-block-hash :confirmed-at-block-hash :original-fraud-block-hash :claim-block-hash :deposit-id))
+(defparameter +hex-fields+ '(:spend-block-hash :anchor-block-hash :confirmed-at-block-hash :original-fraud-block-hash :claim-block-hash :deposit-id))
 
 (defun json->proof (j)
   (let* ((type (car (rassoc (w:jget j "proof_type") +type-names+ :test #'string=)))

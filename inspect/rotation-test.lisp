@@ -63,3 +63,30 @@
                     (rot:verify-spend (rot:attach-tier-witness tx 0 r 4 '()) 0 prevouts)))))))
 
 
+
+(with-gate ("rotation: vault-spend signers and the UnauthorizedVaultSpend proof")
+  (let* ((privs (test-keys 4))
+         (pubs (mapcar #'up:compressed-pubkey privs))
+         (keyring (loop for priv in privs for pub in pubs collect (cons (up:x-only pub) priv)))
+         (r (rs:build-reserves :operator (first pubs) :members (rest pubs) :ledger-hash (u:sha256 (hx "aa"))
+                               :quorum-expiry 5000 :network :signet))
+         (amount 39000000) (txid (u:sha256 (hx "f00d")))
+         (prevouts (vector (cons amount (rs:reserves-spk r)))))
+    (flet ((theft (signers)
+             (let* ((tx (rot:build-spend :prev-txid txid :prev-vout 0 :reserves-amount amount
+                                         :destination-spk (u:octets 0 20 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20) :fee-rate 1))
+                    (ring (remove-if-not (lambda (kv) (member (cdr kv) signers)) keyring)))
+               (rot:attach-tier-witness tx 0 r 0 (rot:sign-tier tx 0 prevouts r 0 ring)))))
+      (let* ((tx (theft (list (first privs) (second privs) (third privs))))
+             (signers (fr:vault-spend-signers tx prevouts r txid 0)))
+        (check-equal "3-of-4 theft: three verified signers" (length signers) 3)
+        (check "the signers are exactly those who signed"
+               (every (lambda (p) (member (up:x-only p) signers :test #'equalp)) (subseq pubs 0 3)))
+        (check "an input that does not spend the vault outpoint yields none"
+               (null (fr:vault-spend-signers tx prevouts r (u:sha256 (hx "beef")) 0)))
+        (let ((proof (fr:make-unauthorized-vault-spend-proof (first pubs) (u:sha256 (hx "01")) (u:sha256 (hx "02")) 7 tx prevouts (u:sha256 (hx "03")))))
+          (check-equal "discriminant is 10" (fr:proof-discriminant :unauthorized-vault-spend) 10)
+          (check "no embedding required" (not (fr:requires-embedding-p :unauthorized-vault-spend)))
+          (let ((back (fr:json->proof (fr:proof->json proof))))
+            (check "JSON round trip keeps the proof hash" (equalp (fr:proof-hash proof) (fr:proof-hash back)))
+            (check "prevouts survive the round trip" (equal (getf (getf back :evidence) :prevouts) (getf (getf proof :evidence) :prevouts)))))))))

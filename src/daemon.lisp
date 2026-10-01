@@ -19,7 +19,7 @@
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:jzon #:com.inuoe.jzon))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
-           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn))
+           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn))
 (in-package #:cl-deposits.daemon)
 
 (defun arg (form key &optional default) (getf (cdr form) key default))
@@ -74,6 +74,10 @@
         (:derelict-watch
          (ok :watch (loop for id being the hash-keys of (nd::node-derelict-watch node) collect (subseq id 0 16))
              :reported (loop for k being the hash-keys of (nd::node-reported-derelict node) collect k)))
+        (:vault-watch   ; run the unauthorised-vault-spend watch now, errors and all
+         (nd:drive-vault-watch node)
+         (ok :reported (loop for k being the hash-keys of (nd::node-reported-vault-spend node) collect (subseq k 0 16))
+             :scanned-to (nd::node-vault-scanned node)))
         (:threads   ; a backtrace of every thread, for a node that is busy and silent
          (ok :threads (mapcar (lambda (th)
                                 (let ((out (make-string-output-stream)) (done (sb-thread:make-semaphore)))
@@ -267,6 +271,31 @@
                                             :confirmations (1+ (- tip (gethash "height" u)))))
                               (gethash "unspents" j))))
           do (sleep 2))))
+
+(defun bitcoin-cli-spender-fn (cli)
+  "(from to outpoints) -> the spends, in blocks FROM..TO, of any of OUTPOINTS (a list of
+   (txid . vout), internal byte order).  Each spend is (:txid :vout :tx hex :prevouts
+   ((sats . spk)...) :block-hash 32 bytes :height n).  One getblock (verbosity 3: includes prevouts) per block however many
+   outpoints are watched."
+  (lambda (from to outpoints)
+    (let ((want (make-hash-table :test #'equal)) (found '()))
+      (dolist (o outpoints) (setf (gethash (format nil "~a:~a" (txid-hex (car o)) (cdr o)) want) o))
+      (loop for h from from to to
+            for hash = (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string h)))
+            for blk = (let ((out (run-cli cli "getblock" hash "3"))) (and (plusp (length out)) (char= (char out 0) #\{) (jzon:parse out)))
+            do (when blk
+                 (loop for tx across (gethash "tx" blk)
+                       do (loop for i across (gethash "vin" tx)
+                                for o = (and (gethash "txid" i) (gethash (format nil "~a:~a" (gethash "txid" i) (gethash "vout" i)) want))
+                                when o
+                                  do (push (list :txid (car o) :vout (cdr o) :tx (gethash "hex" tx) :height h :block-hash (txid-bytes hash)
+                                                 :prevouts (map 'list (lambda (vi)
+                                                                        (let ((pv (gethash "prevout" vi)))
+                                                                          (cons (round (* (gethash "value" pv) 100000000))
+                                                                                (hex->bytes (gethash "hex" (gethash "scriptPubKey" pv))))))
+                                                                (gethash "vin" tx)))
+                                           found)))))
+      (nreverse found))))
 
 (defun bitcoin-cli-height-of-block-fn (cli)
   "Block hash -> confirmed height, or NIL (fraud-proof anchors)."

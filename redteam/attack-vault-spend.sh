@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # redteam/attack-vault-spend.sh — unauthorised vault spend (DEP-06 type 7, docs/MISSING.md).
 #
+# Detection landed in cl (UnauthorizedVaultSpend, proof discriminant 10): every node that
+# replicates the ledger watches its vault outpoint, and a spend no QuorumBegin or confiscation
+# accounts for is proved against each signer and slashed on every ledger that signer operates.
+# PASS now means the honest minority DETECTED it.  (Before, it demonstrated the gap: no reaction.)
+#
 # A colluding majority of a ledger's quorum spends the vault's reserves outpoint
 # at Tier 0 to an address of theirs — no dispute, no rotation, no confiscation.
 # The colluders are the operator (cld1) and three of its cosigners (cld2 cld3
@@ -20,7 +25,7 @@ V_ROW="$S/redteam-${REDTEAM_V:-V}"
 if [ -f "$V_ROW" ]; then read -r V < "$V_ROW"; echo "== reusing V $V"; else
   echo "== forming V (cld1 operates; cld2 cld3 cld4 cld5 cld6 ref6 ref7 cosign)"
   V=$(sx "$(cld_ctl cld1 "(:open-ledger :reserves-id \"genesis:cld1:redteam-V:$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER"); [ -n "$V" ] || fail "open V"
-  for m in cld2 cld3 cld4 cld5 cld6 ref6 ref7; do
+  for m in cld2 cld3 cld4 cld5 cld6 ${REFS-ref6 ref7}; do   # REFS="" forms a cl-only quorum
     case $m in cld*) ml=$(eval echo "\${L${m#cld}}");; ref*) ml=$(eval echo "\${RL${m#ref}}");; esac
     expect "$(cld_ctl cld1 "(:add-member :ledger \"$V\" :member \"$(cat $S/pubkey.$m)\" :member-ledger \"$ml\")")"
   done
@@ -50,31 +55,36 @@ THEFT_TXID=$(sx "$out" ":TXID"); SIGS=$(sx "$out" ":SIGS")
 echo "== theft broadcast: $THEFT_TXID ($SIGS signatures) at $(date -u +%H:%M:%S)"
 
 # Confirm it landed on chain.
-mine 2
+mine 5
 sleep 5
 spent=$(bcli gettxout "$THEFT_TXID" 0 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])" 2>/dev/null)
 [ -n "$spent" ] && echo "== theft output live on chain: $spent BTC at $THEFT_TXID:0" || echo "== (theft output not found via gettxout — check $THEFT_TXID)"
 
-# What do the honest nodes do?  Nothing, if the gap is real.
-echo "== watching the honest minority (cld6 ref6 ref7) for ${WAIT}s"
-reactions=0
+# What do the honest nodes do?  The watch runs once a minute; the spend needs 3 blocks of grace.
+echo "== watching the honest minority (cld6) for ${WAIT}s"
+detected=0
 for i in $(seq 1 $WAIT); do
-  for n in cld6; do
-    r=$(cld_ctl $n '(:log)' 2>/dev/null | grep -ciE "$THEFT_TXID|vault theft|unauthorised" || true)
-    reactions=$((reactions + r))
-  done
-  [ "$reactions" -gt 0 ] && break
+  detected=$(cld_ctl cld6 '(:log)' 2>/dev/null | grep -c "VAULT SPEND" || true)
+  [ "$detected" -gt 0 ] && break
   sleep 1
 done
-disputes=$(for n in cld6; do cld_ctl $n "(:forks :ledger \"$V\")" 2>/dev/null; done | grep -c ":SEQ" || true)
-echo "== honest reactions mentioning the theft: $reactions; disputes on V: $disputes"
+echo "== cld6 VAULT SPEND log lines: $detected"
+sleep 30
+for n in cld6; do
+  echo "--- $n"; cld_ctl $n '(:log)' 2>/dev/null | grep -E "VAULT SPEND|vault spend|unauthori" | tail -12
+done
+# Contagion: the signers' other ledgers (L1 L2 L3 L4 L5) should be disputed by cld6's quorums.
+disputed=0
+for l in "$L1" "$L2" "$L3" "$L4" "$L5"; do
+  d=$(cld_ctl cld6 "(:forks :ledger \"$l\")" 2>/dev/null | grep -c ":SEQ" || true)
+  [ "$d" -gt 0 ] && disputed=$((disputed + 1))
+done
+echo "== signer ledgers disputed by cld6: $disputed"
 
-# Cleanup: disarm the colluders.
 for n in cld2 cld3 cld4 cld5; do cld_ctl $n "(:adversary :set :theft-sign nil)" >/dev/null; done
 
-if [ "$reactions" -eq 0 ] && [ "$disputes" -eq 0 ]; then
-  echo "PASS (gap confirmed): the vault was spent at Tier 0 by a colluding majority and no honest node noticed within ${WAIT}s."
-  echo "     The theft: $THEFT_TXID.  This is docs/MISSING.md's first concern, now demonstrated live."
+if [ "$detected" -gt 0 ]; then
+  echo "PASS: the honest minority detected the unauthorised vault spend $THEFT_TXID and proved it ($disputed signer ledgers disputed)."
 else
-  echo "NOTE: honest nodes reacted ($reactions log lines, $disputes disputes) — the gap may be narrower than MISSING.md records."
+  fail "no honest node detected the vault spend $THEFT_TXID within ${WAIT}s"
 fi

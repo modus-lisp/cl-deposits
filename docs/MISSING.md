@@ -6,11 +6,17 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
 
 ## Fraud proofs and punishment
 
-- **Unauthorised vault spend (DEP-06 type 7).** Specified, but no implementation has it: no watch
-  on a ledger's vault outpoint, no proof type, no verifier, no contagion on the witness signers.
-  So a spend of a vault outside a recorded rotation or a dispute-backed confiscation goes
-  unnoticed by both implementations. The theft the contagion simulation models (a colluding
-  majority spending an honest vault at Tier 0) is not caught by either.
+- **Unauthorised vault spend (DEP-06 type 7).** cl: **done (2026-10-02).** `UnauthorizedVaultSpend`
+  (proof discriminant 10), a node-wide block scan for spends of every vault outpoint it replicates
+  (judged 3 blocks deep, so a rotation's QuorumBegin can arrive first), a verifier that rebuilds the
+  tier leaf and sighash and checks each witness signature, and contagion on every signer's operated
+  ledgers. Proven live (`redteam/attack-vault-spend.sh`). Reference: not yet ported; it ignores the
+  proof. **Numbering:** the spec lists vault spend as type 7 and winner collateral as 6, but both
+  implementations number winner collateral 7 (and 5 non-conforming update, 6 quorum expired), so cl
+  uses discriminant 10 and the spec/implementation conflict is still open. **Limits:** the verifier
+  trusts the verifier's own chain for block existence only (not tx inclusion), a confiscation is
+  recognised only by the verifier's own record of it, and a recovery-tier spend (tiers 1-3) is
+  treated like any other unrecorded spend.
 - **Consolidated `NonConforming` proof (DEP-19 §5).** Neither implementation has it as specified.
   Cross-ledger contagion runs through `NonConformingCosignature` evidence instead, which now
   accepts the fault's operator as the accused.
