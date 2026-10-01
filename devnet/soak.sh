@@ -8,13 +8,15 @@
 #   devnet/soak.sh setup            # form the ledgers, open + credit deposits from BOTH wallets (idempotent, resumable)
 #   devnet/soak.sh start            # mining clock, ref swarms, cl bot workers, monitor, chaos
 #   devnet/soak.sh status           # latest monitor snapshot + bot counters
+#   devnet/soak.sh topup            # one pass: re-credit every deposit below SOAK_TOPUP_FLOOR_MSAT (start runs it as a loop)
 #   devnet/soak.sh stop             # stop the soak processes (nodes stay up)
 #   devnet/soak.sh reset            # stop + forget setup (next setup forms fresh ledgers)
 #
 # Knobs: SOAK_REF_DEPOSITS (bots per ledger, 12), SOAK_CL_WALLETS (each on every ledger, 12),
 #        SOAK_CL_WORKERS (4), SOAK_CREDIT_MSAT (20000000), SOAK_BLOCK_EVERY (60 s),
 #        SOAK_BOT_INTERVAL_MS (10000), SOAK_CL_INTERVAL (20 s), SOAK_MONITOR_EVERY (300 s),
-#        SOAK_RESTART_EVERY (10800 s; 0 = no chaos), SOAK_CHAOS_NODES.
+#        SOAK_RESTART_EVERY (10800 s; 0 = no chaos), SOAK_CHAOS_NODES,
+#        SOAK_TOPUP_EVERY (900 s; 0 = off), SOAK_TOPUP_FLOOR_MSAT (2000000).
 # State: $CLD_ROOT/soak/{env,ledgers.tsv,deposits.tsv,refwallet-*,log/,pids/,status.*}
 source "$(dirname "$0")/_common.sh"
 SOAK="$CLD_ROOT/soak"; mkdir -p "$SOAK/pids" "$SOAK/log"
@@ -127,6 +129,27 @@ setup() {
   done <"$SOAK/ledgers.tsv"
   mine 1; echo "   $n new, $(wc -l <"$SOAK/deposits.tsv") deposits total on $(wc -l <"$SOAK/ledgers.tsv") ledgers"
 }
+balance_of() {   # balance_of LEDGER_ID DEPOSIT — from the first cl replica that holds the ledger
+  local n r; for n in $(cld_names); do
+    r=$(cld_ctl "$n" "(:balance :ledger \"$1\" :deposit \"$2\")" 2>/dev/null)
+    [[ "$r" == *":STATUS :OK"* ]] && { sx "$r" ":BALANCE"; return 0; }
+  done; return 1
+}
+topup() {   # fees drain the bots' deposits and nothing refills them: the operator re-credits any below the floor
+  local floor=${SOAK_TOPUP_FLOOR_MSAT:-2000000} kind who name id dep bal out n=0; declare -A dead
+  while IFS=$'\t' read -r kind who name id dep; do
+    [ -n "${dead[$name]:-}" ] && continue
+    bal=$(balance_of "$id" "$dep") || continue
+    [ "$bal" -lt "$floor" ] 2>/dev/null || continue
+    if out=$( (credit "$name" "$dep" $(( SOAK_CREDIT_MSAT - bal ))) 2>&1 ); then
+      n=$((n+1)); echo "$(date +%FT%T) topped up $kind $who $name ${dep:0:8}: $bal -> $SOAK_CREDIT_MSAT msat"
+    else
+      dead[$name]=1; echo "$(date +%FT%T) top-up on $name refused; skipping it this pass: $(echo "$out" | tail -1 | cut -c1-160)"
+    fi
+  done <"$SOAK/deposits.tsv"
+  echo "$(date +%FT%T) top-up pass: $n deposits re-credited"
+}
+topup_loop() { while true; do topup; sleep "$SOAK_TOPUP_EVERY"; done; }
 start() {
   [ -s "$SOAK/ledgers.tsv" ] && [ -s "$SOAK/deposits.tsv" ] || fail "run setup first"
   echo "== starting soak processes (logs in $SOAK/log)"
@@ -136,6 +159,7 @@ start() {
         --bitcoin-cli "$BCLI" --interval-ms "$SOAK_BOT_INTERVAL_MS" --floor-sats 500 --reserve-sats 100
   done <"$SOAK/ledgers.tsv"
   for i in $(seq 1 "$SOAK_CL_WORKERS"); do alive "clbot-$i" || spawn "clbot-$i" env SOAK_WORKER="$i" "$CLD_SRC/devnet/soak-clbot.sh"; done
+  if [ "${SOAK_TOPUP_EVERY:=900}" -gt 0 ]; then alive topup || spawn topup "$0" topup-loop; fi
   alive monitor || spawn monitor "$CLD_SRC/devnet/soak-monitor.sh"
   alive rotate || spawn rotate "$CLD_SRC/devnet/soak-rotate.sh"
   if [ "$SOAK_RESTART_EVERY" -gt 0 ]; then alive chaos || spawn chaos "$CLD_SRC/devnet/soak-chaos.sh"; fi
@@ -147,6 +171,7 @@ status() {
 }
 case "${1:-}" in
   setup) setup;; start) start;; stop) stop;; status) status;;
+  topup) topup;; topup-loop) SOAK_TOPUP_EVERY=${SOAK_TOPUP_EVERY:-900}; topup_loop;;
   reset) stop; rm -f "$ENV" "$SOAK/ledgers.tsv" "$SOAK/deposits.tsv" "$SOAK/.collateral-funded" "$SOAK/.cl-collateral-funded"; echo "reset (ledgers on the nodes are untouched)";;
   *) sed -n '2,19p' "$0"; exit 2;;
 esac
