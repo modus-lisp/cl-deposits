@@ -46,6 +46,23 @@ unwired. Side observation: a victim's LOCKED balance climbs run to run as never-
 transfers accumulate locks; these self-heal at each lock's timeout_height
 (fail-expired-transfers, ~144 blocks here), so it is latency, not a stuck-funds bug.
 
+### 2026-10-02 — dereliction (DEP-19 §6) end to end, live
+
+`redteam/attack-dereliction.sh` and a manual drive on the devnet.  cld1 forged a witness-less
+lock on a fresh ledger DL with a colluding majority (cld3 cld4 cld5 cosign blind); cld6, a member,
+was set :ignore-fraud — it refused the update but took no dispute action.  The honest member cld2
+self-detected, disputed DL, and armed a dereliction watch.  Once cld6 kept operating its own ledger
+K past dispute_response_blocks (5), cld2 and cld3 produced DisputeDereliction proofs:
+"02d2d197 kept operating ee96a0e4 5 blocks past the fraud without disputing 7667ca05".  cld6's K
+went to :ARMED for confiscation; cld2's and cld3's own ledgers stayed clean (acting members are not
+punished).  So a member that stays online and ignores a fraud proof is itself slashed — the duty the
+trust-model cascade (§2e/§2g) assumes is now real on the wire, both implementations.
+
+Two wiring bugs the live run surfaced and fixed: the dereliction watch was armed only on the
+received-proof path, not on self-detection (report-non-conforming); and :ignore-fraud gated only
+received proofs, so a derelict member still self-disputed.  A deterministic node-test gate now drives
+the whole self-detect -> watch -> drive-dereliction -> dedup chain.
+
 ## Capital efficiency vs security: the axis every attack is measured on
 
 The protocol's security is bought with idle capital: the collateral fraction
