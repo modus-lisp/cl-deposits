@@ -11,17 +11,16 @@
 #            only recourse is the timeout.  We record how long the request
 #            stays unanswered and whether any dispute follows.
 source "$(dirname "$0")/../devnet/_common.sh"
-S="$CLD_ROOT/soak"; source "$S/env"; ARM=${1:-censor}; WAIT=${WAIT:-90}
-fail() { echo "FAIL: $*" >&2; exit 1; }
-A=$(awk -F'\t' '$1=="A"{print $2}' "$S/ledgers.tsv"); AS=${A:0:8}
-FROM=$(grep -P "^cl\t\S+\tA\t" "$S/deposits.tsv" | head -1 | cut -f5); TO=$(grep -P "^cl\t\S+\tA\t" "$S/deposits.tsv" | sed -n 2p | cut -f5)
+S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"; ARM=${1:-censor}; WAIT=${WAIT:-90}
+ROW=${REDTEAM_CH:-CH}   # a fresh ledger A: cld1 operates, cld2 cld3 cld6 cosign
+A=$(form_ledger "$ROW" cld1 "" cld2 cld3 cld6) || exit 1; AS=${A:0:8}
+mapfile -t DEPS < <(fresh_deposits "$ROW" cld1 "$A" 2); FROM=${DEPS[0]}; TO=${DEPS[1]}
 [ -n "$FROM" ] && [ -n "$TO" ] || fail "no cl deposits on A"
 W="$CLD_SRC/devnet/cld-wallet.sh"
 bal() { $W w1 "$A" balance "$1" 2>/dev/null | grep -oE ':BALANCE [0-9]+ :LOCKED [0-9]+'; }
 echo "== target A ($AS…, cld1 operates); victim $FROM: $(bal $FROM)"
 
 if [ "$ARM" = censor ]; then
-  expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "$1";; esac; }
   expect "$(cld_ctl cld1 "(:adversary :set :ignore-requests t)")"
   echo "== cld1 now drops every wallet request"
 fi

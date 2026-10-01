@@ -31,18 +31,20 @@
 
 (defparameter *scenarios*
   (list
-   (make-sc :name "invalid-credit-honest" :script "attack1-invalid-credit.sh" :args '("honest") :timeout 300)
-   (make-sc :name "forge-lock-honest" :script "attack-forge-lock.sh" :args '("honest") :timeout 300)
+   (make-sc :name "invalid-credit-honest" :script "attack1-invalid-credit.sh" :args '("honest") :ledger-var "REDTEAM_IC" :timeout 600)
+   (make-sc :name "forge-lock-honest" :script "attack-forge-lock.sh" :args '("honest") :ledger-var "REDTEAM_FL" :timeout 600)
    (make-sc :name "relabel" :script "attack-relabel.sh" :timeout 300)
    (make-sc :name "fuzz-proofs" :script "attack-fuzz-proofs.sh" :timeout 900)
-   (make-sc :name "censor-hold-honest" :script "attack-censor-hold.sh" :args '("honest") :timeout 300)
-   (make-sc :name "censor-hold" :script "attack-censor-hold.sh" :args '("censor") :timeout 600
+   (make-sc :name "censor-hold-honest" :script "attack-censor-hold.sh" :args '("honest") :ledger-var "REDTEAM_CH" :timeout 600)
+   (make-sc :name "censor-hold" :script "attack-censor-hold.sh" :args '("censor") :ledger-var "REDTEAM_CH" :timeout 600
             :note "finding: the escalation lands and nothing acts on it")
    (make-sc :name "vault-rotate-grace" :script "attack-vault-rotate-grace.sh" :args '("inside")
             :ledger-var "REDTEAM_RG" :timeout 900)
    (make-sc :name "invalid-credit-collude" :script "attack1-invalid-credit.sh" :args '("collude")
+            :ledger-var "REDTEAM_IC"
             :timeout 600 :tags '(:contagion))
    (make-sc :name "forge-lock-collude" :script "attack-forge-lock.sh" :args '("collude")
+            :ledger-var "REDTEAM_FL"
             :timeout 600 :tags '(:contagion))
    (make-sc :name "collude-q7" :script "attack-collude-q7.sh" :ledger-var "REDTEAM_M"
             :env '("WAIT=300") :timeout 1200 :tags '(:contagion))

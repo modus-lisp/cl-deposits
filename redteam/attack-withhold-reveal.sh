@@ -9,28 +9,13 @@
 # sweep (CSV-144) fires.  REDTEAM_W=name forms a fresh test ledger per run.
 source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-300}
-fail() { echo "FAIL: $*" >&2; exit 1; }
-expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "$1";; esac; }
-
-W_ROW="$S/redteam-${REDTEAM_W:-W}"
-if [ -f "$W_ROW" ]; then read -r W < "$W_ROW"; echo "== reusing W $W"; else
-  echo "== forming W (cld1 operates; cld2 cld3 cld4 cld5 cld6 ref6 ref7 cosign)"
-  W=$(sx "$(cld_ctl cld1 "(:open-ledger :reserves-id \"genesis:cld1:redteam-W:$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER"); [ -n "$W" ] || fail "open W"
-  for m in cld2 cld3 cld4 cld5 cld6 ref6 ref7; do
-    case $m in cld*) ml=$(eval echo "\${L${m#cld}}");; ref*) ml=$(eval echo "\${RL${m#ref}}");; esac
-    expect "$(cld_ctl cld1 "(:add-member :ledger \"$W\" :member \"$(cat $S/pubkey.$m)\" :member-ledger \"$ml\")")"
-  done
-  prep=$(cld_ctl cld1 "(:prepare-quorum :ledger \"$W\" :expiry-blocks 4320)"); expect "$prep"; addr=$(sx "$prep" ":ADDRESS")
-  txid=$(wcli sendtoaddress "$addr" 0.5); mine 3
-  vout=$(bcli getrawtransaction "$txid" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$addr'][0])")
-  sleep 20
-  expect "$(cld_ctl cld1 "(:begin-quorum :ledger \"$W\" :txid \"$txid\" :vout $vout :sats 50000000 :collateral-sats 0)")"
-  echo "$W" > "$W_ROW"
-fi
+source "$(dirname "$0")/_lib.sh"
+ROW=${REDTEAM_W:-W}   # a fresh ledger W: cld1 operates; cld2..cld6 ref6 ref7 cosign
+W=$(form_ledger "$ROW" cld1 "" cld2 cld3 cld4 cld5 cld6 ref6 ref7) || exit 1; echo "== W $W"
+mapfile -t DEPS < <(fresh_deposits "$ROW" cld1 "$W" 1); FROM=${DEPS[0]}; [ -n "$FROM" ] || fail "no deposit on W"
 
 # The fraud: cld1 locks a depositor's funds with no witness, cld2..cld4 cosign blind.
 for n in cld2 cld3 cld4; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
-FROM=$(grep -P "^cl\t\S+\tA\t" "$S/deposits.tsv" | head -1 | cut -f5)
 cld_ctl cld1 "(:forge-lock :ledger \"$W\" :from \"$FROM\" :to \"$FROM\" :msat 1000000)" >/dev/null
 sleep 10
 for n in cld2 cld3 cld4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null; done
