@@ -158,6 +158,10 @@ Implemented cosigner contagion (DEP-19 §5): cl d4614e7 (produce and act) and de
 
 ### 2d. Operator contagion quantified: more ledgers, more deterrent (simulation)
 
+*Caveat (2026-10-01): the attacker here is myopic (it never pays a key's up-front exposure). A
+best-of(greedy, all-in) attacker gives ~0.22 / 0.29 / 0.30 at Q=7, R=0.5, L=1 / 3 / 5. Read the table
+as an upper bound; §2e compares design changes under the same attacker.*
+
 `analysis/coverage_sim.py` extends §2a to L ledgers per operator. An on-chain theft (DEP-06 type 7)
 names every signer, so each exposed key loses collateral on **every** ledger it operates with an
 honest majority — one accusation, every vault it runs at risk (the §2c live run). Largest safe
@@ -183,6 +187,41 @@ coalition fraction p (unprofitable in ≥95% of trials, N=60):
 - **Caveat (unchanged):** this assumes random quorums and that a key's vaults are real and
   independent. A coalition that seats its keys on each other's quorums, or fronts thin vaults behind
   many ledgers, is the §10 residual the heuristics must still price. Full output: analysis/coverage_sim.out.
+
+### 2e. Seating guidance, followed by wallets' deposits (simulation)
+
+`analysis/seating_sim.py`, same attacker and dials as §2d. Honest operators seat Q = 7 as **trust
+anchors** (roots: whoever signs the wallet and the few they vouch for, 10% of operators, honest by
+assumption) + **commit-reveal lot** from a shared pool + **vanity** (free choice). Wallets deposit only
+on compliant ledgers (anchors present, lot seats match the draw), in proportion to score^2. Largest
+safe coalition fraction p:
+
+| seating | L=1, R=.5 | L=1, R=.7 | L=3, R=.5 | L=3, R=.7 |
+|---|---|---|---|---|
+| random (§2d) | 0.32 | 0.18 | 0.48 | 0.42 |
+| 2 anchors / 3 lot / 2 vanity | 0.26 | 0.14 | 0.48 | 0.38 |
+| 2/3/2, pool stuffed 2× | 0.16 | 0.10 | 0.26 | 0.20 |
+| **2 anchors / 4 lot / 1 vanity** | **0.38** | **0.22** | **0.60** | **0.48** |
+| 2/4/1, pool stuffed 2× | 0.20 | 0.10 | 0.30 | 0.24 |
+| 2/4/1, coalition wins half the vanity seats | 0.40 | 0.20 | 0.58 | 0.48 |
+
+**Two rules the guidance needs (both checkable by a wallet):**
+- **Eligibility = punishability.** Only keys whose own ledgers comply may fill lot or vanity seats on
+  others' ledgers. Without it, a coalition stacks its own quorums, is then unslashable (its own
+  quorums won't confiscate it), and loots honest vaults for free: 0.06 everywhere.
+- **Non-compliant ledgers get no deposits.** Even a sliver lets a self-stacked coalition steal from
+  its own unslashable ledgers.
+
+**Readings:**
+- **2/4/1 beats random everywhere**, most with scale (0.60 against 0.48 at L=3), and barely notices a
+  coalition winning vanity seats on honest ledgers.
+- **2/3/2 is slightly worse than random**: the danger of vanity is on the coalition's *own* ledgers.
+  Two self-chosen seats plus a couple of lucky lot draws make its own quorum coalition-majority, so
+  its keys escape contagion. One vanity seat makes that self-capture rare.
+- **Pool stuffing is the residual** (2× roughly halves the safe fraction). The pool must be **shared,
+  not operator-curated** (a coalition that defines its own pool draws only itself), and pool
+  eligibility must be **costly** (stake, coverage, track record) so stuffing costs what being p does.
+- Same myopic attacker as §2d, so these are upper bounds; a smarter adversary is the next step.
 
 ## 3. Trust heuristics for a wallet choosing a ledger
 

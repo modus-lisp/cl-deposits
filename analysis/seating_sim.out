@@ -1,0 +1,10 @@
+max safe coalition fraction p (unprofitable in >= 95% of 80 trials), N=60, Q=7, roots 10%
+eligibility = punishability: deviating keys get no lot or vanity seats on others' ledgers
+world                  pool  van   L=1,R=.5  L=1,R=.7  L=3,R=.5  L=3,R=.7
+random                    1    p       0.32      0.18      0.48      0.42
+2 anchor/3 lot/2 van      1    p       0.26      0.14      0.48      0.38
+2 anchor/3 lot/2 van      2    p       0.16      0.10      0.26      0.20
+2 anchor/3 lot/2 van      1  0.5       0.28      0.12      0.48      0.38
+2 anchor/4 lot/1 van      1    p       0.38      0.22      0.60      0.48
+2 anchor/4 lot/1 van      2    p       0.20      0.10      0.30      0.24
+2 anchor/4 lot/1 van      1  0.5       0.40      0.20      0.58      0.48
