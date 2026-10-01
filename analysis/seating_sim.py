@@ -132,8 +132,47 @@ def allin(n, l, r, bad, quorum, weight):
                     if m in bad and m not in seen: seen.add(m); todo.append(m)
     return gain - cost
 
+def smart_attack(n, l, r, bad, quorum, weight):
+    """Choose the theft set that maximises net after the DEP-19 §6 cascade.  Start all-in,
+    then repeatedly drop the theft whose removal most improves net (its loot is worth less
+    than the cascade it alone drags in), to a fixpoint.  A set-cover-style lower bound on the
+    optimal attack: tighter than all-in whenever a few vaults pull in a large cascade."""
+    c = 1.0 - r
+    hm = {led: sum(1 for m in mem if m not in bad) >= NEED for led, mem in quorum.items()}
+    caps = []                                  # capturable vaults: (loot, frozenset signers)
+    for (o, j), mem in quorum.items():
+        members = sorted(m for m in mem if m in bad)
+        if len(members) >= NEED:
+            caps.append(((r if o in bad else 1.0) * weight[(o, j)], frozenset(members[:NEED])))
+
+    def net(chosen):
+        if not chosen: return 0.0
+        signers = set().union(*(s for _, s in chosen))
+        seen = set(signers); todo = list(signers); cost = 0.0
+        while todo:
+            k = todo.pop()
+            for j in range(l):
+                if hm[(k, j)]: cost += c * weight[(k, j)]
+                else:
+                    for m in quorum[(k, j)]:
+                        if m in bad and m not in seen: seen.add(m); todo.append(m)
+        return sum(loot for loot, _ in chosen) - cost
+
+    chosen = list(caps); cur = net(chosen)
+    improved = True
+    while improved and chosen:
+        improved = False; bestdrop = None; bestnet = cur
+        for i in range(len(chosen)):
+            v = net(chosen[:i] + chosen[i+1:])
+            if v > bestnet: bestnet = v; bestdrop = i
+        if bestdrop is not None:
+            chosen.pop(bestdrop); cur = bestnet; improved = True
+    return cur
+
 def best_attack(n, l, r, bad, quorum, weight):
-    return max(attack(n, l, r, bad, quorum, weight), allin(n, l, r, bad, quorum, weight))
+    return max(attack(n, l, r, bad, quorum, weight),
+               allin(n, l, r, bad, quorum, weight),
+               smart_attack(n, l, r, bad, quorum, weight))
 
 def profitable(n, l, p, r, roots, world, pool, vanity, rng, layout=(2, 3, 2)):
     if world == "random":
@@ -160,7 +199,7 @@ if __name__ == "__main__":
     print(f"max safe coalition fraction p (unprofitable in >= 95% of {trials} trials), N={n}, Q=7, roots 10%")
     print("eligibility = punishability: deviating keys get no lot or vanity seats on others' ledgers")
     print("contagion with dereliction (DEP-19 §6): a captured quorum that does not act exposes its own members")
-    print("attacker: best of myopic greedy and coordinated all-in (an upper bound on safety)")
+    print("attacker: best of myopic greedy, coordinated all-in, and theft-set optimisation (upper bound)")
     print(f"{'world':22s} {'pool':>4s} {'van':>4s}   L=1,R=.5  L=1,R=.7  L=3,R=.5  L=3,R=.7")
     rows = [("random", None, 1, -1),
             ("2 anchor/3 lot/2 van", (2, 3, 2), 1, -1), ("2 anchor/3 lot/2 van", (2, 3, 2), 2, -1),

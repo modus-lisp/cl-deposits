@@ -1,7 +1,7 @@
 max safe coalition fraction p (unprofitable in >= 95% of 80 trials), N=60, Q=7, roots 10%
 eligibility = punishability: deviating keys get no lot or vanity seats on others' ledgers
 contagion with dereliction (DEP-19 §6): a captured quorum that does not act exposes its own members
-attacker: best of myopic greedy and coordinated all-in (an upper bound on safety)
+attacker: best of myopic greedy, coordinated all-in, and theft-set optimisation (upper bound)
 world                  pool  van   L=1,R=.5  L=1,R=.7  L=3,R=.5  L=3,R=.7
 random                    1    p       0.24      0.15      0.30      0.24
 2 anchor/3 lot/2 van      1    p       0.27      0.09      0.33      0.21

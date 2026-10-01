@@ -196,9 +196,10 @@ lot** from a shared pool + **vanity** (free choice). Wallets deposit only on com
 present, lot seats match the draw), in proportion to score^2. Contagion includes **dereliction**
 (DEP-19 §6): when an exposed key's own quorum is coalition-captured and doesn't confiscate, that
 quorum's members are derelict and exposed in turn, recursively, until honest majorities act. The
-attacker is the best of a myopic greedy and a **coordinated all-in** (every capturable vault, the
-cascade paid once). That's still a lower bound on the optimal attack, so these are upper bounds on
-safety. Largest safe coalition fraction p:
+attacker is the best of a myopic greedy, a **coordinated all-in** (every capturable vault, the
+cascade paid once), and a **theft-set optimizer** (start all-in, drop any theft whose loot is worth
+less than the cascade it alone drags in, to a fixpoint). Still a lower bound on the optimal attack, so
+these are upper bounds on safety. Largest safe coalition fraction p:
 
 | seating | L=1, R=.5 | L=1, R=.7 | L=3, R=.5 | L=3, R=.7 |
 |---|---|---|---|---|
@@ -230,6 +231,10 @@ safety. Largest safe coalition fraction p:
   is reached. Against a coordinated attack, most of the coalition is exposed anyway, so the cascade
   adds little cost; what it removes is a careful attacker signing only with keys whose own quorums
   are captured. **It is not implemented** (docs/MISSING.md): today that escape is open.
+- **Choosing thefts doesn't help the attacker.** The theft-set optimizer never beat all-in: in a dense
+  coalition the signers are shared, so dropping a theft doesn't shrink the cascade. So 2/4/1's 0.45
+  (L=3, R=0.5) holds against the smartest attacker built so far, with every dishonest operator in one
+  coalition.
 - **§2a and §2d predate both corrections** (no dereliction, myopic attacker); read them as upper bounds
   on their own settings.
 
