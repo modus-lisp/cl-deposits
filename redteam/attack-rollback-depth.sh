@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # redteam/attack-rollback-depth.sh — every honest replica offline at the fraud.
 #
-# On a fresh ledger R, the honest replicas (cld5 cld6 ref6 ref7) are stopped
-# BEFORE the fraud: the operator (cld1) and its colluders (cld2 cld3 cld4)
+# On a fresh ledger R, the honest replicas (cld6 ref6 ref7) are stopped
+# BEFORE the fraud: the operator (cld1) and its colluders (cld2 cld3 cld4 cld5)
 # commit a forged lock.  The fraud stands for $HOLD s with no honest witness.
 # Then the replicas come back, catch up, and dispute.  We measure:
 #   - how long the fraud stood (detection latency = HOLD + catch-up + dispute),
@@ -34,14 +34,20 @@ if [ -f "$R_ROW" ]; then read -r R < "$R_ROW"; echo "== reusing R $R"; else
   echo "$R" > "$R_ROW"
 fi
 
+# A credited deposit on R, so the forged lock is a real over-balance/no-witness fault
+# (not deposit-not-found, which the operator's own apply would reject before signing).
+W="$CLD_SRC/devnet/cld-wallet.sh"
+DEP=$(sx "$($W rbw "$R" open)" ":DEPOSIT"); [ -n "$DEP" ] || fail "open deposit on R"
+expect "$(cld_ctl cld1 "(:credit :ledger \"$R\" :deposit \"$DEP\" :msat 5000000 :txid \"$txid\" :vout ${vout:-0})")" 2>/dev/null ||   cld_ctl cld1 "(:credit :ledger \"$R\" :deposit \"$DEP\" :msat 5000000 :txid \"$(printf '%064d' 1)\" :vout 0)" >/dev/null
+FROM="$DEP"
+
 # Stop the honest replicas.  Their data dirs persist; they catch up on restart.
-echo "== stopping the honest replicas (cld5 cld6 ref6 ref7)"
-stop_cld cld5; stop_cld cld6; stop_ref ref6; stop_ref ref7
+echo "== stopping the honest replicas (cld6 ref6 ref7)"
+stop_cld cld6; stop_ref ref6; stop_ref ref7
 sleep 3
 
 # The fraud: forged lock, blind cosigners.
-for n in cld2 cld3 cld4; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
-FROM=$(grep -P "^cl\t\S+\tA\t" "$S/deposits.tsv" | head -1 | cut -f5)
+for n in cld2 cld3 cld4 cld5; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
 echo "== fraud: forged lock on R with the honest replicas down"
 cld_ctl cld1 "(:forge-lock :ledger \"$R\" :from \"$FROM\" :to \"$FROM\" :msat 1000000)" >/dev/null
 sleep 5
@@ -49,21 +55,21 @@ sleep 5
 for i in 1 2 3; do
   cld_ctl cld1 "(:forge-lock :ledger \"$R\" :from \"$FROM\" :to \"$FROM\" :msat 1000000)" >/dev/null; sleep 3
 done
-for n in cld2 cld3 cld4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null; done
+for n in cld2 cld3 cld4 cld5; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null; done
 tip=$(sx "$(cld_ctl cld1 "(:tip :ledger \"$R\")")" ":SEQ")
 echo "== fraudulent tip at seq $tip; holding the blind window for ${HOLD}s"
 sleep $HOLD
 
 # Bring the honest replicas back.
 echo "== restarting the honest replicas"
-start_cld cld5; start_cld cld6; start_ref ref6; start_ref ref7
+start_cld cld6; start_ref ref6; start_ref ref7
 sleep 30
 
 echo "== watching for the honest dispute on R (up to ${WAIT}s)"
 T0=$(date -u +%s)
 disputed=0
-for i in $(seq 1 $WAIT); do
-  d=$(for n in cld5 cld6; do cld_ctl $n "(:forks :ledger \"$R\")" 2>/dev/null; done | grep -c ":SEQ" || true)
+for i in $(seq 1 $((WAIT/5))); do
+  d=$(for n in cld6; do cld_ctl $n "(:forks :ledger \"$R\")" 2>/dev/null; done | grep -oE ":STATE :(DISPUTED|ARMED)" | wc -l)
   [ "$d" -gt 0 ] && { disputed=$d; break; }
   sleep 5
 done
@@ -72,7 +78,7 @@ if [ "$disputed" -eq 0 ]; then
   exit 1
 fi
 DT=$(( $(date -u +%s) - T0 ))
-fork=$(cld_ctl cld5 "(:forks :ledger \"$R\")" 2>/dev/null)
+fork=$(cld_ctl cld6 "(:forks :ledger \"$R\")" 2>/dev/null)
 last_valid=$(echo "$fork" | grep -oE ':LAST-VALID [0-9]+' | grep -oE '[0-9]+')
 echo "== dispute after ${DT}s; fork last-valid seq $last_valid (fraudulent tip was $tip)"
 depth=$(( tip - last_valid ))

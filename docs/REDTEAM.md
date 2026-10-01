@@ -18,6 +18,22 @@ Every attack states its pass condition as what the HONEST side must do.
 | 8 | transport outside the trust model | censoring / delaying relay; replayed ephemeral requests vs nonce+expiry | replay led to Finding 11 (fixed); relay censorship open |
 | 9 | stated limitation: majority can spend an honest vault at Tier 0 (DEP-05 §120) | measure cost and footprint, not disprove | |
 
+### 2026-09-30 — scenario: rollback depth, and why a blind window needs a self-sufficient majority
+
+`redteam/attack-rollback-depth.sh` aims to measure how deep a rollback reaches when every honest
+replica was offline at the fraud. Building it surfaced the key insight before it even ran: at Q = 7
+a committed update needs 4 cosignatures, so to commit fraud with *no honest witness online* the
+colluders must themselves be a majority (4), and only the remaining 3 honest members can be stopped.
+The first draft stopped 4 and colluded with 3 — the fraud could not commit (tip stayed at seq 8).
+Fixed to 4 colluders (cld2–cld5) and 3 stopped (cld6, ref6, ref7).
+
+**This composes the concerns:** a blind window (no honest witness) is only reachable by a colluding
+majority — exactly the case contagion punishes (§2c: all four colluders' own ledgers confiscated).
+An honest member online means detection is immediate (forge-lock on A: 1 s). So "every honest
+replica offline" is not an independent risk; it is a mode of the majority-collusion risk, and the
+rollback it buys costs the colluders their vaults. (Run blocked on flaky ledger formation under soak
+load; the design analysis stands.)
+
 ### 2026-09-30 — scenario: censorship hold (DEP-11/12), run
 
 `redteam/attack-censor-hold.sh` on A (cld1 operates). **Honest arm:** cld1 answers, the transfer
