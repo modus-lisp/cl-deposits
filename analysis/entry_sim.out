@@ -1,0 +1,10 @@
+max safe p with entry cost lambda (per coalition key, fraction of a vault); Q=7, N=60, dereliction, smart attacker
+seating     lambda   L=1,R=.5  L=1,R=.7  L=3,R=.5  L=3,R=.7
+random       0.000       0.24      0.15      0.27      0.21
+random       0.025       0.24      0.15      0.30      0.21
+random       0.050       0.24      0.15      0.30      0.21
+random       0.100       0.27      0.18      0.30      0.24
+2/4/1        0.000       0.39      0.21      0.42      0.33
+2/4/1        0.025       0.39      0.24      0.45      0.30
+2/4/1        0.050       0.39      0.24      0.45      0.33
+2/4/1        0.100       0.45      0.30      0.42      0.33

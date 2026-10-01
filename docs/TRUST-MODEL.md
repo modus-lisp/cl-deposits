@@ -238,6 +238,50 @@ these are upper bounds on safety. Largest safe coalition fraction p:
 - **§2a and §2d predate both corrections** (no dereliction, myopic attacker); read them as upper bounds
   on their own settings.
 
+### 2f. Entry cost: stake-blocks, with bonding to bootstrap (design and simulation)
+
+§2e left pool stuffing as the critical risk: a coalition that can add lot-pool entries cheaply halves
+the safe fraction. The answer is an entry cost on pool eligibility, and the design question is how to
+let new operators in quickly (bootstrapping) without making that cheaper than waiting.
+
+**Design (proposed):**
+- **Eligibility is measured in stake-blocks:** locked capital × blocks held, threshold S* = V × T. A
+  plain operator accrues V per block and is eligible after T.
+- **A bond compresses time, not cost.** An entrant that locks an extra bond B accrues V + B per block
+  and is eligible after T × V / (V + B) (B = V: T/2; B = 3V: T/4). The opportunity cost burned is the
+  same either way, so bonding buys speed, not a discount. The bond is slashable while held and
+  returned at eligibility. Day-one operators bond to bootstrap the network.
+- **A floor on the wait** (e.g. T/8 whatever the bond) keeps what only time provides: a rate limit on
+  rebuilding after a burn (one good shot per floor), and a visible age signal.
+- **Stake-blocks keep accruing as seniority** that wallets weight deposits by and operators can
+  prefer for vanity seats. **Confiscation resets a key's stake-blocks**, so a theft forfeits the key's
+  whole history, not just its collateral. An honest operator that has run 2T holds twice what a fresh
+  entrant does; time spent honest is an asset, not a sunk cost.
+- **Forfeited bonds go to the robbed ledger's depositors** (towards the "victims aren't made whole"
+  concern in docs/MISSING.md).
+
+**Simulation** (`analysis/entry_sim.py`): λ, the threshold's opportunity cost per key as a fraction of a
+vault, charged at formation to every coalition key. Same dereliction model and smart attacker as §2e.
+
+| seating | λ | L=1, R=.5 | L=1, R=.7 | L=3, R=.5 | L=3, R=.7 |
+|---|---|---|---|---|---|
+| random | 0 | 0.24 | 0.15 | 0.27 | 0.21 |
+| random | 0.10 | 0.27 | 0.18 | 0.30 | 0.24 |
+| 2/4/1 | 0 | 0.39 | 0.21 | 0.42 | 0.33 |
+| 2/4/1 | 0.025 | 0.39 | 0.24 | 0.45 | 0.30 |
+| 2/4/1 | 0.10 | 0.45 | 0.30 | 0.42 | 0.33 |
+
+**Readings:**
+- **The size of λ barely matters** below ~10% of a vault (differences within one 0.03 grid step). At the
+  boundary the attacker's profit doesn't arrive at thin margins but in whole vaults, so a small
+  per-key charge doesn't move where it flips.
+- **What entry cost is for is turning stuffing into participation.** With eligibility requiring
+  stake-blocks on a real, punishable vault, an extra pool entry is an extra coalition key: the 2×
+  stuffing row of §2e (0.15–0.18) stops being a separate threat, and the defence reads off the main
+  rows (0.39–0.45).
+- **So a modest threshold suffices**, which is good for bootstrapping. The floor on the wait matters
+  for repeated attacks (one per floor), which this single-shot model doesn't measure.
+
 ## 3. Trust heuristics for a wallet choosing a ledger
 
 Observable from public data (relay + chain), roughly in order of what the findings say matters:
