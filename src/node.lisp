@@ -2403,27 +2403,31 @@
 
 (defun report-derelict-members (node rec original-fraud-hash32 visible-block-hash32)
   "DEP-19 §6 / DEP-11.  REC was disputed on a fraud proof (hash ORIGINAL-FRAUD-HASH32) that
-   became visible at VISIBLE-BLOCK-HASH32.  Any co-member that kept operating its own ledger
-   dispute_response_blocks past that, without disputing REC, is derelict: broadcast a
-   DisputeDereliction against its own ledger (which we must replicate to prove its activity)."
+   became visible at VISIBLE-BLOCK-HASH32.  Any co-member that kept operating a ledger it runs,
+   dispute_response_blocks past that, without disputing REC, is derelict.  A member is slashed on
+   the ledgers it OPERATES (which have a quorum), found as contagion finds them (advertisements +
+   our replicas), not on the quorumless member-ledger it cited when joining."
   (let* ((ledger (record-ledger rec)) (id (record-id-hex rec))
          (vh (and (node-height-of-block node) (ignore-errors (funcall (node-height-of-block node) visible-block-hash32)))))
     (when vh
       (dolist (m (lg:ledger-quorum-members ledger))
-        (let* ((mk (lg:member-pubkey m)) (mlid (lg:member-ledger-id m))
-               (required (or (lg:member-dispute-response-blocks m) 144))
-               (mrec (and (stringp mlid) (= (length mlid) 64) (find-record node mlid)))
-               (newest (and mrec (find-if (lambda (u) (equalp (up:update-operator-id u) mk)) (record-history mrec)))))
-          (when (and (not (equalp mk (node-pubkey node)))            ; not us
-                     (not (gethash (format nil "~a:~a" id (bytes->hex mk)) (node-reported-derelict node)))
-                     (not (find-fork node id mk))                    ; the member never disputed REC
-                     newest (equalp (lg:ledger-operator-key (record-ledger mrec)) mk)   ; its own ledger
-                     (>= (- (up:update-block-height newest) vh) required))               ; active past the window
-            (setf (gethash (format nil "~a:~a" id (bytes->hex mk)) (node-reported-derelict node)) t)
-            (log! node "DERELICTION: ~a kept operating ~a ~a blocks past the fraud without disputing ~a"
-                  (subseq (bytes->hex mk) 0 8) (subseq mlid 0 8) (- (up:update-block-height newest) vh) (subseq id 0 8))
-            (broadcast-fraud node (fr:make-dispute-dereliction-proof
-                                   mk (hex->bytes mlid) original-fraud-hash32 visible-block-hash32 required newest))))))))
+        (let* ((mk (lg:member-pubkey m)) (required (or (lg:member-dispute-response-blocks m) 144)))
+          (when (and (not (equalp mk (node-pubkey node)))     ; not us
+                     (not (find-fork node id mk)))            ; the member never disputed REC
+            (dolist (target (ledgers-operated-by node mk))
+              (let* ((mrec (find-record node target))
+                     (key (format nil "~a:~a" target (bytes->hex mk)))
+                     (newest (and mrec (not (record-fork-p mrec))
+                                  (find-if (lambda (u) (equalp (up:update-operator-id u) mk)) (record-history mrec)))))
+                (when (and newest
+                           (not (gethash key (node-reported-derelict node)))
+                           (equalp (lg:ledger-operator-key (record-ledger mrec)) mk)   ; it operates target, we hold it
+                           (>= (- (up:update-block-height newest) vh) required))        ; active past the window
+                  (setf (gethash key (node-reported-derelict node)) t)
+                  (log! node "DERELICTION: ~a kept operating ~a ~a blocks past the fraud without disputing ~a"
+                        (subseq (bytes->hex mk) 0 8) (subseq target 0 8) (- (up:update-block-height newest) vh) (subseq id 0 8))
+                  (broadcast-fraud node (fr:make-dispute-dereliction-proof
+                                         mk (hex->bytes target) original-fraud-hash32 visible-block-hash32 required newest)))))))))))
 
 (defun drive-dereliction (node)
   "DEP-19 §6: for each ledger we disputed on a fraud proof, report co-members that stayed
