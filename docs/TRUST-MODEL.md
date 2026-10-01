@@ -282,6 +282,40 @@ vault, charged at formation to every coalition key. Same dereliction model and s
 - **So a modest threshold suffices**, which is good for bootstrapping. The floor on the wait matters
   for repeated attacks (one per floor), which this single-shot model doesn't measure.
 
+### 2g. Multiple rounds: the floor caps damage, it does not move the boundary (simulation)
+
+`analysis/multiround_sim.py` runs the §2f network for H rounds. A key exposed in a theft is
+confiscated (stake-blocks reset): ineligible for FLOOR rounds, re-entry costs λ again, and while it
+cools it neither helps capture nor can be slashed. Two coalition strategies: **all-in** (strike once)
+and **rotate** (strike each round with whatever keys are eligible, a slow bleed).
+
+**The safe boundary is unchanged by rounds or by the floor** (2/4/1, L=3, R=0.5):
+
+| re-entry floor | 1 | 5 | 20 | 40 | single-shot |
+|---|---|---|---|---|---|
+| multi-round safe p | 0.45 | 0.45 | 0.45 | 0.45 | 0.45 |
+
+Why it must be so: round 1 of any strategy faces the same network as the single-shot attack, and every
+later round faces an equal-or-worse one (some coalition keys cooling). So if no single strike profits,
+no sequence does. **Keeping p below the boundary is the whole game**; the floor is not part of it.
+
+**What the floor does is cap damage above the boundary** — and a short floor barely does. At p = 0.48
+(just past 0.45), cumulative net over H = 40 rounds, rotate vs all-in:
+
+| floor | 1 | 2 | 5 | 10 | 20 | 40 |
+|---|---|---|---|---|---|---|
+| rotate / all-in | 6.6× | 9.4× | 7.6× | 8.8× | 2.5× | 0.6× |
+
+A floor shorter than the horizon lets a coalition rotate burnt keys back in and bleed most rounds
+(6–9× a single strike). Only a floor approaching the horizon caps it to one strike. Since the floor
+can't be set to "forever", its role is to **space out** a past-boundary coalition's strikes and
+rate-limit recovery after a burn, not to make an unsafe network safe.
+
+**Takeaway:** the multi-round picture adds no new safety margin and needs none — the defence is entirely
+in keeping p under the single-shot boundary (seating + contagion + entry cost). The floor is a
+damage-and-tempo control, so it can be modest (bootstrapping-friendly), chosen for recovery tempo
+rather than for a safety threshold it does not set.
+
 ## 3. Trust heuristics for a wallet choosing a ledger
 
 Observable from public data (relay + chain), roughly in order of what the findings say matters:

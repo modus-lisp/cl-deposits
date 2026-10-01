@@ -1,0 +1,16 @@
+cumulative net over H=40 rounds, 2/4/1, L=3, R=0.5, p=0.48, lambda=0.05, N=60
+(single-shot net is the all-in value; rotate tests slow-bleed against the re-entry floor)
+ floor     all-in     rotate   rotate/all-in
+     1       0.53       3.45     6.56
+     2       0.38       3.60     9.35
+     5       0.86       6.49     7.56
+    10       0.40       3.55     8.83
+    20       0.31       0.76     2.48
+    40       0.59       0.36     0.61
+multi-round safe boundary vs floor (2/4/1, L=3, R=0.5, H=40, lambda=0.05)
+single-shot boundary for this cell was ~0.45 (TRUST-MODEL §2e/2f)
+ floor   safe p
+     1   0.45
+     5   0.45
+    20   0.45
+    40   0.45
