@@ -14,9 +14,13 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
 - **Consolidated `NonConforming` proof (DEP-19 §5).** Neither implementation has it as specified.
   Cross-ledger contagion runs through `NonConformingCosignature` evidence instead, which now
   accepts the fault's operator as the accused.
-- **Duty to act on proofs (DEP-19 §6).** No dereliction tracking: a member that ignores a
-  valid proof within `dispute_response_blocks` is not provable in either implementation.
-  `DisputeDereliction` evidence exists in both as a type, but no node produces it.
+- ~~**Duty to act on proofs (DEP-19 §6).**~~ **Done (2026-10-02):** both implementations verify,
+  produce and act on `DisputeDereliction`. cl c7976a5 (verifier + `report-derelict-members` +
+  act); deposits-rust ec7457b (producer; it already verified/acted). A cl-built proof verifies on
+  the reference with a matching proof hash. Found and fixed two latent wire mismatches: the proof is
+  now self-evident (no embedding) on both sides, and `original_fraud_block_hash` serialises as hex.
+  Not yet exercised end-to-end on the devnet (needs a member to idle a full `dispute_response_blocks`
+  while active — hours).
 - **Censorship proofs (DEP-11, DEP-12).** Not acted on in either implementation. cl has
   `verify-censorship` with no caller. The reference has DeliveryEmbed, but the wallet-to-member
   escalation channel is unwired.

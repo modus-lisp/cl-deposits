@@ -230,7 +230,7 @@ these are upper bounds on safety. Largest safe coalition fraction p:
   doesn't make its operator safe: it makes the quorum's own members liable, until an honest majority
   is reached. Against a coordinated attack, most of the coalition is exposed anyway, so the cascade
   adds little cost; what it removes is a careful attacker signing only with keys whose own quorums
-  are captured. **It is not implemented** (docs/MISSING.md): today that escape is open.
+  are captured. **Now implemented** (cl c7976a5, deposits-rust ec7457b): the escape is closed, verified cross-implementation.
 - **Choosing thefts doesn't help the attacker.** The theft-set optimizer never beat all-in: in a dense
   coalition the signers are shared, so dropping a theft doesn't shrink the cascade. So 2/4/1's 0.45
   (L=3, R=0.5) holds against the smartest attacker built so far, with every dishonest operator in one
