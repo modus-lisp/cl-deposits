@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# redteam/attack-vault-missed-confiscation.sh — a confiscation the watcher does not know of.
+#
+# A vault spend is excused if it is a recorded rotation or a confiscation the WATCHER knows
+# (one it disputed in or signed).  On a fresh cl-only ledger (cld1 operates; cld2..cld6 cosign),
+# cld3 cld4 cld5 cld6 dispute and confiscate (majority 4 of 6).  cld2 never disputes.  Then:
+#   - cld6 (a disputant) must NOT report the confiscation as a vault spend   [PASS condition]
+#   - cld2 (no fork) does report it, naming the honest confiscation signers  [the known limit]
+# The limit's contagion lands on the signers' (honest) ledgers wherever a verifier also lacks the
+# record.  REDTEAM_MC=name forms a fresh ledger per run.
+source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
+WAIT=${WAIT:-600}
+X=$(form_ledger "${REDTEAM_MC:-MC}" cld1 "" cld2 cld3 cld4 cld5 cld6) || exit 1
+echo "== ledger $X: cld3 cld4 cld5 cld6 dispute"
+for n in cld3 cld4 cld5 cld6; do cld_ctl $n "(:dispute-enter :ledger \"$X\" :reason \"redteam missed-confiscation\")" >/dev/null; done
+conf=""
+for i in $(seq 1 $((WAIT / 5))); do
+  conf=$(cld_ctl cld6 '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain" | grep -oE '[0-9a-f]{64}' | tail -1)
+  [ -n "$conf" ] && break
+  [ $((i % 6)) -eq 0 ] && mine 1 >/dev/null   # the arm window closes on height
+  [ $i -eq 6 ] && { for n in cld3 cld4 cld5 cld6; do cld_ctl $n "(:arm :ledger \"$X\")" >/dev/null; done; }
+  [ $i -eq 12 ] && cld_ctl cld6 "(:confiscate :ledger \"$X\")" >/dev/null
+  sleep 5
+done
+[ -n "$conf" ] || fail "no confiscation within ${WAIT}s"
+echo "== confiscation $conf"
+mine 5 >/dev/null; sleep 5
+accused cld6 "$X" && fail "cld6, a disputant, reported its own confiscation as a vault spend"
+if accused cld2 "$X"; then
+  echo "PASS: the disputant excused the confiscation; cld2 (no fork) reported it as a vault spend — the known limit, demonstrated."
+else
+  echo "PASS: the disputant excused the confiscation, and cld2 did not report it either (the limit did not show)."
+fi

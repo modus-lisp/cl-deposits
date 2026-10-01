@@ -250,6 +250,8 @@
           (check "other members rebuilt the same lottery" (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey m)))) (and (nd:record-lottery f) (equalp (lot:lottery-spk (nd:record-lottery f)) (lot:lottery-spk lottery))))) (list c d)))
           (check "signers kept the unsigned confiscation (same txid as the broadcast one)"
                  (every (lambda (m) (equalp (btx:tx-txid (nd:record-confiscation (nd:find-fork m id (nd:node-pubkey m)))) (btx:tx-txid ctx))) (list c d)))
+          (check "the vault watch excuses a confiscation it knows from its fork (not an unauthorised spend)"
+                 (every (lambda (m) (member (btx:tx-txid ctx) (nd::authorised-spend-txids m (nd:find-record m id)) :test #'equalp)) (list b c d)))
           ;; --- Reveal.  Red team #7: once B has revealed, D publishes B's preimage as its
           ;; own (signed by D).  It opens B's commitment, not D's; honest nodes must not
           ;; count it, or D could pick, after seeing every reveal, the copy that makes it win.

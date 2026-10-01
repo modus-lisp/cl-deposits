@@ -2454,14 +2454,16 @@
 ;;; clears a tier's threshold is a theft by exactly the keys that signed it, and
 ;;; every one of them is slashable on every ledger it operates (contagion).
 
-(defun authorised-spend-txids (rec)
+(defun authorised-spend-txids (node rec)
   "The txids that legitimately spend a vault of REC: every rotation it recorded
-   (a QuorumBegin's new outpoint is the previous vault's spender), and our known confiscation."
+   (a QuorumBegin's new outpoint is the previous vault's spender), and any confiscation we
+   know of.  A confiscation is kept on the dispute's fork records, not on REC."
   (let ((ids '()))
     (dolist (u (record-history rec))
       (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
         (when (and o (eq (op:operation-type o) :quorum-begin)) (push (op:field o :new-outpoint-txid) ids))))
-    (when (record-confiscation rec) (push (btx:tx-txid (record-confiscation rec)) ids))
+    (dolist (r (cons rec (forks-of node (record-id-hex rec))))
+      (when (record-confiscation r) (pushnew (btx:tx-txid (record-confiscation r)) ids :test #'equalp)))
     ids))
 
 (defparameter *vault-spend-grace-blocks* 3
@@ -2500,7 +2502,7 @@
                                                        (getf spend :prevouts) (getf spend :block-hash))))
     (multiple-value-bind (reserves vtxid vvout) (disputed-reserves node rec)
       (let ((signers (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves vtxid vvout)))
-        (when (and signers (not (member (btx:tx-txid tx) (authorised-spend-txids rec) :test #'equalp)))
+        (when (and signers (not (member (btx:tx-txid tx) (authorised-spend-txids node rec) :test #'equalp)))
           (setf (gethash id (node-reported-vault-spend node)) t)
           (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"
                 (subseq id 0 8) (subseq (bytes->hex (btx:tx-txid tx)) 0 16) (length signers))
@@ -2529,7 +2531,7 @@
     (when targets
       (let* ((srec (find-record node spent-id))
              (history (if (and srec (not (record-fork-p srec))) (record-history srec) (ledger-updates-from-relays node spent-id)))
-             (authorised (if srec (authorised-spend-txids srec) '())))
+             (authorised (if srec (authorised-spend-txids node srec) '())))
         (multiple-value-bind (ok why)
             (fr:verify-unauthorized-vault-spend proof history (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
                                                 :authorised-txids authorised)
