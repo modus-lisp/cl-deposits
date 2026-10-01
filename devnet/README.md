@@ -7,9 +7,16 @@ or on a private regtest chain of its own:
                         # BITCOIND=/path/bitcoind BITCOIN_CLI=/path/bitcoin-cli to pick binaries; KEEP=1 to leave it up
                         # (ports 7787 / 10051-10054, data under /tmp/cld-regtest: coexists with the signet devnet)
 
+The relay is beacon (`~/beacon`, a pure-CL Nostr relay), configured by `devnet/beacon-relay.lisp`:
+no result cap or rate limits, ephemeral responses kept 10 minutes for REQs with `since` (the
+reference daemon polls for its confiscation_sign replies), and red-team fault rules from
+`$CLD_ROOT/relay.jsonl.faults.json` (drop/delay by kind, author, action, to).  Its store is
+`$CLD_ROOT/beacon-data/`; on first start it imports relay.py's `relay.jsonl`.  `RELAY_IMPL=py`
+runs the old `devnet/relay.py` instead, for one more cycle.
+
 On signet:
 
-    devnet/up.sh        # relay (devnet/relay.py, ws://127.0.0.1:7777) + cld1..cld4 (cld1 operates; cld2–4 cosign, Q=3)
+    devnet/up.sh        # relay (beacon, ws://127.0.0.1:7777) + cld1..cld4 (cld1 operates; cld2–4 cosign, Q=3)
     devnet/smoke.sh     # quorum formation, on-chain funded QuorumBegin, deposits, transfer, Lightning rail, dispute
                         # CLD_NO_LN=1 skips the Lightning steps
     devnet/status.sh

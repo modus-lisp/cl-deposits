@@ -8,7 +8,7 @@ SOAK="$CLD_ROOT/soak"; EVERY=${SOAK_MONITOR_EVERY:-300}
 rss_kb() { [ -n "$1" ] && ps -o rss= -p "$1" 2>/dev/null | tr -d ' '; }
 while true; do
   {
-    echo "=== $(date +%FT%T)  height $(bcli getblockcount 2>/dev/null)  relay $(relay_running && echo up || echo DOWN) $(du -m "$RELAY_STORE" 2>/dev/null | cut -f1) MB  bots $(pgrep -fc 'deposit-bot --data-dir')"
+    echo "=== $(date +%FT%T)  height $(bcli getblockcount 2>/dev/null)  relay $(relay_running && echo up || echo DOWN) $(relay_mb) MB  bots $(pgrep -fc 'deposit-bot --data-dir')"
     declare -A INFO FORKS
     for n in $(cld_names); do
       if cld_running "$n"; then INFO[$n]=$(cld_ctl "$n" "(:info)" 2>/dev/null); printf '%-5s up   rss %7s KB\n' "$n" "$(rss_kb "$(cld_pid "$n")")"; else echo "$n DOWN"; INFO[$n]=""; fi

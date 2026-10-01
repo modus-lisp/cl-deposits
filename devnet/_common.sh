@@ -32,6 +32,9 @@ case "$CLD_CHAIN" in
 esac
 RELAY_URL="ws://127.0.0.1:$RELAY_PORT"
 RELAY_STORE="$CLD_ROOT/relay.jsonl"
+RELAY_IMPL="${RELAY_IMPL:-beacon}"                       # beacon (pure CL, ~/beacon) | py (devnet/relay.py, kept one cycle)
+BEACON_DIR="$CLD_ROOT/beacon-data/"
+RELAY_FAULTS="$RELAY_STORE.faults.json"                  # red-team fault rules, read by either relay
 bcli() { $BCLI "$@"; }
 wcli() { $BCLI -rpcwallet="$MINER_WALLET" "$@"; }
 
@@ -132,13 +135,27 @@ start_esplora() {   # Esplora-compatible API over our bitcoind, for the referenc
   echo "esplora shim did not come up" >&2; return 1
 }
 relay_running() { (echo >/dev/tcp/127.0.0.1/$RELAY_PORT) 2>/dev/null; }
+relay_events() {   # stored events, for status lines
+  if [ "$RELAY_IMPL" = py ]; then wc -l < "$RELAY_STORE" 2>/dev/null || echo 0
+  else curl -s "http://127.0.0.1:$RELAY_PORT/stats" 2>/dev/null | grep -o '"events":[0-9]*' | cut -d: -f2; fi
+}
+relay_mb() { if [ "$RELAY_IMPL" = py ]; then du -m "$RELAY_STORE" 2>/dev/null | cut -f1; else du -sm "$BEACON_DIR" 2>/dev/null | cut -f1; fi; }
 start_relay() {
   relay_running && return 0
   mkdir -p "$CLD_ROOT"
-  RELAY_PORT=$RELAY_PORT RELAY_STORE=$RELAY_STORE setsid nohup python3 "$CLD_SRC/devnet/relay.py" >"$CLD_ROOT/relay.log" 2>&1 &
-  sleep 0.5; pgrep -nf "python3 $CLD_SRC/devnet/relay.py" >"$CLD_ROOT/relay.pid"   # the python, not the setsid wrapper
-  for i in $(seq 1 30); do (echo >/dev/tcp/127.0.0.1/$RELAY_PORT) 2>/dev/null && return 0; sleep 0.2; done
-  echo "relay did not come up" >&2; return 1
+  if [ "$RELAY_IMPL" = py ]; then
+    RELAY_PORT=$RELAY_PORT RELAY_STORE=$RELAY_STORE setsid nohup python3 "$CLD_SRC/devnet/relay.py" >"$CLD_ROOT/relay.log" 2>&1 &
+    sleep 0.5; pgrep -nf "python3 $CLD_SRC/devnet/relay.py" >"$CLD_ROOT/relay.pid"   # the python, not the setsid wrapper
+  else
+    local sbcl="${CLD_SBCL:-/usr/bin/sbcl}" lisp=(--dynamic-space-size "${BEACON_HEAP:-16GB}" --noinform --non-interactive --load "$CLD_SRC/devnet/beacon-relay.lisp" --end-toplevel-options)
+    if [ ! -s "$BEACON_DIR/events.log" ] && [ -s "$RELAY_STORE" ]; then   # first start: carry relay.py's store over
+      mkdir -p "$BEACON_DIR"; BEACON_DIR=$BEACON_DIR "$sbcl" "${lisp[@]}" import "$RELAY_STORE" >>"$CLD_ROOT/relay.log" 2>&1
+    fi
+    RELAY_PORT=$RELAY_PORT BEACON_DIR=$BEACON_DIR RELAY_FAULTS=$RELAY_FAULTS setsid nohup "$sbcl" "${lisp[@]}" >"$CLD_ROOT/relay.log" 2>&1 &
+    sleep 1; pgrep -nf "sbcl.*devnet/beacon-relay[.]lisp" >"$CLD_ROOT/relay.pid"
+  fi
+  for i in $(seq 1 600); do (echo >/dev/tcp/127.0.0.1/$RELAY_PORT) 2>/dev/null && return 0; sleep 0.3; done   # beacon replays its log first
+  echo "relay did not come up; see $CLD_ROOT/relay.log" >&2; return 1
 }
 start_cld() {
   local n=$1 dir; dir=$(cld_dir "$n"); mkdir -p "$dir"
