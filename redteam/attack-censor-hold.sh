@@ -28,10 +28,10 @@ fi
 
 T0=$(date -u +%s)
 echo "== w1 requests a transfer of 100000 msat $FROM -> $TO"
-out=$(timeout 60 $W w1 "$A" transfer "$FROM" "$TO" 100000 2>&1 | tail -3)
+out=$(timeout 60 $W w1 "$A" transfer "$FROM" "$TO" 100000 "$(bcli getblockcount)" 2>&1 | tail -3)
 echo "$out"
 if [ "$ARM" = honest ]; then
-  case "$out" in *":STATUS :OK"*) echo "PASS: transfer committed against an answering operator";;
+  case "$out" in *":TRANSFER "*) echo "PASS: transfer committed against an answering operator";;
     *) echo "FAIL: transfer did not commit: $out"; exit 1;; esac
   exit 0
 fi
@@ -50,7 +50,7 @@ case "$esc" in *":STATUS :OK"*) echo "== embed accepted by the member";;
 echo "== watching for a dispute on A for ${WAIT}s"
 disputed=0
 for i in $(seq 1 $WAIT); do
-  d=$(for n in cld2 cld3 cld6; do cld_ctl $n "(:forks :ledger \"$A\")" 2>/dev/null; done | grep -c ":SEQ" || true)
+  d=$(for n in cld2 cld3 cld6; do cld_ctl $n "(:forks :ledger \"$A\")" 2>/dev/null; done | grep -oE ":STATE :(DISPUTED|ARMED)" | wc -l)
   [ "$d" -gt 0 ] && { disputed=$d; break; }
   sleep 1
 done

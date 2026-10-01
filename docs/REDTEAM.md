@@ -18,6 +18,17 @@ Every attack states its pass condition as what the HONEST side must do.
 | 8 | transport outside the trust model | censoring / delaying relay; replayed ephemeral requests vs nonce+expiry | replay led to Finding 11 (fixed); relay censorship open |
 | 9 | stated limitation: majority can spend an honest vault at Tier 0 (DEP-05 §120) | measure cost and footprint, not disprove | |
 
+### 2026-09-30 — scenario: censorship hold (DEP-11/12), run
+
+`redteam/attack-censor-hold.sh` on A (cld1 operates). **Honest arm:** cld1 answers, the transfer
+commits. **Censor arm:** cld1 drops every wallet request (`:ignore-requests`); the transfer times
+out; the wallet escalates through member cld6, whose DeliveryEmbed lands on its own ledger
+(`:REQUEST-HASH` returned). Then **nothing acts on it**: no live dispute on A within 60 s (the
+tombstoned forks there are from the earlier forge-lock run, not this), cld6 logs no embed-driven
+action, and the victim's funds stay locked. Confirms docs/MISSING.md: censorship proofs are
+unwired. Side observation: a victim's LOCKED balance climbs run to run as never-completed
+transfers accumulate locks — no auto-expiry of stale locks in cl.
+
 ## Capital efficiency vs security: the axis every attack is measured on
 
 The protocol's security is bought with idle capital: the collateral fraction
