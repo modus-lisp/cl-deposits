@@ -2312,6 +2312,9 @@
 ;;; Fraud broadcasts (Kind 9101): verify, and if we are a member, dispute.
 
 (defun report-non-conforming (node rec update condition)
+  ;; ADVERSARY :ignore-fraud — a passive derelict member: it refuses the bad update
+  ;; (never applies it) but takes no dispute action, self-detected or received.
+  (when (getf (node-adversary node) :ignore-fraud) (return-from report-non-conforming nil))
   "UPDATE passed every signature check on REC (operator, cosign threshold, chain)
    and the ledger rules reject it: publish a NonConformingUpdate proof and, as a
    quorum member, dispute from the last valid sequence.  A member that could only
