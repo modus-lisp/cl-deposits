@@ -190,38 +190,48 @@ coalition fraction p (unprofitable in ≥95% of trials, N=60):
 
 ### 2e. Seating guidance, followed by wallets' deposits (simulation)
 
-`analysis/seating_sim.py`, same attacker and dials as §2d. Honest operators seat Q = 7 as **trust
-anchors** (roots: whoever signs the wallet and the few they vouch for, 10% of operators, honest by
-assumption) + **commit-reveal lot** from a shared pool + **vanity** (free choice). Wallets deposit only
-on compliant ledgers (anchors present, lot seats match the draw), in proportion to score^2. Largest
-safe coalition fraction p:
+`analysis/seating_sim.py`. Honest operators seat Q = 7 as **trust anchors** (roots: whoever signs the
+wallet software, and the few they vouch for: 10% of operators, honest by assumption) + **commit-reveal
+lot** from a shared pool + **vanity** (free choice). Wallets deposit only on compliant ledgers (anchors
+present, lot seats match the draw), in proportion to score^2. Contagion includes **dereliction**
+(DEP-19 §6): when an exposed key's own quorum is coalition-captured and doesn't confiscate, that
+quorum's members are derelict and exposed in turn, recursively, until honest majorities act. The
+attacker is the best of a myopic greedy and a **coordinated all-in** (every capturable vault, the
+cascade paid once). That's still a lower bound on the optimal attack, so these are upper bounds on
+safety. Largest safe coalition fraction p:
 
 | seating | L=1, R=.5 | L=1, R=.7 | L=3, R=.5 | L=3, R=.7 |
 |---|---|---|---|---|
-| random (§2d) | 0.32 | 0.18 | 0.48 | 0.42 |
-| 2 anchors / 3 lot / 2 vanity | 0.26 | 0.14 | 0.48 | 0.38 |
-| 2/3/2, pool stuffed 2× | 0.16 | 0.10 | 0.26 | 0.20 |
-| **2 anchors / 4 lot / 1 vanity** | **0.38** | **0.22** | **0.60** | **0.48** |
-| 2/4/1, pool stuffed 2× | 0.20 | 0.10 | 0.30 | 0.24 |
-| 2/4/1, coalition wins half the vanity seats | 0.40 | 0.20 | 0.58 | 0.48 |
+| random | 0.24 | 0.15 | 0.30 | 0.24 |
+| 2 anchors / 3 lot / 2 vanity | 0.27 | 0.09 | 0.33 | 0.21 |
+| 2/3/2, pool stuffed 2× | 0.12 | 0.06 | 0.15 | 0.12 |
+| **2 anchors / 4 lot / 1 vanity** | **0.36** | **0.21** | **0.45** | **0.33** |
+| 2/4/1, pool stuffed 2× | 0.15 | 0.09 | 0.18 | 0.12 |
+| 2/4/1, coalition wins half the vanity seats | 0.36 | 0.15 | 0.42 | 0.30 |
 
 **Two rules the guidance needs (both checkable by a wallet):**
 - **Eligibility = punishability.** Only keys whose own ledgers comply may fill lot or vanity seats on
-  others' ledgers. Without it, a coalition stacks its own quorums, is then unslashable (its own
-  quorums won't confiscate it), and loots honest vaults for free: 0.06 everywhere.
-- **Non-compliant ledgers get no deposits.** Even a sliver lets a self-stacked coalition steal from
-  its own unslashable ledgers.
+  others' ledgers. Without it, a coalition stacks its own ledgers (visibly non-compliant) and still
+  takes seats on honest ones.
+- **Non-compliant ledgers get no deposits.** Even a sliver gives a self-stacked coalition something
+  to steal from its own ledgers.
 
 **Readings:**
-- **2/4/1 beats random everywhere**, most with scale (0.60 against 0.48 at L=3), and barely notices a
-  coalition winning vanity seats on honest ledgers.
-- **2/3/2 is slightly worse than random**: the danger of vanity is on the coalition's *own* ledgers.
-  Two self-chosen seats plus a couple of lucky lot draws make its own quorum coalition-majority, so
-  its keys escape contagion. One vanity seat makes that self-capture rare.
-- **Pool stuffing is the residual** (2× roughly halves the safe fraction). The pool must be **shared,
-  not operator-curated** (a coalition that defines its own pool draws only itself), and pool
-  eligibility must be **costly** (stake, coverage, track record) so stuffing costs what being p does.
-- Same myopic attacker as §2d, so these are upper bounds; a smarter adversary is the next step.
+- **2/4/1 is a real improvement against a competent attacker**: 0.24 → 0.36 at one ledger per
+  operator, 0.30 → 0.45 at three (R = 0.5). That is the margin to defend.
+- **One vanity seat, not two.** Free seats are where a coalition places itself, on honest ledgers and
+  its own; 2/3/2 is little better than random and degrades when vanity is gamed.
+- **Pool stuffing is the critical risk.** 2× stuffing takes 2/4/1 from 0.36 to 0.15, below random.
+  The design is only as strong as the lot pool's admission: the pool must be **shared, not
+  operator-curated** (a coalition that defines its own pool draws only itself), and entry must be
+  **costly** (stake, coverage, track record), so stuffing costs what being p does.
+- **Dereliction closes the self-capture escape** rather than moving the headline. A captured quorum
+  doesn't make its operator safe: it makes the quorum's own members liable, until an honest majority
+  is reached. Against a coordinated attack, most of the coalition is exposed anyway, so the cascade
+  adds little cost; what it removes is a careful attacker signing only with keys whose own quorums
+  are captured. **It is not implemented** (docs/MISSING.md): today that escape is open.
+- **§2a and §2d predate both corrections** (no dereliction, myopic attacker); read them as upper bounds
+  on their own settings.
 
 ## 3. Trust heuristics for a wallet choosing a ledger
 

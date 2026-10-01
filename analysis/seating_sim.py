@@ -19,11 +19,18 @@ Two worlds on the same dials:
 Vaults follow deposits: a ledger's vault (loot and collateral alike) scales with the
 deposits it holds, normalised so the average vault is 1 in both worlds.
 
+The attacker is the best of two strategies: the myopic greedy of coverage_sim.py, and a
+coordinated all-in that takes every capturable vault and pays the contagion cascade once.
+
 The coalition's dials: POOL (its share of the lot pool is min(1, POOL*p): stuffing),
 VANITY (its share of honest operators' vanity seats; default p, i.e. no more
 attractive than anyone).  Its own ledgers either comply (2 anchors, lot, vanity of
 its own keys) or deviate (stack all 7 seats with its keys: captured, but visibly
 non-compliant, so nearly no deposits).  It takes the better of the two.
+
+Contagion follows DEP-19 §6: an exposed key whose own quorum is coalition-captured is
+not thereby safe.  The captured quorum's members are derelict when they fail to act,
+and are exposed in turn, recursively, until honest majorities confiscate.
 
 Output: the largest coalition fraction p at which the attack is unprofitable in
 >= SAFE of the trials, per world and dial setting.
@@ -69,34 +76,76 @@ def build(n, l, p, roots_frac, world, own, pool, vanity, rng, layout=(2, 3, 2)):
     weight = {led: (w ** K) * len(weight) / tot for led, w in weight.items()}
     return bad, quorum, weight
 
-def attack(n, l, r, bad, quorum, weight):
-    """The coverage_sim.py attacker: myopic per-target greedy, reusing exposed keys."""
+def attack(n, l, r, bad, quorum, weight, dereliction=True):
+    """The coverage_sim.py attacker (myopic per-target greedy, reusing exposed keys), with
+    contagion that follows DEP-19 §6.  An exposed key is confiscated on each ledger it runs
+    whose quorum has an honest majority.  Where its quorum is coalition-captured and does not
+    act, that quorum's coalition members are derelict, so they are exposed in turn, and so on
+    outward until honest majorities are reached.  Each key pays once per ledger."""
     c = 1.0 - r
     hm = {led: sum(1 for m in mem if m not in bad) >= NEED for led, mem in quorum.items()}
-    stake = {k: c * sum(weight[(k, j)] for j in range(l) if hm[(k, j)]) for k in bad}
-    exposed = set(); gain = 0.0
+
+    def closure(exposed):
+        seen = set(exposed); todo = list(exposed); cost = 0.0
+        while todo:
+            k = todo.pop()
+            for j in range(l):
+                led = (k, j)
+                if hm[led]:
+                    cost += c * weight[led]
+                elif dereliction:
+                    for m in quorum[led]:
+                        if m in bad and m not in seen:
+                            seen.add(m); todo.append(m)
+        return cost
+
+    exposed = set(); gain = 0.0; cur = 0.0
     for (o, j), mem in quorum.items():
         members = [m for m in mem if m in bad]
         if len(members) < NEED: continue
         members.sort(key=lambda m: (m not in exposed, m))
         signers = members[:NEED]
         loot = (r if o in bad else 1.0) * weight[(o, j)]
-        new_cost = sum(stake[m] for m in signers if m not in exposed)
-        if loot > new_cost:
-            gain += loot; exposed.update(signers)
-    return gain - sum(stake[k] for k in exposed)
+        new_total = closure(exposed | set(signers))
+        if loot > new_total - cur:
+            gain += loot; exposed.update(signers); cur = new_total
+    return gain - cur
+
+def allin(n, l, r, bad, quorum, weight):
+    """Coordinated: take every capturable vault, pay the dereliction closure once.  Where
+    contagion cascades, this is the binding strategy: no single vault pays for the cascade,
+    so a myopic attacker never starts (it overstated safety to the top of the grid)."""
+    c = 1.0 - r
+    hm = {led: sum(1 for m in mem if m not in bad) >= NEED for led, mem in quorum.items()}
+    gain = 0.0; signers = set()
+    for (o, j), mem in quorum.items():
+        members = sorted(m for m in mem if m in bad)
+        if len(members) >= NEED:
+            gain += (r if o in bad else 1.0) * weight[(o, j)]; signers.update(members[:NEED])
+    seen = set(signers); todo = list(signers); cost = 0.0
+    while todo:
+        k = todo.pop()
+        for j in range(l):
+            if hm[(k, j)]: cost += c * weight[(k, j)]
+            else:
+                for m in quorum[(k, j)]:
+                    if m in bad and m not in seen: seen.add(m); todo.append(m)
+    return gain - cost
+
+def best_attack(n, l, r, bad, quorum, weight):
+    return max(attack(n, l, r, bad, quorum, weight), allin(n, l, r, bad, quorum, weight))
 
 def profitable(n, l, p, r, roots, world, pool, vanity, rng, layout=(2, 3, 2)):
     if world == "random":
-        return attack(n, l, r, *build(n, l, p, roots, world, "comply", pool, vanity, rng)) > 1e-9
+        return best_attack(n, l, r, *build(n, l, p, roots, world, "comply", pool, vanity, rng)) > 1e-9
     seed = rng.random()
-    best = max(attack(n, l, r, *build(n, l, p, roots, world, own, pool, vanity, random.Random(seed), layout))
+    best = max(best_attack(n, l, r, *build(n, l, p, roots, world, own, pool, vanity, random.Random(seed), layout))
                for own in ("comply", "deviate"))
     return best > 1e-9
 
 def max_safe(n, l, r, roots, world, pool, vanity, trials, rng, safe=0.95, layout=(2, 3, 2)):
     best = 0.0
-    for pp in range(0, 61, 2):
+    for pp in range(0, 91, 3):
         p = pp / 100
         if sum(profitable(n, l, p, r, roots, world, pool, vanity, rng, layout) for _ in range(trials)) / trials <= 1 - safe:
             best = p
@@ -110,6 +159,8 @@ if __name__ == "__main__":
     rng = random.Random(20261001)
     print(f"max safe coalition fraction p (unprofitable in >= 95% of {trials} trials), N={n}, Q=7, roots 10%")
     print("eligibility = punishability: deviating keys get no lot or vanity seats on others' ledgers")
+    print("contagion with dereliction (DEP-19 §6): a captured quorum that does not act exposes its own members")
+    print("attacker: best of myopic greedy and coordinated all-in (an upper bound on safety)")
     print(f"{'world':22s} {'pool':>4s} {'van':>4s}   L=1,R=.5  L=1,R=.7  L=3,R=.5  L=3,R=.7")
     rows = [("random", None, 1, -1),
             ("2 anchor/3 lot/2 van", (2, 3, 2), 1, -1), ("2 anchor/3 lot/2 van", (2, 3, 2), 2, -1),
