@@ -156,6 +156,34 @@ Implemented cosigner contagion (DEP-19 §5): cl d4614e7 (produce and act) and de
   at Tier 0 is on-chain, not a ledger update. It needs DEP-06 type 7 (unauthorised vault spend) and
   contagion on its witness signers.
 
+### 2d. Operator contagion quantified: more ledgers, more deterrent (simulation)
+
+`analysis/coverage_sim.py` extends §2a to L ledgers per operator. An on-chain theft (DEP-06 type 7)
+names every signer, so each exposed key loses collateral on **every** ledger it operates with an
+honest majority — one accusation, every vault it runs at risk (the §2c live run). Largest safe
+coalition fraction p (unprofitable in ≥95% of trials, N=60):
+
+| mode | Q=7, R=0.5 | Q=7, R=0.7 | Q=5, R=0.5 | Q=3, R=0.5 |
+|---|---|---|---|---|
+| no contagion | 0.09 | 0.09 | 0.06 | 0.02 |
+| contagion, L=1 | 0.32 | 0.19 | 0.23 | 0.10 |
+| contagion, L=3 | 0.49 | 0.42 | 0.42 | 0.31 |
+| contagion, L=5 | 0.55 | 0.49 | 0.50 | 0.42 |
+
+**Readings:**
+- **L=1 matches §2a** (Q=7,R≤0.5 ≈ 0.30): the model is consistent with the one-ledger sim.
+- **More ledgers, more deterrent.** At Q=7, R=0.5, going 1→5 ledgers lifts tolerance 32%→55%. A
+  key operating L ledgers has L vaults of collateral, all slashable on a single accusation, so each
+  exposed signer costs the coalition ~L×C and theft stops paying at much higher p.
+- **It rescues capital efficiency.** The L=1 cliff above R=0.5 (0.19 at R=0.7) is softened by scale:
+  L=5 holds 0.49 at R=0.7. An operator that runs several ledgers can safely run leaner vaults.
+- **So "runs several ledgers" is a strong, checkable signal** (DEP-04 ads + QuorumBegins): it is
+  exposure, and exposure is the bond. The pyramid DEP-19 §10 describes is the healthy shape — large
+  operators, each with much at stake, anchoring the network.
+- **Caveat (unchanged):** this assumes random quorums and that a key's vaults are real and
+  independent. A coalition that seats its keys on each other's quorums, or fronts thin vaults behind
+  many ledgers, is the §10 residual the heuristics must still price. Full output: analysis/coverage_sim.out.
+
 ## 3. Trust heuristics for a wallet choosing a ledger
 
 Observable from public data (relay + chain), roughly in order of what the findings say matters:
