@@ -464,7 +464,7 @@
                    :amount amount-msats :quorum-expiry expiry :ledger-hash (rs:reserves-ledger-hash reserves)
                    :quorum-members members :collateral-amount collateral-msats
                    :quorum-member-ledger-ids (mapcar #'lg:member-ledger-id staged)
-                   :protocol-version ruleset))
+                   :protocol-version (rs:reserves-ruleset reserves)))
            (update (append-operation node rec op)))
       (setf (record-reserves rec) reserves (record-pinned rec) nil)
       (values update reserves))))

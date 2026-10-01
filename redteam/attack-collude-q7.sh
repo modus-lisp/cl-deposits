@@ -13,37 +13,21 @@
 # Reports times from the fraud to each dispute.  WAIT (s) bounds the watch.
 source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-300}
-fail() { echo "FAIL: $*" >&2; exit 1; }
-expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "$1";; esac; }
-M_ROW="$S/redteam-${REDTEAM_M:-M}"
-if [ -f "$M_ROW" ]; then read -r M < "$M_ROW"; echo "== reusing M $M"; else
-  echo "== forming M (cld1 operates; cld2 cld3 cld4 cld5 cld6 ref6 ref7 cosign)"
-  M=$(sx "$(cld_ctl cld1 "(:open-ledger :reserves-id \"genesis:cld1:redteam-M:$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER"); [ -n "$M" ] || fail "open M"
-  for m in cld2 cld3 cld4 cld5 cld6 ref6 ref7; do
-    case $m in cld*) ml=$(eval echo "\${L${m#cld}}");; ref*) ml=$(eval echo "\${RL${m#ref}}");; esac
-    expect "$(cld_ctl cld1 "(:add-member :ledger \"$M\" :member \"$(cat $S/pubkey.$m)\" :member-ledger \"$ml\")")"
-  done
-  prep=$(cld_ctl cld1 "(:prepare-quorum :ledger \"$M\" :expiry-blocks 4320)"); expect "$prep"; addr=$(sx "$prep" ":ADDRESS")
-  txid=$(wcli sendtoaddress "$addr" 0.5); mine 3
-  vout=$(bcli getrawtransaction "$txid" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$addr'][0])")
-  sleep 20
-  expect "$(cld_ctl cld1 "(:begin-quorum :ledger \"$M\" :txid \"$txid\" :vout $vout :sats 25000000 :collateral-sats 25000000)")"
-  expect "$(cld_ctl cld1 "(:advertise :ledger \"$M\")")"
-  echo "$M $txid $vout" > "$M_ROW"; echo "   M $M"
-fi
-read -r M txid vout < "$M_ROW"
-D1=$(sx "$("$CLD_SRC/devnet/cld-wallet.sh" rt1 "$M" open)" ":DEPOSIT"); D2=$(sx "$("$CLD_SRC/devnet/cld-wallet.sh" rt2 "$M" open)" ":DEPOSIT")
-expect "$(cld_ctl cld1 "(:credit :ledger \"$M\" :deposit \"$D1\" :msat 20000000 :txid \"$txid\" :vout $vout)")"
+source "$(dirname "$0")/_lib.sh"
+ROW=${REDTEAM_M:-M}
+M=$(COLLATERAL_SATS=25000000 form_ledger "$ROW" cld1 "" cld2 cld3 cld4 cld5 cld6 ref6 ref7) || exit 1; echo "   M $M"
+mapfile -t DEPS < <(fresh_deposits "$ROW" cld1 "$M" 2); D1=${DEPS[0]}; D2=${DEPS[1]}
+[ -n "$D1" ] && [ -n "$D2" ] || fail "no deposits on M"
 echo "== victim deposit $D1 credited 20000000 msat on M"
+has_fork() { case $2 in cld*) cld_ctl $2 "(:forks :ledger \"$1\")" | grep -q "$(cut -c1-16 $S/pubkey.$2)";; *) false;; esac; }
 declare -A PRE; while IFS=$'\t' read -r L id _; do for n in $(cld_names); do has_fork "$id" "$n" && PRE[$id/$n]=1; done; done < "$S/ledgers.tsv"   # forks from earlier runs
 T0=$(date -u +%FT%T); t0=$(date +%s)
-for n in cld2 cld3 cld4 cld5; do cld_ctl $n "(:adversary :set :cosign-blind t)" >/dev/null; done
+arm :cosign-blind cld2 cld3 cld4 cld5
 R=$(cld_ctl cld1 "(:forge-lock :ledger \"$M\" :from \"$D1\" :to \"$D2\" :msat 15000000)")
-for n in cld2 cld3 cld4 cld5; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null; done
+disarm :cosign-blind cld2 cld3 cld4 cld5
 echo "== 4-of-7 attempt on M: $(echo "$R" | cut -c1-120)"
 echo "$R" | grep -q ":STATUS :OK" || fail "the colluding majority did not commit"
 declare -A LED; while IFS=$'\t' read -r L id op _; do LED[$L]=$id; done < "$S/ledgers.tsv"
-has_fork() { case $2 in cld*) cld_ctl $2 "(:forks :ledger \"$1\")" | grep -q "$(cut -c1-16 $S/pubkey.$2)";; *) false;; esac; }
 forked() {   # forked LEDGER-ID NODE: did NODE fork LEDGER-ID after the attack (not before)
   case $2 in
     cld*) [ -z "${PRE[$1/$2]:-}" ] && has_fork "$1" "$2";;

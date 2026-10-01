@@ -12,7 +12,7 @@ mapfile -t DEPS < <(fresh_deposits "$ROW" cld1 "$A" 2); FROM=${DEPS[0]}; TO=${DE
 [ -n "$FROM" ] && [ -n "$TO" ] || fail "no deposits on A"
 bal() { "$CLD_SRC/devnet/cld-wallet.sh" w1 "$A" balance "$1" 2>/dev/null | grep -oE ':BALANCE [0-9]+ :LOCKED [0-9]+'; }
 BAL0=$(bal $FROM); echo "== target A ($AS…, cld1 operates; cld2 cld3 ref2 cosign); victim deposit $FROM: $BAL0"
-[ "$ARM" = collude ] && for n in cld2 cld3; do cld_ctl $n "(:adversary :set :cosign-blind t)" >/dev/null; done
+[ "$ARM" = collude ] && arm :cosign-blind cld2 cld3
 T0=$(date -u +%FT%T); t0=$(date +%s)
 R=$(cld_ctl cld1 "(:forge-lock :ledger \"$A\" :from \"$FROM\" :to \"$TO\" :msat 5000000)")
 [ "$ARM" = collude ] && for n in cld2 cld3; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null; done

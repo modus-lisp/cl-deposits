@@ -132,7 +132,15 @@
         (:vault-spend   ; red team: (:vault-spend :ledger L :address "tb1..." [:tier N]) — spend the
                         ; vault outside any rotation or dispute (docs/MISSING.md, DEP-06 type 7 gap)
          (multiple-value-bind (tx n) (nd:vault-spend node (arg form :ledger) (arg form :address)
-                                                     :tier-index (arg form :tier 0))
+                                                     :tier-index (arg form :tier 0) :broadcast-p nil)
+           ;; Broadcast here, not through the node's fire-and-forget broadcast-fn: a rejected
+           ;; theft (non-final, bad witness) must fail the command, not report a txid.
+           (multiple-value-bind (out err code)
+               (uiop:run-program (append (uiop:split-string (or (uiop:getenv "CLD_BITCOIN_CLI") "bitcoin-cli") :separator " ")
+                                         (list "sendrawtransaction" (bytes->hex (cl-consensus.tx:serialize-tx tx))))
+                                 :output :string :error-output :string :ignore-error-status t)
+             (declare (ignore out))
+             (unless (zerop code) (error "sendrawtransaction rejected the theft: ~a" (substitute #\Space #\Newline (string-trim '(#\Newline #\Space) err)))))
            (ok :txid (txid-hex (cl-consensus.tx:tx-txid tx)) :sigs n :warning "unauthorised vault spend broadcast")))
         (:forks (ok :forks (mapcar (lambda (f) (list :operator (subseq (bytes->hex (nd::record-fork-operator f)) 0 16) :seq (lg:ledger-sequence (nd:record-ledger f))
                                                      :state (lg:ledger-dispute-state (nd:record-ledger f)) :armed (and (nd:record-preimage f) t)))

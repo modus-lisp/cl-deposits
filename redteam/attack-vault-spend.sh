@@ -18,24 +18,10 @@
 # sat capturable.  REDTEAM_V=name forms a fresh test ledger per run.
 source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-120}
-fail() { echo "FAIL: $*" >&2; exit 1; }
-expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "$1";; esac; }
-
-V_ROW="$S/redteam-${REDTEAM_V:-V}"
-if [ -f "$V_ROW" ]; then read -r V < "$V_ROW"; echo "== reusing V $V"; else
-  echo "== forming V (cld1 operates; cld2 cld3 cld4 cld5 cld6 ref6 ref7 cosign)"
-  V=$(sx "$(cld_ctl cld1 "(:open-ledger :reserves-id \"genesis:cld1:redteam-V:$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER"); [ -n "$V" ] || fail "open V"
-  for m in cld2 cld3 cld4 cld5 cld6 ${REFS-ref6 ref7}; do   # REFS="" forms a cl-only quorum
-    case $m in cld*) ml=$(eval echo "\${L${m#cld}}");; ref*) ml=$(eval echo "\${RL${m#ref}}");; esac
-    expect "$(cld_ctl cld1 "(:add-member :ledger \"$V\" :member \"$(cat $S/pubkey.$m)\" :member-ledger \"$ml\")")"
-  done
-  prep=$(cld_ctl cld1 "(:prepare-quorum :ledger \"$V\" :expiry-blocks 4320)"); expect "$prep"; addr=$(sx "$prep" ":ADDRESS")
-  txid=$(wcli sendtoaddress "$addr" 0.5); mine 3
-  vout=$(bcli getrawtransaction "$txid" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$addr'][0])")
-  sleep 20
-  expect "$(cld_ctl cld1 "(:begin-quorum :ledger \"$V\" :txid \"$txid\" :vout $vout :sats 50000000 :collateral-sats 0)")"
-  echo "$V" > "$V_ROW"
-fi
+source "$(dirname "$0")/_lib.sh"
+ROW=${REDTEAM_V:-V}   # REFS="" forms a cl-only quorum
+V=$(form_ledger "$ROW" cld1 "" cld2 cld3 cld4 cld5 cld6 ${REFS-ref6 ref7}) || exit 1
+echo "== V $V (cld1 operates; cld2 cld3 cld4 cld5 cld6 ${REFS-ref6 ref7} cosign)"
 
 # The thieves' destination: cld2's own address (its node key's P2TR).
 DEST=$(sx "$(cld_ctl cld2 '(:address)')" ":ADDRESS")

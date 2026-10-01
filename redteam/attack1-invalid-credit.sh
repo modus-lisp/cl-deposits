@@ -17,8 +17,8 @@ info() { cld_ctl cld2 "(:info)" | grep -oE "\(:ID \"$C\"[^)]*:MEMBERS [1-9][^)]*
 echo "== C before: $(info)"; SEQ0=$(info | grep -oE ':SEQ [0-9]+' | cut -d' ' -f2)
 RES=$(cld_ctl cld2 "(:info)" | grep -oE "\(:ID \"$C\"[^)]*:MEMBERS [1-9][^)]*" | grep -oE ':RESERVES [0-9]+' | cut -d' ' -f2)
 AMT=$(( RES * 2 ))     # twice the reserves: unambiguously over the limit
-for n in cld3 cld4; do cld_ctl $n "(:adversary :set :cosign-blind $([ "$ARM" = collude ] && echo t || echo nil))" >/dev/null; done
-cld_ctl cld2 "(:adversary :set :sign-invalid t)" >/dev/null
+[ "$ARM" = collude ] && arm :cosign-blind cld3 cld4
+arm :sign-invalid cld2
 t0=$(date +%s); T0=$(date -u +%FT%T); CS=${C:0:8}; CS16=${C:0:16}
 R=$(cld_ctl cld2 "(:credit :ledger \"$C\" :deposit \"$D\" :msat $AMT :txid \"$CTX\" :vout $CVOUT)")
 echo "== operator's attempt (arm=$ARM): $R"
