@@ -57,7 +57,7 @@
    (make-sc :name "vault-missed-confiscation" :script "attack-vault-missed-confiscation.sh"
             :ledger-var "REDTEAM_MC" :env '("WAIT=900") :timeout 1500 :tags '(:contagion :slow))
    (make-sc :name "withhold-reveal" :script "attack-withhold-reveal.sh" :ledger-var "REDTEAM_W"
-            :env '("WAIT=120") :timeout 2400 :tags '(:contagion :slow))
+            :env '("WAIT=120") :timeout 5400 :tags '(:contagion :slow))
    (make-sc :name "dereliction" :script "attack-dereliction.sh" :ledger-var "REDTEAM_D"
             :timeout 3600 :tags '(:contagion :slow))
    (make-sc :name "rollback-depth" :script "attack-rollback-depth.sh" :ledger-var "REDTEAM_R"

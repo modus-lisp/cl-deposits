@@ -87,6 +87,7 @@ tainted() { grep -qx "$1" "$TAINTED" 2>/dev/null; }
 clean_cl() {
   local n; for n in $(cld_names | sort -t d -k2 -nr); do
     tainted "$n" && continue
+    [[ " ${REDTEAM_AVOID:-} " == *" $n "* ]] && continue   # clean but busy (e.g. still in an earlier scenario's dispute)
     if cld_ctl "$n" '(:info)' 2>/dev/null | grep -qE ':OWNED T [^)]*:DISPUTED [1-9]'; then taint "$n"; continue; fi
     echo "$n"
   done
