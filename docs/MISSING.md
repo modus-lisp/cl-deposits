@@ -6,17 +6,16 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
 
 ## Fraud proofs and punishment
 
-- **Unauthorised vault spend (DEP-06 type 7).** cl: **done (2026-10-02).** `UnauthorizedVaultSpend`
-  (proof discriminant 10), a node-wide block scan for spends of every vault outpoint it replicates
-  (judged 3 blocks deep, so a rotation's QuorumBegin can arrive first), a verifier that rebuilds the
-  tier leaf and sighash and checks each witness signature, and contagion on every signer's operated
-  ledgers. Proven live (`redteam/attack-vault-spend.sh`). Reference: verifier, node verification and producer ported (bitcoind backend only; not yet run live)
-  (deposits-rust cc144a2 + 5accfdb, cross-impl vector passes). **Numbering:** the spec lists vault spend as type 7 and winner collateral as 6, but both
-  implementations number winner collateral 7 (and 5 non-conforming update, 6 quorum expired), so cl
-  uses discriminant 10 and the spec/implementation conflict is still open. **Limits:** the verifier
-  trusts the verifier's own chain for block existence only (not tx inclusion), a confiscation is
-  recognised only by the verifier's own record of it, and a recovery-tier spend (tiers 1-3) is
-  treated like any other unrecorded spend.
+- ~~**Unauthorised vault spend (DEP-06 type 7).**~~ **Done (2026-10-02), both implementations.**
+  `UnauthorizedVaultSpend`, wire type 10 (DEP-06 now carries the wire table). Each node scans every
+  new block for spends of the vault outpoints it replicates, judges them 3 blocks deep, and proves
+  each witness signer on every ledger the signer operates. Proven live on mixed quorums (a Rust
+  node detected a theft, and Rust and cl receivers disputed). **Limits:** a confiscation is
+  excused only by a verifier that knows it (one that disputed in it or signed it), so a member
+  without a fork accuses honest confiscation signers (`attack-vault-missed-confiscation.sh`). A
+  rotation recorded later than the 3-block grace is taken for a theft (`vault-rotate-late`). The
+  Rust record of confiscations it signed is in memory and lost on restart. The verifier checks that
+  the spend's block exists, not that the transaction is in it.
 - **Consolidated `NonConforming` proof (DEP-19 §5).** Neither implementation has it as specified.
   Cross-ledger contagion runs through `NonConformingCosignature` evidence instead, which now
   accepts the fault's operator as the accused.
@@ -41,8 +40,9 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
 - **`ExitRequest`, `ExitCancel`, splice-in (DEP-20 §3–4).** Absent from both implementations.
   The rotation splice-out, one of the two censorship-protected obligations, has nothing to act
   on.
-- **Operator stand-down after confiscation.** A cl operator whose vault was confiscated keeps
-  operating the old ledger. Its members refuse every cosign ("in dispute state").
+- ~~**Operator stand-down after confiscation.**~~ **Done (2026-10-01):** a cl operator stands down
+  once custody moves or a majority of its quorum disputes it (cl 9b1a6d4), and cl members refuse
+  to extend a deposed operator's chain (3e1ad0f), as the reference's members already did.
 
 ## Quorum composition (DEP-19 §10)
 
@@ -81,8 +81,12 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
 - **Contagion simulation** (analysis/contagion_sim.py): no operators with several ledgers, no
   operator contagion, no per-key dilution, no strategic quorum joining, no unequal vaults, no
   detection or punishment failure.
+- **Contagion taints a key for good.** Once a key is accused, every new ledger it runs or cosigns
+  is disputed on sight, including after a false accusation (a late rotation, or a missed
+  confiscation). Nothing clears an accusation. On the devnet this means a scenario must use keys
+  that no earlier run accused.
 - **Not measured on the devnet:**
-  - the rollback depth when every honest replica is offline at the fraud;
+  - the rollback depth when every honest replica is offline at the fraud (scenario written; see REDTEAM.md 2026-10-02);
   - off-ledger extraction through a courier leg;
   - a colluding majority against an honest minority before `quorum_expiry + 720`.
 
