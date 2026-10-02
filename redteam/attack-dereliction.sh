@@ -21,6 +21,9 @@ clean_at() { [ -z "$(cld_ctl $2 "(:forks :ledger \"$1\")" 2>/dev/null | grep -oE
 # moment to land; if K or C is disputed before the fraud, the run cannot tell dereliction apart.
 sleep 45
 clean_at "$K" $ACT && clean_at "$C" $DER || { echo "SKIP: $DER or $ACT is already accused by an earlier run (contagion taint): K $(clean_at "$K" $ACT && echo clean || echo disputed), C $(clean_at "$C" $DER && echo clean || echo disputed); needs fresh-key nodes"; exit 0; }
+# A deposit on K, credited each round after the fraud (below): the derelict keeps operating.
+mapfile -t KDEPS < <(fresh_deposits "$ROW-k" $DER "$K" 1); KD=${KDEPS[0]}; [ -n "$KD" ] || fail "no deposit on K"
+read -r ktxid kvout <"$S/redteam-$ROW-k.outpoint"
 DL_ROW="$S/redteam-${REDTEAM_D:-DL}"
 if [ -f "$DL_ROW" ]; then read -r DL txid vout < "$DL_ROW"; echo "== reusing DL $DL"; else
   echo "== forming DL ($OP operates; $ACT..$DER cosign; dispute_response_blocks=$RESP)"
@@ -50,9 +53,13 @@ taint "$OP"   # it committed the fraud
 echo "== forged lock on DL: $(echo "$R" | cut -c1-80)"
 echo "$R" | grep -q ":STATUS :OK" || { cld_ctl $DER "(:adversary :set :ignore-fraud nil)" >/dev/null; fail "forge did not commit"; }
 echo "== DL disputed; $DER ignoring.  Mining past the $RESP-block window."
+# Dereliction needs the member to keep operating a ledger past the window (an update on K at
+# height >= fraud + RESP): without traffic K never advances and no proof can fire.  Credit a
+# deposit on K each round (opened above); once the honest members dispute K, the credits stop committing.
 der=""
 for i in $(seq 1 $((WAIT/10))); do
   mine 2 >/dev/null
+  cld_ctl $DER "(:credit :ledger \"$K\" :deposit \"$KD\" :msat 1000 :txid \"$ktxid\" :vout $kvout)" >/dev/null 2>&1
   ! clean_at "$K" $ACT && [ -z "$der" ] && der=$(( $(date +%s) - t0 ))
   [ -n "$der" ] && break
   sleep 8
