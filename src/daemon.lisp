@@ -12,6 +12,7 @@
 ;;;;   (:advertise :ledger "hex")
 ;;;;   (:address)                                 the node key's address (replacement collateral, lottery target)
 ;;;;   (:arm :ledger "hex" [:txid "hex" :vout N :sats N])   arm a dispute, optionally pledging replacement collateral
+;;;;   (:tune [:full-arming-wait-blocks N])          devnet: shorten the full-arming wait (red-team scenarios)
 
 (defpackage #:cl-deposits.daemon
   (:use #:cl #:cl-deposits.util)
@@ -50,6 +51,10 @@
          (loop for (k v) on (cdr (member :set form)) by #'cddr
                do (setf (getf (nd:node-adversary node) k) v))
          (ok :adversary (nd:node-adversary node)))
+        (:tune   ; devnet: (:tune :full-arming-wait-blocks N) — shorten a wait a scenario cannot mine through
+         (let ((v (arg form :full-arming-wait-blocks)))
+           (when v (setf cl-deposits.node::*full-arming-wait-blocks* v))
+           (ok :full-arming-wait-blocks cl-deposits.node::*full-arming-wait-blocks*)))
         (:forge-lock   ; red team: (:forge-lock :ledger L :from DEP :to DEP :msat N) — as operator, lock a
                        ; deposit with NO depositor witness, straight to the cosigners (docs/REDTEAM.md)
          (let* ((rec (rec! node form)) (h (nd:height node))

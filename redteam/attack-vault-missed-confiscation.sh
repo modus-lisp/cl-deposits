@@ -9,6 +9,10 @@
 # The limit's contagion lands on the signers' (honest) ledgers wherever a verifier also lacks the
 # record.  REDTEAM_MC=name forms a fresh ledger per run.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
+# Fewer than Q arm here, and cl then waits *full-arming-wait-blocks* (720) before confiscating (the
+# Lottery-N mitigation): shorten it for the run, restore it after.
+tune_arming() { local n; for n in $(cld_names); do cld_ctl "$n" "(:tune :full-arming-wait-blocks $1)" >/dev/null 2>&1; done; }
+tune_arming 2; trap 'tune_arming 720' EXIT
 WAIT=${WAIT:-600}
 X=$(RESP=${RESP:-5} form_ledger "${REDTEAM_MC:-MC}" cld1 "" cld2 cld3 cld4 cld5 cld6) || exit 1
 echo "== ledger $X: cld3 cld4 cld5 cld6 dispute"
@@ -29,5 +33,9 @@ accused cld6 "$X" && fail "cld6, a disputant, reported its own confiscation as a
 if accused cld2 "$X"; then
   echo "PASS: the disputant excused the confiscation; cld2 (no fork) reported it as a vault spend — the known limit, demonstrated."
 else
-  echo "PASS: the disputant excused the confiscation, and cld2 did not report it either (the limit did not show)."
+  if cld_ctl cld2 "(:forks :ledger \"$X\")" | grep -q ":STATE"; then
+    echo "PASS: the disputant excused the confiscation; cld2 disputed too (the operator's key is tainted by an earlier run), so it knew the confiscation and the limit could not show."
+  else
+    echo "PASS: the disputant excused the confiscation, and cld2 did not report it either (the limit did not show)."
+  fi
 fi

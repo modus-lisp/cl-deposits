@@ -14,7 +14,11 @@ ROW=${REDTEAM_D:-DL}
 K=$(form_ledger "$ROW-k" cld6 "" cld2 ref6 ref7) || exit 1; echo "== K $K (cld6 operates; cld2 ref6 ref7)"
 C=$(form_ledger "$ROW-c" cld2 "" cld6 ref6 ref7) || exit 1; echo "== C $C (cld2 operates; cld6 ref6 ref7)"
 clean_at() { [ -z "$(cld_ctl $2 "(:forks :ledger \"$1\")" 2>/dev/null | grep -oE ':STATE :[A-Z]+')" ]; }
-clean_at "$K" cld2 || fail "K is already disputed"
+# Contagion taints a key for good: a node accused in an earlier run (a theft it signed, or a false
+# accusation such as vault-rotate-late's) has every new ledger disputed on sight.  Give the proofs a
+# moment to land; if K or C is disputed before the fraud, the run cannot tell dereliction apart.
+sleep 45
+clean_at "$K" cld2 && clean_at "$C" cld6 || { echo "SKIP: cld6 or cld2 is already accused by an earlier run (contagion taint): K $(clean_at "$K" cld2 && echo clean || echo disputed), C $(clean_at "$C" cld6 && echo clean || echo disputed); needs fresh-key nodes"; exit 0; }
 DL_ROW="$S/redteam-${REDTEAM_D:-DL}"
 if [ -f "$DL_ROW" ]; then read -r DL txid vout < "$DL_ROW"; echo "== reusing DL $DL"; else
   echo "== forming DL (cld1 operates; cld2..cld6 cosign; dispute_response_blocks=$RESP)"
