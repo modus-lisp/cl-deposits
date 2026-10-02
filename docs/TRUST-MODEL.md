@@ -386,6 +386,39 @@ what buys capital efficiency.
 - **Liveness is unchanged:** censorship, co-sign refusal and going offline rest on collateral and
   dereliction as before.
 
+### 2j. A zero-day, repriced: containment, and why the first strike is the seating rule's (simulation)
+
+Contagion maps onto a vendor zero-day: the first exploited theft is on chain, its
+`UnauthorizedVaultSpend` names the signers, and through their ads their attestation classes. No
+proof is *about* the TEE (an enclave claim is not chain-verifiable); nodes and wallets simply stop
+counting those classes as attested and re-seat the quorums relying on them. Any use of a zero-day
+discloses it network-wide, so exploitation is one-shot and all-in.
+
+`analysis/zeroday_sim.py`, worst case: a remote exploit (every key on a broken class signs for the
+attacker, whoever operates it) plus a coalition share p of the unattested operators. Share of vaults
+capturable (N=60, L=3, 80% attested, 200 trials):
+
+| seating | broken | p=0 | p=0.2 | p=0.4 |
+|---|---|---|---|---|
+| 80% attested, random seats | 1 vendor | 8.6% | 13.6% | 19.4% |
+| 80% attested, random seats | 1 vendor + 1 platform | 17.6% | 24.6% | 30.7% |
+| 7 att, ≤1/platform, ≤3/vendor | ≤2 platforms or 1 vendor | 0 | 0 | 0 |
+| 7 att, ≤1/platform, ≤3/vendor | 1 vendor + 1 platform | 20.8% | 20.9% | 22.4% |
+| 7 att, ≤1/platform, ≤3/vendor | 2 vendors | 100% | 100% | 100% |
+
+**On Bitcoin today repricing does not shrink the first strike:** every capturable vault goes in one
+block, before any proof exists. Repricing protects everything after (no second strike, deposits move,
+quorums re-seat). The first strike is set by seating alone: zero inside the counting bound, large
+beyond it. Four vendors at ≤2 seats each would put "1 vendor + 1 platform" and "2 vendors" back inside.
+
+**With a spend cap, containment bounds the loss:** loss = capturable × min(1, f·(2 + r)) for a vault
+spendable at fraction f per window, one window to detect and r to re-seat. f = 2%, r = 1 turns the
+21% vendor+platform strike into 1.3% of deposits. A cap needs a covenant (BIP-345, CTV) today. A
+possible covenant-free shape, to design: a fast path at 6-7 of 7 (used by rotation), a majority path
+behind a relative timelock, and a rescue transaction pre-signed by the intact full quorum
+(Revault-style) that any watcher broadcasts during the delay. The open part is the rescue's
+destination, since the next quorum is not known at signing time; the recovery tiers may be it.
+
 ## 3. Trust heuristics for a wallet choosing a ledger
 
 Observable from public data (relay + chain), roughly in order of what the findings say matters:
