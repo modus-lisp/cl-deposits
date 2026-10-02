@@ -19,7 +19,7 @@ source "$(dirname "$0")/_lib.sh"
 pick OP HON   # a tainted OP's R is disputed on sight, before the honest replicas go down
 trap 'start_cld "$HON" >/dev/null 2>&1; for r in ref6 ref7; do ref_running $r || start_ref $r >/dev/null 2>&1; done' EXIT   # never leave the replicas down
 ROW=${REDTEAM_R:-R}
-R=$(form_ledger "$ROW" $OP "" cld2 cld3 cld4 cld5 $HON ref6 ref7) || exit 1; echo "== R $R ($OP operates; cld2..$HON ref6 ref7 cosign)"
+R=$(COLLATERAL_SATS=25000000 form_ledger "$ROW" $OP "" cld2 cld3 cld4 cld5 $HON ref6 ref7) || exit 1; echo "== R $R ($OP operates; cld2..$HON ref6 ref7 cosign)"
 # A credited deposit on R, so the forged lock is a real over-balance/no-witness fault.
 mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$R" 1); DEP=${DEPS[0]}; [ -n "$DEP" ] || fail "no deposit on R"
 FROM="$DEP"

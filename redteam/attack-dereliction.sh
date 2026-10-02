@@ -13,8 +13,8 @@ source "$(dirname "$0")/_lib.sh"
 pick OP ACT DER   # a tainted OP's DL, or a tainted ACT/DER's K or C, is disputed on sight
 trap 'cld_ctl "$DER" "(:adversary :set :ignore-fraud nil)" >/dev/null 2>&1' EXIT
 ROW=${REDTEAM_D:-DL}
-K=$(form_ledger "$ROW-k" $DER "" $ACT ref6 ref7) || exit 1; echo "== K $K ($DER operates; $ACT ref6 ref7)"
-C=$(form_ledger "$ROW-c" $ACT "" $DER ref6 ref7) || exit 1; echo "== C $C ($ACT operates; $DER ref6 ref7)"
+K=$(COLLATERAL_SATS=25000000 form_ledger "$ROW-k" $DER "" $ACT ref6 ref7) || exit 1; echo "== K $K ($DER operates; $ACT ref6 ref7)"
+C=$(COLLATERAL_SATS=25000000 form_ledger "$ROW-c" $ACT "" $DER ref6 ref7) || exit 1; echo "== C $C ($ACT operates; $DER ref6 ref7)"
 clean_at() { [ -z "$(cld_ctl $2 "(:forks :ledger \"$1\")" 2>/dev/null | grep -oE ':STATE :[A-Z]+')" ]; }
 # Contagion taints a key for good: a node accused in an earlier run (a theft it signed, or a false
 # accusation such as vault-rotate-late's) has every new ledger disputed on sight.  Give the proofs a

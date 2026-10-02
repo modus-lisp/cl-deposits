@@ -17,7 +17,8 @@ trap 'cld_ctl "$WH" "(:adversary :set :withhold-reveal nil)" >/dev/null 2>&1; tu
 tune_arming() { local n; for n in $(cld_names); do cld_ctl "$n" "(:tune :full-arming-wait-blocks $1)" >/dev/null 2>&1; done; }
 tune_arming 2
 ROW=${REDTEAM_W:-W}   # a fresh ledger W: $OP operates; cld2..$WH ref6 ref7 cosign
-W=$(RESP=${RESP:-5} form_ledger "$ROW" $OP "" cld2 cld3 cld4 cld5 $WH ref6 ref7) || exit 1; echo "== W $W"
+REFS=${REFS-ref6 ref7}   # REFS="" forms a cl-only quorum (a reference armer that pledges a spent coin vetoes the confiscation)
+W=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" cld2 cld3 cld4 cld5 $WH $REFS) || exit 1; echo "== W $W"
 mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$W" 1); FROM=${DEPS[0]}; [ -n "$FROM" ] || fail "no deposit on W"
 
 # The fraud: $OP locks a depositor's funds with no witness, cld2..cld4 cosign blind.
