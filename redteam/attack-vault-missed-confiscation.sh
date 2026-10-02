@@ -10,7 +10,7 @@
 # record.  REDTEAM_MC=name forms a fresh ledger per run.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
 WAIT=${WAIT:-600}
-X=$(form_ledger "${REDTEAM_MC:-MC}" cld1 "" cld2 cld3 cld4 cld5 cld6) || exit 1
+X=$(RESP=${RESP:-5} form_ledger "${REDTEAM_MC:-MC}" cld1 "" cld2 cld3 cld4 cld5 cld6) || exit 1
 echo "== ledger $X: cld3 cld4 cld5 cld6 dispute"
 for n in cld3 cld4 cld5 cld6; do cld_ctl $n "(:dispute-enter :ledger \"$X\" :reason \"redteam missed-confiscation\")" >/dev/null; done
 conf=""

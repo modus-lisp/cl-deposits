@@ -11,7 +11,7 @@ source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-300}
 source "$(dirname "$0")/_lib.sh"
 ROW=${REDTEAM_W:-W}   # a fresh ledger W: cld1 operates; cld2..cld6 ref6 ref7 cosign
-W=$(form_ledger "$ROW" cld1 "" cld2 cld3 cld4 cld5 cld6 ref6 ref7) || exit 1; echo "== W $W"
+W=$(RESP=${RESP:-5} form_ledger "$ROW" cld1 "" cld2 cld3 cld4 cld5 cld6 ref6 ref7) || exit 1; echo "== W $W"
 mapfile -t DEPS < <(fresh_deposits "$ROW" cld1 "$W" 1); FROM=${DEPS[0]}; [ -n "$FROM" ] || fail "no deposit on W"
 
 # The fraud: cld1 locks a depositor's funds with no witness, cld2..cld4 cosign blind.

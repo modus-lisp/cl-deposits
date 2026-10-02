@@ -12,14 +12,15 @@ consent() {         # consent LEDGER OPERATOR MEMBER... — a reference member's
   local l=$1 op=$2 m r i; shift 2
   for m in "$@"; do
     for i in 1 2 3; do
-      r=$(cld_ctl "$op" "(:add-member :ledger \"$l\" :member \"$(cat "$S/pubkey.$m")\" :member-ledger \"$(own_ledger "$m")\")")
+      r=$(cld_ctl "$op" "(:add-member :ledger \"$l\" :member \"$(cat "$S/pubkey.$m")\" :member-ledger \"$(own_ledger "$m")\"${RESP:+ :dispute-response-blocks $RESP})")
       [[ "$r" == *":STATUS :OK"* ]] && break; sleep 5
     done; expect "$r" "add-member $m"
   done
 }
 # form_ledger ROWNAME OPERATOR RULESET MEMBER... — a fresh funded ledger, remembered in $S/redteam-ROWNAME
 # (its reserves outpoint in ROWNAME.outpoint).  Prints the ledger id.  RULESET "" means the default.
-# COLLATERAL_SATS (default 0) of the 0.5 BTC vault is collateral, the rest reserves.
+# COLLATERAL_SATS (default 0) of the 0.5 BTC vault is collateral, the rest reserves.  RESP (blocks), when
+# set, is each member's dispute_response_blocks: the arm window, so a scenario need not mine ~720 blocks.
 form_ledger() {
   local row="$S/redteam-$1" op=$2 rs=$3 l prep addr txid vout coll=${COLLATERAL_SATS:-0}; shift 3
   if [ -f "$row" ]; then cat "$row"; return; fi
