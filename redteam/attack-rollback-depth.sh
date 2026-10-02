@@ -25,13 +25,16 @@ mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$R" 1); DEP=${DEPS[0]}; [ -n "$DE
 FROM="$DEP"
 
 # Stop the honest replicas.  Their data dirs persist; they catch up on restart.
+sleep 15; pre_forks=$(cld_ctl $HON "(:forks :ledger \"$R\")" 2>/dev/null | grep -oE ":STATE :[A-Z]+" | wc -l)
+[ "$pre_forks" -eq 0 ] || fail "R was disputed before the fraud ($pre_forks fork(s) on $HON): the measure would be meaningless"
 echo "== stopping the honest replicas ($HON ref6 ref7)"
 stop_cld $HON; stop_ref ref6; stop_ref ref7
 sleep 3
 
 # The fraud: forged lock, blind cosigners.
 for n in cld2 cld3 cld4 cld5; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
-echo "== fraud: forged lock on R with the honest replicas down"
+pre=$(sx "$(cld_ctl $OP "(:tip :ledger \"$R\")")" ":SEQ")   # the last honest update: an honest fork must branch at or before it
+echo "== fraud: forged lock on R with the honest replicas down (honest tip seq $pre)"
 cld_ctl $OP "(:forge-lock :ledger \"$R\" :from \"$FROM\" :to \"$FROM\" :msat 1000000)" >/dev/null
 sleep 5
 # More updates on top, so the rollback has depth.
@@ -55,7 +58,8 @@ echo "== watching for the honest dispute on R (up to ${WAIT}s)"
 T0=$(date -u +%s)
 disputed=0
 for i in $(seq 1 $((WAIT/5))); do
-  d=$(for n in $HON; do cld_ctl $n "(:forks :ledger \"$R\")" 2>/dev/null; done | grep -oE ":STATE :(DISPUTED|ARMED)" | wc -l)
+  # only the honest replica's OWN fork: (:forks) also lists forks it replicates from other members
+  d=$(cld_ctl $HON "(:forks :ledger \"$R\")" 2>/dev/null | grep -oE ":OPERATOR \"$(cut -c1-16 "$S/pubkey.$HON")\" :SEQ [0-9]+ :STATE :(DISPUTED|ARMED)" | wc -l)
   [ "$d" -gt 0 ] && { disputed=$d; break; }
   sleep 5
 done
@@ -64,10 +68,9 @@ if [ "$disputed" -eq 0 ]; then
   exit 1
 fi
 DT=$(( $(date -u +%s) - T0 ))
-fork=$(cld_ctl $HON "(:forks :ledger \"$R\")" 2>/dev/null)
-last_valid=$(echo "$fork" | grep -oE ':LAST-VALID [0-9]+' | grep -oE '[0-9]+')
-echo "== dispute after ${DT}s; fork last-valid seq $last_valid (fraudulent tip was $tip)"
-depth=$(( tip - last_valid ))
+fseq=$(cld_ctl $HON "(:forks :ledger \"$R\")" 2>/dev/null | grep -oE ":OPERATOR \"$(cut -c1-16 "$S/pubkey.$HON")\" :SEQ [0-9]+" | grep -oE '[0-9]+$')
+echo "== $HON disputed ${DT}s after it answered; its fork is at seq $fseq (honest tip $pre, fraudulent tip $tip)"
+depth=$(( tip - pre ))
 echo "== rollback depth: $depth updates"
 echo "PASS: the fraud stood ${HOLD}s unnoticed (no honest witness), was caught ${DT}s after the replicas returned, and rolled back $depth updates."
 echo "     A courier leg paid against the fraudulent tip during the blind window is gone: the payment left, the ledger rolled back."
