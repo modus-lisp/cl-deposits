@@ -821,3 +821,48 @@ see MISSING.md.
 **Facilities added:** `(:tune :full-arming-wait-blocks N)` on cl (the runner restores 720 after each
 run), `RESP=` for a short arm window in `form_ledger`, `devnet/soak.sh collateral` (refills
 dispute collateral when a node reports none unpledged).
+
+### 2026-10-02 (afternoon) — fresh-key nodes; the slow scenarios run
+
+**Why fresh keys.** Contagion taints a key for good, and all six soak cl keys were accused by
+earlier runs, so every ledger they ran or cosigned was disputed on sight. Eight, then twelve
+fresh-key cl nodes joined the devnet (cld7–cld18; red-team actors, not soak operators; cl 32e758c,
+7200f2b). Scenarios now `pick` clean actors: a registry of burned keys (`$S/redteam-tainted`,
+appended by each scenario for the keys it burns) plus each node's own view of its disputed
+ledgers; too few clean nodes is a SKIP. Every scenario burns at least one key (the fraudster), so
+the pool runs down; add nodes as needed.
+
+| scenario | attack succeeds? | caught? |
+|---|---|---|
+| vault-missed-confiscation (clean operator) | — | the disputant excused the confiscation; cld2, which never disputed, reported it as a vault spend naming the honest confiscation signers: **the known limit, demonstrated** |
+| dereliction | the derelict ignores the fraud | **yes, end to end**: a `DisputeDereliction` proof, and the derelict's own ledger disputed 178 s after the window; the acting member's ledger untouched |
+| rollback-depth | the fraud stands while the honest replicas are down | yes: the restarted honest replica disputed at once; the fork branched at the last honest seq (depth 1 here) |
+| withhold-reveal (cl-only quorum) | **yes — custody held indefinitely** | the confiscation lands; the withholder never reveals; 187 blocks later (past CSV-144) the lottery output is unspent |
+
+**Withhold-reveal, in detail.** The honest armers revealed and then loop on `waiting to claim:
+missing a reveal`; they never switch to the recovery path. The one node that tries recovery
+(`sweep-lottery`) gathers 1 of 3 recovery signatures, because the honest armers do not take the
+recovery branch. Funds sit in the lottery output with no one operating the ledger.
+
+**Found, recorded, not fixed:**
+- *A spent collateral coin vetoes the confiscation.* ref7 armed pledging a coin that was already
+  spent; cl's strict check (`check-armer-collateral`, per DEP-06) then refuses the confiscation for
+  everyone. A colluding member can stall a confiscation the same way on purpose. The reference
+  should not pick a spent coin; the spec could drop an armer whose collateral is invalid instead of
+  failing the confiscation.
+- *Implementations disagree on credits beyond collateral.* The reference treats an update whose
+  obligations exceed the collateral (`ExceedsCollateral`, active quorum) as non-conforming: it
+  refuses to cosign, and disputes when others cosign. cl has no such rule, and the spec states
+  only reserves ≥ obligations (DEP-03). On a zero-collateral ledger an honest credit is a fraud to
+  the reference members. Scenario ledgers that take deposits now carry collateral.
+- *A reference node deadlocked.* ref6 stopped logging for 1 h 40 m: all 116 workers parked on
+  futexes, no CPU; unlike the busy loop fixed in 0db8541. Stack dump and tail in
+  `ref6/node.log.hang-1002-stack` (the dump caught only the parked main thread).
+- *The devnet relay died silently* (beacon, 10:52, nothing in its log); every consent timed out
+  until it was restarted. The run's watchdog now restarts the relay as well as hung reference nodes.
+
+**Harness fixes:** dereliction now keeps the derelict's ledger busy past the window (a member is
+derelict only if it kept operating; the first run passed only on a manual nudge); rollback-depth
+times only the honest replica's own fork (`(:forks)` also lists replicated forks, which read as an
+instant dispute) and refuses a ledger disputed before the fraud; withhold-reveal's timeout fits
+the chain (~5 blocks/min); `REFS=` forms a cl-only quorum; `REDTEAM_AVOID` skips busy clean nodes.

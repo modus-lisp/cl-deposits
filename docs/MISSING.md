@@ -24,8 +24,18 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   act); deposits-rust ec7457b (producer; it already verified/acted). A cl-built proof verifies on
   the reference with a matching proof hash. Found and fixed two latent wire mismatches: the proof is
   now self-evident (no embedding) on both sides, and `original_fraud_block_hash` serialises as hex.
-  Not yet exercised end-to-end on the devnet (needs a member to idle a full `dispute_response_blocks`
-  while active — hours).
+  Exercised end to end on the devnet (2026-10-02, `redteam/attack-dereliction.sh`, short
+  `dispute_response_blocks`): proof produced, derelict's ledger disputed, acting member untouched.
+- **Lottery recovery after a withheld reveal.** When an armer withholds its preimage, cl's honest
+  armers loop on "missing a reveal" and never take the recovery path; recovery needs 3 signatures
+  and gets 1. Shown live 2026-10-02: the lottery output unspent 187 blocks after confiscation (past
+  CSV-144). Neither the claim nor the recovery leaf moves the funds.
+- **Invalid armer collateral vetoes a confiscation.** One armer pledging a spent coin makes strict
+  cosigners (cl, per DEP-06) refuse the whole confiscation, rather than dropping that armer. A
+  colluding member can use it to stall; the reference picked a spent coin by accident (ref7).
+- **Credits beyond collateral: the implementations disagree.** The reference rejects (and disputes)
+  an update whose obligations exceed the collateral while the quorum is active; cl allows it; the
+  spec requires only reserves ≥ obligations. A mixed quorum disputes an honest zero-collateral ledger.
 - **Censorship proofs (DEP-11, DEP-12).** Not acted on in either implementation. cl has
   `verify-censorship` with no caller. The reference has DeliveryEmbed, but the wallet-to-member
   escalation channel is unwired.
@@ -84,9 +94,10 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
 - **Contagion taints a key for good.** Once a key is accused, every new ledger it runs or cosigns
   is disputed on sight, including after a false accusation (a late rotation, or a missed
   confiscation). Nothing clears an accusation. On the devnet this means a scenario must use keys
-  that no earlier run accused.
+  that no earlier run accused (fresh-key nodes cld7+, picked by `redteam/_lib.sh`).
 - **Not measured on the devnet:**
-  - the rollback depth when every honest replica is offline at the fraud (scenario written; see REDTEAM.md 2026-10-02);
+  - ~~the rollback depth when every honest replica is offline~~ measured 2026-10-02: caught on return,
+    rolled back to the last honest seq (REDTEAM.md);
   - off-ledger extraction through a courier leg;
   - a colluding majority against an honest minority before `quorum_expiry + 720`.
 
@@ -123,6 +134,7 @@ Risks we are worried about, given what exists and what doesn't.
   longer servable at the deadline.
 - The custody lottery goes unclaimed: the committed N differs from the armed count (lottery N), or
   a last revealer withholds. Custody then waits for recovery leaves while no one operates the ledger.
+  Confirmed live for the withheld reveal (2026-10-02): past CSV-144 the recovery does not happen either.
 
 **Honest parties punished**
 - DEP-19 §5 implemented as written would slash honest members for re-signing a round that did not
