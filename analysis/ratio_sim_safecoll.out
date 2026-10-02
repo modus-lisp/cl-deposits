@@ -1,0 +1,7 @@
+variant: collateral not takeable by a captured quorum (loot from an honest vault = its deposits R only)
+  R    eff  rand L=3  guid L=3  guid L=5
+0.50  1.00      0.36      0.48      0.51
+0.60  1.50      0.30      0.42      0.45
+0.70  2.33      0.27      0.36      0.36
+0.80  4.00      0.18      0.27      0.30
+0.90  9.00      0.12      0.15      0.18

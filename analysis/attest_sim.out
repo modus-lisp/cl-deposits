@@ -1,0 +1,12 @@
+max safe coalition fraction p (>= 95% of 60 trials), N=60, Q=7, L=3, 80% of operators attested over 3 vendors
+seating                  broken   R=0.5  R=0.6  R=0.7  R=0.8  R=0.9
+no attestation                0    0.99   0.99   0.87   0.69   0.42
+4 attested, <=2/vendor        0    0.99   0.99   0.99   0.99   0.99
+4 attested, <=2/vendor        1    0.72   0.72   0.57   0.48   0.24
+4 attested, <=2/vendor        2    0.39   0.36   0.30   0.24   0.15
+6 attested, <=2/vendor        0    0.99   0.99   0.99   0.99   0.99
+6 attested, <=2/vendor        1    0.99   0.99   0.99   0.99   0.99
+6 attested, <=2/vendor        2    0.42   0.36   0.30   0.24   0.15
+7 attested, <=3/vendor        0    0.99   0.99   0.99   0.99   0.99
+7 attested, <=3/vendor        1    0.99   0.99   0.99   0.99   0.99
+7 attested, <=3/vendor        2    0.39   0.36   0.27   0.27   0.15

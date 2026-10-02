@@ -315,6 +315,75 @@ in keeping p under the single-shot boundary (seating + contagion + entry cost). 
 damage-and-tempo control, so it can be modest (bootstrapping-friendly), chosen for recovery tempo
 rather than for a safety threshold it does not set.
 
+### 2h. Collateral ratio: efficiency against resilience (simulation)
+
+`analysis/ratio_sim.py` sweeps R, the deposits' share of a vault (capital efficiency R/(1-R) deposits
+per unit of collateral), under the §2e attacker and cascade (N=60, Q=7, 80 trials, 0.03 steps).
+Largest unprofitable coalition fraction p:
+
+| R | eff | random L=1 | guidance L=1 | random L=3 | guidance L=3 | guidance L=5 |
+|---|---|---|---|---|---|---|
+| 0.3 | 0.43 | 0.30 | 0.48 | 0.33 | 0.54 | 0.54 |
+| 0.5 | 1.0 | 0.24 | 0.36 | 0.27 | 0.42 | 0.45 |
+| 0.6 | 1.5 | 0.18 | 0.30 | 0.27 | 0.39 | 0.39 |
+| 0.7 | 2.3 | 0.15 | 0.18 | 0.21 | 0.33 | 0.36 |
+| 0.8 | 4.0 | 0.09 | 0.09 | 0.15 | 0.24 | 0.27 |
+| 0.9 | 9.0 | 0.09 | 0.09 | 0.12 | 0.12 | 0.18 |
+
+**Readings:** the knee is R≈0.6-0.7, and only with guidance and several ledgers per operator (R=0.6
+holds ~0.39; R=0.7 a third). Below R=0.5 more collateral buys little; above 0.8 tolerance is under a
+quarter in every world. A profitable attack (profiled at p=0.36, random, L=3) is one coordinated
+strike: every capturable vault at once, two thirds of them honest operators' vaults (which yield
+deposits *and* collateral), every coalition key burned, ~20% of its ledgers shielded by
+coalition-majority quorums. A variant where a captured quorum cannot take an honest vault's
+collateral (`ratio_sim_safecoll.out`) gains only 0.03-0.09, about one step of R.
+
+### 2i. Attestation as a trust root that degrades to economics (design and simulation)
+
+A node's key can be generated inside an enclave running a reproducible image that cosigns only
+conforming updates and refuses any vault spend that is not a recorded rotation or dispute-backed
+confiscation, and the DEP-04 ad can carry the attestation quote binding the key to the image. An
+attested key on an intact platform cannot sign a theft, whoever owns it.
+
+`analysis/attest2_sim.py` models classes as vendor x platform (CPU family / microcode / board
+firmware: most breaks hit one platform, a vendor-root compromise hits all of a vendor's), 3 vendors
+x 4 platforms, 80% of operators attested, the §2e attacker and cascade (N=60, Q=7, L=3). 0.99 is the
+top of the grid: no coalition of any size profits.
+
+| seating | broken | R=0.5 | R=0.7 | R=0.8 | R=0.9 |
+|---|---|---|---|---|---|
+| nobody attested | - | 0.27 | 0.24 | 0.18 | 0.12 |
+| 80% attested, random seats | 1 platform | 0.90 | 0.63 | 0.57 | 0.30 |
+| 80% attested, random seats | 1 vendor | 0.48 | 0.42 | 0.33 | 0.18 |
+| **7 attested, ≤1/platform, ≤3/vendor** | **≤3 platforms, or 1 vendor** | **0.99** | **0.99** | **0.99** | **0.99** |
+| same | 1 vendor + 1 platform | 0.75 | 0.54 | 0.45 | 0.30 |
+| 7 attested, ≤2/platform, ≤3/vendor | 2 platforms | 0.99 | 0.99 | 0.99 | 0.69 |
+| 5 attested, ≤1/platform, ≤2/vendor | 1 vendor | 0.99 | 0.78 | 0.60 | 0.33 |
+
+**The guarantee is counting, not simulation.** With every seat attested, ≤1 per platform and ≤3 per
+vendor, a vendor break plus up to two more platform breaks leave a coalition at most 3 of 7 seats; it
+cannot reach the 4 a theft needs, at any coalition size. The simulation confirms the cascade and the
+attacker find no way around it.
+
+**What is different from earlier TEE designs** (Teechain, HSM federations): they put the enclave alone
+in the safety path, so one break was total loss. Here a break moves the system down to a line it
+already holds: beyond the designed failure, the §2e economics still apply (0.45 at R=0.8 after a
+vendor and a platform break; today's design needs R≈0.4 for that). **Sizing rule:** choose R for the
+tolerance wanted after the worst planned break; attestation is margin above it, and that margin is
+what buys capital efficiency.
+
+**Conditions the model does not capture:**
+- **The image is a class spanning every platform.** A policy bug breaks every enclave running it. Two
+  independent implementations become a requirement: cap seats per implementation too (≤3 cl, ≤3 Rust).
+- **Revocation tempo is a safety parameter.** While a broken class keeps its seats the system runs on
+  the economic line; how fast a class is demoted (TCB advisories) and quorums re-seated sets that window.
+- **Supply:** each quorum needs 7 distinct platforms over ≥3 vendors (TDX, SEV-SNP, CCA; Nitro as a
+  cloud option). Whether operators have enough attestable combinations is open.
+- **The enclave's view of the world:** it must check header proof-of-work and keep rollback-proof
+  state, or the host feeds it a fake chain or replays sealed state into an equivocation.
+- **Liveness is unchanged:** censorship, co-sign refusal and going offline rest on collateral and
+  dereliction as before.
+
 ## 3. Trust heuristics for a wallet choosing a ledger
 
 Observable from public data (relay + chain), roughly in order of what the findings say matters:
@@ -344,6 +413,9 @@ Observable from public data (relay + chain), roughly in order of what the findin
   *Devnet: stop the honest members, commit a fault, restart them, measure k.*
 - **Off-ledger extraction:** a courier leg across two ledgers whose source lock rolls back. Who loses,
   and how much should a courier wait? *node-test plus devnet.*
+- **Attestation (§2i):** per-implementation classes; exposure as a function of class revocation and
+  re-seating time; platform supply among real operators; what an attestable cl-deposits image needs.
+  *Simulation, then a design note for DEP-04 ads and DEP-19 §10 seating.*
 - **Extend the simulation (§2a):** strategic quorum joining, unequal vaults, several ledgers per
   operator, and implementation diversity as a second axis.
 - **DEP-05 §Cosignature Threshold** needs rewording: it claims an honest majority prevents equivocation;

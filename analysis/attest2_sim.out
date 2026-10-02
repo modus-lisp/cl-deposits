@@ -1,0 +1,17 @@
+max safe p (>= 95% of 60 trials), N=60, Q=7, L=3; classes = 3 vendors x 4 platforms
+world                              broken                 R=0.5  R=0.7  R=0.8  R=0.9
+baseline: nobody attested          -                       0.27   0.24   0.18   0.12
+80% attested, random seats         1 platform              0.90   0.63   0.57   0.30
+80% attested, random seats         1 vendor                0.48   0.42   0.33   0.18
+7 att, <=1/platform, <=3/vendor    none                    0.99   0.99   0.99   0.99
+7 att, <=1/platform, <=3/vendor    1 platform              0.99   0.99   0.99   0.99
+7 att, <=1/platform, <=3/vendor    2 platforms             0.99   0.99   0.99   0.99
+7 att, <=1/platform, <=3/vendor    3 platforms             0.99   0.99   0.99   0.99
+7 att, <=1/platform, <=3/vendor    1 vendor                0.99   0.99   0.99   0.99
+7 att, <=1/platform, <=3/vendor    1 vendor + 1 platform   0.75   0.54   0.45   0.30
+7 att, <=2/platform, <=3/vendor    1 platform              0.99   0.99   0.99   0.99
+7 att, <=2/platform, <=3/vendor    2 platforms             0.99   0.99   0.99   0.69
+7 att, <=2/platform, <=3/vendor    1 vendor                0.99   0.99   0.99   0.99
+5 att, <=1/platform, <=2/vendor    1 platform              0.99   0.99   0.99   0.99
+5 att, <=1/platform, <=2/vendor    2 platforms             0.99   0.99   0.99   0.57
+5 att, <=1/platform, <=2/vendor    1 vendor                0.99   0.78   0.60   0.33

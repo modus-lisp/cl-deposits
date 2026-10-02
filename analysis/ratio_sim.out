@@ -1,0 +1,10 @@
+max safe coalition fraction p (unprofitable in >= 95% of 80 trials), N=60, Q=7, roots 10%
+R = deposits' share of the vault; efficiency = R/(1-R) deposits per unit of collateral
+  R    eff  rand L=1  guid L=1  rand L=3  guid L=3  rand L=5  guid L=5
+0.30  0.43       0.30       0.48       0.33       0.54       0.36       0.54
+0.40  0.67       0.27       0.42       0.30       0.48       0.33       0.51
+0.50  1.00       0.24       0.36       0.27       0.42       0.30       0.45
+0.60  1.50       0.18       0.30       0.27       0.39       0.27       0.39
+0.70  2.33       0.15       0.18       0.21       0.33       0.24       0.36
+0.80  4.00       0.09       0.09       0.15       0.24       0.18       0.27
+0.90  9.00       0.09       0.09       0.12       0.12       0.12       0.18

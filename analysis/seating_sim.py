@@ -38,6 +38,7 @@ Output: the largest coalition fraction p at which the attack is unprofitable in
 import random, sys
 
 Q, NEED, K = 7, 4, 2.0          # quorum, majority, deposit-weighting exponent (score^K)
+COLLATERAL_SAFE = False         # True: a captured quorum can take an honest vault's deposits but not its collateral
 EPS = 0.0                       # deposit weight of a visibly non-compliant ledger (wallets skip it)
 
 def build(n, l, p, roots_frac, world, own, pool, vanity, rng, layout=(2, 3, 2)):
@@ -105,7 +106,7 @@ def attack(n, l, r, bad, quorum, weight, dereliction=True):
         if len(members) < NEED: continue
         members.sort(key=lambda m: (m not in exposed, m))
         signers = members[:NEED]
-        loot = (r if o in bad else 1.0) * weight[(o, j)]
+        loot = (r if (o in bad or COLLATERAL_SAFE) else 1.0) * weight[(o, j)]
         new_total = closure(exposed | set(signers))
         if loot > new_total - cur:
             gain += loot; exposed.update(signers); cur = new_total
@@ -121,7 +122,7 @@ def allin(n, l, r, bad, quorum, weight):
     for (o, j), mem in quorum.items():
         members = sorted(m for m in mem if m in bad)
         if len(members) >= NEED:
-            gain += (r if o in bad else 1.0) * weight[(o, j)]; signers.update(members[:NEED])
+            gain += (r if (o in bad or COLLATERAL_SAFE) else 1.0) * weight[(o, j)]; signers.update(members[:NEED])
     seen = set(signers); todo = list(signers); cost = 0.0
     while todo:
         k = todo.pop()
@@ -143,7 +144,7 @@ def smart_attack(n, l, r, bad, quorum, weight):
     for (o, j), mem in quorum.items():
         members = sorted(m for m in mem if m in bad)
         if len(members) >= NEED:
-            caps.append(((r if o in bad else 1.0) * weight[(o, j)], frozenset(members[:NEED])))
+            caps.append(((r if (o in bad or COLLATERAL_SAFE) else 1.0) * weight[(o, j)], frozenset(members[:NEED])))
 
     def net(chosen):
         if not chosen: return 0.0
