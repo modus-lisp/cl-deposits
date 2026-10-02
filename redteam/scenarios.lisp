@@ -60,6 +60,10 @@
             :env '("WAIT=120") :timeout 5400 :tags '(:contagion :slow))
    (make-sc :name "veto-pledge" :script "attack-veto-pledge.sh" :ledger-var "REDTEAM_VP"
             :timeout 2400 :tags '(:contagion) :note "one armer spends its pledge; the confiscation must still land")
+   (make-sc :name "veto-pledge-sole" :script "attack-veto-pledge.sh" :args '("sole") :ledger-var "REDTEAM_VPS"
+            :timeout 2400 :tags '(:contagion) :note "one eligible armer takes custody without a draw")
+   (make-sc :name "veto-pledge-reopen" :script "attack-veto-pledge.sh" :args '("reopen") :ledger-var "REDTEAM_VPR"
+            :timeout 3000 :tags '(:contagion) :note "nobody eligible: the honest armer re-arms")
    (make-sc :name "dereliction" :script "attack-dereliction.sh" :ledger-var "REDTEAM_D"
             :timeout 3600 :tags '(:contagion :slow))
    (make-sc :name "rollback-depth" :script "attack-rollback-depth.sh" :ledger-var "REDTEAM_R"
