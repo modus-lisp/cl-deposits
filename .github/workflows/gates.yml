@@ -73,6 +73,11 @@ jobs:
             --eval '(quicklisp-quickstart:install)' \
             --eval '(ql-util:without-prompting (ql:add-to-init-file))' \
             --eval '(ql:quickload (list :ironclad :usocket :bordeaux-threads :com.inuoe.jzon :hunchentoot))'
+      - name: Install beacon (the devnet relay)
+        run: |
+          git clone --depth 1 https://github.com/modus-lisp/beacon.git ~/quicklisp/local-projects/beacon
+          git clone --depth 1 https://github.com/modus-lisp/secp256k1-fast.git ~/quicklisp/local-projects/secp256k1-fast
+          sbcl --non-interactive --load ~/quicklisp/setup.lisp --eval '(ql:quickload :beacon)'
       - name: Install Bitcoin Core 28.1
         run: |
           curl -sSL -o /tmp/btc.tgz https://bitcoincore.org/bin/bitcoin-core-28.1/bitcoin-28.1-x86_64-linux-gnu.tar.gz
