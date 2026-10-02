@@ -29,7 +29,11 @@ form_ledger() {
   prep=$(cld_ctl "$op" "(:prepare-quorum :ledger \"$l\" :expiry-blocks 4320${rs:+ :ruleset \"$rs\"})"); expect "$prep" "prepare-quorum"; addr=$(sx "$prep" ":ADDRESS")
   txid=$(wcli sendtoaddress "$addr" 0.5); mine 3 >/dev/null
   vout=$(outpoint_vout "$txid" "$addr")
-  expect "$(cld_ctl "$op" "(:begin-quorum :ledger \"$l\" :txid \"$txid\" :vout $vout :sats $(( 50000000 - coll )) :collateral-sats $coll)")" "begin-quorum"
+  local r i; for i in 1 2 3; do   # a busy member can miss the cosign round: retry
+    r=$(cld_ctl "$op" "(:begin-quorum :ledger \"$l\" :txid \"$txid\" :vout $vout :sats $(( 50000000 - coll )) :collateral-sats $coll)")
+    case "$r" in *":STATUS :OK"*) break;; *"cosignatures"*) echo "   begin-quorum retry $i: $r" >&2; sleep 15;; *) break;; esac
+  done
+  expect "$r" "begin-quorum"
   cld_ctl "$op" "(:advertise :ledger \"$l\")" >/dev/null 2>&1
   await_active "$l" "$@" >&2
   echo "$txid $vout" > "$row.outpoint"; echo "$l" > "$row"; echo "$l"

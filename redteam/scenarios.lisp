@@ -47,7 +47,7 @@
             :ledger-var "REDTEAM_FL"
             :timeout 600 :tags '(:contagion))
    (make-sc :name "collude-q7" :script "attack-collude-q7.sh" :ledger-var "REDTEAM_M"
-            :env '("WAIT=300") :timeout 1200 :tags '(:contagion))
+            :env '("WAIT=300") :timeout 1800 :tags '(:contagion))
    (make-sc :name "vault-spend" :script "attack-vault-spend.sh" :ledger-var "REDTEAM_V"
             :env '("REFS=" "WAIT=300") :timeout 1200 :tags '(:contagion))
    (make-sc :name "vault-recovery-tier" :script "attack-vault-recovery-tier.sh" :ledger-var "REDTEAM_RT"

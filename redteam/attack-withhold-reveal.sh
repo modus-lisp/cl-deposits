@@ -30,7 +30,7 @@ conf_txid=""
 for i in $(seq 1 $WAIT); do
   out=$(cld_ctl cld6 "(:forks :ledger \"$W\")" 2>/dev/null)
   state=$(echo "$out" | grep -oE ':STATE :[A-Z-]+' | head -1)
-  log=$(cld_ctl cld6 '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain|withholding" | tail -2)
+  log=$(cld_ctl cld6 '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain|withholding" | grep -F "dispute ${W:0:8}:" | tail -2)
   [ -n "$log" ] && echo "  [$i s] $log"
   case "$log" in *"withholding"*) conf_txid=$(echo "$log" | grep -oE '[0-9a-f]{64}' | head -1); break;; esac
   sleep 5
@@ -47,10 +47,22 @@ for i in $(seq 1 $WAIT); do
   [ -z "$spent" ] && { outcome="spent"; break; }
   sleep 5
 done
-cld_ctl cld6 "(:adversary :set :withhold-reveal nil)" >/dev/null
+# Past the recovery delay: mine 150 blocks (CSV-144) and see whether anything recovers the output.
 if [ "$outcome" = held ]; then
+  echo "== mining 150 blocks past the confiscation (CSV-144 recovery path)"
+  for i in $(seq 1 15); do
+    mine 10 >/dev/null; sleep 10
+    [ -z "$(bcli gettxout "$conf_txid" 0 2>/dev/null | head -1)" ] && { outcome="swept-after-csv"; break; }
+  done
+  [ "$outcome" = held ] && sleep 60 && [ -z "$(bcli gettxout "$conf_txid" 0 2>/dev/null | head -1)" ] && outcome="swept-after-csv"
+fi
+cld_ctl cld6 "(:adversary :set :withhold-reveal nil)" >/dev/null
+if [ "$outcome" = swept-after-csv ]; then
+  echo "PASS (bounded): the withholder stalled the lottery, but the output was recovered after the CSV-144 delay."
+  echo "     Confiscation $conf_txid:0 spent after ~$((i*10)) blocks."
+elif [ "$outcome" = held ]; then
   echo "PASS (gap confirmed): the lottery output is unspent and unclaimable — the withholder holds custody hostage."
-  echo "     Confiscation $conf_txid:0.  No claim, no recovery sweep within ${WAIT}s (CSV-144 needs 144 confirmations)."
+  echo "     Confiscation $conf_txid:0.  No claim, and no recovery sweep even 150 blocks past CSV-144."
 else
   echo "NOTE: the lottery output was spent — someone claimed or swept it.  Investigate $conf_txid."
 fi

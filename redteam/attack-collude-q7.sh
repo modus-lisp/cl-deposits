@@ -5,11 +5,11 @@
 # (four of seven, a majority) cosign blind, and cld1 locks a depositor's funds with no
 # witness.  It commits.  PASS = what the protocol promises after that:
 #   - M's honest members (cld6, ref6, ref7) dispute M;
-#   - contagion: the ledgers the four colluders operate (C, E, G, I: cld2..cld5 at Q = 7,
-#     each with an honest majority) are disputed by their own members;
-#   - operator contagion: A, the forging operator cld1's other ledger, is disputed by its
-#     honest members.  (A ledger already confiscated from a colluder stays quiet: it has a new
-#     operator.)  REDTEAM_M=name forms a fresh test ledger per run.
+#   - contagion: a fresh ledger each colluder operates (X2..X5: cld2..cld5, quorum cld6 ref6
+#     ref7, all honest) is disputed by its members;
+#   - operator contagion: X1, a fresh ledger the forging operator cld1 also runs, is disputed.
+#   (The soak's own colluder ledgers were deposed in earlier runs, so the targets are formed here.)
+#   REDTEAM_M=name forms fresh test ledgers per run.
 # Reports times from the fraud to each dispute.  WAIT (s) bounds the watch.
 source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-300}
@@ -20,30 +20,38 @@ mapfile -t DEPS < <(fresh_deposits "$ROW" cld1 "$M" 2); D1=${DEPS[0]}; D2=${DEPS
 [ -n "$D1" ] && [ -n "$D2" ] || fail "no deposits on M"
 echo "== victim deposit $D1 credited 20000000 msat on M"
 has_fork() { case $2 in cld*) cld_ctl $2 "(:forks :ledger \"$1\")" | grep -q "$(cut -c1-16 $S/pubkey.$2)";; *) false;; esac; }
-declare -A PRE; while IFS=$'\t' read -r L id _; do for n in $(cld_names); do has_fork "$id" "$n" && PRE[$id/$n]=1; done; done < "$S/ledgers.tsv"   # forks from earlier runs
+declare -A X; for k in 1 2 3 4 5; do X[$k]=$(form_ledger "$ROW-x$k" cld$k "" cld6 ref6 ref7) || exit 1; echo "   X$k ${X[$k]} (cld$k)"; done
 T0=$(date -u +%FT%T); t0=$(date +%s)
+declare -A OFF; for n in $(ref_names); do OFF[$n]=$(stat -c %s "$(ref_dir $n)/node.log" 2>/dev/null || echo 0); done   # read only what is logged after the attack
 arm :cosign-blind cld2 cld3 cld4 cld5
 R=$(cld_ctl cld1 "(:forge-lock :ledger \"$M\" :from \"$D1\" :to \"$D2\" :msat 15000000)")
 disarm :cosign-blind cld2 cld3 cld4 cld5
 echo "== 4-of-7 attempt on M: $(echo "$R" | cut -c1-120)"
 echo "$R" | grep -q ":STATUS :OK" || fail "the colluding majority did not commit"
-declare -A LED; while IFS=$'\t' read -r L id op _; do LED[$L]=$id; done < "$S/ledgers.tsv"
-forked() {   # forked LEDGER-ID NODE: did NODE fork LEDGER-ID after the attack (not before)
+forked() {   # forked LEDGER-ID NODE: did NODE fork LEDGER-ID after the attack
   case $2 in
-    cld*) [ -z "${PRE[$1/$2]:-}" ] && has_fork "$1" "$2";;
-    ref*) local L; L=$(sed 's/\x1b\[[0-9;]*m//g' "$(ref_dir $2)/node.log" | awk -v t="$T0" '$1 > t' | grep -E "${1:0:16}")
-          echo "$L" | grep -qE "Created dispute fork|INITIATING DISPUTE" && ! echo "$L" | grep -q "Already have fork";;
+    cld*) cld_ctl $2 "(:forks :ledger \"$1\")" | grep -q "$(cut -c1-16 $S/pubkey.$2)";;
+    ref*) tail -c +$(( ${OFF[$2]:-0} + 1 )) "$(ref_dir $2)/node.log" | grep -F "${1:0:16}" | grep -qE "Created dispute fork|INITIATING DISPUTE";;
   esac; }
+PAIRS="M:$M"; for k in 1 2 3 4 5; do PAIRS="$PAIRS X$k:${X[$k]}"; done
 declare -A DONE
 for i in $(seq 1 $((WAIT/10))); do
-  for pair in "M:$M:cld6 ref6 ref7" "A:${LED[A]}:ref2 ref3 ref4 ref5" "C:${LED[C]}:ref3 ref4 ref5 ref6" "E:${LED[E]}:ref4 ref5 ref6 ref7" "G:${LED[G]}:ref5 ref6 ref7 cld6" "I:${LED[I]}:ref6 ref7 ref2 ref3 cld6"; do
-    IFS=: read -r L id nodes <<<"$pair"
-    for n in $nodes; do k="$L/$n"; [ -z "${DONE[$k]:-}" ] && forked "$id" "$n" && DONE[$k]=$(( $(date +%s) - t0 )); done
+  all=1
+  for pair in $PAIRS; do
+    IFS=: read -r L id <<<"$pair"
+    for n in cld6 ref6 ref7; do k="$L/$n"; [ -n "${DONE[$k]:-}" ] && continue; if forked "$id" "$n"; then DONE[$k]=$(( $(date +%s) - t0 )); else all=0; fi; done
   done
+  [ $all = 1 ] && break
   sleep 10
 done
 echo "== disputes (seconds after the fraud; - = none within $WAIT s):"
-for pair in "M:cld6 ref6 ref7" "A:ref2 ref3 ref4 ref5" "C:ref3 ref4 ref5 ref6" "E:ref4 ref5 ref6 ref7" "G:ref5 ref6 ref7 cld6" "I:ref6 ref7 ref2 ref3 cld6"; do
-  IFS=: read -r L nodes <<<"$pair"; printf "   %s:" $L; for n in $nodes; do printf " %s=%s" $n "${DONE[$L/$n]:--}"; done; echo
+missing=0
+for pair in $PAIRS; do
+  IFS=: read -r L id <<<"$pair"; printf "   %s:" $L
+  for n in cld6 ref6 ref7; do printf " %s=%s" $n "${DONE[$L/$n]:--}"; [ -n "${DONE[$L/$n]:-}" ] || missing=$((missing+1)); done; echo
 done
 echo "== contagion proofs sent by cld6: $(cld_ctl cld6 '(:log)' | tr '"' '\n' | grep -c 'contagion:.*proof against')"
+# A ledger is caught when a majority of its 3 honest members dispute it.
+caught=0; for pair in $PAIRS; do L=${pair%%:*}; c=0; for n in cld6 ref6 ref7; do [ -n "${DONE[$L/$n]:-}" ] && c=$((c+1)); done; [ $c -ge 2 ] && caught=$((caught+1)); done
+[ $caught = 6 ] || fail "$caught of 6 ledgers (M, X1..X5) disputed by a majority of their honest members ($missing member disputes missing)"
+echo "PASS: M and all five colluder ledgers disputed by their honest members (contagion and operator contagion)."

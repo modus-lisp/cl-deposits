@@ -15,30 +15,11 @@
 # equals the number of updates committed during the blind window.
 source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; HOLD=${HOLD:-60}; WAIT=${WAIT:-300}
-fail() { echo "FAIL: $*" >&2; exit 1; }
-expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "$1";; esac; }
-
-R_ROW="$S/redteam-${REDTEAM_R:-R}"
-if [ -f "$R_ROW" ]; then read -r R < "$R_ROW"; echo "== reusing R $R"; else
-  echo "== forming R (cld1 operates; cld2..cld6 ref6 ref7 cosign)"
-  R=$(sx "$(cld_ctl cld1 "(:open-ledger :reserves-id \"genesis:cld1:redteam-R:$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER"); [ -n "$R" ] || fail "open R"
-  for m in cld2 cld3 cld4 cld5 cld6 ref6 ref7; do
-    case $m in cld*) ml=$(eval echo "\${L${m#cld}}");; ref*) ml=$(eval echo "\${RL${m#ref}}");; esac
-    expect "$(cld_ctl cld1 "(:add-member :ledger \"$R\" :member \"$(cat $S/pubkey.$m)\" :member-ledger \"$ml\")")"
-  done
-  prep=$(cld_ctl cld1 "(:prepare-quorum :ledger \"$R\" :expiry-blocks 4320)"); expect "$prep"; addr=$(sx "$prep" ":ADDRESS")
-  txid=$(wcli sendtoaddress "$addr" 0.5); mine 3
-  vout=$(bcli getrawtransaction "$txid" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$addr'][0])")
-  sleep 20
-  expect "$(cld_ctl cld1 "(:begin-quorum :ledger \"$R\" :txid \"$txid\" :vout $vout :sats 50000000 :collateral-sats 0)")"
-  echo "$R" > "$R_ROW"
-fi
-
-# A credited deposit on R, so the forged lock is a real over-balance/no-witness fault
-# (not deposit-not-found, which the operator's own apply would reject before signing).
-W="$CLD_SRC/devnet/cld-wallet.sh"
-DEP=$(sx "$($W rbw "$R" open)" ":DEPOSIT"); [ -n "$DEP" ] || fail "open deposit on R"
-expect "$(cld_ctl cld1 "(:credit :ledger \"$R\" :deposit \"$DEP\" :msat 5000000 :txid \"$txid\" :vout ${vout:-0})")" 2>/dev/null ||   cld_ctl cld1 "(:credit :ledger \"$R\" :deposit \"$DEP\" :msat 5000000 :txid \"$(printf '%064d' 1)\" :vout 0)" >/dev/null
+source "$(dirname "$0")/_lib.sh"
+ROW=${REDTEAM_R:-R}
+R=$(form_ledger "$ROW" cld1 "" cld2 cld3 cld4 cld5 cld6 ref6 ref7) || exit 1; echo "== R $R (cld1 operates; cld2..cld6 ref6 ref7 cosign)"
+# A credited deposit on R, so the forged lock is a real over-balance/no-witness fault.
+mapfile -t DEPS < <(fresh_deposits "$ROW" cld1 "$R" 1); DEP=${DEPS[0]}; [ -n "$DEP" ] || fail "no deposit on R"
 FROM="$DEP"
 
 # Stop the honest replicas.  Their data dirs persist; they catch up on restart.
@@ -63,7 +44,9 @@ sleep $HOLD
 # Bring the honest replicas back.
 echo "== restarting the honest replicas"
 start_cld cld6; start_ref ref6; start_ref ref7
-sleep 30
+t_up=$(date +%s)
+for i in $(seq 1 120); do cld_ctl cld6 "(:info)" 2>/dev/null | grep -q ":STATUS :OK" && break; sleep 5; done   # a cl node loads its histories for minutes
+echo "== cld6 answering $(( $(date +%s) - t_up ))s after restart"
 
 echo "== watching for the honest dispute on R (up to ${WAIT}s)"
 T0=$(date -u +%s)

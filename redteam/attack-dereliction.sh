@@ -3,19 +3,18 @@
 # operates; cld2 cld3 cld4 cld5 cld6 cosign, short dispute_response_blocks), cld1 forges a
 # lock with a colluding majority (cld3 cld4 cld5 cosign blind), so a NonConformingUpdate
 # proof is published and DL is disputed.  cld6 is set to :ignore-fraud: it drops the proof
-# but keeps operating the ledger it runs (K).  cld2 is the honest acting member.
-# PASS = an honest member produces a DisputeDereliction proof against cld6, and cld6's own
-# operated ledger (K, clean before) is freshly disputed, while cld2's ledger (C) is not.
+# but keeps operating a ledger it runs (K: a fresh ledger, quorum cld2 ref6 ref7).  cld2 is
+# the honest acting member and also operates a fresh control ledger (C: quorum cld6 ref6 ref7).
+# PASS = an honest member produces a DisputeDereliction proof against cld6, and cld6's operated
+# ledger K is freshly disputed (seen by cld2), while cld2's ledger C is not (seen by cld6).
 source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-480}; RESP=${RESP:-5}
-fail() { echo "FAIL: $*" >&2; exit 1; }
-expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "$1";; esac; }
-oper_ledger() { awk -F'\t' -v o="$1" '$3==o{print $2}' "$S/ledgers.tsv"; }
-K=$(oper_ledger cld6)    # the derelict member's operated ledger (must be clean to be slashed)
-C=$(oper_ledger cld2)    # the acting member's operated ledger (must NOT be disputed)
-[ -n "$K" ] && [ -n "$C" ] || fail "cld6/cld2 operated ledgers not found"
-clean() { [ -z "$(cld_ctl cld1 "(:forks :ledger \"$1\")" 2>/dev/null | grep -oE ':STATE :[A-Z]+')" ]; }
-clean "$K" || fail "cld6's ledger K is already disputed; pick another derelict member"
+source "$(dirname "$0")/_lib.sh"
+ROW=${REDTEAM_D:-DL}
+K=$(form_ledger "$ROW-k" cld6 "" cld2 ref6 ref7) || exit 1; echo "== K $K (cld6 operates; cld2 ref6 ref7)"
+C=$(form_ledger "$ROW-c" cld2 "" cld6 ref6 ref7) || exit 1; echo "== C $C (cld2 operates; cld6 ref6 ref7)"
+clean_at() { [ -z "$(cld_ctl $2 "(:forks :ledger \"$1\")" 2>/dev/null | grep -oE ':STATE :[A-Z]+')" ]; }
+clean_at "$K" cld2 || fail "K is already disputed"
 DL_ROW="$S/redteam-${REDTEAM_D:-DL}"
 if [ -f "$DL_ROW" ]; then read -r DL txid vout < "$DL_ROW"; echo "== reusing DL $DL"; else
   echo "== forming DL (cld1 operates; cld2..cld6 cosign; dispute_response_blocks=$RESP)"
@@ -47,7 +46,7 @@ echo "== DL disputed; cld6 ignoring.  Mining past the $RESP-block window."
 der=""
 for i in $(seq 1 $((WAIT/10))); do
   mine 2 >/dev/null
-  ! clean "$K" && [ -z "$der" ] && der=$(( $(date +%s) - t0 ))
+  ! clean_at "$K" cld2 && [ -z "$der" ] && der=$(( $(date +%s) - t0 ))
   [ -n "$der" ] && break
   sleep 8
 done
@@ -55,9 +54,9 @@ cld_ctl cld6 "(:adversary :set :ignore-fraud nil)" >/dev/null
 der1=$(for n in cld1 cld2 cld3 cld4; do cld_ctl $n '(:log)' | tr '"' '\n' | grep -c 'DERELICTION:'; done | paste -sd+ | bc)
 echo "== DERELICTION proofs produced this run: $(( der1 - der0 ))"
 echo "== cld6's operated ledger K freshly disputed: ${der:+after ${der}s}${der:-NO}"
-echo "== cld2's operated ledger C disputed (should be no): $(clean "$C" && echo no || echo YES)"
-if [ -n "$der" ] && [ "$(( der1 - der0 ))" -gt 0 ] && clean "$C"; then
+echo "== cld2's operated ledger C disputed (should be no): $(clean_at "$C" cld6 && echo no || echo YES)"
+if [ -n "$der" ] && [ "$(( der1 - der0 ))" -gt 0 ] && clean_at "$C" cld6; then
   echo "PASS: the derelict member (cld6) was reported and its vault disputed; the acting member (cld2) was not."
 else
-  echo "RESULT: K=${der:-none} proofs=$(( der1 - der0 )) C=$(clean "$C" && echo clean || echo disputed)"
+  echo "FAIL: K=${der:-none} proofs=$(( der1 - der0 )) C=$(clean_at "$C" cld6 && echo clean || echo disputed)"
 fi

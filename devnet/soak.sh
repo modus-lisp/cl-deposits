@@ -148,6 +148,32 @@ topup() {   # fees drain the bots' deposits and nothing refills them: the operat
     fi
   done <"$SOAK/deposits.tsv"
   echo "$(date +%FT%T) top-up pass: $n deposits re-credited"
+  topup_collateral
+}
+collateral_addr() {   # cached: the reference CLI takes minutes on a soaked data dir
+  local f="$SOAK/collateral-addr.$1" a
+  [ -s "$f" ] && { cat "$f"; return; }
+  case $1 in
+    cld*) a=$(sx "$(cld_ctl "$1" '(:address)')" ":ADDRESS");;
+    ref*) a=$(env $(ref_env) RUST_LOG=error "$REF_NODE_BIN" pubkey-to-p2wpkh --network "$CLD_CHAIN" --seed-file "$(ref_dir "$1")/seed.hex" --data-dir "$(ref_dir "$1")" 2>&1 | grep -oE '(tb1|bcrt1)[0-9a-z]+' | head -1);;
+  esac
+  [ -n "$a" ] && echo "$a" | tee "$f"
+}
+topup_collateral() {   # disputes pledge these coins and red-team runs leave disputes open: keep SOAK_COLLATERAL_MIN spare
+  local n a have sent=0 min=${SOAK_COLLATERAL_MIN:-6}
+  for n in $(cld_names) $(ref_names); do
+    a=$(collateral_addr "$n") || continue; [ -n "$a" ] || continue
+    have=$(bcli scantxoutset start "[\"addr($a)\"]" 2>/dev/null | grep -c '"txid"')
+    case $n in
+      cld*) # pledged and declared coins still sit at the address: ask the node whether it ran short
+        cld_ctl "$n" '(:log)' 2>/dev/null | tr '"' '\n' | grep "^collateral for" | tail -1 | grep -q "have 0 unpledged" || [ "$have" -lt "$min" ] || continue;;
+      *) [ "$have" -ge "$min" ] && continue;;
+    esac
+    for i in $(seq 1 8); do wcli sendtoaddress "$a" 0.01 >/dev/null && sent=$((sent+1)); done
+    echo "$(date +%FT%T) collateral $n: had $have coins (short); sent 8"
+  done
+  [ $sent -gt 0 ] && mine 1 >/dev/null
+  echo "$(date +%FT%T) collateral pass: $sent coins sent"
 }
 topup_loop() { while true; do topup; sleep "$SOAK_TOPUP_EVERY"; done; }
 start() {
@@ -171,7 +197,7 @@ status() {
 }
 case "${1:-}" in
   setup) setup;; start) start;; stop) stop;; status) status;;
-  topup) topup;; topup-loop) SOAK_TOPUP_EVERY=${SOAK_TOPUP_EVERY:-900}; topup_loop;;
+  topup) topup;; collateral) topup_collateral;; topup-loop) SOAK_TOPUP_EVERY=${SOAK_TOPUP_EVERY:-900}; topup_loop;;
   reset) stop; rm -f "$ENV" "$SOAK/ledgers.tsv" "$SOAK/deposits.tsv" "$SOAK/.collateral-funded" "$SOAK/.cl-collateral-funded"; echo "reset (ledgers on the nodes are untouched)";;
   *) sed -n '2,19p' "$0"; exit 2;;
 esac
