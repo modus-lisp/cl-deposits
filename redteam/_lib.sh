@@ -1,7 +1,17 @@
 # redteam/_lib.sh — shared by the scenario scripts.  Source after devnet/_common.sh and $S/env.
 fail() { echo "FAIL: $*" >&2; exit 1; }
 expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "${2:+$2: }${1:-no answer (control port timed out?)}";; esac; }
-own_ledger() { case $1 in cld*) eval echo "\${L${1#cld}}";; ref*) eval echo "\${RL${1#ref}}";; esac; }
+own_ledger() {      # own_ledger NODE — the ledger NODE cites as a member; opened and recorded in $S/env on first use
+  local var id; case $1 in cld*) var="L${1#cld}";; ref*) var="RL${1#ref}";; esac
+  [ -f "$S/env" ] && source "$S/env"
+  if [ -z "${!var:-}" ]; then
+    case $1 in
+      cld*) id=$(sx "$(cld_ctl "$1" "(:open-ledger :reserves-id \"genesis:$1:redteam:$RANDOM\")")" ":LEDGER");;
+      ref*) id=$(ref_ledger "$1"); [ -n "$id" ] || id=$(ref_cli "$1" ledger open --collateral-ratio 0.5 | sed -nE 's/.*Ledger ID: ([0-9a-f]{64}).*/\1/p');;
+    esac
+    [ -n "$id" ] || fail "own ledger for $1"; printf '%s=%s\n' "$var" "$id" >>"$S/env"; declare -g "$var=$id"
+  fi; echo "${!var}"
+}
 outpoint_vout() {   # outpoint_vout TXID ADDRESS
   bcli getrawtransaction "$1" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$2'][0])"
 }
