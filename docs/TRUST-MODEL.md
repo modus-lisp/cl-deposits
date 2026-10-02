@@ -361,8 +361,10 @@ top of the grid: no coalition of any size profits.
 | 5 attested, ≤1/platform, ≤2/vendor | 1 vendor | 0.99 | 0.78 | 0.60 | 0.33 |
 
 **The guarantee is counting, not simulation.** With every seat attested, ≤1 per platform and ≤3 per
-vendor, a vendor break plus up to two more platform breaks leave a coalition at most 3 of 7 seats; it
-cannot reach the 4 a theft needs, at any coalition size. The simulation confirms the cascade and the
+vendor, any three platform breaks, or one whole vendor, leave a coalition at most 3 of 7 seats; it
+cannot reach the 4 a theft needs, at any coalition size. A vendor break plus one more platform can
+(3 + 1), which is where the economic line takes over. Tightening the vendor cap to ≤2 needs ≥4
+vendors per quorum. The simulation confirms the cascade and the
 attacker find no way around it.
 
 **What is different from earlier TEE designs** (Teechain, HSM federations): they put the enclave alone
