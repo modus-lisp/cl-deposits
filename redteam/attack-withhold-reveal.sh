@@ -37,6 +37,7 @@ for i in $(seq 1 $WAIT); do
   log=$(cld_ctl cld6 '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain|withholding" | grep -F "dispute ${W:0:8}:" | tail -2)
   [ -n "$log" ] && echo "  [$i s] $log"
   case "$log" in *"withholding"*) conf_txid=$(echo "$log" | grep -oE '[0-9a-f]{64}' | head -1); break;; esac
+  [ $((i % 6)) -eq 0 ] && mine 1 >/dev/null   # the arm window closes on height
   sleep 5
 done
 [ -n "$conf_txid" ] || fail "no confiscation reached within ${WAIT}s (state: $state)"

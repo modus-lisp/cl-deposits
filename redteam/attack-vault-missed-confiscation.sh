@@ -22,8 +22,6 @@ for i in $(seq 1 $((WAIT / 5))); do
   conf=$(cld_ctl cld6 '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain" | grep -F "dispute ${X:0:8}:" | grep -oE '[0-9a-f]{64}' | tail -1)
   [ -n "$conf" ] && break
   [ $((i % 6)) -eq 0 ] && mine 1 >/dev/null   # the arm window closes on height
-  [ $i -eq 6 ] && { for n in cld3 cld4 cld5 cld6; do cld_ctl $n "(:arm :ledger \"$X\")" >/dev/null; done; }
-  [ $i -eq 12 ] && cld_ctl cld6 "(:confiscate :ledger \"$X\")" >/dev/null
   sleep 5
 done
 [ -n "$conf" ] || fail "no confiscation within ${WAIT}s"
