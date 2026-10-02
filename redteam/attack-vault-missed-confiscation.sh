@@ -2,7 +2,7 @@
 # redteam/attack-vault-missed-confiscation.sh — a confiscation the watcher does not know of.
 #
 # A vault spend is excused if it is a recorded rotation or a confiscation the WATCHER knows
-# (one it disputed in or signed).  On a fresh cl-only ledger (cld1 operates; cld2..cld6 cosign),
+# (one it disputed in or signed).  On a fresh cl-only ledger (OP, a clean node, operates; cld2..cld6 cosign),
 # cld3 cld4 cld5 cld6 dispute and confiscate (majority 4 of 6).  cld2 never disputes.  Then:
 #   - cld6 (a disputant) must NOT report the confiscation as a vault spend   [PASS condition]
 #   - cld2 (no fork) does report it, naming the honest confiscation signers  [the known limit]
@@ -14,7 +14,9 @@ source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/en
 tune_arming() { local n; for n in $(cld_names); do cld_ctl "$n" "(:tune :full-arming-wait-blocks $1)" >/dev/null 2>&1; done; }
 tune_arming 2; trap 'tune_arming 720' EXIT
 WAIT=${WAIT:-600}
-X=$(RESP=${RESP:-5} form_ledger "${REDTEAM_MC:-MC}" cld1 "" cld2 cld3 cld4 cld5 cld6) || exit 1
+pick OP   # clean: a tainted operator's ledger is disputed on sight by cld2 too, hiding the limit
+X=$(RESP=${RESP:-5} form_ledger "${REDTEAM_MC:-MC}" $OP "" cld2 cld3 cld4 cld5 cld6) || exit 1
+taint "$OP"   # confiscated below
 echo "== ledger $X: cld3 cld4 cld5 cld6 dispute"
 for n in cld3 cld4 cld5 cld6; do cld_ctl $n "(:dispute-enter :ledger \"$X\" :reason \"redteam missed-confiscation\")" >/dev/null; done
 conf=""

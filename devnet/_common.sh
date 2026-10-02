@@ -10,7 +10,9 @@ MINER_WALLET="${MINER_WALLET:-miner}"
 case "$CLD_CHAIN" in
   signet)
     RELAY_PORT="${RELAY_PORT:-7777}"
-    CLD_NODES=("cld1:10041" "cld2:10042" "cld3:10043" "cld4:10044" "cld5:10045" "cld6:10046")   # name:control-port
+    CLD_NODES=("cld1:10041" "cld2:10042" "cld3:10043" "cld4:10044" "cld5:10045" "cld6:10046"   # name:control-port
+               "cld7:10047" "cld8:10048" "cld9:10049" "cld10:10050"     # fresh keys for the red team (2026-10-02);
+               "cld11:10055" "cld12:10056" "cld13:10057" "cld14:10058")  # 10051-4 are the regtest devnet's
     CLD_ROOT="${CLD_ROOT:-$SIGNET_ROOT/deposits}"        # data dirs live OUTSIDE the repo
     BITCOIN_DATADIR="$SIGNET_ROOT/bitcoin"
     BITCOIN_CLI="${BITCOIN_CLI:-$SIGNET_ROOT/bin/bitcoin-cli}"
@@ -89,7 +91,7 @@ ref_ledger(){ ref_cli "$1" quorum show-identity | sed -nE 's/^ *([0-9a-f]{66}):(
 # implementations one always holds a majority of 7; a third is needed to avoid that.)
 soak_plan() {
   local ring=() c r i j names=(A B C D E F G H I J K L M N O P) plan=""
-  local cl=($(cld_names)) rf=($(ref_names))
+  local cl=($(cld_names | head -n "${SOAK_PLAN_CL:-6}")) rf=($(ref_names))   # cld7+ are red-team actors, not soak operators
   for i in "${!cl[@]}"; do ring+=("${cl[$i]}"); [ -n "${rf[$i]:-}" ] && ring+=("${rf[$i]}"); done
   local n=${#ring[@]} q=${SOAK_Q:-7}
   for i in $(seq 0 $((n-1))); do

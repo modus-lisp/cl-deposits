@@ -89,6 +89,15 @@ credit() {   # credit NAME DEPOSIT MSAT — through whichever implementation ope
 spawn() { local name=$1; shift; setsid nohup "$@" >>"$SOAK/log/$name.log" 2>&1 & echo $! >"$SOAK/pids/$name"; echo "  $name (pid $!)"; }
 alive() { local p; p=$(cat "$SOAK/pids/$1" 2>/dev/null) && [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
 
+fund_cl_collateral() {   # coins at each cl node's key-path address: its collateral wallet pledges from these (once per node)
+  local n CA i funded=0
+  for n in $(cld_names); do
+    [ -f "$SOAK/.cl-collateral-funded.$n" ] && continue
+    CA=$(sx "$(cld_ctl "$n" '(:address)')" ":ADDRESS"); [ -n "$CA" ] || fail "$n address"
+    for i in $(seq 1 "${SOAK_CL_COLLATERAL_COINS:-8}"); do wcli sendtoaddress "$CA" 0.01 >/dev/null; done
+    touch "$SOAK/.cl-collateral-funded.$n"; funded=1
+  done; [ $funded = 1 ] && mine 1; return 0
+}
 setup() {
   for n in $(cld_names); do cld_running "$n" || fail "$n not running (devnet/up.sh)"; done
   for n in $(ref_names); do ref_running "$n" || fail "$n not running (devnet/up.sh)"; done
@@ -98,12 +107,7 @@ setup() {
       for i in $(seq 1 "${SOAK_REF_COLLATERAL_COINS:-8}"); do wcli sendtoaddress "$CA" 0.01 >/dev/null; done   # one per concurrent dispute (Q = 7: 7 quorums each)
     done; mine 1; touch "$SOAK/.collateral-funded"
   fi
-  if [ ! -f "$SOAK/.cl-collateral-funded" ]; then   # coins at each cl node's key-path address: its collateral wallet pledges from these
-    for n in $(cld_names); do
-      CA=$(sx "$(cld_ctl "$n" '(:address)')" ":ADDRESS"); [ -n "$CA" ] || fail "$n address"
-      for i in $(seq 1 "${SOAK_CL_COLLATERAL_COINS:-8}"); do wcli sendtoaddress "$CA" 0.01 >/dev/null; done
-    done; mine 1; touch "$SOAK/.cl-collateral-funded"
-  fi
+  fund_cl_collateral
   for spec in $LEDGER_PLAN; do IFS=: read -r name op members <<<"$spec"; form_ledger "$name" "$op" "$members"; done
   echo "== deposits: $SOAK_REF_DEPOSITS reference bots per ledger + $SOAK_CL_WALLETS cl wallets on every ledger, $SOAK_CREDIT_MSAT msat each"
   touch "$SOAK/deposits.tsv"; local n=0
@@ -196,7 +200,7 @@ status() {
   echo; [ -f "$SOAK/status.txt" ] && cat "$SOAK/status.txt"
 }
 case "${1:-}" in
-  setup) setup;; start) start;; stop) stop;; status) status;;
+  setup) setup;; fund-cl) fund_cl_collateral;; start) start;; stop) stop;; status) status;;
   topup) topup;; collateral) topup_collateral;; topup-loop) SOAK_TOPUP_EVERY=${SOAK_TOPUP_EVERY:-900}; topup_loop;;
   reset) stop; rm -f "$ENV" "$SOAK/ledgers.tsv" "$SOAK/deposits.tsv" "$SOAK/.collateral-funded" "$SOAK/.cl-collateral-funded"; echo "reset (ledgers on the nodes are untouched)";;
   *) sed -n '2,19p' "$0"; exit 2;;

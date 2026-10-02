@@ -76,3 +76,26 @@ accused() {
 }
 arm()    { local k=$1 n; shift; for n in "$@"; do expect "$(cld_ctl "$n" "(:adversary :set $k t)")"; done; }
 disarm() { local k=$1 n; shift; for n in "$@"; do cld_ctl "$n" "(:adversary :set $k nil)" >/dev/null 2>&1; done; }
+# Actors.  Contagion taints a key for good (a theft it signed, a fraud it committed, a false accusation):
+# every later ledger it operates is disputed on sight, so a scenario that needs a clean operator or a
+# clean honest member must not reuse it.  $S/redteam-tainted lists tainted cl nodes; a scenario calls
+# `taint` on the keys it burns.  clean_cl prints the untainted cl nodes, freshest (highest-numbered) first,
+# and also drops — and records — a node any of whose operated ledgers its own :info shows disputed.
+TAINTED="$S/redteam-tainted"
+taint() { local n; for n in "$@"; do grep -qx "$n" "$TAINTED" 2>/dev/null || echo "$n" >>"$TAINTED"; done; }
+tainted() { grep -qx "$1" "$TAINTED" 2>/dev/null; }
+clean_cl() {
+  local n; for n in $(cld_names | sort -t d -k2 -nr); do
+    tainted "$n" && continue
+    if cld_ctl "$n" '(:info)' 2>/dev/null | grep -qE ':OWNED T [^)]*:DISPUTED [1-9]'; then taint "$n"; continue; fi
+    echo "$n"
+  done
+}
+# pick ROLE... — bind each named shell variable to a distinct clean cl node (in order).  Not enough clean
+# nodes is a SKIP, not a FAIL: the scenario cannot tell its result apart from earlier taint.
+pick() {
+  local pool=($(clean_cl)) i=0 v
+  [ ${#pool[@]} -ge $# ] || { echo "SKIP: needs $# clean cl nodes ($*), have ${#pool[@]} (${pool[*]:-none}); add fresh-key nodes (devnet/_common.sh CLD_NODES)"; exit 0; }
+  for v in "$@"; do declare -g "$v=${pool[$i]}"; i=$((i+1)); done
+  echo "== actors: $(for v in "$@"; do printf '%s=%s ' "$v" "${!v}"; done)"
+}
