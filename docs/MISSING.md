@@ -1,6 +1,6 @@
 # What's missing
 
-*As of 2026-09-30.* An inventory of gaps between the Deposits spec, cl-deposits and deposits-rust
+*As of 2026-10-02.* An inventory of gaps between the Deposits spec, cl-deposits and deposits-rust
 (branch `signed-header-v2`), found while running the devnet and the red team. What exists is
 recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does not.
 
@@ -30,9 +30,12 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   armers loop on "missing a reveal" and never take the recovery path; recovery needs 3 signatures
   and gets 1. Shown live 2026-10-02: the lottery output unspent 187 blocks after confiscation (past
   CSV-144). Neither the claim nor the recovery leaf moves the funds.
-- **Invalid armer collateral vetoes a confiscation.** One armer pledging a spent coin makes strict
-  cosigners (cl, per DEP-06) refuse the whole confiscation, rather than dropping that armer. A
-  colluding member can use it to stall; the reference picked a spent coin by accident (ref7).
+- ~~**Invalid armer collateral vetoes a confiscation.**~~ **Done (2026-10-02):** DEP-03 makes the
+  participant set an eligibility cut (pledge confirmed by, unspent through, and worth its
+  declaration at the snapshot E); a failing armer is excluded, not a veto. One eligible armer
+  takes custody without a draw; none reopens arming (four arms per armer), then the post-expiry
+  tiers. Both implementations agree on a shared vector and live (`attack-veto-pledge.sh`, all
+  three modes: cl and the reference excluded the same armer at the same snapshot).
 - **Credits beyond collateral: the implementations disagree.** The reference rejects (and disputes)
   an update whose obligations exceed the collateral while the quorum is active; cl allows it; the
   spec requires only reserves ≥ obligations. A mixed quorum disputes an honest zero-collateral ledger.
@@ -44,6 +47,23 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
 - **Stale-proof handling in a yielded reference member.** A member that yielded never applies
   the winner's DisputeAcquire, so a replayed proof against the former operator passes its
   current-operator check. Each replay then re-announces its dispute (no state change).
+
+## Rulesets and rotation
+
+- ~~**Absolute-height recovery tiers.**~~ **Removed (2026-10-02):** the `legacy` and
+  `cltv-offset-literal` rulesets are gone from both implementations and the spec; the Tier-1
+  minority is ceil(n/2)-1. The devnet was reset to fresh ledgers to drop vaults built under them
+  (old state in `pre-reset-20261002/`).
+- ~~**cl members ignore the reference's `rotation_sign`.**~~ **Done (2026-10-02):** a reference
+  operator rotates its vault itself; cl members now rebuild and sign that rotation. Soak ledger B
+  (ref2) rotated with four cl cosigners.
+
+## Devnet infrastructure
+
+- **The signet cannot mine fast any more.** Fast red-team mining made a 2016-block window take 1.3
+  days, so difficulty rose 4× at 14112; blocks now take ~25 s and grinding sometimes fails. Scenarios
+  that mine hundreds of blocks (vault-recovery-tier, withhold-reveal) cannot run. Needs a regtest
+  devnet, or a signet reset and a mining budget per window.
 
 ## Ledger operations
 

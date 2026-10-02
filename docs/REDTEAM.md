@@ -866,3 +866,45 @@ derelict only if it kept operating; the first run passed only on a manual nudge)
 times only the honest replica's own fork (`(:forks)` also lists replicated forks, which read as an
 instant dispute) and refuses a ledger disputed before the fraud; withhold-reveal's timeout fits
 the chain (~5 blocks/min); `REFS=` forms a cl-only quorum; `REDTEAM_AVOID` skips busy clean nodes.
+
+### 2026-10-02 (evening) — after the reset: rotation interop, the veto fix live, regression
+
+The devnet was reset to fresh ledgers when the `legacy` and `cltv-offset-literal` rulesets were
+removed (absolute-height recovery tiers; Tier-1 minority now ceil(n/2)-1). Node keys and the
+red-team nodes cld7-18 were kept; old state is in `pre-reset-20261002/`.
+
+**Fixed:**
+- *cl members never answered the reference's `rotation_sign`*, so ledgers operated by the reference
+  collected 3 of 4 signatures and never rotated. The member now rebuilds the 1-in/1-out rotation
+  (input = current vault, output = next quorum's reserves, lock time = the tier's, fee ≤ 100k sats)
+  and signs only that (befd453). Soak ledger B (ref2) rotated with four cl cosigners.
+- *The regtest smoke flake "no armer is a lottery participant"* was real: each pledge was mined and
+  armed at once under a node height cached one block behind, so every arm named a height before its
+  own pledge and the DEP-03 cut excluded them all. Arming now waits for the pledge's height; pledge
+  heights come from `gettxout`'s own best block (5854048). Four consecutive CI smoke runs pass.
+- *Harness:* red-team nodes' member ledgers were missing from the reset env (654be86); veto-pledge
+  on a mixed quorum never reached a majority for its fraud (5089ce7).
+
+**Veto fix, live** (`attack-veto-pledge.sh`): `veto` — cld12 spent its pledge; cl and the reference
+excluded the same armer at the same snapshot (14020) and the confiscation landed; `sole` — one
+eligible armer took custody without a draw; `reopen` — nobody eligible, the honest armer re-armed and
+took custody.
+
+| scenario | verdict | | scenario | verdict |
+|---|---|---|---|---|
+| invalid-credit-honest | PASS | | collude-q7 | PASS |
+| forge-lock-honest | PASS | | vault-spend | PASS |
+| relabel | PASS | | vault-rotate-grace | PASS |
+| fuzz-proofs | PASS | | vault-rotate-late | PASS (accused, the known grace bound) |
+| censor-hold-honest | PASS | | vault-missed-confiscation | PASS (the known limit shown) |
+| censor-hold | PASS (finding: escalation not acted on) | | veto-pledge / -sole / -reopen | PASS |
+| invalid-credit-collude | PASS | | vault-recovery-tier | FAIL: chain could not be mined 730 blocks |
+| forge-lock-collude | PASS | | withhold-reveal | FAIL: confiscation not reached in 120 s |
+
+**New blocker (infrastructure): the signet's difficulty retargeted up 4×** at 14112. The window
+12096-14111 was mined in 1.3 days by the red-team's fast mining, so the clamp-maximum increase applied
+(bits 1d0377ac → 1d00ddeb). Blocks now take ~25 s each with every core busy, and `bitcoin-util grind`
+sometimes exhausts its nonces (85 failures in `logs/mine.log`). `--set-block-time` cannot run ahead of
+real time, so the next window cannot lower it quickly: about two weeks at real pacing. Both failures
+above are this (`mine 730` advanced 37 blocks; the confiscation waits on confirmations). Scenarios
+that mine past expiry need a regtest chain, or a signet reset with a short-expiry design.
