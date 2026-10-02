@@ -25,6 +25,7 @@
                 :priv priv :bus bus :network (env "CLD_NETWORK" "signet") :data-dir dir :relays relays
                 :height-fn (and cli (cl-deposits.daemon:bitcoin-cli-height-fn cli))
                 :chain-fn (and cli (cl-deposits.daemon:bitcoin-cli-chain-fn cli))
+                :pledge-fn (and cli (cl-deposits.daemon:bitcoin-cli-pledge-fn cli))
                 :spender-fn (and cli (cl-deposits.daemon:bitcoin-cli-spender-fn cli))
                 :utxos-fn (and cli (cl-deposits.daemon:bitcoin-cli-utxos-fn cli))
                 :broadcast-fn (and cli (cl-deposits.daemon:bitcoin-cli-broadcast-fn cli))

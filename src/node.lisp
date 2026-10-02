@@ -34,7 +34,7 @@
            #:record #:record-ledger #:record-history #:record-owned-p #:record-id-hex #:record-reserves
            #:find-record #:own-ledger
            #:open-ledger #:append-operation #:add-member #:prepare-quorum #:begin-quorum #:credit-onchain
-           #:node-chain-fn #:node-min-confs #:node-data-dir #:record-pinned #:height #:tip
+           #:node-chain-fn #:node-pledge-fn #:lottery-armers #:split-armers #:eligibility-floor-sats #:node-min-confs #:node-data-dir #:record-pinned #:height #:tip
            #:node-error #:request #:wallet #:make-wallet #:wallet-pubkey #:wallet-request
            #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer
            #:wallet-make-invoice #:wallet-pay-invoice #:credit-paid-invoices #:start-invoice-poller #:node-ln #:node-invoices
@@ -103,6 +103,7 @@
   (hooks '())                                  ; (lambda (rec update op)) called after every accepted/committed update
   (invoices (make-hash-table :test #'equalp))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
   (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
+  (pledge-fn nil)                              ; (lambda (txid vout scan-from)) -> plist :created :value-sats :spend (DEP-03 cut), or NIL
   (utxos-fn nil)                               ; (lambda (address)) -> list of plists :txid :vout :sats :confirmations
   (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
   (dispute-notes (make-hash-table :test #'equal))   ; ledger id -> the last dispute-driver state we logged
@@ -131,13 +132,13 @@
   (let ((o (op:decode-operation (up:update-message update))))
     (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn pledge-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn)
   (let* ((priv (w:even-y-privkey priv))
          (pub (up:compressed-pubkey priv))
          (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
-                           :chain-fn chain-fn :spender-fn spender-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
+                           :chain-fn chain-fn :pledge-fn pledge-fn :spender-fn spender-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
                            :broadcast-fn broadcast-fn :height-of-block height-of-block :block-hash-fn block-hash-fn
                            ;; We subscribe below, before the caller loads the data dir.  A
                            ;; cosign request handled then found no record, took the ledger
@@ -1265,11 +1266,21 @@
    operator's change output), so both are tried; a rebuild with the defaults
    (non-respectful) never matched a respectful confiscation after a restart."
   (when (node-chain-fn node)
-    (loop for respectful in '(t nil)
-          thereis (loop for ti below (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))
-                        for built = (ignore-errors (multiple-value-list (build-confiscation node id-hex :tier-index ti :respectful respectful)))
-                        when (and built (first built) (funcall (node-chain-fn node) (btx:tx-txid (first built)) 0))
-                          return built))))
+    (flet ((try (armers)
+             (loop for respectful in '(t nil)
+                   thereis (loop for ti below (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))
+                                 for built = (ignore-errors (multiple-value-list (build-confiscation node id-hex :tier-index ti :respectful respectful :armers armers)))
+                                 when (and built (first built) (funcall (node-chain-fn node) (btx:tx-txid (first built)) 0))
+                                   return built))))
+      ;; The eligibility cut first; then every other set of two or more armers, so
+      ;; a confiscation built on a different view of the cut (or by an older node,
+      ;; over every armer) is still recognised.
+      (or (try nil)
+          (let ((all (sort (copy-list (armers-of node id-hex)) #'bytes< :key #'first)))
+            (when (<= (length all) 8)
+              (loop for mask from (1- (ash 1 (length all))) downto 3
+                    for subset = (loop for a in all for i from 0 when (logbitp i mask) collect a)
+                    thereis (and (>= (length subset) 2) (try subset)))))))))
 
 (defun confiscation-on-chain (node id-hex)
   "The confiscation of ID-HEX whose lottery output is in the UTXO set (we
@@ -1810,16 +1821,27 @@
                                                           :replacement-collateral-txid (first replacement)
                                                           :replacement-collateral-vout (second replacement)
                                                           :replacement-collateral-amount (third replacement)))))
+    ;; ADVERSARY :spend-pledge — arm, then spend the pledged coin back to ourselves.
+    ;; Under the old rule every cosigner then refused the confiscation: one armer
+    ;; vetoed the dispute.  DEP-03 now excludes it instead (redteam/attack-veto-pledge.sh).
+    (when (and replacement (getf (node-adversary node) :spend-pledge))
+      (handler-case
+          (let ((txid (consolidate-utxos node (list (list :txid (first replacement) :vout (second replacement) :sats (third replacement))))))
+            (log! node "adversary: spent our pledge ~a:~a in ~a" (txid-hex (first replacement)) (second replacement) (txid-hex txid)))
+        (error (e) (log! node "adversary: could not spend our pledge: ~a" e))))
     preimage))
 
 (defun armers-of (node id-hex)
-  "Each armer's latest DisputeArmed on any fork of the ledger: (pubkey33 commitment
-   target collateral).  A member may re-arm to add the replacement collateral its
-   first arm lacked (DEP-03; the reference does after losing a scantxoutset race).
-   Counting every arm listed it twice: once in the lottery's participants and its N,
-   and once as an armer without collateral that check-armer-collateral refused."
-  (let ((all (%all-arms node id-hex)) (seen '()))
-    (remove-if (lambda (a) (if (member (first a) seen :test #'equalp) t (progn (push (first a) seen) nil))) all)))
+  "Each armer's latest DisputeArmed (highest sequence) on any fork of the ledger:
+   (pubkey33 commitment target collateral arm-height seq), ARM-HEIGHT being the
+   update's signed-header block height.  A member may re-arm to add the replacement
+   collateral its first arm lacked (DEP-03; the reference does after losing a
+   scantxoutset race); counting every arm listed it twice."
+  (let ((best (make-hash-table :test #'equalp)))
+    (dolist (a (%all-arms node id-hex))
+      (let ((cur (gethash (first a) best)))
+        (when (or (null cur) (> (sixth a) (sixth cur))) (setf (gethash (first a) best) a))))
+    (loop for a being the hash-values of best collect a)))
 
 (defun %all-arms (node id-hex)
   "Every DisputeArmed on every fork of the ledger, newest first within each fork."
@@ -1830,34 +1852,90 @@
                        collect (list (up:update-operator-id u) (op:field o :commitment-hash) (op:field o :target-reserves)
                                      (and (op:field o :replacement-collateral-txid)
                                           (list (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)
-                                                (op:field o :replacement-collateral-amount)))))))
+                                                (op:field o :replacement-collateral-amount)))
+                                     (up:update-block-height u) (up:update-seq u)))))
 
-(defun collateral-floor-sats (base &key (claim-fee 400))
+;;; DEP-03 §"Replacement collateral declaration": who is in the lottery is a
+;;; deterministic function of the ledger and the confirmed chain.  E is the highest
+;;; signed-header height among the armers' latest arms; a pledge counts if it is
+;;; large enough, confirmed by E, unspent through E and holds what it declares.  A
+;;; failing armer is excluded and never stalls the dispute: one armer pledging a
+;;; spent coin used to make every cosigner refuse, forever.
+
+(defparameter *claim-fee-floor-sats* 5000
+  "DEP-03 claim_fee_floor when the governing QuorumBegin records no reference feerate.")
+
+(defun dispute-last-valid-seq (node id-hex)
+  "The dispute's fork point: the lowest last_valid_sequence any fork's DisputeEnter names."
+  (loop for f in (forks-of node id-hex)
+        for (u o) = (multiple-value-list (fork-op f :dispute-enter))
+        when u minimize (op:field o :last-valid-sequence)))
+
+(defun eligibility-floor-sats (node id-hex)
+  "obligations x collateral/reserves at the fork point, + the claim fee floor, in the
+   reference's integer arithmetic (floor the product, then round msat up to sats)."
+  (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
+         (lvs (dispute-last-valid-seq node id-hex))
+         (l (if lvs
+                (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base))))
+                (record-ledger base)))
+         (reserves (lg:ledger-reserves-amount l)))
+    (unless (plusp reserves) (fail "QuorumBegin reserves were zero"))
+    (+ (ceiling (floor (* (lg:total-obligations l) (lg:ledger-collateral-amount l)) reserves) 1000)
+       *claim-fee-floor-sats*)))
+
+(defvar *pledge-verdicts* (make-hash-table :test #'equal) "(txid vout amount E) -> NIL or a reason, once E is buried.")
+(defvar *pledge-verdicts-lock* (bt:make-lock "pledge-verdicts"))
+
+(defun pledge-failure (pledge-fn coll snapshot floor-sats tip)
+  "Why the pledge COLL = (txid vout sats) fails the cut at SNAPSHOT, or NIL.  PLEDGE-FN
+   is a node's pledge-fn; without one only the declaration is checked."
+  (destructuring-bind (txid vout sats) coll
+    (when (< sats floor-sats) (return-from pledge-failure (format nil "declared ~a sats, below the floor ~a" sats floor-sats)))
+    (unless pledge-fn (return-from pledge-failure nil))
+    (let ((key (list (bytes->hex txid) vout sats snapshot)))
+      (multiple-value-bind (hit found) (bt:with-lock-held (*pledge-verdicts-lock*) (gethash key *pledge-verdicts*))
+        (when found (return-from pledge-failure hit)))
+      (let* ((facts (funcall pledge-fn txid vout (1+ snapshot)))
+             (created (getf facts :created)) (value (getf facts :value-sats)) (spend (getf facts :spend))
+             (verdict (cond ((null facts) "pledge transaction not found")
+                            ((null value) "pledge output does not exist")
+                            ((null created) "pledge is unconfirmed")
+                            ((> created snapshot) (format nil "pledge confirmed at ~a, after the snapshot ~a" created snapshot))
+                            ((< value sats) (format nil "pledge holds ~a sats, less than the ~a declared" value sats))
+                            ((eq spend :unspent) nil)
+                            ((and (consp spend) (> (second spend) snapshot)) nil)
+                            (t (format nil "pledge spent at or before the snapshot ~a" snapshot)))))
+        (when (and tip (>= tip (+ snapshot 6)))
+          (bt:with-lock-held (*pledge-verdicts-lock*) (setf (gethash key *pledge-verdicts*) verdict)))
+        verdict))))
+
+(defun split-armers (armers floor-sats pledge-fn &key tip)
+  "The DEP-03 cut over ARMERS (armers-of entries): (values participants excluded snapshot),
+   participants sorted by key, EXCLUDED ((entry . reason) ...)."
+  (let* ((armers (sort (copy-list armers) #'bytes< :key #'first))
+         (snapshot (reduce #'max armers :key #'fifth :initial-value 0))
+         (in '()) (out '()))
+    (dolist (a armers)
+      (let ((why (if (fourth a) (pledge-failure pledge-fn (fourth a) snapshot floor-sats tip) "declared no replacement collateral")))
+        (if why (push (cons a why) out) (push a in))))
+    (values (nreverse in) (nreverse out) snapshot)))
+
+(defun lottery-armers (node id-hex)
+  "The lottery's participants: (values participants excluded snapshot floor)."
+  (let ((floor-sats (eligibility-floor-sats node id-hex)))
+    (multiple-value-bind (in out snapshot)
+        (split-armers (armers-of node id-hex) floor-sats (node-pledge-fn node) :tip (height node))
+      (dolist (x out)
+        (log! node "armer ~a excluded from ~a's lottery: ~a" (subseq (bytes->hex (first (car x))) 0 8) (subseq id-hex 0 8) (cdr x)))
+      (values in out snapshot floor-sats))))
+
+(defun collateral-floor-sats (base &key (claim-fee *claim-fee-floor-sats*))
   "DEP-06: obligations x the ledger's collateral ratio, plus the claim fee."
   (let* ((l (record-ledger base))
          (obligations (floor (lg:total-obligations l) 1000))
          (ratio (if (plusp (lg:ledger-reserves-amount l)) (/ (lg:ledger-collateral-amount l) (lg:ledger-reserves-amount l)) 0)))
     (+ (ceiling (* obligations ratio)) claim-fee)))
-
-(defun check-armer-collateral (node base armers)
-  "Every armer must have declared replacement collateral (DEP-06: \"legacy events
-   without it cause strict cosigners to refuse confiscation\"), enough of it, and
-   (when we have a chain view) it must exist, be unspent and confirmed.  We used
-   to check only those that declared one: on the soak cl's two signatures carried
-   a confiscation for an armer that declared none, and the winner took custody
-   of the ledger with no bond behind it (docs/REDTEAM.md finding 10)."
-  (let ((floor-sats (collateral-floor-sats base)))
-    (loop for entry in armers
-          for pk = (first entry) for coll = (fourth entry)
-          do (unless coll (fail "armer ~a declared no replacement collateral" (subseq (bytes->hex pk) 0 8)))
-             (when coll
-               (destructuring-bind (txid vout sats) coll
-                 (when (< sats floor-sats) (fail "armer ~a declared ~a sats, below the floor ~a" (subseq (bytes->hex pk) 0 8) sats floor-sats))
-                 (when (node-chain-fn node)
-                   (let ((info (funcall (node-chain-fn node) txid vout)))
-                     (unless info (fail "armer ~a's collateral outpoint not found or spent" (subseq (bytes->hex pk) 0 8)))
-                     (when (< (getf info :value-sats) sats) (fail "armer ~a's collateral outpoint is smaller than declared" (subseq (bytes->hex pk) 0 8)))
-                     (when (< (getf info :confirmations) (node-min-confs node)) (fail "armer ~a's collateral is unconfirmed" (subseq (bytes->hex pk) 0 8))))))))))
 
 (defun disputed-reserves (node rec)
   "From the latest QuorumBegin: (values reserves-struct txid vout sats operator33)."
@@ -1889,19 +1967,19 @@
             do (setf best i))
     best))
 
-(defun build-confiscation (node id-hex &key respectful (fee 1000) tier-index)
+(defun build-confiscation (node id-hex &key respectful (fee 1000) tier-index armers)
   "The confiscation transaction for a disputed ledger, from public state only,
    so every cosigner rebuilds the same one.  It spends the reserves through
    TIER-INDEX (default: the tier open at our height), its nLockTime that tier's
-   CLTV.  Returns (values tx lottery prevouts reserves tier-index)."
+   CLTV.  Its lottery is over ARMERS, by default the DEP-03 eligibility cut
+   (lottery-armers).  Returns (values tx lottery prevouts reserves tier-index)."
   (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
-         (armers (sort (copy-list (armers-of node id-hex)) #'bytes< :key #'first))
+         (armers (sort (copy-list (or armers (lottery-armers node id-hex))) #'bytes< :key #'first))
          (voters (recovery-voters base))
          (threshold (lg:majority-threshold (length voters)))
-         (participants (loop for (pk c target nil) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target)))
-         (lottery (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword))))
-    (when (< (length participants) 2) (fail "fewer than two armers"))
-    (check-armer-collateral node base armers)
+         (participants (loop for (pk c target) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target)))
+         (lottery (progn (when (< (length participants) 2) (fail "fewer than two armers are lottery participants"))
+                         (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword)))))
     (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node base)
       (let* ((tier-index (or tier-index (confiscation-tier reserves (height node))))
              (locktime (rs:tier-locktime (nth tier-index (rs:reserves-tiers reserves))))

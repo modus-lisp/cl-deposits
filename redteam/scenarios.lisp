@@ -58,12 +58,14 @@
             :ledger-var "REDTEAM_MC" :env '("WAIT=900") :timeout 1500 :tags '(:contagion :slow))
    (make-sc :name "withhold-reveal" :script "attack-withhold-reveal.sh" :ledger-var "REDTEAM_W"
             :env '("WAIT=120") :timeout 5400 :tags '(:contagion :slow))
+   (make-sc :name "veto-pledge" :script "attack-veto-pledge.sh" :ledger-var "REDTEAM_VP"
+            :timeout 2400 :tags '(:contagion) :note "one armer spends its pledge; the confiscation must still land")
    (make-sc :name "dereliction" :script "attack-dereliction.sh" :ledger-var "REDTEAM_D"
             :timeout 3600 :tags '(:contagion :slow))
    (make-sc :name "rollback-depth" :script "attack-rollback-depth.sh" :ledger-var "REDTEAM_R"
             :timeout 2400 :tags '(:contagion :disruptive :slow))))
 
-(defparameter *switches* '(:cosign-blind :ignore-fraud :ignore-requests :sign-invalid :theft-sign :withhold-reveal))
+(defparameter *switches* '(:cosign-blind :ignore-fraud :ignore-requests :sign-invalid :spend-pledge :theft-sign :withhold-reveal))
 
 ;;; --- the devnet, as devnet/_common.sh describes it -------------------------------------
 

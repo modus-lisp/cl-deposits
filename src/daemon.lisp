@@ -20,7 +20,7 @@
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:jzon #:com.inuoe.jzon))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
-           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn))
+           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn))
 (in-package #:cl-deposits.daemon)
 
 (defun arg (form key &optional default) (getf (cdr form) key default))
@@ -313,6 +313,41 @@
                                                                 (gethash "vin" tx)))
                                            found)))))
       (nreverse found))))
+
+(defun bitcoin-cli-pledge-fn (cli)
+  "(txid vout scan-from) -> (:created height-or-NIL :value-sats n-or-NIL :spend s), or NIL
+   when the transaction is unknown.  S is :unspent (no confirmed spend: a mempool-only
+   spend is unspent), (:at h) for a confirmed spend found in blocks SCAN-FROM..tip, or
+   :before for a confirmed spend earlier than that.  The DEP-03 eligibility cut reads
+   only the confirmed chain so every cosigner agrees."
+  (lambda (txid vout scan-from)
+    (let* ((hex (txid-hex txid))
+           (raw (run-cli cli "getrawtransaction" hex "true"))
+           (j (and (plusp (length raw)) (char= (char raw 0) #\{) (jzon:parse raw))))
+      (when j
+        (let* ((out (find vout (gethash "vout" j) :key (lambda (o) (gethash "n" o))))
+               (value (and out (round (* (gethash "value" out) 100000000))))
+               (bh (gethash "blockhash" j))
+               (created (and bh (let ((hdr (run-cli cli "getblockheader" bh)))
+                                  (and (plusp (length hdr)) (char= (char hdr 0) #\{)
+                                       (let ((hj (jzon:parse hdr)))
+                                         (and (> (or (gethash "confirmations" hj) 0) 0) (gethash "height" hj)))))))
+               (unspent (let ((o (run-cli cli "gettxout" hex (princ-to-string vout) "false")))
+                          (and (plusp (length o)) (char= (char o 0) #\{))))
+               (spend (cond (unspent :unspent)
+                            ((null created) :unspent)
+                            (t (let ((tip (parse-integer (string-trim '(#\Newline #\Space) (run-cli cli "getblockcount")) :junk-allowed t)))
+                                 (or (and tip
+                                          (loop for h from (max scan-from created) to tip
+                                                for bhash = (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string h)))
+                                                for blk = (let ((b (run-cli cli "getblock" bhash "2"))) (and (plusp (length b)) (char= (char b 0) #\{) (jzon:parse b)))
+                                                thereis (and blk
+                                                             (loop for tx across (gethash "tx" blk)
+                                                                   thereis (loop for i across (gethash "vin" tx)
+                                                                                 thereis (and (equal (gethash "txid" i) hex) (eql (gethash "vout" i) vout)
+                                                                                              (list :at h)))))))
+                                     :before))))))
+          (list :created created :value-sats value :spend spend))))))
 
 (defun bitcoin-cli-height-of-block-fn (cli)
   "Block hash -> confirmed height, or NIL (fraud-proof anchors)."

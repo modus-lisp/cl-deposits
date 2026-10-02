@@ -180,4 +180,35 @@
                  (lot:armer-share-address (lot:build-armer-share (xonly-of (funcall seed-priv 1)) (make-array 20 :element-type '(unsigned-byte 8) :initial-element 1) voters 2 :network :signet))
                  (funcall vec 3 "armer_share"))))
 
+;;; inspect/vectors/armer_eligibility.json: the DEP-03 replacement-collateral cut,
+;;; shared with deposits-rust (deposits-node/tests/vectors/armer_eligibility.json).
+(with-gate ("lottery: armer eligibility cut against the shared vector")
+  (let ((v (com.inuoe.jzon:parse (uiop:read-file-string (vector-path "armer_eligibility.json")))))
+    (loop for case across (gethash "cases" v)
+          do (let ((facts (make-hash-table :test #'equalp)) (names (make-hash-table :test #'equalp)) (armers '()))
+               (loop for a across (gethash "armers" case) for i from 1
+                     for pk = (let ((b (make-array 33 :element-type '(unsigned-byte 8) :initial-element i))) (setf (aref b 0) 2) b)
+                     for p = (gethash "pledge" a)
+                     for txid = (make-array 32 :element-type '(unsigned-byte 8) :initial-element i)
+                     for num = (lambda (k h) (let ((x (gethash k h))) (and (integerp x) x)))
+                     do (setf (gethash pk names) (gethash "id" a))
+                        (when (hash-table-p p)
+                          (setf (gethash txid facts) (list (funcall num "created" p) (funcall num "value" p) (funcall num "spent_at" p))))
+                        (push (list pk (make-array 20 :element-type '(unsigned-byte 8) :initial-element i) "t"
+                                    (and (hash-table-p p) (list txid 0 (gethash "declared" a)))
+                                    (gethash "arm_height" a) 1)
+                              armers))
+               (let ((pledge-fn (lambda (txid vout scan-from)
+                                  (declare (ignore vout))
+                                  (destructuring-bind (&optional created value spent) (gethash txid facts)
+                                    (list :created created :value-sats value
+                                          :spend (cond ((null spent) :unspent) ((>= spent scan-from) (list :at spent)) (t :before)))))))
+                 (multiple-value-bind (in out snapshot)
+                     (nd:split-armers armers (gethash "required_sats" case) pledge-fn)
+                   (declare (ignore out))
+                   (check-equal (format nil "~a: participants" (gethash "name" case))
+                                (sort (mapcar (lambda (a) (gethash (first a) names)) in) #'string<)
+                                (coerce (gethash "participants" (gethash "expect" case)) 'list))
+                   (check-equal (format nil "~a: snapshot" (gethash "name" case)) snapshot (gethash "snapshot" (gethash "expect" case)))))))))
+
 (report)

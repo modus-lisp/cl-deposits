@@ -548,10 +548,14 @@
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (chain (make-hash-table :test #'equalp))      ; "txid:vout" -> sats  (a mock chain view)
          (cf (lambda (txid vout) (let ((v (gethash (cons (coerce txid 'list) vout) chain))) (and v (list :value-sats v :confirmations 3)))))
+         ;; The DEP-03 cut's view: confirmed at block 1, unspent while on the mock chain.
+         (pf (lambda (txid vout scan-from) (declare (ignore scan-from))
+               (let ((v (gethash (cons (coerce txid 'list) vout) chain)))
+                 (list :created 1 :value-sats (or v 1) :spend (if v :unspent :before)))))
          (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
-         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf :chain-fn cf))
-         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf :chain-fn cf))
-         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf :chain-fn cf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf :chain-fn cf :pledge-fn pf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf :chain-fn cf :pledge-fn pf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf :chain-fn cf :pledge-fn pf))
          (la (nd:open-ledger a :reserves-id "genesis:a7" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
     (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
       (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
@@ -560,7 +564,7 @@
     (let* ((w (nd:make-wallet :priv 55555555555555555555 :bus bus)) (dw (nd:wallet-open-deposit w id)))
       (nd:credit-onchain a la dw 4000000 :txid (u:sha256 (hx "09")))
       (let ((floor-sats (nd:collateral-floor-sats la)))
-        (check-equal "collateral floor = obligations x ratio + claim fee" floor-sats (+ (ceiling (* 4000 3/2)) 400))
+        (check-equal "collateral floor = obligations x ratio + claim fee" floor-sats (+ (ceiling (* 4000 3/2)) 5000))
         ;; Members fund their own collateral UTXOs (key-path P2TR) on the mock chain, then dispute.
         (dolist (m (list b c d))
           (setf (gethash (cons (coerce (u:sha256 (nd:node-pubkey m)) 'list) 1) chain) (+ floor-sats 1000)))
@@ -582,9 +586,14 @@
                          (btx:txout-value (first (btx:tx-outputs claim)))
                          (- (+ (btx:txout-value (first (btx:tx-outputs ctx))) (+ floor-sats 1000)) 400))
             (check "second input is a key-path spend with a 64-byte signature" (= 64 (length (first (second (btx:tx-witnesses claim))))))))
-        ;; Missing collateral on chain: confiscation refused.
+        ;; DEP-03: a pledge spent before the snapshot excludes its armer; it no
+        ;; longer blocks the confiscation (one armer could veto the dispute).
         (remhash (cons (coerce (u:sha256 (nd:node-pubkey c)) 'list) 1) chain)
-        (check-signals "a vanished collateral outpoint blocks the confiscation" nd:node-error (nd:confiscate b id))))))
+        (multiple-value-bind (in out) (nd:lottery-armers b id)
+          (check-equal "a spent pledge excludes only its armer"
+                       (list (length in) (mapcar (lambda (x) (first (car x))) out))
+                       (list 2 (list (nd:node-pubkey c)))))
+        (check "the confiscation still builds over the other two" (nd:build-confiscation b id))))))
 
 
 
@@ -929,10 +938,14 @@
                (null (nth-value 1 (gethash "embedding" (fr:broadcast->json proof)))))
         (check "an off-ledger proof still carries one"
                (nth-value 1 (gethash "embedding" (fr:broadcast->json (list :type :uncredited-onchain-payment :accused "00" :ledger-id id :evidence '()))))))
-      ;; Finding 10: one armer pledges, one declares nothing — no confiscation is built.
+      ;; Finding 10: an armer that declares no replacement collateral is never a
+      ;; lottery participant (it could win custody with no bond).  DEP-03 excludes
+      ;; it rather than refusing; here that leaves one participant.
       (nd:arm-dispute d (nd:find-fork d id (nd:node-pubkey d)) :replacement (list (u:sha256 (hx "b1d0")) 0 10000000))
       (nd:arm-dispute b (nd:find-fork b id (nd:node-pubkey b)))
-      (check-signals "an armer with no replacement collateral blocks the confiscation" nd:node-error
+      (check-equal "an armer with no replacement collateral is excluded"
+                   (mapcar (lambda (x) (first (car x))) (nth-value 1 (nd:lottery-armers d id))) (list (nd:node-pubkey b)))
+      (check-signals "leaving fewer than two participants, so no confiscation is built" nd:node-error
         (nd:build-confiscation d id)))))
 
 
