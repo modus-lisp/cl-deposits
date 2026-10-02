@@ -315,39 +315,32 @@
       (nreverse found))))
 
 (defun bitcoin-cli-pledge-fn (cli)
-  "(txid vout scan-from) -> (:created height-or-NIL :value-sats n-or-NIL :spend s), or NIL
-   when the transaction is unknown.  S is :unspent (no confirmed spend: a mempool-only
-   spend is unspent), (:at h) for a confirmed spend found in blocks SCAN-FROM..tip, or
-   :before for a confirmed spend earlier than that.  The DEP-03 eligibility cut reads
-   only the confirmed chain so every cosigner agrees."
+  "(txid vout scan-from) -> (:created h :value-sats n :spend s) for the DEP-03 cut, read from
+   the confirmed chain only and without -txindex.  S is :unspent (in the confirmed UTXO set;
+   a mempool-only spend is unspent), (:at h) for a spend confirmed in blocks SCAN-FROM..tip
+   (getblock verbosity 3 gives the input's prevout height and value), or :before when the
+   output is neither: spent earlier, unconfirmed, or unknown.  All three exclude the pledge."
   (lambda (txid vout scan-from)
     (let* ((hex (txid-hex txid))
-           (raw (run-cli cli "getrawtransaction" hex "true"))
-           (j (and (plusp (length raw)) (char= (char raw 0) #\{) (jzon:parse raw))))
-      (when j
-        (let* ((out (find vout (gethash "vout" j) :key (lambda (o) (gethash "n" o))))
-               (value (and out (round (* (gethash "value" out) 100000000))))
-               (bh (gethash "blockhash" j))
-               (created (and bh (let ((hdr (run-cli cli "getblockheader" bh)))
-                                  (and (plusp (length hdr)) (char= (char hdr 0) #\{)
-                                       (let ((hj (jzon:parse hdr)))
-                                         (and (> (or (gethash "confirmations" hj) 0) 0) (gethash "height" hj)))))))
-               (unspent (let ((o (run-cli cli "gettxout" hex (princ-to-string vout) "false")))
-                          (and (plusp (length o)) (char= (char o 0) #\{))))
-               (spend (cond (unspent :unspent)
-                            ((null created) :unspent)
-                            (t (let ((tip (parse-integer (string-trim '(#\Newline #\Space) (run-cli cli "getblockcount")) :junk-allowed t)))
-                                 (or (and tip
-                                          (loop for h from (max scan-from created) to tip
-                                                for bhash = (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string h)))
-                                                for blk = (let ((b (run-cli cli "getblock" bhash "2"))) (and (plusp (length b)) (char= (char b 0) #\{) (jzon:parse b)))
-                                                thereis (and blk
-                                                             (loop for tx across (gethash "tx" blk)
-                                                                   thereis (loop for i across (gethash "vin" tx)
-                                                                                 thereis (and (equal (gethash "txid" i) hex) (eql (gethash "vout" i) vout)
-                                                                                              (list :at h)))))))
-                                     :before))))))
-          (list :created created :value-sats value :spend spend))))))
+           (json (lambda (out) (and (plusp (length out)) (char= (char out 0) #\{) (jzon:parse out))))
+           (tip (parse-integer (string-trim '(#\Newline #\Space) (run-cli cli "getblockcount")) :junk-allowed t))
+           (utxo (funcall json (run-cli cli "gettxout" hex (princ-to-string vout) "false"))))
+      (cond
+        (utxo (list :created (and tip (- tip (1- (gethash "confirmations" utxo))))
+                    :value-sats (round (* (gethash "value" utxo) 100000000)) :spend :unspent))
+        ((null tip) nil)
+        (t (or (loop for h from scan-from to tip
+                     for bhash = (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string h)))
+                     for blk = (funcall json (run-cli cli "getblock" bhash "3"))
+                     thereis (and blk
+                                  (loop for tx across (gethash "tx" blk)
+                                        thereis (loop for i across (gethash "vin" tx)
+                                                      for pv = (gethash "prevout" i)
+                                                      thereis (and pv (equal (gethash "txid" i) hex) (eql (gethash "vout" i) vout)
+                                                                   (list :created (gethash "height" pv)
+                                                                         :value-sats (round (* (gethash "value" pv) 100000000))
+                                                                         :spend (list :at h)))))))
+               (list :created 0 :value-sats most-positive-fixnum :spend :before)))))))
 
 (defun bitcoin-cli-height-of-block-fn (cli)
   "Block hash -> confirmed height, or NIL (fraud-proof anchors)."

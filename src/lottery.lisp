@@ -56,7 +56,11 @@
 (defun lottery-script (participants &key (bounds-n (length participants)))
   "The primary claim leaf: verify each preimage, sum contributions, dispatch."
   (let* ((n (length participants)) (max-len (+ 16 bounds-n)) (parts '()))
-    (unless (<= 2 n +max-disputants+) (error "lottery needs 2..~a participants" +max-disputants+))
+    ;; DEP-03: a sole eligible armer takes custody without a draw; its leaf is a
+    ;; plain signature check and no preimage is revealed.
+    (when (= n 1)
+      (return-from lottery-script (cat (pushb (participant-pubkey (first participants))) (octets +op-checksig+))))
+    (unless (<= 2 n +max-disputants+) (error "lottery needs 1..~a participants" +max-disputants+))
     (unless (<= n bounds-n +max-disputants+) (error "bad bounds"))
     (flet ((emit (&rest bs) (dolist (b bs) (push (if (integerp b) (octets b) b) parts))))
       (loop for p in participants for i from 0
@@ -164,7 +168,8 @@
   "Index of the winner among PREIMAGES.  In a partial-reveal sub-lottery the
    length bounds stay those of the full quorum (BOUNDS-N)."
   (let ((n (length preimages)))
-    (when (< n 2) (error "need at least 2 preimages"))
+    (when (= n 1) (return-from calculate-winner 0))   ; a sole participant: no draw
+    (when (< n 1) (error "need at least 1 preimage"))
     (mod (loop for p in preimages
                do (unless (<= 17 (length p) (+ 16 bounds-n)) (error "preimage length ~a out of 17..~a" (length p) (+ 16 bounds-n)))
                sum (- (length p) 16))
@@ -185,7 +190,9 @@
 (defun claim-witness (l winner-sig preimages)
   "[sig, preimage_{n-1} ... preimage_0, leaf, control]."
   (unless (= (length preimages) (length (lottery-participants l))) (error "need every preimage"))
-  (append (list winner-sig) (reverse preimages) (list (first (lottery-leaves l)) (lottery-control-block l 0))))
+  (append (list winner-sig)
+          (and (> (length preimages) 1) (reverse preimages))   ; a sole participant's leaf checks only the signature
+          (list (first (lottery-leaves l)) (lottery-control-block l 0))))
 
 (defun partial-reveal-witness (l missing-index winner-sig preimages)
   "PREIMAGES for the N-1 revealers in participant order (the missing one omitted)."

@@ -593,7 +593,26 @@
           (check-equal "a spent pledge excludes only its armer"
                        (list (length in) (mapcar (lambda (x) (first (car x))) out))
                        (list 2 (list (nd:node-pubkey c)))))
-        (check "the confiscation still builds over the other two" (nd:build-confiscation b id))))))
+        (check "the confiscation still builds over the other two" (nd:build-confiscation b id))
+        ;; One honest armer left (the veto case the floor of 2 reintroduced): it takes custody alone.
+        (remhash (cons (coerce (u:sha256 (nd:node-pubkey b)) 'list) 1) chain)
+        (check-equal "one eligible armer is the sole participant"
+                     (mapcar #'first (nd:lottery-armers b id)) (list (nd:node-pubkey d)))
+        (check "and its confiscation builds over a one-participant lottery"
+               (= 1 (length (lot:lottery-participants (nth-value 1 (nd:build-confiscation b id))))))
+        ;; None left: no confiscation; an armer re-arms with a fresh pledge to reopen the window.
+        (remhash (cons (coerce (u:sha256 (nd:node-pubkey d)) 'list) 1) chain)
+        (check "no eligible armer: no confiscation is built" (null (ignore-errors (nd:build-confiscation b id))))
+        (setf (gethash (cons (coerce (u:sha256 (hx "dd2")) 'list) 0) chain) (+ floor-sats 1000))
+        (nd:arm-dispute d (nd:find-fork d id (nd:node-pubkey d)) :replacement (list (u:sha256 (hx "dd2")) 0 (+ floor-sats 1000)))
+        (check-equal "a re-arm with a fresh pledge reopens it"
+                     (mapcar #'first (nd:lottery-armers b id)) (list (nd:node-pubkey d)))
+        ;; Arms 3..6 declare 1..4 sats: only arms 3 and 4 count, so the latest counted is 2.
+        (loop for sats from 1 to 4
+              do (nd:arm-dispute d (nd:find-fork d id (nd:node-pubkey d)) :replacement (list (u:sha256 (hx "dd2")) 0 sats)))
+        (check-equal "arms beyond the fourth are ignored (a griefer cannot keep moving E)"
+                     (third (fourth (find (nd:node-pubkey d) (nd:armers-of b id) :key #'first :test #'equalp)))
+                     2)))))
 
 
 
@@ -945,8 +964,8 @@
       (nd:arm-dispute b (nd:find-fork b id (nd:node-pubkey b)))
       (check-equal "an armer with no replacement collateral is excluded"
                    (mapcar (lambda (x) (first (car x))) (nth-value 1 (nd:lottery-armers d id))) (list (nd:node-pubkey b)))
-      (check-signals "leaving fewer than two participants, so no confiscation is built" nd:node-error
-        (nd:build-confiscation d id)))))
+      (check "the sole participant's confiscation builds (it takes custody without a draw)"
+             (= 1 (length (lot:lottery-participants (nth-value 1 (nd:build-confiscation d id)))))))))
 
 
 (with-gate ("red team: an operator cannot spend a depositor's funds without its authorization")

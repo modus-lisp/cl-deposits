@@ -176,6 +176,16 @@
         (check-equal (format nil "n=~a recovery leaf (CSV 144)" n) (u:bytes->hex (nth (lot::recovery-leaf-index l 0) (lot:lottery-leaves l))) (funcall vec n "recovery144"))
         (check-equal (format nil "n=~a lottery address" n) (lot:lottery-address l) (funcall vec n "address"))
         (check-equal (format nil "n=~a control block of the primary leaf" n) (u:bytes->hex (lot:lottery-control-block l 0)) (funcall vec n "control0"))))
+    ;; N=1 (DEP-03): a sole participant's claim leaf is a plain signature check.
+    (let ((l (lot:build-lottery (list (lot:make-participant :pubkey (xonly-of (funcall seed-priv 1))
+                                                            :commitment (make-array 20 :element-type '(unsigned-byte 8) :initial-element 1)
+                                                            :target "tb1p1"))
+                                voters 2 :network :signet)))
+      (check-equal "n=1 primary script (key + CHECKSIG)" (u:bytes->hex (first (lot:lottery-leaves l))) (funcall vec 1 "script"))
+      (check-equal "n=1 recovery leaf (CSV 144)" (u:bytes->hex (nth (lot::recovery-leaf-index l 0) (lot:lottery-leaves l))) (funcall vec 1 "recovery144"))
+      (check-equal "n=1 lottery address" (lot:lottery-address l) (funcall vec 1 "address"))
+      (check-equal "n=1 control block of the primary leaf" (u:bytes->hex (lot:lottery-control-block l 0)) (funcall vec 1 "control0"))
+      (check-equal "n=1 winner needs no draw" (lot:calculate-winner (list (make-array 20 :element-type '(unsigned-byte 8) :initial-element 7))) 0))
     (check-equal "armer share address"
                  (lot:armer-share-address (lot:build-armer-share (xonly-of (funcall seed-priv 1)) (make-array 20 :element-type '(unsigned-byte 8) :initial-element 1) voters 2 :network :signet))
                  (funcall vec 3 "armer_share"))))

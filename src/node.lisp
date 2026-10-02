@@ -1300,6 +1300,8 @@
 ;;; the destination DEP-06 names for lottery-recovery funds, as the respectful
 ;;; confiscation's change.
 
+(defconstant +max-arms+ 4 "Arms that count per armer: the first and up to three re-arms (DEP-03).")
+
 (defparameter *full-arming-wait-blocks* 720
   "Blocks past the arm window a driver waits for every recovery voter to arm
    before confiscating with fewer: the reference's own auto-dispute hold-off.")
@@ -1475,6 +1477,23 @@
                      (progn (arm-dispute node fork :replacement p)
                             (note-dispute node id "armed, pledging ~a:~a (~a sats)" (txid-hex (first p)) (second p) (third p)))
                      (note-dispute node id "waiting for collateral (~a sats)" (required-replacement-sats base)))))
+              ;; DEP-03: our pledge stopped passing the eligibility cut (spent, or never
+              ;; confirmed), so we would be excluded from the lottery.  Re-arm with a
+              ;; fresh one; the latest arm counts and moves E, reopening the window, up
+              ;; to +max-arms+ arms in all.
+              ((and (null conf) (not (eq lstate :pending)) (not (getf (node-adversary node) :spend-pledge))
+                    (< (count (node-pubkey node) (%all-arms node id) :key #'first :test #'equalp) +max-arms+)
+                    (let ((ours (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp)))
+                      (and ours (fourth ours) (node-pledge-fn node)
+                           (pledge-failure (node-pledge-fn node) (fourth ours) (height node) 0 nil))))
+               (remhash (outpoint-key (first (fourth (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp)))
+                                      (second (fourth (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp))))
+                        (node-pledges node))
+               (let ((p (pledge-collateral node id)))
+                 (if p
+                     (progn (arm-dispute node fork :replacement p)
+                            (note-dispute node id "re-armed: our pledge no longer counted; now pledging ~a:~a" (txid-hex (first p)) (second p)))
+                     (note-dispute node id "our pledge no longer counts; waiting for collateral to re-arm"))))
               ((eq lstate :pending)
                (cond ((not (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
                       ;; ADVERSARY :withhold-reveal — an armer that never publishes its
@@ -1499,7 +1518,7 @@
                (let* ((closes (dispute-arm-closes node base))
                       (armers (sort (mapcar #'first (armers-of node id)) #'bytes<))
                       (q (dispute-lottery-n base)) (k (length armers)))
-                 (cond ((< k 2) (note-dispute node id "armed; waiting for a second armer"))
+                 (cond ((< k 1) (note-dispute node id "armed; waiting for an armer"))
                        ((< h closes) (note-dispute node id "armed; arm window closes at ~a" closes))
                        ;; Fewer than Q armed: the preimages were committed under Q, the
                        ;; claim leaf will be built for k, and only (k/Q)^k of such
@@ -1837,11 +1856,12 @@
    update's signed-header block height.  A member may re-arm to add the replacement
    collateral its first arm lacked (DEP-03; the reference does after losing a
    scantxoutset race); counting every arm listed it twice."
-  (let ((best (make-hash-table :test #'equalp)))
-    (dolist (a (%all-arms node id-hex))
-      (let ((cur (gethash (first a) best)))
-        (when (or (null cur) (> (sixth a) (sixth cur))) (setf (gethash (first a) best) a))))
-    (loop for a being the hash-values of best collect a)))
+  (let ((arms (make-hash-table :test #'equalp)))
+    (dolist (a (%all-arms node id-hex)) (push a (gethash (first a) arms)))
+    ;; Only the first +max-arms+ arms (by sequence) count, so a griefer cannot keep moving E.
+    (loop for list being the hash-values of arms
+          collect (let ((counted (subseq (sort (copy-list list) #'< :key #'sixth) 0 (min +max-arms+ (length list)))))
+                    (car (last counted))))))
 
 (defun %all-arms (node id-hex)
   "Every DisputeArmed on every fork of the ledger, newest first within each fork."
@@ -1905,7 +1925,7 @@
                             ((< value sats) (format nil "pledge holds ~a sats, less than the ~a declared" value sats))
                             ((eq spend :unspent) nil)
                             ((and (consp spend) (> (second spend) snapshot)) nil)
-                            (t (format nil "pledge spent at or before the snapshot ~a" snapshot)))))
+                            (t (format nil "pledge spent, unconfirmed or unknown at the snapshot ~a" snapshot)))))
         (when (and tip (>= tip (+ snapshot 6)))
           (bt:with-lock-held (*pledge-verdicts-lock*) (setf (gethash key *pledge-verdicts*) verdict)))
         verdict))))
@@ -1978,7 +1998,7 @@
          (voters (recovery-voters base))
          (threshold (lg:majority-threshold (length voters)))
          (participants (loop for (pk c target) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target)))
-         (lottery (progn (when (< (length participants) 2) (fail "fewer than two armers are lottery participants"))
+         (lottery (progn (when (null participants) (fail "no armer is a lottery participant"))
                          (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword)))))
     (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node base)
       (let* ((tier-index (or tier-index (confiscation-tier reserves (height node))))
