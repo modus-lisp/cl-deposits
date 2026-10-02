@@ -1261,4 +1261,20 @@
             (check "a claimed expiry the output was not built for is refused"
                    (handler-case (progn (nd::check-rotation b rb (tx) 0 hash (1+ expiry)) nil) (error () t)))))))))
 
+(with-gate ("arming waits for its pledge's height: a stale cached height never excludes the armer")
+  ;; regtest smoke flake: each pledge mined, then armed at once with a cached height one
+  ;; block behind, so every arm named a height before its own pledge and the cut dropped all.
+  (let* ((h 100) (pledge (list (u:sha256 (hx "a1")) 0 1000000))
+         (node (nd:make-node :priv 66666666666666666666 :bus (bus:make-mock-bus) :height-fn (lambda () h)
+                             :pledge-fn (lambda (txid vout from) (declare (ignore txid vout from))
+                                          (list :created 101 :value-sats 1000000 :spend :unspent))))
+         (nd::*pledge-height-wait-seconds* 1))
+    (check "with the node's height behind the pledge, arming refuses"
+           (handler-case (progn (nd::await-pledge-height node pledge) nil) (error () t)))
+    (setf h 101)
+    (check "once the height reaches the pledge's block, arming proceeds"
+           (handler-case (progn (nd::await-pledge-height node pledge) t) (error () nil)))
+    (check "and the cut includes the armer at that snapshot"
+           (null (nd::pledge-failure (nd:node-pledge-fn node) pledge 101 1000 101)))))
+
 (report)

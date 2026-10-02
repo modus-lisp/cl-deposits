@@ -326,7 +326,9 @@
            (tip (parse-integer (string-trim '(#\Newline #\Space) (run-cli cli "getblockcount")) :junk-allowed t))
            (utxo (funcall json (run-cli cli "gettxout" hex (princ-to-string vout) "false"))))
       (cond
-        (utxo (list :created (and tip (- tip (1- (gethash "confirmations" utxo))))
+        (utxo (list :created (let ((best (funcall json (run-cli cli "getblockheader" (gethash "bestblock" utxo)))))
+                               ;; heights from gettxout's own bestblock: a block between two calls cannot skew it
+                               (and best (- (gethash "height" best) (1- (gethash "confirmations" utxo)))))
                     :value-sats (round (* (gethash "value" utxo) 100000000)) :spend :unspent))
         ((null tip) nil)
         (t (or (loop for h from scan-from to tip

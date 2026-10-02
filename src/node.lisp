@@ -1829,10 +1829,31 @@
    restarted node recovers the preimage it committed to."
   (sha256 (cat (ascii->bytes "deposits/cl/lottery-seed/v1") (int->be (node-priv node) 32) (hex->bytes id-hex))))
 
+(defparameter *pledge-height-wait-seconds* 15)
+
+(defun await-pledge-height (node replacement)
+  "An arm commits to (height node) as its armed block, and the DEP-03 cut excludes a
+   pledge confirmed after the highest such height.  The node's height is cached, so an
+   arm right after its pledge's block could name a height before it and exclude itself
+   (with every armer doing so, nobody is a participant).  Wait until our height reaches
+   the pledge's confirmation; refuse rather than arm with a pledge the cut would drop."
+  (let ((pledge-fn (node-pledge-fn node)))
+    (when pledge-fn
+      (destructuring-bind (txid vout sats) replacement
+        (declare (ignore sats))
+        (let ((created (getf (funcall pledge-fn txid vout (1+ (height node))) :created))
+              (deadline (+ (get-universal-time) *pledge-height-wait-seconds*)))
+          (unless created (fail "pledge ~a:~a is not confirmed" (txid-hex txid) vout))
+          (loop until (>= (height node) created)
+                do (when (> (get-universal-time) deadline)
+                     (fail "pledge confirmed at ~a, our chain height is still ~a" created (height node)))
+                   (sleep 0.5)))))))
+
 (defun arm-dispute (node fork &key seed replacement)
   "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL."
   (let* ((n (dispute-lottery-n fork))
          (preimage (lot:derive-preimage (or seed (lottery-seed node (record-id-hex fork))) n)))
+    (when replacement (await-pledge-height node replacement))
     (setf (record-preimage fork) preimage)
     (commit-update node fork (new-update node fork (%strip-nil-fields
                                                     (list :type :dispute-armed :armed-block (height node)
