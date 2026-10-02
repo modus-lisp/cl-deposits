@@ -760,3 +760,64 @@ spend of ...'s vault; disputing its ledger ...`).  Found live: `getblock` verbos
 `prevout` (need 3), and a per-ledger scan was minutes per pass, so the scan is node-wide.
 Harness: `redteam/attack-vault-spend.sh` now PASSes on detection (`REFS=""` forms a cl-only quorum;
 the reference members' add-member stalled under this run).
+
+### 2026-10-02 — the scenario suite on beacon: what holds, what was fixed, what blocks
+
+**Infrastructure.** The devnet relay is now beacon (pure CL, `devnet/beacon-relay.lisp`; cl 74e505a,
+beacon 35c98ef/3fab92d), with the old relay's fault injection carried over (drop/delay by kind,
+author, action, recipient). Rust bot failures fell from 38% to 18% on it. The scenario suite is
+`redteam/run-all.sh` (17 scenarios, each on fresh ledgers, switches disarmed after each run,
+PASS/FAIL table; cl 02228ca, c74d390). A watchdog restarts a reference node that falls silent.
+
+**Bugs found by running it, all fixed:**
+
+| bug | where | fix |
+|---|---|---|
+| vault watch accused the signers of the node's own confiscation (it looked on the base record; the confiscation lives on the fork) | cl | 02228ca |
+| only the member that *built* a confiscation knew it, so its cosigners accused its signers | Rust | 091afc7 |
+| deposed operators kept operating ledgers whose custody had moved; members kept retrying | cl | 9b1a6d4 (stand down), 3e1ad0f (cl members refuse a deposed operator, as Rust did) |
+| every stale update from a deposed operator re-imported its ledger (~6k updates) and stalled consent | Rust | f09a300 (rate limit) |
+| non-members fully verified every fraud proof, re-importing each named ledger (~4 h of main loop on ref6) | Rust | b0068c9 |
+| QuorumBegin recorded the default ruleset, not the prepared one, so a tier-1 theft did not match | cl | 848485d |
+| a theft's proof storm (one per signer × parity × operated ledger) made each cl node re-fetch the spent ledger per copy; two workers fell 7k events behind and consent timed out | cl | f3d7685 (verdict cache) |
+| soak bots sent fee 0; bot wallets and dispute collateral drained | harness | 8de35cf, 5117518 |
+
+**Results** (contagion = honest members dispute the colluders' other ledgers too):
+
+| scenario | attack succeeds? | caught? |
+|---|---|---|
+| invalid-credit / forge-lock, honest quorum | no — refused | n/a |
+| invalid-credit / forge-lock, colluding majority | commits | yes, disputed + contagion |
+| collude-q7 (4 of 7 forge) | commits | yes: M and all five colluder ledgers disputed by cld6, ref6, ref7 within 12 s |
+| vault-spend (Tier 0 theft, mixed quorum) | coins move | yes: Rust producer reported, cl and Rust receivers disputed signer ledgers |
+| vault-recovery-tier (Tier 1 theft) | coins move | yes (after 848485d) |
+| vault-rotate-grace (rotation inside 3 blocks) | — | not accused (correct) |
+| vault-rotate-late (rotation after grace) | — | **falsely accused** (documented bound) |
+| vault-missed-confiscation | — | disputant excuses; a non-disputant accuses honest signers (the known limit); this run's cld2 was already tainted, so it showed nothing |
+| censor-hold | censorship succeeds | **no** — the escalation lands, nothing acts (DEP-12 gap) |
+| relabel, fuzz-proofs | no | n/a |
+| withhold-reveal | — | **not run**: Rust members hang (below) |
+| dereliction | — | **not run**: Rust members hang; also every cl key is now tainted (below) |
+| rollback-depth | — | **not run**: Rust members hang |
+
+**Blocking: Rust nodes hang in the confiscation path.** Since the vault-spend runs, ref nodes stop
+logging mid-run: main thread parked in a futex, 0 CPU, all 233 threads asleep, no recovery. Every
+hang (ref3, ref6, ref7; over 25 restarts on 2026-10-02) follows one of two log lines in
+`dispute.rs`: `Lottery address: …` (an initiated confiscation, 2869) or `Sent confiscation_sign
+request` (3153). The next step there is `fetch_fraud_proof_type_for_ledger` →
+`verify_fraud_broadcast_locally`, which for `UnauthorizedVaultSpend` calls
+`Wallet::confirms_block` (a **blocking** reqwest client with a 60 s timeout, from async code) and
+takes the `ledgers` and `known_confiscation_txids` std mutexes. Likely a std-mutex or blocking-I/O
+deadlock on the runtime. It needs a stack dump from a live hang (ptrace is not permitted in this
+container; run the node with tokio-console or `RUST_BACKTRACE` + a SIGQUIT handler). Log tails
+are saved as `refN/node.log.hang-HHMM`.
+
+**Contagion taints a key for good.** A key accused once (by a real theft or by a known-limit false
+accusation such as vault-rotate-late) has every new ledger it runs or cosigns disputed on sight.
+All six cl keys are now tainted on this devnet, so scenarios that need an innocent member
+(dereliction, missed-confiscation's limit) need fresh-key nodes. Nothing clears an accusation;
+see MISSING.md.
+
+**Facilities added:** `(:tune :full-arming-wait-blocks N)` on cl (the runner restores 720 after each
+run), `RESP=` for a short arm window in `form_ledger`, `devnet/soak.sh collateral` (refills
+dispute collateral when a node reports none unpledged).
