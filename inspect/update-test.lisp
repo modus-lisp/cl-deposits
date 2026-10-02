@@ -163,9 +163,10 @@
     (mapc #'bt:join-thread threads)
     (check-equal "4 threads x 3 rounds x 40 updates: no false rejections" (reduce #'+ failures) 0)))
 
-;;; A real v2 ledger: the first 52 updates of the devnet's ledger B as the relay
-;;; held them (ref2 operates; cld2, cld3 and ref3 cosign), captured 2026-09-29.
-(defvar *v2-raw* (read-json-string-array (vector-path "ledger_038353902675b77b.json")))
+;;; A real v2 ledger: the first 52 updates of the devnet's ledger B (ref2 operates;
+;;; cl and reference members cosign, Q = 7, cltv-offset-v2), from cld3's replica after
+;;; the 2026-10-02 devnet reset.
+(defvar *v2-raw* (read-json-string-array (vector-path "ledger_ffc73cfcc120b84d.json")))
 (defvar *v2* (mapcar (lambda (s) (up:decode-update (u:base64-decode s))) *v2-raw*))
 
 (with-gate ("signed-update: a reference-built v2 ledger")

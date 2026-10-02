@@ -51,7 +51,7 @@
    (make-sc :name "vault-spend" :script "attack-vault-spend.sh" :ledger-var "REDTEAM_V"
             :env '("REFS=" "WAIT=300") :timeout 1200 :tags '(:contagion))
    (make-sc :name "vault-recovery-tier" :script "attack-vault-recovery-tier.sh" :ledger-var "REDTEAM_RT"
-            :timeout 900 :tags '(:contagion))
+            :timeout 1800 :tags '(:contagion :disruptive :slow) :note "mines past expiry + 720")
    (make-sc :name "vault-rotate-late" :script "attack-vault-rotate-grace.sh" :args '("late")
             :ledger-var "REDTEAM_RG" :timeout 900 :tags '(:contagion) :note "documents the grace bound")
    (make-sc :name "vault-missed-confiscation" :script "attack-vault-missed-confiscation.sh"

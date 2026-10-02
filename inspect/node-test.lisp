@@ -673,7 +673,7 @@
     (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d9")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
     (let* ((w (nd:make-wallet :priv 55555555555555555555 :bus bus)) (dw (nd:wallet-open-deposit w id)))
       (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
-      (let* ((reserves (nd:prepare-quorum a la :ruleset "cltv-offset-literal")) (anchor (rs:reserves-ledger-hash reserves)))
+      (let* ((reserves (nd:prepare-quorum a la :ruleset "fee-cap-v3")) (anchor (rs:reserves-ledger-hash reserves)))
         (nd:credit-onchain a la dw 1000 :txid (u:sha256 (hx "79")))
         (check "the ledger moved after prepare" (not (equalp anchor (up:chain-hash (nd::tip la)))))
         (multiple-value-bind (qb r2) (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00da")) :funding-vout 0
@@ -682,7 +682,7 @@
             (check "rotation commits" (eq (op:operation-type o) :quorum-begin))
             (check-equal "QuorumBegin anchors the prepared hash" (op:field o :ledger-hash) anchor)
             (check-equal "and the reserves it promotes are the prepared ones" (rs:reserves-address r2) (rs:reserves-address reserves))
-            (check-equal "it names the prepared ruleset, not begin-quorum's default" (op:field o :protocol-version) "cltv-offset-literal")
+            (check-equal "it names the prepared ruleset, not begin-quorum's default" (op:field o :protocol-version) "fee-cap-v3")
             (check-equal "so a verifier rebuilding from it gets the funded address"
                          (rs:reserves-address (nd::disputed-reserves b (nd:find-record b id))) (rs:reserves-address reserves))
             (check-equal "cosigners replicated it" (lg:ledger-sequence (nd:record-ledger (nd:find-record b id)))

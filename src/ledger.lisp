@@ -24,7 +24,7 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
+           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
 (in-package #:cl-deposits.ledger)
 
 (define-condition ledger-error (error)
@@ -33,6 +33,12 @@
   (:report (lambda (c s) (format s "ledger: ~a~@[ (~a)~]" (ledger-error-kind c) (detail c)))))
 
 (defun fail (kind &optional detail) (error 'ledger-error :kind kind :detail detail))
+
+;; The registered rulesets.  All share the cltv-offset-v2 reserves cascade (tier-1
+;; minority ceil(n/2) - 1); fee-cap-v3 and balance-commit-v4 add off-chain op rules
+;; this implementation does not enforce, so it advertises only cltv-offset-v2.
+(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4"))
+(defparameter +supported-rulesets+ '("cltv-offset-v2"))
 
 (defparameter +valid-quorum-sizes+ '(3 5 7)
   "DEP-03 §Pre-release policy cap: odd for clean majorities, >= 3 for redundancy, <= 7.")
@@ -57,7 +63,7 @@
   id (genesis-block 0) operator-key (reserves-key "")
   (reserves-amount 0) (collateral-amount 0)
   (quorum-state :pre-quorum) (quorum-members '()) (next-quorum-members '()) quorum-expiry
-  (active-ruleset "v1")
+  (active-ruleset nil)
   (deposits (make-hash-table :test #'equalp))
   (pending-transfers (make-hash-table :test #'equalp))
   (open-invoice-locks (make-hash-table :test #'equalp))
@@ -135,12 +141,14 @@
          ;; DEP-03 pre-release size policy, enforced by every validator.
          (unless (member (length declared) +valid-quorum-sizes+)
            (fail :quorum-size-invalid (format nil "Q=~a not in ~a" (length declared) +valid-quorum-sizes+)))
+         (unless (member (f :protocol-version) +rulesets+ :test #'equal)
+           (fail :unknown-ruleset (format nil "QuorumBegin protocol_version ~s is not a known ruleset" (f :protocol-version))))
          (setf (ledger-next-quorum-members ledger) '()
                (ledger-reserves-key ledger) (f :reserves-id)
                (ledger-reserves-amount ledger) (f :amount)
                (ledger-collateral-amount ledger) (f :collateral-amount)
                (ledger-quorum-expiry ledger) (f :quorum-expiry)
-               (ledger-active-ruleset ledger) (or (f :protocol-version) "v1")
+               (ledger-active-ruleset ledger) (f :protocol-version)
                (ledger-quorum-members ledger) promoted
                (ledger-quorum-state ledger) :active)))
       (:deposit-open
@@ -347,10 +355,10 @@
                         (t nil))))
     (when (null signers)
       (return-from cosign-requirement (values 0 '() :tier0 nil t)))
-    (let* ((n (length signers)) (majority (majority-threshold n)) (minority (max 1 (floor n 3)))
-           (tier (if (member (ledger-active-ruleset ledger) '("legacy" "cltv-offset-literal") :test #'string=)
-                     :tier0
-                     (lifecycle-tier ledger height))))
+    (let* ((n (length signers)) (majority (majority-threshold n)) (minority (max 1 (1- (ceiling n 2))))
+           (tier (if (member (ledger-active-ruleset ledger) +rulesets+ :test #'string=)
+                     (lifecycle-tier ledger height)
+                     :tier0)))
       (cond ((eq tier :tier0) (values majority signers tier nil t))
             ((not (establishment-p op)) (values 0 signers tier nil nil))
             ((eq tier :tier0-post-expiry) (values majority signers tier nil t))

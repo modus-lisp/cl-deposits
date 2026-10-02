@@ -37,32 +37,24 @@
 (defun make-reserves (&rest args) (apply #'build-reserves args))
 
 ;;; ---------------------------------------------------------------------------
-;;; Rulesets: tier tables.  N is the VOTER count (operator + members).
+;;; Rulesets: tier tables.  N is the VOTER count (operator + members).  Every
+;;; registered ruleset shares the cltv-offset-v2 cascade; the absolute-height
+;;; cascades (legacy, cltv-offset-literal) are gone.
+
+(defun recovery-minority (n)
+  "Tier-1 minority: ceil(n/2) - 1 (= n - majority), at least 1."
+  (max 1 (1- (ceiling n 2))))
 
 (defun tiers-for (ruleset n quorum-expiry)
   (flet ((abs-h (offset) (if (zerop offset) 0 (+ quorum-expiry offset)))
          (mk (th tb lock desc) (make-tier :threshold th :tie-breaker-p tb :locktime lock :description desc)))
-    (cond
-      ((member ruleset '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4") :test #'string=)
-       (if (<= n 2)
-           (list (mk 2 nil (abs-h 0) "both") (mk 1 nil (abs-h 720) "single after expiry+5d")
-                 (mk 1 t (abs-h 8064) "operator after expiry+8w"))
-           (let ((majority (1+ (floor n 2))) (minority (max 1 (floor n 3))))
-             (list (mk majority nil (abs-h 0) "majority") (mk minority nil (abs-h 720) "minority after expiry+5d")
-                   (mk 1 nil (abs-h 4032) "single after expiry+4w") (mk 1 t (abs-h 8064) "operator after expiry+8w")))))
-      ((string= ruleset "cltv-offset-literal")
-       (if (<= n 2)
-           (list (mk 2 nil 0 "both") (mk 1 nil 720 "single") (mk 1 t 8064 "operator"))
-           (let ((majority (1+ (floor n 2))) (minority (max 1 (floor n 3))))
-             (list (mk majority nil 0 "majority") (mk minority nil 720 "minority")
-                   (mk 1 nil 4032 "single") (mk 1 t 8064 "operator")))))
-      ((string= ruleset "legacy")
-       (if (<= n 2)
-           (list (mk 2 nil 0 "both") (mk 1 t 2016 "operator after 2016") (mk 1 nil 4032 "emergency"))
-           (let ((majority (1+ (floor n 2))) (minority (max 1 (floor n 3))))
-             (list (mk majority nil 0 "majority") (mk minority nil 1008 "minority after 1008")
-                   (mk 1 t 2016 "operator after 2016") (mk 1 nil 4032 "emergency")))))
-      (t (error "unknown ruleset ~s" ruleset)))))
+    (unless (member ruleset cl-deposits.ledger:+rulesets+ :test #'equal) (error "unknown ruleset ~s" ruleset))
+    (if (<= n 2)
+        (list (mk 2 nil (abs-h 0) "both") (mk 1 nil (abs-h 720) "single after expiry+5d")
+              (mk 1 t (abs-h 8064) "operator after expiry+8w"))
+        (list (mk (1+ (floor n 2)) nil (abs-h 0) "majority")
+              (mk (recovery-minority n) nil (abs-h 720) "minority after expiry+5d")
+              (mk 1 nil (abs-h 4032) "single after expiry+4w") (mk 1 t (abs-h 8064) "operator after expiry+8w")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Script assembly

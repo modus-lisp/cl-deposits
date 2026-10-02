@@ -144,16 +144,17 @@
                  (length (lot:confiscation-outputs (hx "5120aa") 40700 500 :respectful t :obligations-sats 40000 :operator-pubkey33 (up:compressed-pubkey 9)))
                  1)))
 
-(with-gate ("reserves: the reference's pinned legacy-ruleset script")
-  ;; deposits-core's snapshot test: operator + 3 members, legacy tiers, mainnet.
-  (let ((r (rs:build-reserves :operator (hx "02b017e1288da93b90d9ca139d9fdb3310c4ba65d451803875471c2b6d57a4520f")
-                              :members (list (hx "0206c4db20bda97893e99f843b0acf6bd61624baa09c72536841a974230f1e4995")
-                                             (hx "036cba47c801a59c0792fd4a214ec6b37eb6f206a5be68a9d87064d5f89fd8a777")
-                                             (hx "02208787bb5c2d2428d4055d353d4656642be7ef6550a3240b2063b4c073d8ae1a"))
-                              :ledger-hash (hx "7fc25d5245e7003be4f1c4138fbf608bf0ecbb4eca7be4954529d42168473b76")
-                              :quorum-expiry 0 :ruleset "legacy" :network :mainnet)))
-    (check-bytes "scriptPubKey matches EXPECTED_CURRENT_SCRIPT_HEX" (rs:reserves-spk r)
-                 (hx "51202da85682af56fd62b6fa106e30831a8dbfa05c74259bdca8e0cfad0242ff0e55"))))
+(with-gate ("reserves: the reference's pinned cltv-offset-v2 seven-voter script")
+  ;; deposits-core CLTV_OFFSET_V2_SEVEN_VOTERS_HEX: operator key [1;32], members [2..7;32],
+  ;; quorum_expiry 800000, ledger hash [0x5a;32], signet.  Tier 1 is ceil(7/2) - 1 = 3 of 7.
+  (let* ((key (lambda (i) (up:compressed-pubkey (u:be->int (make-array 32 :element-type '(unsigned-byte 8) :initial-element i)))))
+         (r (rs:build-reserves :operator (funcall key 1) :members (loop for i from 2 to 7 collect (funcall key i))
+                               :ledger-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5a)
+                               :quorum-expiry 800000 :ruleset "cltv-offset-v2" :network :signet)))
+    (format t "~&  CL_SEVEN_VOTERS_HEX=~a~%" (u:bytes->hex (rs:reserves-spk r)))
+    (check-equal "tier 1 is 3 of 7" (rs:tier-threshold (second (rs:reserves-tiers r))) 3)
+    (check-bytes "scriptPubKey matches CLTV_OFFSET_V2_SEVEN_VOTERS_HEX" (rs:reserves-spk r)
+                 (hx "51206e92587c6bcdf7bd653c242c1937224eac71bc486fe7c3b9fc6edb70b129dbeb"))))
 
 
 

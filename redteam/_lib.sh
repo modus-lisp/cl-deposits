@@ -27,7 +27,7 @@ form_ledger() {
   l=$(sx "$(cld_ctl "$op" "(:open-ledger :reserves-id \"genesis:$op:redteam-$(basename "$row"):$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER")
   [ -n "$l" ] || fail "open ledger $(basename "$row")"
   consent "$l" "$op" "$@" >&2
-  prep=$(cld_ctl "$op" "(:prepare-quorum :ledger \"$l\" :expiry-blocks 4320${rs:+ :ruleset \"$rs\"})"); expect "$prep" "prepare-quorum"; addr=$(sx "$prep" ":ADDRESS")
+  prep=$(cld_ctl "$op" "(:prepare-quorum :ledger \"$l\" :expiry-blocks ${FORM_EXPIRY:-4320}${rs:+ :ruleset \"$rs\"})"); expect "$prep" "prepare-quorum"; addr=$(sx "$prep" ":ADDRESS")
   txid=$(wcli sendtoaddress "$addr" 0.5); mine 3 >/dev/null
   vout=$(outpoint_vout "$txid" "$addr")
   local r i; for i in 1 2 3; do   # a busy member can miss the cosign round: retry

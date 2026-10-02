@@ -899,7 +899,7 @@
                  (cons 4 (ascii->bytes their-id)) (cons 5 (ascii->bytes (or ruleset "cltv-offset-v2")))
                  (cons 6 (ascii->bytes (node-member-ledger-hex node)))
                  (cons 7 (apply #'cat (mapcar (lambda (s) (cat (octets (length s)) (ascii->bytes s)))
-                                              '("legacy" "cltv-offset-literal" "cltv-offset-v2" "fee-cap-v3" "balance-commit-v4"))))
+                                              lg:+supported-rulesets+)))
                  (let ((v (w:jget params "min_fee_bps"))) (and v (cons 10 (int->be v 2))))
                  (let ((v (w:jget params "min_fee_fixed"))) (and v (cons 11 (int->be v 8))))
                  (let ((v (w:jget params "max_fee_period"))) (and v (cons 12 (int->be v 4))))

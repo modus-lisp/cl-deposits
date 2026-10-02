@@ -6,7 +6,7 @@
 ;;; ledger.  Its signatures and hash chain are v1, which v2 retired (DEP-02
 ;;; §Versions), so it is used here for its operations and its fold only.
 ;;; The chain walk and cosignature-majority checks now run against a v2
-;;; reference ledger (update-test, ledger_038353902675b77b.json).
+;;; reference ledger (update-test, ledger_ffc73cfcc120b84d.json).
 (defvar *distinct* (remove-duplicates (mapcar (lambda (s) (up:decode-update (u:base64-decode s)))
                                               (read-json-string-array (vector-path "ledger_57f60e1dbef339e2.json")))
                                       :test #'equalp :key #'up:encode-update))
