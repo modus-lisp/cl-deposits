@@ -110,6 +110,9 @@
   (spender-fn nil)                             ; (lambda (from to outpoints)) -> spend plists (:txid :vout :tx :prevouts :block-hash :height)
   (vault-scanned nil)                          ; the last block height scanned for vault spends
   (reported-vault-spend (make-hash-table :test (quote equal) :synchronized t))
+  ;; (accused spent-ledger spend-tx governing-seq) -> (universal-time ok why): one theft yields a proof
+  ;; per signer, key parity and operated ledger, and verifying fetches the spent ledger's history
+  (vault-spend-verdicts (make-hash-table :test (quote equal) :synchronized t))
   (derelict-watch (make-hash-table :test (quote equal) :synchronized t))
   (reported-derelict (make-hash-table :test (quote equal) :synchronized t))
   (min-confs 1)
@@ -2560,7 +2563,7 @@
         (when (and signers (not (member (btx:tx-txid tx) (authorised-spend-txids node rec) :test #'equalp)))
           (setf (gethash id (node-reported-vault-spend node)) t)
           (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"
-                (subseq id 0 8) (subseq (bytes->hex (btx:tx-txid tx)) 0 16) (length signers))
+                (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16) (length signers))
           (dolist (x signers)
             ;; x-only key; the operated ledgers are advertised under the full key, either parity
             (dolist (full (list (cat (octets 2) x) (cat (octets 3) x)))
@@ -2569,6 +2572,10 @@
                 (broadcast-fraud node (fr:make-unauthorized-vault-spend-proof full (hex->bytes target) (hex->bytes id) qb tx
                                                                               (getf spend :prevouts) (getf spend :block-hash))))))
           t)))))
+
+(defparameter *vault-spend-verdict-ttl* 600
+  "Seconds a spend's verdict is reused: long enough to absorb one theft's proof storm, short
+   enough that a QuorumBegin or confiscation learned later changes the answer.")
 
 (defun handle-vault-spend-fraud (node proof)
   "An UnauthorizedVaultSpend against a ledger the accused operates: if we cosign it, verify
@@ -2584,18 +2591,25 @@
                                   (not (find-fork node (record-id-hex rec) (node-pubkey node))))
                           collect rec)))
     (when targets
-      (let* ((srec (find-record node spent-id))
-             (history (if (and srec (not (record-fork-p srec))) (record-history srec) (ledger-updates-from-relays node spent-id)))
-             (authorised (if srec (authorised-spend-txids node srec) '())))
-        (multiple-value-bind (ok why)
-            (fr:verify-unauthorized-vault-spend proof history (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
-                                                :authorised-txids authorised)
+      (multiple-value-bind (ok why)
+          (let* ((key (list (getf proof :accused) spent-id (getf ev :spend-tx-hex) (getf ev :governing-quorumbegin-seq)))
+                 (hit (gethash key (node-vault-spend-verdicts node))))
+            (if (and hit (< (- (get-universal-time) (first hit)) *vault-spend-verdict-ttl*))
+                (values (second hit) (third hit))
+                (let* ((srec (find-record node spent-id))
+                       (history (if (and srec (not (record-fork-p srec))) (record-history srec) (ledger-updates-from-relays node spent-id)))
+                       (authorised (if srec (authorised-spend-txids node srec) '())))
+                  (multiple-value-bind (ok why)
+                      (fr:verify-unauthorized-vault-spend proof history (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
+                                                          :authorised-txids authorised)
+                    (setf (gethash key (node-vault-spend-verdicts node)) (list (get-universal-time) ok why))
+                    (values ok why)))))
           (if (not ok)
               (log! node "vault-spend proof against ~a rejected: ~a" (subseq (getf proof :accused) 0 8) why)
               (dolist (rec targets)
                 (log! node "contagion: ~a signed an unauthorised spend of ~a's vault; disputing its ledger ~a"
                       (subseq (getf proof :accused) 0 8) (subseq spent-id 0 8) (subseq (record-id-hex rec) 0 8))
-                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "unauthorized_vault_spend"))))))))
+                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "unauthorized_vault_spend")))))))
 
 (defun broadcast-fraud (node proof)
   (bus:bus-publish (node-bus node) (w:fraud-event (node-keypair node) (getf proof :ledger-id) (getf proof :accused) (fr:broadcast->json proof))))

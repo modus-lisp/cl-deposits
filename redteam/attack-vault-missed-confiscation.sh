@@ -19,7 +19,10 @@ echo "== ledger $X: cld3 cld4 cld5 cld6 dispute"
 for n in cld3 cld4 cld5 cld6; do cld_ctl $n "(:dispute-enter :ledger \"$X\" :reason \"redteam missed-confiscation\")" >/dev/null; done
 conf=""
 for i in $(seq 1 $((WAIT / 5))); do
-  conf=$(cld_ctl cld6 '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain" | grep -F "dispute ${X:0:8}:" | grep -oE '[0-9a-f]{64}' | tail -1)
+  for n in cld3 cld4 cld5 cld6; do   # any disputant: one that armed late is not in the lottery and never logs it
+    conf=$(cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain" | grep -F "dispute ${X:0:8}:" | grep -oE '[0-9a-f]{64}' | tail -1)
+    [ -n "$conf" ] && break
+  done
   [ -n "$conf" ] && break
   [ $((i % 6)) -eq 0 ] && mine 1 >/dev/null   # the arm window closes on height
   sleep 5
