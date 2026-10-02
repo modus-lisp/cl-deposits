@@ -532,6 +532,7 @@
           ((string= action "cosign_update") (handle-cosign node event params))
           ((string= action "confiscation_sign") (handle-confiscation-sign node event params))
           ((string= action "theft_sign") (handle-theft-sign node event params))
+          ((string= action "rotation_sign") (handle-rotation-sign node event params))
           ((string= action "lottery_recovery_sign") (handle-lottery-recovery-sign node event params))
           ((string= action "lottery_reveal") (handle-lottery-reveal-request node event params))
           ((string= action "consent_request") (handle-consent node event params))
@@ -2140,6 +2141,67 @@
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
                                                            "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))))
       (error (e) (log! node "refused theft_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
+
+;;; A reference operator rotates its vault itself (deposits-rust auto_rotation): it
+;;; spends the current vault at a tier, 1-in/1-out, into the reserves of the next
+;;; quorum, and asks the members for the tier's script-path signature with
+;;; `rotation_sign` {sighash, unsigned_tx, tier_index, ledger_hash, new_quorum_expiry}.
+;;; A member rebuilds both ends from the replica it holds and signs only that.
+
+(defparameter *max-rotation-fee-sats* 100000)
+
+(defun check-rotation (node rec proposed tier-index claimed-hash claimed-expiry)
+  "Signal unless PROPOSED is the rotation of REC's current vault at TIER-INDEX into the
+   reserves of its next quorum (staged members, else the current ones) under
+   CLAIMED-HASH / CLAIMED-EXPIRY.  Returns the script-path sighash to sign."
+  (when (record-fork-p rec) (fail "not a base ledger"))
+  (check-not-deposed node rec)
+  (unless (and (= (length (btx:tx-inputs proposed)) 1) (= (length (btx:tx-outputs proposed)) 1))
+    (fail "rotation tx must be 1-in/1-out"))
+  (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node rec)
+    (let* ((ledger (record-ledger rec))
+           (me (node-pubkey node))
+           (current (rs:reserves-members reserves))
+           (staged (mapcar #'lg:member-pubkey (lg:ledger-next-quorum-members ledger)))
+           (next (or staged current))
+           (in (first (btx:tx-inputs proposed)))
+           (out (first (btx:tx-outputs proposed)))
+           (tier (or (nth tier-index (rs:reserves-tiers reserves)) (fail "tier_index ~a out of range" tier-index))))
+      (unless (member me current :test #'equalp) (fail "not a current quorum member"))
+      (unless (and (equalp (btx:txin-prev-hash in) txid) (= (btx:txin-prev-index in) vout))
+        (fail "input is not the vault outpoint"))
+      (when (and (node-chain-fn node) (null (funcall (node-chain-fn node) txid vout)))
+        (fail "vault outpoint is spent or unknown"))
+      (unless (= (btx:tx-locktime proposed) (rs:tier-locktime tier))
+        (fail "lock_time ~a is not tier ~a's ~a" (btx:tx-locktime proposed) tier-index (rs:tier-locktime tier)))
+      (let ((expected (rs:build-reserves :operator operator :members next :ledger-hash claimed-hash
+                                         :quorum-expiry claimed-expiry
+                                         :ruleset (or (lg:ledger-active-ruleset ledger) "cltv-offset-v2")
+                                         :network (intern (string-upcase (node-network node)) :keyword))))
+        (unless (equalp (btx:txout-script out) (rs:reserves-spk expected))
+          (fail "output is not the next quorum's reserves")))
+      (let ((value (btx:txout-value out)))
+        (when (> value sats) (fail "output ~a exceeds the vault's ~a" value sats))
+        (when (> (- sats value) *max-rotation-fee-sats*) (fail "rotation fee ~a sats over ~a" (- sats value) *max-rotation-fee-sats*)))
+      (rot:tier-sighash proposed 0 (vector (cons sats (rs:reserves-spk reserves)))
+                        (nth tier-index (rs:reserves-leaves reserves))))))
+
+(defun handle-rotation-sign (node event params)
+  (let* ((id (w:event-ledger-id event)) (rec (find-record node id)))
+    (unless rec (return-from handle-rotation-sign nil))
+    (handler-case
+        (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (fail "no unsigned_tx"))))))
+               (tier-index (or (w:jget params "tier_index") 0))
+               (claimed-hash (hex->bytes (or (w:jget params "ledger_hash") (fail "no ledger_hash"))))
+               (claimed-expiry (or (w:jget params "new_quorum_expiry") (fail "no new_quorum_expiry")))
+               (expected (check-rotation node rec proposed tier-index claimed-hash claimed-expiry)))
+          (unless (equalp expected (hex->bytes (or (w:jget params "sighash") (fail "no sighash"))))
+            (fail "sighash is not the rotation's"))
+          (log! node "signing rotation of ~a at tier ~a" (subseq id 0 8) tier-index)
+          (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
+                                                       "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))
+      (error (e) (log! node "refused rotation_sign for ~a: ~a" (subseq id 0 8) e)
+        (respond node event nil :error (princ-to-string e))))))
 
 (defun arg-theft-destination (node tx)
   "The destination address of a theft tx: its single output's spk, re-encoded as

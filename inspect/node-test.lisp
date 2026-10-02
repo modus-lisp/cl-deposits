@@ -1231,4 +1231,34 @@
                             (= (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+)))) (length after)))))))))))
 
 
+;; Shape of a reference operator's auto_rotation: a 1-in/1-out spend of the current
+;; vault at a tier into the next quorum's reserves.  A cl member rebuilds both ends.
+(with-gate ("rotation_sign: a cl member signs a reference-shaped vault rotation, and only that")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a10" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00e1")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let ((rb (nd:find-record b id)) (hash (u:sha256 (hx "a5"))) (expiry (+ *height* 4320)))
+      (multiple-value-bind (cur txid vout sats operator) (nd::disputed-reserves b rb)
+        (let* ((next (rs:build-reserves :operator operator :members (rs:reserves-members cur) :ledger-hash hash
+                                        :quorum-expiry expiry :network :signet))
+               (prevouts (vector (cons sats (rs:reserves-spk cur)))))
+          (flet ((tx (&key (spk (rs:reserves-spk next)) (prev txid) (locktime 0) (fee-rate 5))
+                   (rot:build-spend :prev-txid prev :prev-vout vout :reserves-amount sats :destination-spk spk
+                                    :fee-rate fee-rate :locktime locktime))
+                 (refused (tx) (handler-case (progn (nd::check-rotation b rb tx 0 hash expiry) nil) (error () t))))
+            (check-equal "the rotation's tier-0 sighash is what the member signs"
+                         (nd::check-rotation b rb (tx) 0 hash expiry)
+                         (rot:tier-sighash (tx) 0 prevouts (first (rs:reserves-leaves cur))))
+            (check "a different destination is refused" (refused (tx :spk (rs:reserves-spk cur))))
+            (check "a different input is refused" (refused (tx :prev (u:sha256 (hx "beef")))))
+            (check "a lock_time not the tier's is refused" (refused (tx :locktime 99)))
+            (check "a claimed expiry the output was not built for is refused"
+                   (handler-case (progn (nd::check-rotation b rb (tx) 0 hash (1+ expiry)) nil) (error () t)))))))))
+
 (report)
