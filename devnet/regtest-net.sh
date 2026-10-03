@@ -32,7 +32,7 @@ up() {
   start_bitcoind || exit 1
   [ "$(bcli getblockcount)" -ge 400 ] || mine 300          # coins for 12 vaults, collateral, scenarios
   start_relay || exit 1; start_esplora || exit 1
-  local n; for n in $(cld_names); do start_cld "$n" & done; wait   # each loads in ~40 s: in parallel
+  local n pids=(); for n in $(cld_names); do start_cld "$n" & pids+=($!); done; wait "${pids[@]}"   # ~40 s each: in parallel (not a bare wait: the relay is a child too)
   for n in $(cld_names); do cld_running "$n" || { echo "$n did not start" >&2; exit 1; }; done
   for n in $(ref_names); do start_ref "$n" || exit 1; done
   start_ticker
