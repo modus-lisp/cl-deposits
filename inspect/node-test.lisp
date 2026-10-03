@@ -260,6 +260,15 @@
                  (every (lambda (m) (equalp (btx:tx-txid (nd:record-confiscation (nd:find-fork m id (nd:node-pubkey m)))) (btx:tx-txid ctx))) (list c d)))
           (check "the vault watch excuses a confiscation it knows from its fork (not an unauthorised spend)"
                  (every (lambda (m) (member (btx:tx-txid ctx) (nd::authorised-spend-txids m (nd:find-record m id)) :test #'equalp)) (list b c d)))
+          ;; The fork forgets its confiscation once the lottery output is spent (the winner's claim);
+          ;; a confiscation the node saw confirmed must stay excused after that (regtest red team,
+          ;; 2026-10-03: a disputant accused the signers of its own concluded confiscation).
+          (nd::note-confiscation c id (btx:tx-txid ctx))
+          (let ((f (nd:find-fork c id (nd:node-pubkey c))) (saved nil))
+            (setf saved (nd:record-confiscation f) (nd:record-confiscation f) nil)
+            (check "a confirmed confiscation stays excused after its fork forgets it (the lottery claimed)"
+                   (member (btx:tx-txid ctx) (nd::authorised-spend-txids c (nd:find-record c id)) :test #'equalp))
+            (setf (nd:record-confiscation f) saved))
           ;; --- Reveal.  Red team #7: once B has revealed, D publishes B's preimage as its
           ;; own (signed by D).  It opens B's commitment, not D's; honest nodes must not
           ;; count it, or D could pick, after seeing every reveal, the copy that makes it win.

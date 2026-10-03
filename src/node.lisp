@@ -111,6 +111,10 @@
   (spender-fn nil)                             ; (lambda (from to outpoints)) -> spend plists (:txid :vout :tx :prevouts :block-hash :height)
   (vault-scanned nil)                          ; the last block height scanned for vault spends
   (reported-vault-spend (make-hash-table :test (quote equal) :synchronized t))
+  ;; ledger id hex -> txids of confiscations we saw confirmed.  Kept apart from the forks: a fork
+  ;; forgets its confiscation once the lottery output is spent (the winner's claim), and the vault
+  ;; watch must still excuse it.  Persisted in confiscations.txt.
+  (known-confiscations (make-hash-table :test (quote equal) :synchronized t))
   ;; (accused spent-ledger spend-tx governing-seq) -> (universal-time ok why): one theft yields a proof
   ;; per signer, key parity and operated ledger, and verifying fetches the spent ledger's history
   (vault-spend-verdicts (make-hash-table :test (quote equal) :synchronized t))
@@ -1432,12 +1436,17 @@
       (when f
         (let ((tx (record-confiscation f)) (l (record-lottery f)))
           (cond ((not (node-chain-fn node)) (return-from fork-lottery (values tx l :pending)))
-                ((funcall (node-chain-fn node) (btx:tx-txid tx) 0) (return-from fork-lottery (values tx l :pending)))
+                ((funcall (node-chain-fn node) (btx:tx-txid tx) 0)
+                 (note-confiscation node id-hex (btx:tx-txid tx))
+                 (return-from fork-lottery (values tx l :pending)))
                 ((funcall (node-chain-fn node) (btx:tx-txid (build-lottery-recovery node id-hex tx l)) 0)
+                 (note-confiscation node id-hex (btx:tx-txid tx))
                  (return-from fork-lottery (values tx l :recovered)))
                 (t (forget)))))
       (multiple-value-bind (tx l state) (confiscated-lottery node id-hex)
-        (when tx (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) tx (record-lottery f) l)))
+        (when tx
+          (when state (note-confiscation node id-hex (btx:tx-txid tx)))
+          (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) tx (record-lottery f) l)))
         (values tx l state)))))
 
 (defun drive-dispute (node fork)
@@ -2693,6 +2702,25 @@
 ;;; clears a tier's threshold is a theft by exactly the keys that signed it, and
 ;;; every one of them is slashable on every ledger it operates (contagion).
 
+(defun note-confiscation (node id-hex txid)
+  "Remember that TXID, a confiscation of ledger ID-HEX, confirmed (see known-confiscations)."
+  (unless (member txid (gethash id-hex (node-known-confiscations node)) :test #'equalp)
+    (push txid (gethash id-hex (node-known-confiscations node)))
+    (when (node-data-dir node)
+      (ignore-errors
+       (with-open-file (out (merge-pathnames "confiscations.txt" (node-data-dir node))
+                            :direction :output :if-exists :append :if-does-not-exist :create)
+         (format out "~a ~a~%" id-hex (txid-hex txid)))))))
+
+(defun load-known-confiscations (node)
+  (let ((f (and (node-data-dir node) (probe-file (merge-pathnames "confiscations.txt" (node-data-dir node))))))
+    (when f
+      (with-open-file (in f)
+        (loop for line = (read-line in nil) while line
+              do (let ((sp (position #\Space line)))
+                   (when sp (pushnew (reverse (hex->bytes (subseq line (1+ sp))))
+                                     (gethash (subseq line 0 sp) (node-known-confiscations node)) :test #'equalp))))))))
+
 (defun authorised-spend-txids (node rec)
   "The txids that legitimately spend a vault of REC: every rotation it recorded
    (a QuorumBegin's new outpoint is the previous vault's spender), and any confiscation we
@@ -2703,6 +2731,8 @@
         (when (and o (eq (op:operation-type o) :quorum-begin)) (push (op:field o :new-outpoint-txid) ids))))
     (dolist (r (cons rec (forks-of node (record-id-hex rec))))
       (when (record-confiscation r) (pushnew (btx:tx-txid (record-confiscation r)) ids :test #'equalp)))
+    (dolist (txid (gethash (record-id-hex rec) (node-known-confiscations node)))
+      (pushnew txid ids :test #'equalp))
     ids))
 
 (defparameter *vault-spend-grace-blocks* 3
@@ -2948,6 +2978,7 @@
     (setf (node-loading node) nil)))
 
 (defun %load-data-dir (node &key (log-fn (lambda (fmt &rest args) (apply #'log! node fmt args))))
+  (load-known-confiscations node)
   (let* ((dir (node-data-dir node))
          (log-lock (bt:make-lock "load-log"))
          (files (directory (merge-pathnames "ledger_*.json" dir))))
