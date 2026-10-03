@@ -537,7 +537,7 @@
           ((string= action "confiscation_sign") (handle-confiscation-sign node event params))
           ((string= action "theft_sign") (handle-theft-sign node event params))
           ((string= action "rotation_sign") (handle-rotation-sign node event params))
-          ((string= action "lottery_recovery_sign") (handle-lottery-recovery-sign node event params))
+          ((string= action "lottery_subset_attest") (handle-lottery-subset-attest node event params))
           ((string= action "lottery_reveal") (handle-lottery-reveal-request node event params))
           ((string= action "consent_request") (handle-consent node event params))
           ((string= action "cosign_invoice") (handle-cosign-invoice node event params))
@@ -1296,120 +1296,77 @@
       (or (and known (funcall (node-chain-fn node) (btx:tx-txid known) 0) known)
           (first (rebuild-confiscation-on-chain node id-hex))))))
 
-;;; An unclaimable lottery (docs/LOTTERY-N.md): armers commit preimages under
-;;; N = Q (the recovery voters) but the claim leaf is built for the k who armed,
-;;; so with k < Q a revealed preimage longer than 16 + k locks the claim leaf for
-;;; good.  Two mitigations until the protocol settles it: do not confiscate with
-;;; k < Q while the others may still arm, and sweep a lottery that cannot be
-;;; claimed through its CSV-144 recovery leaf, to the original operator's key —
-;;; the destination DEP-06 names for lottery-recovery funds, as the respectful
-;;; confiscation's change.
+;;; DEP-06 Phase 4: the full-set leaf when everyone revealed; otherwise, past the
+;;; reveal deadline, the leaf of the revealers R, which the recovery voters attest.
+;;; Nobody revealing sends the output to a re-arm round (not yet orchestrated), and
+;;; no voter signs a recovery spend to the accused operator.
 
 (defconstant +max-arms+ 4 "Arms that count per armer: the first and up to three re-arms (DEP-03).")
 
-(defparameter *full-arming-wait-blocks* 720
-  "Blocks past the arm window a driver waits for every recovery voter to arm
-   before confiscating with fewer: the reference's own auto-dispute hold-off.")
-(defparameter *lottery-recovery-fee* 500
-  "Fixed, so every recovery voter rebuilds the same sweep.")
-(defconstant +lottery-recovery-csv+ 144)
-
-(defun lottery-claimable (node id-hex lottery)
-  "NIL when a revealed preimage is out of the claim leaf's bounds (it can never
-   be claimed), T when every participant revealed within them, else :UNKNOWN."
-  (let* ((ps (lot:lottery-participants lottery)) (k (length ps)) (reveals (reveals-of node id-hex))
-         (pre (mapcar (lambda (p) (cdr (find (lot:participant-pubkey p) reveals :key (lambda (r) (up:x-only (car r))) :test #'equalp)))
-                      ps)))
-    (cond ((some (lambda (x) (and x (> (length x) (+ 16 k)))) pre) nil)
-          ((every #'identity pre) t)
-          (t :unknown))))
-
-(defun build-lottery-recovery (node id-hex conf lottery)
-  "The CSV-144 recovery sweep of CONF's lottery output to the original operator:
-   (values tx prevouts leaf).  Deterministic, so every voter rebuilds it."
-  (let* ((operator (nth-value 4 (disputed-reserves node (find-record node id-hex))))
-         (amount (btx:txout-value (first (btx:tx-outputs conf))))
-         (tx (btx:parse-tx (bw:make-reader
-                            (btx:serialize-tx
-                             (btx:make-tx :version 2 :locktime 0 :segwit-p t
-                                          :inputs (list (btx:make-txin :prev-hash (btx:tx-txid conf) :prev-index 0 :script (octets)
-                                                                       :sequence +lottery-recovery-csv+))
-                                          :outputs (list (btx:make-txout :value (- amount *lottery-recovery-fee*)
-                                                                         :script (cat (octets 0 20) (cl-consensus.wire:hash160 operator))))
-                                          :witnesses (list nil))))))
-         (leaf (nth (lot::recovery-leaf-index lottery 0) (lot:lottery-leaves lottery))))
-    (values tx (vector (cons amount (lot:lottery-spk lottery))) leaf)))
-
 (defun confiscated-lottery (node id-hex)
   "The confiscation of ID-HEX that is on chain, rebuilt from public state:
-   (values tx lottery state), STATE :PENDING while its lottery output is unspent,
-   :RECOVERED once our recovery sweep of it is; NIL if neither is found."
+   (values tx lottery :pending) while its lottery output is unspent, else NIL."
   (when (node-chain-fn node)
-    (loop for respectful in '(t nil)
-          do (loop for ti below (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))
-                   for built = (ignore-errors (multiple-value-list (build-confiscation node id-hex :tier-index ti :respectful respectful)))
-                   when built
-                     do (destructuring-bind (tx lottery &rest rest) built
-                          (declare (ignore rest))
-                          (when (funcall (node-chain-fn node) (btx:tx-txid tx) 0)
-                            (return-from confiscated-lottery (values tx lottery :pending)))
-                          (when (funcall (node-chain-fn node) (btx:tx-txid (build-lottery-recovery node id-hex tx lottery)) 0)
-                            (return-from confiscated-lottery (values tx lottery :recovered))))))))
+    (let ((built (rebuild-confiscation-on-chain node id-hex)))
+      (when built (values (first built) (second built) :pending)))))
 
-(defun lottery-recovery-open-p (node conf)
-  (let ((info (funcall (node-chain-fn node) (btx:tx-txid conf) 0)))
-    (and info (>= (getf info :confirmations) +lottery-recovery-csv+))))
+(defun reveal-deadline-passed-p (node conf)
+  (let ((info (and (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid conf) 0))))
+    (and info (>= (getf info :confirmations) lot:+reveal-csv+))))
 
-(defun sweep-lottery (node id-hex conf lottery)
-  "Gather the recovery threshold's signatures (ours, then lottery_recovery_sign)
-   and broadcast the sweep.  Returns the signed tx."
-  (multiple-value-bind (tx prevouts leaf) (build-lottery-recovery node id-hex conf lottery)
-    (let* ((sighash (rot:tier-sighash tx 0 prevouts leaf))
-           (voters (lot::sorted-keys (lot:lottery-recovery-voters lottery)))
-           (threshold (lot:lottery-recovery-threshold lottery))
-           (me (up:x-only (node-pubkey node)))
-           (sigs (list (cons me (schnorr:schnorr-sign (node-priv node) sighash (random-aux))))))
-      (unless (member me voters :test #'equalp) (fail "not a recovery voter"))
-      (when (> threshold 1)
-        (dolist (r (send-request node id-hex "lottery_recovery_sign"
-                                 (w:json-object "sighash" (bytes->hex sighash) "unsigned_tx" (unsigned-tx-hex tx))
-                                 :want (1- threshold) :timeout 20 :successes-only t))
-          (let ((res (w:jget r "result")))
-            (when (and (w:jget r "success") res)
-              (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
-                (when (and (member pk voters :test #'equalp) (schnorr:schnorr-verify pk sighash sig) (not (assoc pk sigs :test #'equalp)))
-                  (push (cons pk sig) sigs)))))))
-      (when (< (length sigs) threshold) (fail "only ~a of ~a recovery signatures" (length sigs) threshold))
-      (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) voters))
-             (signed (btx:parse-tx (bw:make-reader
-                                    (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs (btx:tx-inputs tx)
-                                                                   :outputs (btx:tx-outputs tx)
-                                                                   :witnesses (list (lot:recovery-witness lottery 0 ordered))))))))
-        (unless (rot:verify-spend signed 0 prevouts) (fail "assembled lottery recovery does not verify"))
-        (broadcast node signed)
-        signed))))
+(defun revealed-indices (node id-hex lottery)
+  "(values indices preimages): the participants whose valid reveals we hold, in
+   canonical order."
+  (let ((reveals (reveals-of node id-hex)) (idx '()) (pre '()))
+    (loop for p in (lot:lottery-participants lottery) for i from 0
+          for r = (cdr (find (lot:participant-pubkey p) reveals :key (lambda (r) (up:x-only (car r))) :test #'equalp))
+          when (and r (equalp (lot:commitment-of r) (lot:participant-commitment p)) (<= 17 (length r) lot:+max-preimage-len+))
+            do (push i idx) (push r pre))
+    (values (nreverse idx) (nreverse pre))))
 
-(defun handle-lottery-recovery-sign (node event params)
-  "A recovery voter: sign the sweep only of a lottery that can never be claimed,
-   once its CSV has passed, and only the exact sweep we rebuild ourselves."
+(defun handle-lottery-subset-attest (node event params)
+  "A recovery voter (DEP-06 Phase 4): sign a revealer-subset claim only past the
+   reveal deadline, only for exactly the reveals we hold, only for that subset's
+   winner, and only a claim paying the winner's declared target."
   (let ((id (w:event-ledger-id event)))
-    (unless (find-fork node id (node-pubkey node)) (return-from handle-lottery-recovery-sign nil))
+    (unless (find-record node id) (return-from handle-lottery-subset-attest nil))
     (handler-case
-        (multiple-value-bind (conf lottery state) (confiscated-lottery node id)
-          (unless (eq state :pending) (fail "no pending lottery on chain"))
-          (unless (null (lottery-claimable node id lottery)) (fail "the lottery can still be claimed"))
-          (unless (lottery-recovery-open-p node conf) (fail "recovery leaf not open yet (CSV ~a)" +lottery-recovery-csv+))
-          (multiple-value-bind (tx prevouts leaf) (build-lottery-recovery node id conf lottery)
-            (declare (ignore tx))
-            (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (w:jget params "unsigned_tx")))))
-                   (ours (rot:tier-sighash proposed 0 prevouts leaf)))
-              (unless (and (equalp ours (hex->bytes (w:jget params "sighash")))
-                           (equalp (btx:tx-txid proposed) (btx:tx-txid (build-lottery-recovery node id conf lottery))))
-                (fail "not the sweep we expect"))
-              (log! node "signed lottery recovery of ~a proposed by ~a" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8))
-              (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
-                                                           "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) ours (random-aux))))))))
-      (error (e) (log! node "refused lottery_recovery_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
+        (multiple-value-bind (conf lottery) (fork-lottery node id)
+          (unless (and conf lottery) (fail "no pending lottery on chain"))
+          (unless (member (up:x-only (node-pubkey node)) (lot:lottery-recovery-voters lottery) :test #'equalp)
+            (fail "not a recovery voter"))
+          (unless (reveal-deadline-passed-p node conf) (fail "reveal deadline not reached (~a blocks)" lot:+reveal-csv+))
+          (multiple-value-bind (idx pre) (revealed-indices node id lottery)
+            (let* ((asked (mapcar (lambda (h) (let ((x (let ((k (hex->bytes h))) (if (= (length k) 33) (up:x-only k) k))))
+                                                (or (position x (lot:lottery-participants lottery) :key #'lot:participant-pubkey :test #'equalp)
+                                                    (fail "~a is not a participant" (subseq h 0 8)))))
+                                  (coerce (w:jget params "subset") 'list)))
+                   (asked (sort (copy-list asked) #'<)))
+              (unless (equal asked idx) (fail "subset ~a is not the reveals we hold ~a" asked idx))
+              (when (= (length idx) (length (lot:lottery-participants lottery))) (fail "everyone revealed: the full-set leaf needs no attestation"))
+              (let ((winner (nth (lot:subset-winner idx pre) (lot:lottery-participants lottery))))
+                (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (w:jget params "unsigned_tx")))))
+                       (in0 (first (btx:tx-inputs proposed)))
+                       (target (lot:participant-target winner))
+                       (spk (multiple-value-bind (witver program)
+                                (cl-consensus.encoding:segwit-decode target (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)))
+                              (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program))))
+                  (unless (and (equalp (btx:txin-prev-hash in0) (btx:tx-txid conf)) (= (btx:txin-prev-index in0) 0))
+                    (fail "the claim does not spend the lottery output"))
+                  (unless (and (= 1 (length (btx:tx-outputs proposed))) (equalp (btx:txout-script (first (btx:tx-outputs proposed))) spk))
+                    (fail "the claim does not pay the winner's target"))
+                  (let* ((leaf (nth (lot:subset-leaf-index lottery idx) (lot:lottery-leaves lottery)))
+                         (amounts (coerce (w:jget params "prevout_amounts") 'list)) (spks (coerce (w:jget params "prevout_spks") 'list))
+                         (prevouts (coerce (loop for a in amounts for k in spks collect (cons a (hex->bytes k))) 'vector)))
+                    (unless (and prevouts (equalp (cdr (aref prevouts 0)) (lot:lottery-spk lottery)))
+                      (fail "prevout 0 is not the lottery output"))
+                    (let ((sighash (rot:tier-sighash proposed 0 prevouts leaf)))
+                      (unless (equalp sighash (hex->bytes (w:jget params "sighash"))) (fail "sighash mismatch"))
+                      (log! node "attested lottery subset ~a of ~a for ~a" idx (subseq id 0 8)
+                            (subseq (bytes->hex (lot:participant-pubkey winner)) 0 8))
+                      (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
+                                                                   "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) sighash (random-aux))))))))))))
+      (error (e) (log! node "refused lottery_subset_attest: ~a" e) (respond node event nil :error (princ-to-string e))))))
 
 (defun note-dispute (node id-hex fmt &rest args)
   "Log a dispute's state only when it changes: a stuck dispute is retried every
@@ -1424,13 +1381,12 @@
   (and (stringp reason) (string= (substitute #\_ #\- reason) "quorum_expired")))
 
 (defun fork-lottery (node id-hex)
-  "(values confiscation lottery state) for ID-HEX, STATE :PENDING or :RECOVERED,
-   or NIL.  Found once by rebuilding (CONFISCATED-LOTTERY), then kept on our
-   forks so a pass costs a couple of UTXO lookups.  A kept transaction that is
-   neither pending nor swept is not evidence of anything: a signer keeps every
-   proposal it signs, and the one that confirmed may be another proposer's
-   (on the soak cld3 signed a proposal that never went out, while ref3's did,
-   and took its own for spent) — so it is dropped and the chain asked again."
+  "(values confiscation lottery :pending) for ID-HEX while its lottery output is
+   unspent, or NIL.  Found once by rebuilding (CONFISCATED-LOTTERY), then kept on
+   our forks so a pass costs a UTXO lookup.  A kept transaction that is not on
+   chain is not evidence of anything (a signer keeps every proposal it signs, and
+   the one that confirmed may be another proposer's), so it is dropped and the
+   chain asked again."
   (flet ((forget () (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) nil (record-lottery f) nil))))
     (let ((f (find-if (lambda (f) (and (record-confiscation f) (record-lottery f))) (forks-of node id-hex))))
       (when f
@@ -1439,9 +1395,6 @@
                 ((funcall (node-chain-fn node) (btx:tx-txid tx) 0)
                  (note-confiscation node id-hex (btx:tx-txid tx))
                  (return-from fork-lottery (values tx l :pending)))
-                ((funcall (node-chain-fn node) (btx:tx-txid (build-lottery-recovery node id-hex tx l)) 0)
-                 (note-confiscation node id-hex (btx:tx-txid tx))
-                 (return-from fork-lottery (values tx l :recovered)))
                 (t (forget)))))
       (multiple-value-bind (tx l state) (confiscated-lottery node id-hex)
         (when tx
@@ -1467,8 +1420,6 @@
           (let ((expiry (lg:ledger-quorum-expiry (record-ledger base))))
             (when (and (expiry-reason-p (op:field enter-op :reason)) expiry (<= h (+ expiry *expiry-grace-blocks*)) (null conf))
               (conclude "quorum re-established (expiry ~a); yielded" expiry)))
-          (when (eq lstate :recovered)
-            (conclude "lottery could not be claimed; recovered to the operator (sweep of ~a)" (txid-hex (btx:tx-txid conf))))
           (let ((reserves-spent (multiple-value-bind (r txid vout) (disputed-reserves node base)
                                   (declare (ignore r))
                                   (and (node-chain-fn node) (null (funcall (node-chain-fn node) txid vout))))))
@@ -1513,13 +1464,10 @@
                           (note-dispute node id "ADVERSARY: confiscation ~a on chain; withholding our reveal" (txid-hex (btx:tx-txid conf)))
                           (progn (publish-reveal node id)
                                  (note-dispute node id "confiscation ~a on chain; revealed" (txid-hex (btx:tx-txid conf))))))
-                     ((null (lottery-claimable node id lottery))
-                      (if (lottery-recovery-open-p node conf)
-                          (handler-case (let ((tx (sweep-lottery node id conf lottery)))
-                                          (note-dispute node id "lottery cannot be claimed; swept to the operator (~a)" (txid-hex (btx:tx-txid tx))))
-                            (error (e) (note-dispute node id "lottery cannot be claimed; recovery not yet: ~a" e)))
-                          (note-dispute node id "lottery cannot be claimed (a preimage is out of the claim leaf's bounds); ~
-                                                 its recovery leaf opens after ~a confirmations" +lottery-recovery-csv+)))
+                     ((and (< (length (revealed-indices node id lottery)) (length (lot:lottery-participants lottery)))
+                           (not (reveal-deadline-passed-p node conf)))
+                      (note-dispute node id "~a of ~a revealed; the reveal deadline is ~a blocks after the confiscation"
+                                    (length (revealed-indices node id lottery)) (length (lot:lottery-participants lottery)) lot:+reveal-csv+))
                      (t (handler-case (let ((outcome (claim-or-yield node id :confiscation-txid (btx:tx-txid conf))))
                                         (release-pledges node id)
                                         (note-dispute node id "lottery: ~(~a~)" outcome))
@@ -1530,12 +1478,6 @@
                       (q (dispute-lottery-n base)) (k (length armers)))
                  (cond ((< k 1) (note-dispute node id "armed; waiting for an armer"))
                        ((< h closes) (note-dispute node id "armed; arm window closes at ~a" closes))
-                       ;; Fewer than Q armed: the preimages were committed under Q, the
-                       ;; claim leaf will be built for k, and only (k/Q)^k of such
-                       ;; lotteries can be claimed (docs/LOTTERY-N.md).  Give the others
-                       ;; until the deadline before confiscating without them.
-                       ((and (< k q) (< h (+ closes *full-arming-wait-blocks*)))
-                        (note-dispute node id "~a of ~a armed; waiting for the rest until ~a" k q (+ closes *full-arming-wait-blocks*)))
                        ((or (equalp (first armers) (node-pubkey node)) (>= h (+ closes *proposer-grace-blocks*)))
                         (handler-case
                             (let ((tx (confiscate node id :respectful (expiry-reason-p (op:field enter-op :reason)))))
@@ -1860,8 +1802,7 @@
 
 (defun arm-dispute (node fork &key seed replacement)
   "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL."
-  (let* ((n (dispute-lottery-n fork))
-         (preimage (lot:derive-preimage (or seed (lottery-seed node (record-id-hex fork))) n)))
+  (let ((preimage (lot:derive-preimage (or seed (lottery-seed node (record-id-hex fork))))))
     (when replacement (await-pledge-height node replacement))
     (setf (record-preimage fork) preimage)
     (commit-update node fork (new-update node fork (%strip-nil-fields
@@ -2344,9 +2285,10 @@
 (defun reveals-of (node id-hex) (gethash id-hex (node-reveals node)))
 
 (defun claim-or-yield (node id-hex &key confiscation-txid (fee 400))
-  "With every preimage in: the script-selected winner claims the lottery output
-   and takes custody (DisputeAcquire); everyone else yields.  Returns
-   (values :won-or-:yielded claim-tx)."
+  "The drawn winner claims the lottery output and takes custody (DisputeAcquire);
+   everyone else yields.  Every participant revealed: the full-set leaf.  Past the
+   reveal deadline with some missing: the leaf of the revealers we hold, with the
+   recovery voters' attestation.  Returns (values :won-or-:yielded claim-tx)."
   (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork")))
          (lottery (or (record-lottery fork)
                       ;; After a restart: rebuild from public state (the unsigned tx has the claim's
@@ -2359,45 +2301,77 @@
                         (setf (record-lottery fork) l (record-confiscation fork) tx)
                         l)))
          (participants (lot:lottery-participants lottery))
-         (reveals (reveals-of node id-hex))
-         (preimages (mapcar (lambda (p) (or (cdr (find (lot:participant-pubkey p) reveals :key (lambda (r) (up:x-only (car r))) :test #'equalp))
-                                            (fail "missing a reveal")))
-                            participants))
-         (winner (lot:calculate-winner preimages))
-         (winner-pk (lot:participant-pubkey (nth winner participants))))
-    (if (equalp winner-pk (up:x-only (node-pubkey node)))
-        (let* ((conf (record-confiscation fork))
-               (txid (or confiscation-txid (and conf (btx:tx-txid conf)) (fail "no confiscation tx")))
-               (amount (btx:txout-value (first (btx:tx-outputs conf))))
-               (target (lot:participant-target (nth winner participants)))
-               (spk (multiple-value-bind (witver program)
-                        (cl-consensus.encoding:segwit-decode target (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)))
-                      (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
-               ;; Our declared replacement collateral (a key-path P2TR of our key) comes along as input 1.
-               (coll (fourth (find (node-pubkey node) (armers-of node id-hex) :key #'first :test #'equalp)))
-               (coll-spk (and coll (lot:key-path-spk (up:x-only (node-pubkey node)))))
-               (inputs (append (list (btx:make-txin :prev-hash txid :prev-index 0 :script (octets) :sequence rot:+sequence-rbf+))
-                               (and coll (list (btx:make-txin :prev-hash (first coll) :prev-index (second coll) :script (octets) :sequence rot:+sequence-rbf+)))))
-               (total (+ amount (if coll (third coll) 0)))
-               (tx (btx:parse-tx (bw:make-reader
-                                  (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs inputs
-                                                                 :outputs (list (btx:make-txout :value (- total fee) :script spk))
-                                                                 :witnesses (make-list (length inputs) :initial-element nil))))))
-               (prevouts (coerce (append (list (cons amount (lot:lottery-spk lottery))) (and coll (list (cons (third coll) coll-spk)))) 'vector))
-               (sig (schnorr:schnorr-sign (node-priv node) (rot:tier-sighash tx 0 prevouts (first (lot:lottery-leaves lottery))) (random-aux)))
-               (witnesses (append (list (lot:claim-witness lottery sig preimages))
-                                  (and coll (list (list (key-path-signature node tx 1 prevouts))))))
-               (signed (btx:parse-tx (bw:make-reader
-                                      (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs (btx:tx-inputs tx) :outputs (btx:tx-outputs tx)
-                                                                     :witnesses witnesses))))))
-          (dotimes (i (length inputs))
-            (unless (rot:verify-spend signed i prevouts) (fail "claim input ~a does not verify" i)))
-          (broadcast node signed)
-          (commit-update node fork (new-update node fork (list :type :dispute-acquire :new-custodian (node-pubkey node)
-                                                               :claim-txid (btx:tx-txid signed) :new-reserves-address target)))
-          (values :won signed))
-        (progn (commit-update node fork (new-update node fork (list :type :dispute-yield)))
-               (values :yielded nil)))))
+         (k (length participants))
+         (conf (record-confiscation fork)))
+    (multiple-value-bind (idx preimages) (revealed-indices node id-hex lottery)
+      (let ((full (= (length idx) k)))
+        (cond ((= k 1) (setf idx '(0) preimages (list nil) full t))
+              (full)
+              ((null idx) (fail "nobody revealed"))
+              ((not (and conf (reveal-deadline-passed-p node conf))) (fail "missing a reveal before the deadline")))
+        (let* ((winner (if (= k 1) 0 (lot:subset-winner idx preimages)))
+               (winner-pk (lot:participant-pubkey (nth winner participants))))
+          (unless (equalp winner-pk (up:x-only (node-pubkey node)))
+            (commit-update node fork (new-update node fork (list :type :dispute-yield)))
+            (return-from claim-or-yield (values :yielded nil)))
+          (let* ((txid (or confiscation-txid (and conf (btx:tx-txid conf)) (fail "no confiscation tx")))
+                 (amount (btx:txout-value (first (btx:tx-outputs conf))))
+                 (target (lot:participant-target (nth winner participants)))
+                 (spk (multiple-value-bind (witver program)
+                          (cl-consensus.encoding:segwit-decode target (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)))
+                        (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
+                 ;; Our declared replacement collateral (a key-path P2TR of our key) comes along as input 1.
+                 (coll (fourth (find (node-pubkey node) (armers-of node id-hex) :key #'first :test #'equalp)))
+                 (coll-spk (and coll (lot:key-path-spk (up:x-only (node-pubkey node)))))
+                 (seq0 (if full rot:+sequence-rbf+ lot:+reveal-csv+))
+                 (inputs (append (list (btx:make-txin :prev-hash txid :prev-index 0 :script (octets) :sequence seq0))
+                                 (and coll (list (btx:make-txin :prev-hash (first coll) :prev-index (second coll) :script (octets) :sequence rot:+sequence-rbf+)))))
+                 (total (+ amount (if coll (third coll) 0)))
+                 (tx (btx:parse-tx (bw:make-reader
+                                    (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs inputs
+                                                                   :outputs (list (btx:make-txout :value (- total fee) :script spk))
+                                                                   :witnesses (make-list (length inputs) :initial-element nil))))))
+                 (prevouts (coerce (append (list (cons amount (lot:lottery-spk lottery))) (and coll (list (cons (third coll) coll-spk)))) 'vector))
+                 (leaf (if full (first (lot:lottery-leaves lottery))
+                           (nth (lot:subset-leaf-index lottery idx) (lot:lottery-leaves lottery))))
+                 (sighash (rot:tier-sighash tx 0 prevouts leaf))
+                 (sig (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))
+                 (w0 (if full
+                         (lot:claim-witness lottery sig preimages)
+                         (lot:subset-witness lottery idx sig preimages (subset-attestations node id-hex lottery idx tx prevouts sighash))))
+                 (witnesses (append (list w0) (and coll (list (list (key-path-signature node tx 1 prevouts))))))
+                 (signed (btx:parse-tx (bw:make-reader
+                                        (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs (btx:tx-inputs tx) :outputs (btx:tx-outputs tx)
+                                                                       :witnesses witnesses))))))
+            (dotimes (i (length inputs))
+              (unless (rot:verify-spend signed i prevouts) (fail "claim input ~a does not verify" i)))
+            (broadcast node signed)
+            (commit-update node fork (new-update node fork (list :type :dispute-acquire :new-custodian (node-pubkey node)
+                                                                 :claim-txid (btx:tx-txid signed) :new-reserves-address target)))
+            (values :won signed)))))))
+
+(defun subset-attestations (node id-hex lottery idx tx prevouts sighash)
+  "The recovery voters' signatures on a revealer-subset claim, parallel to the
+   sorted voters (NIL where absent): ours if we are a voter, then
+   lottery_subset_attest until the threshold is met."
+  (let* ((voters (lot::sorted-keys (lot:lottery-recovery-voters lottery)))
+         (threshold (lot:lottery-recovery-threshold lottery))
+         (me (up:x-only (node-pubkey node)))
+         (sigs (and (member me voters :test #'equalp) (list (cons me (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))))
+    (when (< (length sigs) threshold)
+      (dolist (r (send-request node id-hex "lottery_subset_attest"
+                               (w:json-object "unsigned_tx" (unsigned-tx-hex tx) "sighash" (bytes->hex sighash)
+                                              "subset" (mapcar (lambda (i) (bytes->hex (lot:participant-pubkey (nth i (lot:lottery-participants lottery))))) idx)
+                                              "prevout_amounts" (map 'list #'car prevouts)
+                                              "prevout_spks" (map 'list (lambda (p) (bytes->hex (cdr p))) prevouts))
+                               :want (- threshold (length sigs)) :timeout 30 :successes-only t))
+        (let ((res (w:jget r "result")))
+          (when (and (w:jget r "success") res)
+            (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
+              (when (and (member pk voters :test #'equalp) (schnorr:schnorr-verify pk sighash sig) (not (assoc pk sigs :test #'equalp)))
+                (push (cons pk sig) sigs)))))))
+    (when (< (length sigs) threshold) (fail "only ~a of ~a subset attestations" (length sigs) threshold))
+    (mapcar (lambda (v) (cdr (assoc v sigs :test #'equalp))) voters)))
 
 ;;; Testing only: the operator publishes a conflicting update at its current tip
 ;;; sequence, so members can be seen catching it.
@@ -2965,7 +2939,7 @@
     (when (and fork-p (record-owned-p rec))
       (let ((armed (find :dispute-armed (record-history rec) :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u)))))))
         (when armed
-          (let ((preimage (lot:derive-preimage (lottery-seed node id-hex) (dispute-lottery-n rec))))
+          (let ((preimage (lot:derive-preimage (lottery-seed node id-hex))))
             (if (equalp (lot:commitment-of preimage) (op:field (op:decode-operation (up:update-message armed)) :commitment-hash))
                 (setf (record-preimage rec) preimage)
                 (log! node "fork ~a: armed with a preimage we cannot re-derive" (subseq id-hex 0 8)))))))

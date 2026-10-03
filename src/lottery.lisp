@@ -1,13 +1,13 @@
 ;;;; src/lottery.lisp — DEP-03/06 custody lottery: the on-chain selection of a
 ;;;; disputed ledger's new custodian.
 ;;;;
-;;;; Disputants each commit HASH160(preimage) where the preimage's LENGTH minus
-;;;; 16 is their contribution in 1..N.  The lottery output's primary leaf checks
-;;;; every preimage, sums the contributions, and lets only participant
-;;;; (sum mod N) spend.  Partial-reveal leaves (N >= 3, CSV 72) cover one
-;;;; missing disputant; a recovery cascade (CSV 144/1008/4032, thresholds
-;;;; T/T-1/T-2) and an escape hatch (CSV 8064, any one voter) cover the rest.
-;;;; Armer shares (punitive confiscations) are reveal-or-sweep outputs.
+;;;; Participants each commit HASH160(preimage); LEN(preimage) - 16 is their
+;;;; contribution in 1..60, independent of how many arm.  The lottery output has a
+;;;; full-set leaf (every preimage, winner = sum mod k), a CSV-72 leaf per nonempty
+;;;; proper subset S of the participants (a threshold of recovery voters attests S,
+;;;; then sum over S mod |S|), a recovery cascade (CSV 144/1008/4032, thresholds
+;;;; T/T-1/T-2) and an escape hatch (CSV 8064, one voter).  A withholder is simply
+;;;; outside S.  Armer shares (punitive confiscations) are reveal-or-sweep outputs.
 ;;;;
 ;;;; Scripts are reproduced opcode for opcode from the reference; the gate
 ;;;; spends every leaf under cl-consensus's interpreter.
@@ -17,18 +17,22 @@
   (:local-nicknames (#:rs #:cl-deposits.reserves) (#:tr #:cl-consensus.taproot-script)
                     (#:enc #:cl-consensus.encoding) (#:up #:cl-deposits.update))
   (:export #:participant #:make-participant #:participant-pubkey #:participant-commitment #:participant-target
-           #:lottery-script #:partial-reveal-leaves #:recovery-script #:build-lottery
+           #:lottery-script #:subset-leaves #:claim-body #:recovery-script #:build-lottery #:lottery-subsets
+           #:subset-leaf-index #:subset-witness #:subset-winner #:attest-voters
            #:lottery #:lottery-leaves #:lottery-root #:lottery-spk #:lottery-address #:lottery-participants
            #:lottery-recovery-voters #:lottery-recovery-threshold #:lottery-control-block
-           #:calculate-winner #:derive-preimage #:commitment-of #:claim-witness #:partial-reveal-witness
+           #:calculate-winner #:derive-preimage #:commitment-of #:claim-witness
            #:recovery-witness #:build-armer-share #:armer-share #:armer-share-spk #:armer-share-address
            #:armer-share-leaves #:armer-share-control-block #:forfeit-sweep-outputs
            #:confiscation-outputs #:revealers-from-witness #:tapbuilder-tree #:p2tr-spk #:key-path-spk
-           #:+partial-reveal-csv+ #:+armer-sweep-csv+ #:+max-disputants+ #:+timeout-recovery-csv+))
+           #:+reveal-csv+ #:+armer-sweep-csv+ #:+max-disputants+ #:+timeout-recovery-csv+
+           #:+contribution-range+ #:+max-preimage-len+))
 (in-package #:cl-deposits.lottery)
 
-(defconstant +max-disputants+ 15)
-(defconstant +partial-reveal-csv+ 72)
+(defconstant +max-disputants+ 7 "MAX_LOTTERY_PARTICIPANTS: the subset tree has 2^k - 1 claim leaves.")
+(defconstant +reveal-csv+ 72 "The reveal deadline: subset leaves open this many blocks after the confiscation.")
+(defconstant +contribution-range+ 60 "Contributions 1..60: uniform mod every m in 1..6 (60 = lcm(1..6)).")
+(defconstant +max-preimage-len+ (+ 16 +contribution-range+) "76 bytes, within the 80-byte standard tapscript stack item.")
 (defconstant +armer-sweep-csv+ 144)
 (defconstant +timeout-recovery-csv+ 8064)
 (defconstant +p2wsh-dust+ 330)
@@ -53,50 +57,61 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Scripts
 
-(defun lottery-script (participants &key (bounds-n (length participants)))
-  "The primary claim leaf: verify each preimage, sum contributions, dispatch."
-  (let* ((n (length participants)) (max-len (+ 16 bounds-n)) (parts '()))
-    ;; DEP-03: a sole eligible armer takes custody without a draw; its leaf is a
-    ;; plain signature check and no preimage is revealed.
-    (when (= n 1)
-      (return-from lottery-script (cat (pushb (participant-pubkey (first participants))) (octets +op-checksig+))))
-    (unless (<= 2 n +max-disputants+) (error "lottery needs 1..~a participants" +max-disputants+))
-    (unless (<= n bounds-n +max-disputants+) (error "bad bounds"))
+(defun claim-body (members)
+  "Verify each member's preimage (hash, 17..76 bytes), sum the contributions, and
+   let only member (sum mod m) spend.  MEMBERS in canonical order."
+  (let ((m (length members)) (parts '()))
     (flet ((emit (&rest bs) (dolist (b bs) (push (if (integerp b) (octets b) b) parts))))
-      (loop for p in participants for i from 0
+      (loop for p in members for i from 0
             do (emit +op-dup+ +op-hash160+ (pushb (participant-commitment p)) +op-equalverify+
                      +op-size+ +op-dup+ (pint 17) +op-greaterthanorequal+ +op-verify+
-                     +op-dup+ (pint max-len) +op-lessthanorequal+ +op-verify+
+                     +op-dup+ (pint +max-preimage-len+) +op-lessthanorequal+ +op-verify+
                      +op-swap+ +op-drop+ (pint 16) +op-sub+)
-               (when (< i (1- n)) (emit +op-toalt+)))
-      (dotimes (i (1- n)) (emit +op-fromalt+ +op-add+))
-      (if (not (<= 6 n 10))
+               (when (< i (1- m)) (emit +op-toalt+)))
+      (dotimes (i (1- m)) (emit +op-fromalt+ +op-add+))
+      (if (= m 1)
+          (emit +op-drop+ (pushb (participant-pubkey (first members))) +op-checksig+)
           (progn
-            (dotimes (i n) (emit +op-dup+ (pint n) +op-greaterthanorequal+ +op-if+ (pint n) +op-sub+ +op-endif+))
-            (loop for p in participants for i from 0
+            ;; the sum is below 64m: six conditional subtractions of m*2^b reduce it mod m
+            (loop for b from 5 downto 0
+                  do (let ((x (* m (ash 1 b)))) (emit +op-dup+ (pint x) +op-greaterthanorequal+ +op-if+ (pint x) +op-sub+ +op-endif+)))
+            (loop for p in members for i from 0
                   do (emit +op-dup+ (pint i) +op-equal+ +op-if+ +op-drop+ (pushb (participant-pubkey p)) +op-checksig+ +op-else+))
             (emit +op-drop+ +op-0+)
-            (dotimes (i n) (emit +op-endif+)))
-          (let ((arms 0))
-            (loop for s from n to (* n n)
-                  do (let ((p (nth (mod s n) participants)))
-                       (emit +op-dup+ (pint s) +op-equal+ +op-if+ +op-drop+ (pushb (participant-pubkey p)) +op-checksig+ +op-else+)
-                       (incf arms)))
-            (emit +op-drop+ +op-0+)
-            (dotimes (i arms) (emit +op-endif+)))))
+            (dotimes (i m) (emit +op-endif+)))))
     (apply #'cat (nreverse parts))))
+
+(defun lottery-script (participants)
+  "The full-set claim leaf.  DEP-03: a sole eligible armer takes custody without a
+   draw; its leaf is a plain signature check and no preimage is revealed."
+  (let ((k (length participants)))
+    (cond ((= k 1) (cat (pushb (participant-pubkey (first participants))) (octets +op-checksig+)))
+          ((<= 2 k +max-disputants+) (claim-body participants))
+          (t (error "lottery needs 1..~a participants" +max-disputants+)))))
 
 (defun csv-prefix (blocks) (cat (pint blocks) (octets +op-csv+ +op-drop+)))
 
-(defun partial-reveal-leaves (participants)
-  "For N >= 3: one leaf per possibly-missing disputant, a sub-lottery over the
-   other N-1 with the full N's size bounds, behind CSV 72."
-  (let ((n (length participants)))
-    (when (>= n 3)
-      (loop for missing from 0 below n
-            collect (cat (csv-prefix +partial-reveal-csv+)
-                         (lottery-script (loop for p in participants for j from 0 unless (= j missing) collect p)
-                                         :bounds-n n))))))
+(defun attest-voters (voters threshold)
+  "Recovery voters attesting a revealer subset: all of them, sorted, CHECKSIGADD, >= T."
+  (let ((keys (sorted-keys voters)))
+    (when (< (length keys) threshold) (error "not enough recovery voters"))
+    (apply #'cat (pushb (first keys)) (octets +op-checksig+)
+           (append (loop for k in (rest keys) collect (cat (pushb k) (octets +op-checksigadd+)))
+                   (list (pint threshold) (octets +op-greaterthanorequal+ +op-verify+))))))
+
+(defun subset-indices (k)
+  "Nonempty proper subsets of 0..k-1: by decreasing size, then lexicographically."
+  (labels ((combos (start m) (if (zerop m) (list '())
+                                  (loop for i from start to (- k m) append (mapcar (lambda (c) (cons i c)) (combos (1+ i) (1- m)))))))
+    (loop for m from (1- k) downto 1 append (combos 0 m))))
+
+(defun subset-leaves (participants voters threshold)
+  "(indices . leaf) for every nonempty proper subset; none for k < 2."
+  (let ((k (length participants)))
+    (when (>= k 2)
+      (loop for idx in (subset-indices k)
+            collect (cons idx (cat (csv-prefix +reveal-csv+) (attest-voters voters threshold)
+                                   (claim-body (mapcar (lambda (i) (nth i participants)) idx))))))))
 
 (defun sorted-keys (xonlys) (sort (copy-list xonlys) #'bytes<))
 
@@ -143,12 +158,13 @@
   (multiple-value-bind (spk parity) (tr::taproot-output-spk-from-root xonly-internal root) (values spk parity)))
 
 (defstruct (lottery (:constructor %make-lottery))
-  participants recovery-voters recovery-threshold network leaves paths root spk parity address)
+  participants recovery-voters recovery-threshold network leaves paths root spk parity address subsets)
 
 (defun build-lottery (participants recovery-voters recovery-threshold &key (network :signet))
   "PARTICIPANTS are sorted by pubkey here (the canonical disputant order)."
   (let* ((ps (sort (copy-list participants) #'bytes< :key #'participant-pubkey))
-         (leaves (append (list (lottery-script ps)) (partial-reveal-leaves ps)
+         (subsets (subset-leaves ps recovery-voters recovery-threshold))
+         (leaves (append (list (lottery-script ps)) (mapcar #'cdr subsets)
                          (loop for (csv . th) in (recovery-specs recovery-threshold)
                                collect (recovery-script recovery-voters th csv))))
          (hashes (mapcar #'tr::tapleaf-hash leaves)))
@@ -156,6 +172,7 @@
       (multiple-value-bind (spk parity) (p2tr-spk rs:+nums-point+ root)
         (%make-lottery :participants ps :recovery-voters recovery-voters :recovery-threshold recovery-threshold
                        :network network :leaves leaves :paths paths :root root :spk spk :parity parity
+                       :subsets (mapcar #'car subsets)
                        :address (enc:segwit-encode (rs:hrp-for network) 1 (subseq spk 2)))))))
 
 (defun lottery-control-block (l leaf-index)
@@ -164,26 +181,28 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Winner, preimages, witnesses
 
-(defun calculate-winner (preimages &key (bounds-n (length preimages)))
-  "Index of the winner among PREIMAGES.  In a partial-reveal sub-lottery the
-   length bounds stay those of the full quorum (BOUNDS-N)."
+(defun calculate-winner (preimages)
+  "Index of the winner among PREIMAGES (in canonical member order): sum of
+   (LEN - 16) mod their count.  Every preimage must be 17..76 bytes."
   (let ((n (length preimages)))
-    (when (= n 1) (return-from calculate-winner 0))   ; a sole participant: no draw
     (when (< n 1) (error "need at least 1 preimage"))
     (mod (loop for p in preimages
-               do (unless (<= 17 (length p) (+ 16 bounds-n)) (error "preimage length ~a out of 17..~a" (length p) (+ 16 bounds-n)))
+               do (unless (<= 17 (length p) +max-preimage-len+) (error "preimage length ~a out of 17..~a" (length p) +max-preimage-len+))
                sum (- (length p) 16))
          n)))
 
-(defun derive-preimage (seed32 n)
-  "The reference's deterministic preimage: length 16 + (seed mod n) + 1, bytes
-   from SHA256(\"deposits/lottery/preimage/v1\" || seed || n_le64 || counter_le32)."
-  (unless (<= 2 n +max-disputants+) (error "bad n"))
-  (let* ((residue (mod (be->int seed32) n))
-         (length (+ 17 residue))
+(defun subset-winner (indices preimages)
+  "The participant index (into the full canonical order) that wins the draw over
+   INDICES, given PREIMAGES parallel to INDICES."
+  (nth (calculate-winner preimages) indices))
+
+(defun derive-preimage (seed32)
+  "Length 17 + (seed mod 60); bytes from SHA256(\"deposits/lottery/preimage/v2\" ||
+   seed || counter_le32), expanded by counter."
+  (let* ((length (+ 17 (mod (be->int seed32) +contribution-range+)))
          (out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
     (loop for counter from 0 while (< (length out) length)
-          do (let ((block (sha256 (cat (ascii->bytes "deposits/lottery/preimage/v1") seed32 (int->le n 8) (int->le counter 4)))))
+          do (let ((block (sha256 (cat (ascii->bytes "deposits/lottery/preimage/v2") seed32 (int->le counter 4)))))
                (loop for b across block while (< (length out) length) do (vector-push-extend b out))))
     (coerce out 'octets)))
 
@@ -194,12 +213,20 @@
           (and (> (length preimages) 1) (reverse preimages))   ; a sole participant's leaf checks only the signature
           (list (first (lottery-leaves l)) (lottery-control-block l 0))))
 
-(defun partial-reveal-witness (l missing-index winner-sig preimages)
-  "PREIMAGES for the N-1 revealers in participant order (the missing one omitted)."
-  (let ((leaf-index (1+ missing-index)))
-    (append (list winner-sig) (reverse preimages) (list (nth leaf-index (lottery-leaves l)) (lottery-control-block l leaf-index)))))
+(defun subset-leaf-index (l indices)
+  (let ((pos (position indices (lottery-subsets l) :test #'equal)))
+    (unless pos (error "no claim leaf for subset ~a" indices))
+    (1+ pos)))
 
-(defun recovery-leaf-index (l tier) (+ 1 (length (partial-reveal-leaves (lottery-participants l))) tier))
+(defun subset-witness (l indices winner-sig preimages voter-sigs)
+  "PREIMAGES parallel to INDICES; VOTER-SIGS parallel to the sorted voters, NIL
+   where absent.  [sig, pre_{m-1}..pre_0, vsig_{r-1}..vsig_0, leaf, control]."
+  (let ((i (subset-leaf-index l indices)))
+    (append (list winner-sig) (reverse preimages)
+            (reverse (mapcar (lambda (s) (or s (octets))) voter-sigs))
+            (list (nth i (lottery-leaves l)) (lottery-control-block l i)))))
+
+(defun recovery-leaf-index (l tier) (+ 1 (length (lottery-subsets l)) tier))
 
 (defun recovery-witness (l tier signatures)
   "TIER 0..3 = CSV 144/1008/4032/8064.  SIGNATURES parallel the sorted voter
@@ -231,17 +258,16 @@
 (defun revealers-from-witness (witness armers)
   "ARMERS: alist (xonly . commitment).  Which of them revealed in this witness?"
   (sorted-keys (loop for item in witness
-                     when (<= 17 (length item) (+ 16 +max-disputants+))
+                     when (<= 17 (length item) +max-preimage-len+)
                        append (loop for (pk . c) in armers when (equalp c (hash160 item)) collect pk))))
 
-(defun forfeit-sweep-outputs (slice-sats revealers fee-sats &key fallback-xonly)
-  "DEP-06: pro-rata to revealers (sorted), one P2TR per revealer; dust to fee."
+(defun forfeit-sweep-outputs (slice-sats revealers fee-sats)
+  "DEP-06: pro-rata to revealers (sorted), one P2TR per revealer; dust to fee.
+   With no revealers the slice waits for the re-arm round: never the operator."
   (when (>= fee-sats slice-sats) (error "sweep uneconomical"))
-  (let ((spendable (- slice-sats fee-sats)))
-    (if (null revealers)
-        (list (cons (p2tr-spk (or fallback-xonly (error "no revealers and no fallback")) nil) spendable))
-        (let ((each (floor spendable (length revealers))))
-          (loop for r in (sorted-keys revealers) collect (cons (key-path-spk r) each))))))
+  (when (null revealers) (error "no revealers: the slice goes to the re-arm round"))
+  (let ((each (floor (- slice-sats fee-sats) (length revealers))))
+    (loop for r in (sorted-keys revealers) collect (cons (key-path-spk r) each))))
 
 (defun key-path-spk (xonly)
   "P2TR with no script tree: tweak by tagged_hash(TapTweak, key)."

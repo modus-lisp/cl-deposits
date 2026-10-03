@@ -18,9 +18,7 @@ S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-400}
 source "$(dirname "$0")/_lib.sh"
 MODE=${1:-veto}
 pick OP VC
-tune_arming() { local n; for n in $(cld_names); do cld_ctl "$n" "(:tune :full-arming-wait-blocks $1)" >/dev/null 2>&1; done; }
-trap 'disarm :spend-pledge "$VC" cld5; disarm :ignore-fraud cld2 cld3 cld4; tune_arming 720' EXIT
-tune_arming 2
+trap 'disarm :spend-pledge "$VC" cld5; disarm :ignore-fraud cld2 cld3 cld4' EXIT
 case "$MODE" in sole) ROW=${REDTEAM_VPS:-VPS};; reopen) ROW=${REDTEAM_VPR:-VPR};; *) ROW=${REDTEAM_VP:-VP};; esac
 REFS=${REFS-ref6 ref7}
 [ "$MODE" = veto ] || REFS=""   # sole/reopen: count the armers exactly

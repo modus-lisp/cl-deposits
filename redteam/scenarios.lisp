@@ -104,11 +104,9 @@
     (error () nil)))
 
 (defun disarm-all (nodes)
-  "Every adversary switch off, and the devnet tunings back at their defaults (a scenario killed by
-   its timeout never runs its own restore)."
+  "Every adversary switch off (a scenario killed by its timeout never runs its own restore)."
   (let ((form (format nil "(:adversary :set~{ ~s nil~})" *switches*)))
     (loop for (name . port) in nodes
-          do (control port "(:tune :full-arming-wait-blocks 720)")
           unless (search ":STATUS :OK" (or (control port form) ""))
             collect name)))
 

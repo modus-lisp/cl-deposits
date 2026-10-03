@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
-# redteam/attack-withhold-reveal.sh — the last revealer holds the lottery hostage.
+# redteam/attack-withhold-reveal.sh — an armer withholds its lottery reveal.
 #
-# A dispute on a fresh ledger V2 runs to confiscation; one armer (WH, the
-# adversary :withhold-reveal) never publishes its preimage.  The lottery cannot
-# be claimed without it.  PASS (the finding): custody waits indefinitely — the
-# confiscation tx is on chain, the honest armers revealed, and the winner
-# cannot claim; we measure how long the funds sit and whether the recovery
-# sweep (CSV-144) fires.  REDTEAM_W=name forms a fresh test ledger per run.
+# A dispute on a fresh ledger W runs to confiscation; one armer (WH, the
+# adversary :withhold-reveal) never publishes its preimage.  DEP-06: past the
+# reveal deadline (72 blocks) the winner over the revealers claims through its
+# subset leaf with the recovery voters' attestation.  PASS: the lottery output
+# is claimed by a revealer, not by the withholder and not by the accused
+# operator.  REDTEAM_W=name forms a fresh test ledger per run.
 source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-300}
 source "$(dirname "$0")/_lib.sh"
 pick OP WH   # both need clean keys: a tainted operator's W is disputed on sight, before the fraud
-trap 'cld_ctl "$WH" "(:adversary :set :withhold-reveal nil)" >/dev/null 2>&1; tune_arming 720' EXIT
-# Fewer than Q arm here, and cl then waits *full-arming-wait-blocks* (720) before confiscating (the
-# Lottery-N mitigation): shorten it for the run, restore it after.
-tune_arming() { local n; for n in $(cld_names); do cld_ctl "$n" "(:tune :full-arming-wait-blocks $1)" >/dev/null 2>&1; done; }
-tune_arming 2
+trap 'cld_ctl "$WH" "(:adversary :set :withhold-reveal nil)" >/dev/null 2>&1' EXIT
 ROW=${REDTEAM_W:-W}   # a fresh ledger W: $OP operates; cld2..$WH ref6 ref7 cosign
 REFS=${REFS-ref6 ref7}   # REFS="" forms a cl-only quorum (a reference armer that pledges a spent coin vetoes the confiscation)
 W=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" cld2 cld3 cld4 cld5 $WH $REFS) || exit 1; echo "== W $W"
@@ -47,31 +43,36 @@ done
 [ -n "$conf_txid" ] || fail "no confiscation reached within ${WAIT}s (state: $state)"
 
 echo "== confiscation on chain: $conf_txid; $WH is withholding its reveal"
-# The honest armers (cld5, ref6, ref7 — whoever armed) reveal; the lottery needs
-# every participant's preimage.  Watch for a claim or a recovery sweep.
-echo "== watching ${WAIT}s for a claim or the CSV-144 recovery sweep"
-outcome="held"
+echo "== mining past the reveal deadline (72 blocks), then watching ${WAIT}s for the subset claim"
+for i in $(seq 1 8); do mine 10 >/dev/null; sleep 5; done
+claim=""
 for i in $(seq 1 $WAIT); do
-  spent=$(bcli gettxout "$conf_txid" 0 2>/dev/null | head -1)
-  [ -z "$spent" ] && { outcome="spent"; break; }
+  if [ -z "$(bcli gettxout "$conf_txid" 0 2>/dev/null | head -1)" ]; then
+    tip=$(bcli getblockcount)
+    for h in $(seq "$tip" -1 $((tip - 30))); do
+      claim=$(bcli getblock "$(bcli getblockhash "$h")" 2 2>/dev/null | python3 -c '
+import json,sys
+b=json.load(sys.stdin); t=sys.argv[1]
+for tx in b["tx"]:
+    for vin in tx.get("vin",[]):
+        if vin.get("txid")==t and vin.get("vout")==0:
+            print(tx["txid"], tx["vout"][0]["scriptPubKey"]["hex"], len(vin.get("txinwitness",[]))); sys.exit()
+' "$conf_txid")
+      [ -n "$claim" ] && break
+    done
+    [ -z "$claim" ] && claim=$(bcli getrawmempool | tr -d '[]", ' | head -1)
+    break
+  fi
+  [ $((i % 10)) -eq 0 ] && mine 1 >/dev/null
   sleep 5
 done
-# Past the recovery delay: mine 150 blocks (CSV-144) and see whether anything recovers the output.
-if [ "$outcome" = held ]; then
-  echo "== mining 150 blocks past the confiscation (CSV-144 recovery path)"
-  for i in $(seq 1 15); do
-    mine 10 >/dev/null; sleep 10
-    [ -z "$(bcli gettxout "$conf_txid" 0 2>/dev/null | head -1)" ] && { outcome="swept-after-csv"; break; }
-  done
-  [ "$outcome" = held ] && sleep 60 && [ -z "$(bcli gettxout "$conf_txid" 0 2>/dev/null | head -1)" ] && outcome="swept-after-csv"
-fi
 cld_ctl $WH "(:adversary :set :withhold-reveal nil)" >/dev/null
-if [ "$outcome" = swept-after-csv ]; then
-  echo "PASS (bounded): the withholder stalled the lottery, but the output was recovered after the CSV-144 delay."
-  echo "     Confiscation $conf_txid:0 spent after ~$((i*10)) blocks."
-elif [ "$outcome" = held ]; then
-  echo "PASS (gap confirmed): the lottery output is unspent and unclaimable — the withholder holds custody hostage."
-  echo "     Confiscation $conf_txid:0.  No claim, and no recovery sweep even 150 blocks past CSV-144."
-else
-  echo "NOTE: the lottery output was spent — someone claimed or swept it.  Investigate $conf_txid."
-fi
+[ -n "$claim" ] || fail "the lottery output $conf_txid:0 was not claimed within ${WAIT}s past the reveal deadline"
+read -r claim_txid claim_spk witness_items <<<"$claim"
+op_pk=$(pubkey_of "$OP")
+op_spk=$(python3 -c 'import hashlib,sys; k=bytes.fromhex(sys.argv[1]); print("0014"+hashlib.new("ripemd160",hashlib.sha256(k).digest()).hexdigest())' "$op_pk" 2>/dev/null)
+wh_acq=$(cld_ctl $WH "(:forks :ledger \"$W\")" 2>/dev/null | grep -c "DISPUTE-ACQUIRE")
+echo "== claimed by $claim_txid (output $claim_spk, $witness_items witness items)"
+[ -n "$op_spk" ] && [ "$claim_spk" = "$op_spk" ] && fail "the lottery output paid the accused operator"
+[ "$wh_acq" -gt 0 ] && fail "the withholder took custody"
+echo "PASS: the withholder only removed itself; a revealer claimed the lottery through its subset leaf ($claim_txid)."

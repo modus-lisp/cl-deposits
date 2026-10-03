@@ -9,10 +9,6 @@
 # The limit's contagion lands on the signers' (honest) ledgers wherever a verifier also lacks the
 # record.  REDTEAM_MC=name forms a fresh ledger per run.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
-# Fewer than Q arm here, and cl then waits *full-arming-wait-blocks* (720) before confiscating (the
-# Lottery-N mitigation): shorten it for the run, restore it after.
-tune_arming() { local n; for n in $(cld_names); do cld_ctl "$n" "(:tune :full-arming-wait-blocks $1)" >/dev/null 2>&1; done; }
-tune_arming 2; trap 'tune_arming 720' EXIT
 WAIT=${WAIT:-600}
 pick OP OBS D3 D4 D5 D6   # clean: a tainted operator's ledger is disputed on sight by OBS too, hiding the limit
 X=$(RESP=${RESP:-5} form_ledger "${REDTEAM_MC:-MC}" $OP "" $OBS $D3 $D4 $D5 $D6) || exit 1
