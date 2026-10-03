@@ -908,3 +908,51 @@ sometimes exhausts its nonces (85 failures in `logs/mine.log`). `--set-block-tim
 real time, so the next window cannot lower it quickly: about two weeks at real pacing. Both failures
 above are this (`mine 730` advanced 37 blocks; the confiscation waits on confirmations). Scenarios
 that mine past expiry need a regtest chain, or a signet reset with a short-expiry design.
+
+### 2026-10-03 — the full suite on a regtest network
+
+The signet can no longer mine hundreds of blocks (difficulty 4x since 14112), so the scenarios that
+mine past quorum expiry moved to a persistent regtest network: `devnet/regtest-net.sh up` (bitcoind,
+beacon on 7787, the Esplora shim, cld1-48, ref2-7 on their own deposits-rust build, a block every
+10 s with a replacement-collateral refill, and the soak's ledgers A-L) and
+`DEVNET=regtest redteam/run-all.sh`. The signet soak runs on, untouched. A full run burns about 31
+keys for good (contagion), hence 48 cl nodes.
+
+| scenario | attack succeeded? | caught? |
+|---|---|---|
+| invalid-credit-honest, forge-lock-honest | no: refused | n/a |
+| relabel, fuzz-proofs | no | n/a |
+| censor-hold-honest | no | n/a |
+| censor-hold | **yes**: the transfer is never applied | escalation lands, nothing acts on it (known gap) |
+| vault-rotate-grace (inside) | n/a (honest rotation) | correctly not accused |
+| invalid-credit-collude, forge-lock-collude | yes: committed | yes: disputed, contagion |
+| collude-q7 | yes: 4-of-7 committed | yes: M and every colluder ledger disputed |
+| vault-spend (Tier 0) | yes: vault spent | yes: VAULT SPEND, contagion on the signers |
+| vault-recovery-tier (Tier 1, 2 of 6) | yes, but only with the whole quorum idle | yes: reported by an idle member's vault watch |
+| vault-rotate-late | n/a (honest rotation past the grace) | falsely accused: the known grace bound |
+| vault-missed-confiscation | n/a | the disputant excuses it; the known limit shown |
+| withhold-reveal | **yes**: custody held | **no**: lottery unspent ~450 blocks on, no CSV-144 sweep |
+| veto-pledge, -sole | no: the confiscation lands | yes |
+| veto-pledge-reopen | no: nobody eligible, the honest armer re-arms and the confiscation lands | yes (run 2 hit the unclaimable lottery below) |
+| dereliction | yes: the derelict ignores the fraud | yes: dereliction proof, its ledger disputed |
+| rollback-depth | yes while replicas are offline | yes on their return; rolled back 1 update |
+
+**Found:**
+- *A lottery made unclaimable by exclusion* (protocol, open; MISSING.md): preimages are sized for the
+  quorum's n recovery voters, the claim leaf bounds them by the k participants, and the DEP-03 cut makes
+  k < n. At n = 7 one exclusion leaves the lottery unclaimable ~60% of the time, and the CSV-144
+  sweep then pays the original operator. veto-pledge-reopen (run 2) logged "a preimage is out of the
+  claim leaf's bounds".
+- *cl accused the signers of its own concluded confiscation* (fixed, cde3ca3): a fork forgets its
+  confiscation once the lottery output is spent, so a disputant whose vault scan reached the
+  confiscation after the winner's claim reported it as a theft. Confirmed confiscations are now kept
+  per ledger (`confiscations.txt`); a gate check covers it.
+- *Past expiry, the quorum confiscates its own vault within blocks* (QuorumExpired, then a full arm),
+  even with a 900-block arm window, so Tier 1 (expiry + 720) is reachable only by an idle quorum. The
+  recovery-tier scenario now idles every member (`:ignore-fraud`) to test detection at all.
+- *Harness*: contagion scenarios hard-coded cld1-6 and failed once earlier runs had tainted them (now
+  `pick` + `taint`); cld7+ had no cached pubkey (`pubkey_of`); `accused` checked once, before a vault
+  watch pass over hundreds of new blocks finished (now polls); regtest disputes ran out of replacement
+  collateral (ticker refill); withhold-reveal needs a cl-only quorum (a mixed one cannot reach the
+  confiscation majority with a single honest disputant); veto-pledge read log lines left by earlier
+  runs.

@@ -58,12 +58,30 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   operator rotates its vault itself; cl members now rebuild and sign that rotation. Soak ledger B
   (ref2) rotated with four cl cosigners.
 
+- **A lottery made unclaimable by exclusion (found 2026-10-03, regtest).** A committed preimage is
+  sized for n, the quorum's recovery voters (17 + seed mod n bytes, DEP-06 / `derive-preimage`), but the
+  claim leaf bounds it by k, the lottery's actual participants. The DEP-03 eligibility cut excludes
+  armers, so k < n, and each remaining preimage is then out of bounds with probability (n-k)/n: at
+  n = 7, one exclusion makes the lottery unclaimable ~60% of the time. The output then waits for the
+  CSV-144 recovery sweep, which pays the original operator, the fraudster. A colluder that arms and
+  spends its pledge (the veto the cut was meant to close) turns it into a probable refund. Seen live
+  in veto-pledge-reopen ("a preimage is out of the claim leaf's bounds"). Fix candidates: bound the
+  claim leaf by n, not k (changes the lottery script shape; both implementations and the vectors), or
+  re-derive and re-commit preimages for k at the cut. Spec decision.
+- **Withhold-reveal holds custody indefinitely (confirmed on regtest, 2026-10-03).** The confiscation
+  lands, the withholder never reveals, and the lottery output was still unspent ~450 blocks later:
+  no claim and no CSV-144 recovery sweep (recovery collects too few signatures).
+- **Past expiry, a quorum confiscates its own vault long before Tier 1 opens.** Every member arms
+  on the QuorumExpired proof and the confiscation lands within blocks; Tier 1 (expiry + 720) is
+  reachable only while the whole quorum is idle. Correct, but it means the recovery tiers are
+  exercised only by derelict quorums.
+
 ## Devnet infrastructure
 
-- **The signet cannot mine fast any more.** Fast red-team mining made a 2016-block window take 1.3
-  days, so difficulty rose 4× at 14112; blocks now take ~25 s and grinding sometimes fails. Scenarios
-  that mine hundreds of blocks (vault-recovery-tier, withhold-reveal) cannot run. Needs a regtest
-  devnet, or a signet reset and a mining budget per window.
+- ~~**The signet cannot mine fast any more.**~~ **Worked around (2026-10-03):** the signet keeps the
+  soak at real pacing; scenarios that mine past expiry run on a persistent regtest network
+  (`devnet/regtest-net.sh`, `DEVNET=regtest redteam/run-all.sh`), where `mine` is instant. The signet
+  difficulty (4x since 14112) still limits any signet run that mines hundreds of blocks.
 
 ## Ledger operations
 

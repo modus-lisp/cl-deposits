@@ -46,17 +46,21 @@ fi
 echo "== $VC disputes V; it will spend its pledge right after arming"
 cld_ctl $VC "(:dispute-enter :ledger \"$V\" :reason \"redteam veto-pledge\")" >/dev/null
 
+# Logs outlive a scenario (an earlier run's "spent our pledge" on cld5 released it at once): count
+# only lines that were not already there when this run started.
+OLD=$(for n in $VC cld5 cld2; do cld_ctl $n '(:log)' 2>/dev/null; done | tr '"' '\n' | grep "adversary: spent our pledge" | sort -u)
+fresh() { grep -vxF -f <(printf '%s\n' "${OLD:-@@none@@}"); }
 echo "== waiting for the confiscation (up to ${WAIT}s)"
 conf=""; spent=""; excluded=""; released=""
 for i in $(seq 1 $WAIT); do
   logs=$(for n in $VC cld5 cld2; do cld_ctl $n '(:log)' 2>/dev/null; done | tr '"' '\n')
-  [ -z "$spent" ] && spent=$(echo "$logs" | grep -m1 "adversary: spent our pledge")
+  [ -z "$spent" ] && spent=$(echo "$logs" | grep "adversary: spent our pledge" | fresh | head -1)
   [ -z "$excluded" ] && excluded=$(echo "$logs" | grep -m1 "excluded from ${V:0:8}'s lottery")
   conf=$(echo "$logs" | grep -F "dispute ${V:0:8}:" | grep -oE "confiscation [0-9a-f]{64} on chain" | grep -oE '[0-9a-f]{64}' | head -1)
   [ -n "$conf" ] && [ -n "$(bcli getrawtransaction "$conf" 2>/dev/null | head -c1)" ] && break
   conf=""
   # reopen: once the honest armer has spent its pledge too, let it recover and re-arm.
-  if [ "$MODE" = reopen ] && [ -z "$released" ] && cld_ctl cld5 '(:log)' 2>/dev/null | tr '"' '\n' | grep -q "adversary: spent our pledge"; then
+  if [ "$MODE" = reopen ] && [ -z "$released" ] && cld_ctl cld5 '(:log)' 2>/dev/null | tr '"' '\n' | grep "adversary: spent our pledge" | fresh | grep -q .; then
     mine 2 >/dev/null; cld_ctl cld5 "(:adversary :set :spend-pledge nil)" >/dev/null; released=1
     echo "  [$i] cld5 spent its pledge too (nobody eligible); it may now re-arm"
   fi
@@ -74,7 +78,12 @@ n_out=$(bcli getrawtransaction "$conf" true 2>/dev/null | grep -c '"scriptPubKey
 case "$MODE" in
   veto) echo "PASS: the confiscation $conf landed although $VC spent its pledge; one armer can no longer veto.";;
   sole|reopen)
-    rearm=$(cld_ctl cld5 '(:log)' 2>/dev/null | tr '"' '\n' | grep -m1 "re-armed")
+    # A re-arm is logged "re-armed: ..." when the first arm is replaced, or as a plain "armed, pledging"
+    # with a coin other than the one spent when the spend overtook the first arm (regtest's 10 s blocks).
+    c5=$(cld_ctl cld5 '(:log)' 2>/dev/null | tr '"' '\n')
+    gone=$(echo "$c5" | grep "adversary: spent our pledge" | fresh | grep -oE '[0-9a-f]{64}:[0-9]+' | head -1)
+    rearm=$(echo "$c5" | grep -m1 "re-armed")
+    [ -z "$rearm" ] && rearm=$(echo "$c5" | grep -F "dispute ${V:0:8}: armed, pledging" | grep -vF "${gone:-none}" | head -1)
     [ "$MODE" = reopen ] && { [ -n "$rearm" ] || fail "cld5 never re-armed (${rearm:-no log})"; echo "   $rearm"; }
     echo "PASS ($MODE): the confiscation $conf landed with cld5 the only eligible armer (it takes custody without a draw).";;
 esac
