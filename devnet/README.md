@@ -5,7 +5,19 @@ or on a private regtest chain of its own:
 
     devnet/regtest.sh   # bitcoind regtest + relay + cld1..cld4 + smoke.sh (no Lightning) + teardown; what CI runs
                         # BITCOIND=/path/bitcoind BITCOIN_CLI=/path/bitcoin-cli to pick binaries; KEEP=1 to leave it up
-                        # (ports 7787 / 10051-10054, data under /tmp/cld-regtest: coexists with the signet devnet)
+                        # (ports 7797 / 10201-10204 / rpc 18553, data under /tmp/cld-regtest: coexists with both networks below)
+
+    devnet/regtest-net.sh up|down|status|reset
+                        # the persistent regtest red-team network: bitcoind, beacon (7787), Esplora shim (3012),
+                        # cld1..cld18 (control 10101-10118), ref2..ref7 (admin 8866-8871, its own deposits-rust
+                        # build at /mnt/lisp/cargo-target/regtest-net), a block every REGTEST_BLOCK_EVERY s (10),
+                        # and the soak's ledgers A..L + deposits (soak.sh setup, no soak loops).  Data under
+                        # /mnt/lisp/regtest-devnet.  `mine` is instant here.
+    DEVNET=regtest redteam/run-all.sh --tags slow   # the scenarios that mine past quorum expiry
+
+`DEVNET` (or `CLD_CHAIN`) selects the network for every devnet and red-team script: `signet`
+(default; the soak, real block pacing; its difficulty retargets, so mining hundreds of blocks takes
+days) or `regtest`.  Same node names on both, different ports and data dirs.
 
 The relay is beacon (`~/beacon`, a pure-CL Nostr relay), configured by `devnet/beacon-relay.lisp`:
 no result cap or rate limits, ephemeral responses kept 10 minutes for REQs with `since` (the

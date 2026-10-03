@@ -7,6 +7,8 @@
 #   KEEP=1 devnet/regtest.sh     leave everything running for a look
 export CLD_CHAIN=regtest
 export CLD_ROOT="${CLD_ROOT:-/tmp/cld-regtest}"
+# Four cl nodes, no references, on ports clear of the persistent regtest network (devnet/regtest-net.sh).
+export REGTEST_CL=4 REGTEST_REFS=0 REGTEST_PORT_BASE=${REGTEST_PORT_BASE:-10200} RELAY_PORT=${RELAY_PORT:-7797} BITCOIN_RPC_PORT=${BITCOIN_RPC_PORT:-18553}
 source "$(dirname "$0")/_common.sh"
 teardown() {
   local rc=$?

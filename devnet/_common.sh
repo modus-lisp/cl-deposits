@@ -1,9 +1,13 @@
 # devnet/_common.sh — shared by the cl-deposits devnet scripts.
-# CLD_CHAIN=signet (default) rides on the signet devnet at /mnt/lisp/signet
-# (bitcoind + miner wallet + Lightning).  CLD_CHAIN=regtest runs a private
-# bitcoind of its own under CLD_ROOT with no Lightning: what CI uses.
+# DEVNET (or CLD_CHAIN) selects the network:
+#   signet (default)  the signet devnet at /mnt/lisp/signet (bitcoind + miner wallet + Lightning):
+#                     the soak, at real block pacing.
+#   regtest           a private bitcoind under CLD_ROOT with no Lightning, where `mine` is instant:
+#                     the persistent red-team network (devnet/regtest-net.sh, CLD_ROOT
+#                     /mnt/lisp/regtest-devnet, REGTEST_CL cl nodes + REGTEST_REFS reference
+#                     nodes) and CI's smoke (devnet/regtest.sh: /tmp, 4 cl nodes, no references).
 set -u
-CLD_CHAIN="${CLD_CHAIN:-signet}"
+CLD_CHAIN="${CLD_CHAIN:-${DEVNET:-signet}}"
 SIGNET_ROOT="${SIGNET_ROOT:-/mnt/lisp/signet}"
 CLD_SRC="${CLD_SRC:-$HOME/cl-deposits}"
 MINER_WALLET="${MINER_WALLET:-miner}"
@@ -12,7 +16,7 @@ case "$CLD_CHAIN" in
     RELAY_PORT="${RELAY_PORT:-7777}"
     CLD_NODES=("cld1:10041" "cld2:10042" "cld3:10043" "cld4:10044" "cld5:10045" "cld6:10046"   # name:control-port
                "cld7:10047" "cld8:10048" "cld9:10049" "cld10:10050"     # fresh keys for the red team (2026-10-02);
-               "cld11:10055" "cld12:10056" "cld13:10057" "cld14:10058"   # 10051-4 are the regtest devnet's
+               "cld11:10055" "cld12:10056" "cld13:10057" "cld14:10058"   # 10101+ are the regtest network's
                "cld15:10059" "cld16:10060" "cld17:10061" "cld18:10062")
     CLD_ROOT="${CLD_ROOT:-$SIGNET_ROOT/deposits}"        # data dirs live OUTSIDE the repo
     BITCOIN_DATADIR="$SIGNET_ROOT/bitcoin"
@@ -21,12 +25,13 @@ case "$CLD_CHAIN" in
     mine() { "$SIGNET_ROOT/mine.sh" "${1:-1}" >/dev/null; }
     ;;
   regtest)
-    CLD_ROOT="${CLD_ROOT:-/tmp/cld-regtest}"
-    RELAY_PORT="${RELAY_PORT:-7787}"                       # distinct ports: a signet devnet may be up alongside
-    CLD_NODES=("cld1:10051" "cld2:10052" "cld3:10053" "cld4:10054")
+    CLD_ROOT="${CLD_ROOT:-/mnt/lisp/regtest-devnet}"
+    RELAY_PORT="${RELAY_PORT:-7787}"                       # distinct ports: the signet devnet is up alongside
+    CLD_NODES=(); for i in $(seq 1 "${REGTEST_CL:-18}"); do CLD_NODES+=("cld$i:$((${REGTEST_PORT_BASE:-10100}+i))"); done
     BITCOIN_DATADIR="$CLD_ROOT/bitcoin"
-    BITCOIN_CLI="${BITCOIN_CLI:-bitcoin-cli}"
-    BITCOIND="${BITCOIND:-bitcoind}"
+    _bin() { command -v "$1" 2>/dev/null || { [ -x "$SIGNET_ROOT/bin/$1" ] && echo "$SIGNET_ROOT/bin/$1"; } || echo "$1"; }
+    BITCOIN_CLI="${BITCOIN_CLI:-$(_bin bitcoin-cli)}"
+    BITCOIND="${BITCOIND:-$(_bin bitcoind)}"
     BITCOIN_RPC_PORT="${BITCOIN_RPC_PORT:-18543}"
     BCLI="$BITCOIN_CLI -regtest -datadir=$BITCOIN_DATADIR -rpcport=$BITCOIN_RPC_PORT"
     mine() { $BCLI -rpcwallet="$MINER_WALLET" -generate "${1:-1}" >/dev/null; }
@@ -70,8 +75,13 @@ stop_bitcoind() { bitcoind_running && $BCLI stop >/dev/null 2>&1; }
 # devnet: name:admin-port.  Each has its own data dir (seed.hex, wallet, node.log)
 # and talks to the same relay and bitcoind; its wallet syncs through the Esplora
 # shim.  (ref1 is the hand-run node from the first interop session; left alone.)
-REF_NODES=("ref2:8766" "ref3:8767" "ref4:8768" "ref5:8769" "ref6:8770" "ref7:8771")
-DEPOSITS_RUST="${DEPOSITS_RUST:-$HOME/workspace/deposits-rust/target/release}"
+if [ "$CLD_CHAIN" = regtest ]; then
+  REF_NODES=(); for i in $(seq 2 $(( ${REGTEST_REFS:-6} + 1 ))); do REF_NODES+=("ref$i:$((8864+i))"); done
+else
+  REF_NODES=("ref2:8766" "ref3:8767" "ref4:8768" "ref5:8769" "ref6:8770" "ref7:8771")
+fi
+# regtest runs its own build (a rebuild for the signet devnet never pulls the binary from under it)
+DEPOSITS_RUST="${DEPOSITS_RUST:-$([ "$CLD_CHAIN" = regtest ] && echo /mnt/lisp/cargo-target/regtest-net/release || echo "$HOME/workspace/deposits-rust/target/release")}"
 REF_NODE_BIN="$DEPOSITS_RUST/deposits-node"; REF_WALLET_BIN="$DEPOSITS_RUST/deposits-wallet"
 ref_names() { for e in "${REF_NODES[@]}"; do echo "${e%%:*}"; done; }
 ref_port()  { for e in "${REF_NODES[@]}"; do [ "${e%%:*}" = "$1" ] && echo "${e##*:}" && return; done; return 1; }
@@ -127,13 +137,14 @@ ref_begin_quorum() {
 }
 stop_ref() { local p; p=$(ref_pid "$1") || return 0; [ -n "$p" ] && kill "$p" 2>/dev/null && echo "$1 stopped"; rm -f "$(ref_dir "$1")/ref.pid"; }
 
-ESPLORA_PORT="${ESPLORA_PORT:-3002}"
+ESPLORA_PORT="${ESPLORA_PORT:-$([ "$CLD_CHAIN" = regtest ] && echo 3012 || echo 3002)}"
 ESPLORA_URL="http://127.0.0.1:$ESPLORA_PORT"
-esplora_running() { pgrep -f "esplora[.]py" >/dev/null; }
+esplora_running() { curl -sf "$ESPLORA_URL/blocks/tip/height" >/dev/null 2>&1; }   # by port: each network has its own shim
 start_esplora() {   # Esplora-compatible API over our bitcoind, for the reference node's wallet
   esplora_running && return 0
   mkdir -p "$CLD_ROOT"
   ESPLORA_BITCOIN_CLI="$BCLI" ESPLORA_PORT=$ESPLORA_PORT setsid nohup python3 "$CLD_SRC/devnet/esplora.py" >"$CLD_ROOT/esplora.log" 2>&1 &
+  echo $! >"$CLD_ROOT/esplora.pid"
   for i in $(seq 1 120); do curl -sf "$ESPLORA_URL/blocks/tip/height" >/dev/null 2>&1 && return 0; sleep 1; done
   echo "esplora shim did not come up" >&2; return 1
 }
