@@ -38,7 +38,7 @@ fi
 # censor arm: the transfer timed out.  Escalate through a member (DEP-12).
 # cld6 is a member of A; its own ledger is L6 (from the soak env).
 MEMBER_LEDGER=$(eval echo "\${L6}")
-OPERATOR=$(cat "$S/pubkey.cld1")
+OPERATOR=$(pubkey_of cld1)
 echo "== escalating: delivery_embed through cld6 (a quorum member of A)"
 esc=$(timeout 60 $W w1 "$A" escalate "$FROM" "$TO" 100000 "$MEMBER_LEDGER" "$OPERATOR" 2>&1 | tail -3)
 echo "$esc"

@@ -6,7 +6,7 @@ source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/en
 T=${1:-D}
 read -r TID OP < <(awk -F'\t' -v t="$T" '$1==t{print $2, $3}' "$S/ledgers.tsv")
 [ -n "$TID" ] || fail "no soak ledger $T"
-OPK=$(cat "$S/pubkey.$OP")
+OPK=$(pubkey_of $OP)
 forks() { local n c=0; for n in cld1 cld2 cld3 cld4 cld5 cld6; do c=$((c + $(cld_ctl $n "(:forks :ledger \"$TID\")" 2>/dev/null | grep -o ":SEQ" | wc -l))); done; echo $c; }
 before=$(forks)
 echo "== fuzzing $T ($TID, operator $OP): forks before $before"

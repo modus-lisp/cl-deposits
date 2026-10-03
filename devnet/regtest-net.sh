@@ -4,7 +4,7 @@
 # signet once its difficulty caught up).  Runs alongside the signet devnet on its own ports and data
 # dir (/mnt/lisp/regtest-devnet): bitcoind, a beacon relay, the Esplora shim, REGTEST_CL cl nodes
 # (default 18) and REGTEST_REFS reference nodes (default 6, its own deposits-rust build), a block
-# ticker (one block every REGTEST_BLOCK_EVERY s, default 10), and the soak's ledgers A..L and
+# ticker (one block every REGTEST_BLOCK_EVERY s, default 10, with a collateral refill), and the soak's ledgers A..L and
 # deposits (devnet/soak.sh setup, no soak loops) so scenarios find the same names as on the signet.
 #
 #   devnet/regtest-net.sh up       start everything; first run also mines coins and runs setup
@@ -18,7 +18,12 @@ SOAK="$CLD_ROOT/soak"
 ticker_pid() { cat "$CLD_ROOT/ticker.pid" 2>/dev/null; }
 start_ticker() {
   local p; p=$(ticker_pid) && kill -0 "$p" 2>/dev/null && return 0
-  ( while sleep "${REGTEST_BLOCK_EVERY:-10}"; do mine 1 2>/dev/null; done ) >/dev/null 2>&1 &
+  # Disputes pledge replacement collateral and red-team runs leave many open: every
+  # REGTEST_COLLATERAL_EVERY blocks, refill any node that ran short (soak.sh collateral).
+  ( i=0; while sleep "${REGTEST_BLOCK_EVERY:-10}"; do
+      mine 1 2>/dev/null; i=$((i+1))
+      [ $((i % ${REGTEST_COLLATERAL_EVERY:-12})) -eq 0 ] && "$CLD_SRC/devnet/soak.sh" collateral >>"$CLD_ROOT/collateral.log" 2>&1
+    done ) >/dev/null 2>&1 &
   echo $! >"$CLD_ROOT/ticker.pid"
 }
 up() {
@@ -27,9 +32,11 @@ up() {
   start_bitcoind || exit 1
   [ "$(bcli getblockcount)" -ge 400 ] || mine 300          # coins for 12 vaults, collateral, scenarios
   start_relay || exit 1; start_esplora || exit 1
-  local n; for n in $(cld_names); do start_cld "$n" || exit 1; done
+  local n; for n in $(cld_names); do start_cld "$n" & done; wait   # each loads in ~40 s: in parallel
+  for n in $(cld_names); do cld_running "$n" || { echo "$n did not start" >&2; exit 1; }; done
   for n in $(ref_names); do start_ref "$n" || exit 1; done
   start_ticker
+  for n in $(cld_names); do [ -s "$SOAK/pubkey.$n" ] || cld_pubkey "$n" >"$SOAK/pubkey.$n"; done   # scenarios seat any node
   if [ ! -s "$SOAK/deposits.tsv" ]; then
     SOAK_REF_DEPOSITS=${SOAK_REF_DEPOSITS:-2} SOAK_CL_WALLETS=${SOAK_CL_WALLETS:-2} "$CLD_SRC/devnet/soak.sh" setup || exit 1
   fi

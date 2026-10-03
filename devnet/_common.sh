@@ -27,7 +27,7 @@ case "$CLD_CHAIN" in
   regtest)
     CLD_ROOT="${CLD_ROOT:-/mnt/lisp/regtest-devnet}"
     RELAY_PORT="${RELAY_PORT:-7787}"                       # distinct ports: the signet devnet is up alongside
-    CLD_NODES=(); for i in $(seq 1 "${REGTEST_CL:-18}"); do CLD_NODES+=("cld$i:$((${REGTEST_PORT_BASE:-10100}+i))"); done
+    CLD_NODES=(); for i in $(seq 1 "${REGTEST_CL:-36}"); do CLD_NODES+=("cld$i:$((${REGTEST_PORT_BASE:-10100}+i))"); done
     BITCOIN_DATADIR="$CLD_ROOT/bitcoin"
     _bin() { command -v "$1" 2>/dev/null || { [ -x "$SIGNET_ROOT/bin/$1" ] && echo "$SIGNET_ROOT/bin/$1"; } || echo "$1"; }
     BITCOIN_CLI="${BITCOIN_CLI:-$(_bin bitcoin-cli)}"

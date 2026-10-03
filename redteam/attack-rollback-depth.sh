@@ -59,7 +59,7 @@ T0=$(date -u +%s)
 disputed=0
 for i in $(seq 1 $((WAIT/5))); do
   # only the honest replica's OWN fork: (:forks) also lists forks it replicates from other members
-  d=$(cld_ctl $HON "(:forks :ledger \"$R\")" 2>/dev/null | grep -oE ":OPERATOR \"$(cut -c1-16 "$S/pubkey.$HON")\" :SEQ [0-9]+ :STATE :(DISPUTED|ARMED)" | wc -l)
+  d=$(cld_ctl $HON "(:forks :ledger \"$R\")" 2>/dev/null | grep -oE ":OPERATOR \"$(pubkey_of $HON | cut -c1-16)\" :SEQ [0-9]+ :STATE :(DISPUTED|ARMED)" | wc -l)
   [ "$d" -gt 0 ] && { disputed=$d; break; }
   sleep 5
 done
@@ -68,7 +68,7 @@ if [ "$disputed" -eq 0 ]; then
   exit 1
 fi
 DT=$(( $(date -u +%s) - T0 ))
-fseq=$(cld_ctl $HON "(:forks :ledger \"$R\")" 2>/dev/null | grep -oE ":OPERATOR \"$(cut -c1-16 "$S/pubkey.$HON")\" :SEQ [0-9]+" | grep -oE '[0-9]+$')
+fseq=$(cld_ctl $HON "(:forks :ledger \"$R\")" 2>/dev/null | grep -oE ":OPERATOR \"$(pubkey_of $HON | cut -c1-16)\" :SEQ [0-9]+" | grep -oE '[0-9]+$')
 echo "== $HON disputed ${DT}s after it answered; its fork is at seq $fseq (honest tip $pre, fraudulent tip $tip)"
 depth=$(( tip - pre ))
 echo "== rollback depth: $depth updates"

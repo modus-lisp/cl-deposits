@@ -9,7 +9,7 @@ or on a private regtest chain of its own:
 
     devnet/regtest-net.sh up|down|status|reset
                         # the persistent regtest red-team network: bitcoind, beacon (7787), Esplora shim (3012),
-                        # cld1..cld18 (control 10101-10118), ref2..ref7 (admin 8866-8871, its own deposits-rust
+                        # cld1..cld36 (control 10101-10136; contagion burns keys for good), ref2..ref7 (admin 8866-8871, its own deposits-rust
                         # build at /mnt/lisp/cargo-target/regtest-net), a block every REGTEST_BLOCK_EVERY s (10),
                         # and the soak's ledgers A..L + deposits (soak.sh setup, no soak loops).  Data under
                         # /mnt/lisp/regtest-devnet.  `mine` is instant here.

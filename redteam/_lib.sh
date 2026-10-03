@@ -1,5 +1,12 @@
 # redteam/_lib.sh — shared by the scenario scripts.  Source after devnet/_common.sh and $S/env.
 fail() { echo "FAIL: $*" >&2; exit 1; }
+pubkey_of() {   # pubkey_of NODE — its protocol key, cached in $S/pubkey.NODE (a key never changes)
+  local c="$S/pubkey.$1" k i; [ -s "$c" ] && { cat "$c"; return 0; }
+  for i in 1 2 3 4 5 6; do
+    k=$(case $1 in cld*) cld_pubkey "$1";; ref*) ref_pubkey "$1";; esac)
+    [ -n "$k" ] && { echo "$k" >"$c"; echo "$k"; return 0; }; sleep 5
+  done; fail "no pubkey for $1"
+}
 expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "${2:+$2: }${1:-no answer (control port timed out?)}";; esac; }
 own_ledger() {      # own_ledger NODE — the ledger NODE cites as a member; opened and recorded in $S/env on first use
   local var id; case $1 in cld*) var="L${1#cld}";; ref*) var="RL${1#ref}";; esac
@@ -22,7 +29,7 @@ consent() {         # consent LEDGER OPERATOR MEMBER... — a reference member's
   local l=$1 op=$2 m r i; shift 2
   for m in "$@"; do
     for i in 1 2 3 4 5 6; do   # a reference node can hang and be restarted by the devnet watchdog: ride it out
-      r=$(cld_ctl "$op" "(:add-member :ledger \"$l\" :member \"$(cat "$S/pubkey.$m")\" :member-ledger \"$(own_ledger "$m")\"${RESP:+ :dispute-response-blocks $RESP})")
+      r=$(cld_ctl "$op" "(:add-member :ledger \"$l\" :member \"$(pubkey_of $m)\" :member-ledger \"$(own_ledger "$m")\"${RESP:+ :dispute-response-blocks $RESP})")
       [[ "$r" == *":STATUS :OK"* ]] && break; sleep 20
     done; expect "$r" "add-member $m"
   done
@@ -79,10 +86,16 @@ vault_spend() {
   printf '%s\n' "(:vault-spend :ledger \"$2\" :address \"$3\" :tier ${4:-0})" |
     timeout 180 bash -c "exec 3<>/dev/tcp/127.0.0.1/$(cld_port "$1"); cat >&3; head -n1 <&3"
 }
-# accused NODE LEDGER — run NODE's vault watch now; true if it logs VAULT SPEND for LEDGER.
+# accused NODE LEDGER [SECS] — run NODE's vault watch now; true if it logs VAULT SPEND for LEDGER
+# within SECS (default 180).  After mining hundreds of blocks a pass scans them all, which outlasts
+# one control call (60 s), so poll the log rather than trusting the call's return.
 accused() {
+  local i
   cld_ctl "$1" '(:vault-watch)' >/dev/null 2>&1
-  cld_ctl "$1" '(:log)' 2>/dev/null | grep -q "VAULT SPEND: ${2:0:8}"
+  for i in $(seq 1 $(( ${3:-180} / 10 ))); do
+    cld_ctl "$1" '(:log)' 2>/dev/null | grep -q "VAULT SPEND: ${2:0:8}" && return 0
+    sleep 10; cld_ctl "$1" '(:vault-watch)' >/dev/null 2>&1
+  done; return 1
 }
 arm()    { local k=$1 n; shift; for n in "$@"; do expect "$(cld_ctl "$n" "(:adversary :set $k t)")"; done; }
 disarm() { local k=$1 n; shift; for n in "$@"; do cld_ctl "$n" "(:adversary :set $k nil)" >/dev/null 2>&1; done; }

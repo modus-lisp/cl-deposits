@@ -14,14 +14,14 @@ source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/en
 tune_arming() { local n; for n in $(cld_names); do cld_ctl "$n" "(:tune :full-arming-wait-blocks $1)" >/dev/null 2>&1; done; }
 tune_arming 2; trap 'tune_arming 720' EXIT
 WAIT=${WAIT:-600}
-pick OP   # clean: a tainted operator's ledger is disputed on sight by cld2 too, hiding the limit
-X=$(RESP=${RESP:-5} form_ledger "${REDTEAM_MC:-MC}" $OP "" cld2 cld3 cld4 cld5 cld6) || exit 1
+pick OP OBS D3 D4 D5 D6   # clean: a tainted operator's ledger is disputed on sight by OBS too, hiding the limit
+X=$(RESP=${RESP:-5} form_ledger "${REDTEAM_MC:-MC}" $OP "" $OBS $D3 $D4 $D5 $D6) || exit 1
 taint "$OP"   # confiscated below
-echo "== ledger $X: cld3 cld4 cld5 cld6 dispute"
-for n in cld3 cld4 cld5 cld6; do cld_ctl $n "(:dispute-enter :ledger \"$X\" :reason \"redteam missed-confiscation\")" >/dev/null; done
+echo "== ledger $X: $D3 $D4 $D5 $D6 dispute"
+for n in $D3 $D4 $D5 $D6; do cld_ctl $n "(:dispute-enter :ledger \"$X\" :reason \"redteam missed-confiscation\")" >/dev/null; done
 conf=""
 for i in $(seq 1 $((WAIT / 5))); do
-  for n in cld3 cld4 cld5 cld6; do   # any disputant: one that armed late is not in the lottery and never logs it
+  for n in $D3 $D4 $D5 $D6; do   # any disputant: one that armed late is not in the lottery and never logs it
     conf=$(cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain" | grep -F "dispute ${X:0:8}:" | grep -oE '[0-9a-f]{64}' | tail -1)
     [ -n "$conf" ] && break
   done
@@ -32,13 +32,13 @@ done
 [ -n "$conf" ] || fail "no confiscation within ${WAIT}s"
 echo "== confiscation $conf"
 mine 5 >/dev/null; sleep 5
-accused cld6 "$X" && fail "cld6, a disputant, reported its own confiscation as a vault spend"
-if accused cld2 "$X"; then
-  echo "PASS: the disputant excused the confiscation; cld2 (no fork) reported it as a vault spend — the known limit, demonstrated."
+accused $D6 "$X" 40 && fail "$D6, a disputant, reported its own confiscation as a vault spend"
+if accused $OBS "$X"; then
+  echo "PASS: the disputant excused the confiscation; $OBS (no fork) reported it as a vault spend — the known limit, demonstrated."
 else
-  if cld_ctl cld2 "(:forks :ledger \"$X\")" | grep -q ":STATE"; then
-    echo "PASS: the disputant excused the confiscation; cld2 disputed too (the operator's key is tainted by an earlier run), so it knew the confiscation and the limit could not show."
+  if cld_ctl $OBS "(:forks :ledger \"$X\")" | grep -q ":STATE"; then
+    echo "PASS: the disputant excused the confiscation; $OBS disputed too (the operator's key is tainted by an earlier run), so it knew the confiscation and the limit could not show."
   else
-    echo "PASS: the disputant excused the confiscation, and cld2 did not report it either (the limit did not show)."
+    echo "PASS: the disputant excused the confiscation, and $OBS did not report it either (the limit did not show)."
   fi
 fi

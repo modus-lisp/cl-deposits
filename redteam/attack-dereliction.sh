@@ -30,7 +30,7 @@ if [ -f "$DL_ROW" ]; then read -r DL txid vout < "$DL_ROW"; echo "== reusing DL 
   DL=$(sx "$(cld_ctl $OP "(:open-ledger :reserves-id \"genesis:$OP:derelict:$RANDOM\" :reserves-msat 20000000000 :collateral-msat 20000000000)")" ":LEDGER"); [ -n "$DL" ] || fail "open DL"
   for m in $ACT cld3 cld4 cld5 $DER; do
     ml=$(eval echo "\${L${m#cld}}")
-    expect "$(cld_ctl $OP "(:add-member :ledger \"$DL\" :member \"$(cat $S/pubkey.$m)\" :member-ledger \"$ml\" :dispute-response-blocks $RESP)")"
+    expect "$(cld_ctl $OP "(:add-member :ledger \"$DL\" :member \"$(pubkey_of $m)\" :member-ledger \"$ml\" :dispute-response-blocks $RESP)")"
   done
   prep=$(cld_ctl $OP "(:prepare-quorum :ledger \"$DL\" :expiry-blocks 4320)"); expect "$prep"; addr=$(sx "$prep" ":ADDRESS")
   txid=$(wcli sendtoaddress "$addr" 0.4); mine 3
