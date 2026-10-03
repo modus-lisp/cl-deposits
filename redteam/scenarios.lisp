@@ -57,7 +57,7 @@
    (make-sc :name "vault-missed-confiscation" :script "attack-vault-missed-confiscation.sh"
             :ledger-var "REDTEAM_MC" :env '("WAIT=900") :timeout 1500 :tags '(:contagion :slow))
    (make-sc :name "withhold-reveal" :script "attack-withhold-reveal.sh" :ledger-var "REDTEAM_W"
-            :env '("WAIT=120") :timeout 5400 :tags '(:contagion :slow))
+            :env '("REFS=" "WAIT=600") :timeout 5400 :tags '(:contagion :slow))
    (make-sc :name "veto-pledge" :script "attack-veto-pledge.sh" :ledger-var "REDTEAM_VP"
             :timeout 2400 :tags '(:contagion) :note "one armer spends its pledge; the confiscation must still land")
    (make-sc :name "veto-pledge-sole" :script "attack-veto-pledge.sh" :args '("sole") :ledger-var "REDTEAM_VPS"

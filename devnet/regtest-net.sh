@@ -3,7 +3,7 @@
 # scenarios that must mine past quorum expiry (hundreds of blocks: minutes on regtest, weeks on the
 # signet once its difficulty caught up).  Runs alongside the signet devnet on its own ports and data
 # dir (/mnt/lisp/regtest-devnet): bitcoind, a beacon relay, the Esplora shim, REGTEST_CL cl nodes
-# (default 18) and REGTEST_REFS reference nodes (default 6, its own deposits-rust build), a block
+# (default 48: a full suite run burns ~31 keys for good) and REGTEST_REFS reference nodes (default 6, its own deposits-rust build), a block
 # ticker (one block every REGTEST_BLOCK_EVERY s, default 10, with a collateral refill), and the soak's ledgers A..L and
 # deposits (devnet/soak.sh setup, no soak loops) so scenarios find the same names as on the signet.
 #

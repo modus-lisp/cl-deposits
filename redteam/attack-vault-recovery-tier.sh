@@ -10,7 +10,11 @@
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
 pick OP C1 H1 H2 H3 H4   # OP and C1 spend at Tier 1 (2 of 6) and are burned
 trap 'disarm :theft-sign $C1' EXIT
-X=$(FORM_EXPIRY=6 form_ledger "${REDTEAM_RT:-RT}" $OP cltv-offset-v2 $C1 $H1 $H2 $H3 $H4) || exit 1
+# Past expiry the honest members dispute respectfully and confiscate once their arm window closes
+# (regtest, 2026-10-03: with the default window the vault was confiscated long before Tier 1 opened,
+# so the minority tier is reachable only while that dispute is still arming).  RESP > 720 keeps it
+# arming when Tier 1 opens.
+X=$(RESP=${RESP:-900} FORM_EXPIRY=6 form_ledger "${REDTEAM_RT:-RT}" $OP cltv-offset-v2 $C1 $H1 $H2 $H3 $H4) || exit 1
 echo "== mining past the ledger's expiry + 720 so Tier 1 opens"; mine 730 >/dev/null; sleep 10
 DEST=$(sx "$(cld_ctl $C1 '(:address)')" ":ADDRESS")
 echo "== ledger $X; spending at Tier 1 (minority) to $DEST"
