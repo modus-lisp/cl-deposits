@@ -224,6 +224,31 @@
                  (lot:armer-share-address (lot:build-armer-share (xonly-of (funcall seed-priv 1)) (make-array 20 :element-type '(unsigned-byte 8) :initial-element 1) voters 2 :network :signet))
                  (funcall vec "armer_share"))))
 
+(with-gate ("lottery: the unsigned confiscation, byte for byte against the reference")
+  ;; inspect/vectors/confiscation_tx.txt: deposits-node's confiscation_tx_vector_is_pinned.
+  (let* ((lines (with-open-file (in (vector-path "confiscation_tx.txt")) (loop for l = (read-line in nil) while l collect l)))
+         (vec (lambda (key) (let ((pfx (format nil "VEC ~a=" key)))
+                              (let ((l (find-if (lambda (l) (and (>= (length l) (length pfx)) (string= pfx (subseq l 0 (length pfx))))) lines)))
+                                (and l (subseq l (length pfx)))))))
+         (seed-priv (lambda (i) (u:be->int (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))))
+         (voters (mapcar (lambda (i) (xonly-of (funcall seed-priv i))) '(21 22 23)))
+         (parts (loop for i from 1 to 3 collect (lot:make-participant :pubkey (xonly-of (funcall seed-priv i))
+                                                                       :commitment (make-array 20 :element-type '(unsigned-byte 8) :initial-element i)
+                                                                       :target (format nil "tb1p~a" i))))
+         (l (lot:build-lottery parts voters 2 :network :signet))
+         (fee (lot:confiscation-fee 8))
+         (operator (up:compressed-pubkey (funcall seed-priv 9))))
+    (check-equal "DEP-03 fee for 8 voters" (princ-to-string fee) (funcall vec "fee"))
+    (loop for (name respectful locktime) in '(("punitive" nil 0) ("respectful" t 1234))
+          do (let* ((outs (lot:confiscation-outputs (lot:lottery-spk l) 50000000 fee :respectful respectful
+                                                    :obligations-sats 10000000 :operator-pubkey33 operator))
+                    (tx (btx:make-tx :version 2 :locktime locktime :segwit-p nil
+                                     :inputs (list (btx:make-txin :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11)
+                                                                  :prev-index 1 :script (u:octets) :sequence #xfffffffd))
+                                     :outputs (loop for (spk . v) in outs collect (btx:make-txout :value v :script spk))
+                                     :witnesses nil)))
+               (check-equal (format nil "~a confiscation tx" name) (u:bytes->hex (btx:serialize-tx tx)) (funcall vec name))))))
+
 ;;; inspect/vectors/armer_eligibility.json: the DEP-03 replacement-collateral cut,
 ;;; shared with deposits-rust (deposits-node/tests/vectors/armer_eligibility.json).
 (with-gate ("lottery: armer eligibility cut against the shared vector")

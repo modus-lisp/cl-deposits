@@ -26,7 +26,7 @@
            #:armer-share-leaves #:armer-share-control-block #:forfeit-sweep-outputs
            #:confiscation-outputs #:revealers-from-witness #:tapbuilder-tree #:p2tr-spk #:key-path-spk
            #:+reveal-csv+ #:+armer-sweep-csv+ #:+max-disputants+ #:+timeout-recovery-csv+
-           #:+contribution-range+ #:+max-preimage-len+))
+           #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+))
 (in-package #:cl-deposits.lottery)
 
 (defconstant +max-disputants+ 7 "MAX_LOTTERY_PARTICIPANTS: the subset tree has 2^k - 1 claim leaves.")
@@ -275,6 +275,13 @@
 
 ;;; ---------------------------------------------------------------------------
 ;;; Confiscation outputs (DEP-06 §Respectful vs Punitive)
+
+(defconstant +confiscation-default-feerate+ 2 "sat/vB while no reference_feerate_sat_vb is recorded.")
+
+(defun confiscation-fee (voters &optional (feerate +confiscation-default-feerate+))
+  "DEP-03 \"Confiscation fee\": feerate x (120 + 30 x VOTERS) sats, VOTERS counting the
+   vault's members and operator.  Deterministic, so every cosigner builds the same tx."
+  (* feerate (+ 120 (* 30 voters))))
 
 (defun confiscation-outputs (lottery-spk reserves-sats fee-sats &key respectful obligations-sats operator-pubkey33)
   "A list of (spk . sats).  Punitive: everything to the lottery output.

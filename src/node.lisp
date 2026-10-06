@@ -2005,7 +2005,7 @@
             do (setf best i))
     best))
 
-(defun build-confiscation (node id-hex &key respectful (fee 1000) tier-index armers)
+(defun build-confiscation (node id-hex &key respectful fee tier-index armers)
   "The confiscation transaction for a disputed ledger, from public state only,
    so every cosigner rebuilds the same one.  It spends the reserves through
    TIER-INDEX (default: the tier open at our height), its nLockTime that tier's
@@ -2019,7 +2019,8 @@
          (lottery (progn (when (null participants) (fail "no armer is a lottery participant"))
                          (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword)))))
     (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node base)
-      (let* ((tier-index (or tier-index (confiscation-tier reserves (height node))))
+      (let* ((fee (or fee (lot:confiscation-fee (1+ (length voters)))))   ; DEP-03: members + operator
+             (tier-index (or tier-index (confiscation-tier reserves (height node))))
              (locktime (rs:tier-locktime (nth tier-index (rs:reserves-tiers reserves))))
              (outs (lot:confiscation-outputs (lot:lottery-spk lottery) sats fee :respectful respectful
                                              :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
@@ -2043,10 +2044,11 @@
 (defun confiscation-sighash (tx prevouts reserves &optional (tier-index 0))
   (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves reserves))))
 
-(defun confiscate (node id-hex &key respectful (fee 1000))
+(defun confiscate (node id-hex &key respectful fee)
   "Build the confiscation, gather the recovery quorum's tier-0 signatures over
    the relay (confiscation_sign), assemble, and broadcast.  Returns (values tx lottery)."
   (multiple-value-bind (tx lottery prevouts reserves tier-index) (build-confiscation node id-hex :respectful respectful :fee fee)
+    (setf fee (- (car (aref prevouts 0)) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))
     (let* ((sighash (confiscation-sighash tx prevouts reserves tier-index))
            (tier (nth tier-index (rs:reserves-tiers reserves)))
            (keys (rs:tier-keys tier))
@@ -2240,10 +2242,9 @@
         (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (w:jget params "tx_hex") (fail "no unsigned_tx"))))))
                (_seen (unless (find (btx:tx-txid proposed) (gethash id (node-seen-confiscations node)) :key #'btx:tx-txid :test #'equalp)
                         (push proposed (gethash id (node-seen-confiscations node)))))
-               (outputs-total (reduce #'+ (btx:tx-outputs proposed) :key #'btx:txout-value))
-               ;; The reference sends neither fee nor shape: read both off the proposed tx.
-               (fee (or (w:jget params "fee_sats")
-                        (- (nth-value 3 (disputed-reserves node (or (find-record node id) (fail "unknown ledger")))) outputs-total)))
+               ;; DEP-03: the fee is the rule's, not the proposer's (build-confiscation's default);
+               ;; the shape is read off the proposed tx.
+               (fee nil)
                (respectful (let ((r (w:jget params "respectful"))) (if (eq r nil) (> (length (btx:tx-outputs proposed)) 1) r))))
           (multiple-value-bind (tx lottery prevouts reserves tier-index)
               ;; The proposer names its tier (the reference's `tier_index`; else the
@@ -2270,7 +2271,8 @@
               (unless (find (btx:tx-txid proposed) (gethash id (node-signed-confiscations node))
                             :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
                 (push (cons proposed lottery) (gethash id (node-signed-confiscations node))))
-              (log! node "signed confiscation of ~a proposed by ~a (fee ~a sats)" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8) fee)
+              (log! node "signed confiscation of ~a proposed by ~a (fee ~a sats)" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8)
+                    (- (car (aref prevouts 0)) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
                                                            "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))))
       (error (e) (log! node "refused confiscation_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
