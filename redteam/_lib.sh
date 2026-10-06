@@ -70,11 +70,12 @@ await_active() {
 # fresh_deposits ROWNAME OPERATOR LEDGER N [MSAT] — N cl wallet deposits (w1..wN) on a form_ledger ledger,
 # each credited MSAT (default 20000000) by its operator.  Prints the deposit ids, one per line.
 fresh_deposits() {
-  local row="$S/redteam-$1" op=$2 l=$3 n=$4 msat=${5:-20000000} i d txid vout
+  local row="$S/redteam-$1" op=$2 l=$3 n=$4 msat=${5:-20000000} i d txid vout out
   if [ -f "$row.deposits" ]; then cat "$row.deposits"; return; fi
   read -r txid vout <"$row.outpoint"
   for i in $(seq 1 "$n"); do
-    d=$(sx "$("$CLD_SRC/devnet/cld-wallet.sh" "w$i" "$l" open)" ":DEPOSIT"); [ -n "$d" ] || fail "w$i open on $1"
+    out=$("$CLD_SRC/devnet/cld-wallet.sh" "w$i" "$l" open); d=$(sx "$out" ":DEPOSIT")
+    [ -n "$d" ] || fail "w$i open on $1: ${out:-no reply}"
     expect "$(cld_ctl "$op" "(:credit :ledger \"$l\" :deposit \"$d\" :msat $msat :txid \"$txid\" :vout $vout)")"
     echo "$d" >>"$row.deposits.tmp"
   done
@@ -117,8 +118,28 @@ clean_cl() {
 }
 # pick ROLE... — bind each named shell variable to a distinct clean cl node (in order).  Not enough clean
 # nodes is a SKIP, not a FAIL: the scenario cannot tell its result apart from earlier taint.
+# mint_cl K — on regtest, start K more cl nodes with fresh keys (cldN+1..), each with collateral coins,
+# so a scenario never runs out of untainted actors.  They persist (counted in $CLD_ROOT/minted-cl).
+mint_cl() {
+  [ "$CLD_CHAIN" = regtest ] || return 1
+  local k=$1 have i n a j
+  have=$(cld_names | wc -l)
+  echo $(( $(cat "$CLD_ROOT/minted-cl" 2>/dev/null || echo 0) + k )) >"$CLD_ROOT/minted-cl"
+  source "$CLD_SRC/devnet/_common.sh" >/dev/null 2>&1
+  for i in $(seq $((have + 1)) $((have + k))); do
+    n=cld$i; start_cld "$n" >&2 || return 1
+    pubkey_of "$n" >/dev/null
+    a=$(sx "$(cld_ctl "$n" '(:address)')" ":ADDRESS") || return 1
+    for j in 1 2 3 4 5 6 7 8; do wcli sendtoaddress "$a" 0.01 >/dev/null; done
+    touch "$S/.cl-collateral-funded.$n"
+  done
+  mine 2 >/dev/null; echo "== minted $k fresh cl nodes (cld$((have + 1))..cld$((have + k)))" >&2
+}
 pick() {
   local pool=($(clean_cl)) i=0 v
+  if [ ${#pool[@]} -lt $# ] && [ "$CLD_CHAIN" = regtest ]; then
+    mint_cl $(( $# - ${#pool[@]} )) && pool=($(clean_cl))
+  fi
   [ ${#pool[@]} -ge $# ] || { echo "SKIP: needs $# clean cl nodes ($*), have ${#pool[@]} (${pool[*]:-none}); add fresh-key nodes (devnet/_common.sh CLD_NODES)"; exit 0; }
   for v in "$@"; do declare -g "$v=${pool[$i]}"; i=$((i+1)); done
   echo "== actors: $(for v in "$@"; do printf '%s=%s ' "$v" "${!v}"; done)"

@@ -1,7 +1,11 @@
 # The custody lottery's N is decided after it is committed to
 
-*Red-team finding, 2026-09-27. Status: protocol unchanged (a change needs a wider audience);
-mitigated in cl-deposits (c3cd4cd), see "Mitigation" below. See docs/REDTEAM.md.*
+*Red-team finding, 2026-09-27. **Resolved 2026-10-03** (DEP-06 Phase 2-4): a contribution is now
+1..60 whatever the arming count (lengths 17..76), every claim leaf accepts that range, and the output
+has a CSV-72 claim leaf per revealer subset attested by the recovery voters, so neither an excluded
+armer nor a withheld reveal makes the draw unclaimable, and no recovery spend pays the original
+operator. The full-arming wait and the CSV-144 sweep below are removed. The text below describes the
+old construction. See docs/REDTEAM.md.*
 
 ## Summary
 

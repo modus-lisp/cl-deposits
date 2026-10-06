@@ -27,7 +27,9 @@ case "$CLD_CHAIN" in
   regtest)
     CLD_ROOT="${CLD_ROOT:-/mnt/lisp/regtest-devnet}"
     RELAY_PORT="${RELAY_PORT:-7787}"                       # distinct ports: the signet devnet is up alongside
-    CLD_NODES=(); for i in $(seq 1 "${REGTEST_CL:-48}"); do CLD_NODES+=("cld$i:$((${REGTEST_PORT_BASE:-10100}+i))"); done
+    # REGTEST_CL nodes from `up`, plus any the red-team harness minted since (redteam/_lib.sh mint_cl).
+    _ncl=$(( ${REGTEST_CL:-24} + $(cat "$CLD_ROOT/minted-cl" 2>/dev/null || echo 0) ))
+    CLD_NODES=(); for i in $(seq 1 "$_ncl"); do CLD_NODES+=("cld$i:$((${REGTEST_PORT_BASE:-10100}+i))"); done
     BITCOIN_DATADIR="$CLD_ROOT/bitcoin"
     _bin() { command -v "$1" 2>/dev/null || { [ -x "$SIGNET_ROOT/bin/$1" ] && echo "$SIGNET_ROOT/bin/$1"; } || echo "$1"; }
     BITCOIN_CLI="${BITCOIN_CLI:-$(_bin bitcoin-cli)}"
@@ -64,7 +66,7 @@ start_bitcoind() {   # regtest only: a private chain under CLD_ROOT with a funde
   bitcoind_running && return 0
   mkdir -p "$BITCOIN_DATADIR"
   $BITCOIND -regtest -datadir="$BITCOIN_DATADIR" -rpcport=$BITCOIN_RPC_PORT -port=$((BITCOIN_RPC_PORT+1)) \
-    -listen=0 -txindex=1 -fallbackfee=0.0001 -daemonwait >"$CLD_ROOT/bitcoind.log" 2>&1 || { echo "bitcoind did not start; see $CLD_ROOT/bitcoind.log" >&2; return 1; }
+    -listen=0 -txindex=1 -fallbackfee=0.0001 -rpcthreads=32 -rpcworkqueue=512 -daemonwait >"$CLD_ROOT/bitcoind.log" 2>&1 || { echo "bitcoind did not start; see $CLD_ROOT/bitcoind.log" >&2; return 1; }
   $BCLI -named createwallet wallet_name="$MINER_WALLET" load_on_startup=true >/dev/null 2>&1 || $BCLI loadwallet "$MINER_WALLET" >/dev/null
   [ "$(bcli getblockcount)" -ge 101 ] || mine 101
 }

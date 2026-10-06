@@ -22,7 +22,7 @@ clean_at() { [ -z "$(cld_ctl $2 "(:forks :ledger \"$1\")" 2>/dev/null | grep -oE
 sleep 45
 clean_at "$K" $ACT && clean_at "$C" $DER || { echo "SKIP: $DER or $ACT is already accused by an earlier run (contagion taint): K $(clean_at "$K" $ACT && echo clean || echo disputed), C $(clean_at "$C" $DER && echo clean || echo disputed); needs fresh-key nodes"; exit 0; }
 # A deposit on K, credited each round after the fraud (below): the derelict keeps operating.
-mapfile -t KDEPS < <(fresh_deposits "$ROW-k" $DER "$K" 1); KD=${KDEPS[0]}; [ -n "$KD" ] || fail "no deposit on K"
+mapfile -t KDEPS < <(fresh_deposits "$ROW-k" $DER "$K" 1); KD=${KDEPS[0]:-}; [ -n "$KD" ] || fail "no deposit on K"
 read -r ktxid kvout <"$S/redteam-$ROW-k.outpoint"
 DL_ROW="$S/redteam-${REDTEAM_D:-DL}"
 if [ -f "$DL_ROW" ]; then read -r DL txid vout < "$DL_ROW"; echo "== reusing DL $DL"; else

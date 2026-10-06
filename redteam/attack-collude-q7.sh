@@ -17,7 +17,7 @@ source "$(dirname "$0")/_lib.sh"
 pick OP C2 C3 C4 C5 HON   # OP and C2..C5 commit the fraud and are burned; HON is the honest cl member
 ROW=${REDTEAM_M:-M}
 M=$(COLLATERAL_SATS=25000000 form_ledger "$ROW" $OP "" $C2 $C3 $C4 $C5 $HON ref6 ref7) || exit 1; echo "   M $M"
-mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$M" 2); D1=${DEPS[0]}; D2=${DEPS[1]}
+mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$M" 2); D1=${DEPS[0]:-}; D2=${DEPS[1]:-}
 [ -n "$D1" ] && [ -n "$D2" ] || fail "no deposits on M"
 echo "== victim deposit $D1 credited 20000000 msat on M"
 has_fork() { case $2 in cld*) cld_ctl $2 "(:forks :ledger \"$1\")" | grep -q "$(pubkey_of $2 | cut -c1-16)";; *) false;; esac; }

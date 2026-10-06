@@ -10,19 +10,19 @@
 source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-300}
 source "$(dirname "$0")/_lib.sh"
-pick OP WH   # both need clean keys: a tainted operator's W is disputed on sight, before the fraud
+pick OP WH C2 C3 C4 H   # both need clean keys: a tainted operator's W is disputed on sight, before the fraud
 trap 'cld_ctl "$WH" "(:adversary :set :withhold-reveal nil)" >/dev/null 2>&1' EXIT
-ROW=${REDTEAM_W:-W}   # a fresh ledger W: $OP operates; cld2..$WH ref6 ref7 cosign
+ROW=${REDTEAM_W:-W}   # a fresh ledger W: $OP operates; $C2..$WH ref6 ref7 cosign
 REFS=${REFS-ref6 ref7}   # REFS="" forms a cl-only quorum (a reference armer that pledges a spent coin vetoes the confiscation)
-W=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" cld2 cld3 cld4 cld5 $WH $REFS) || exit 1; echo "== W $W"
-mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$W" 1); FROM=${DEPS[0]}; [ -n "$FROM" ] || fail "no deposit on W"
+W=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" $C2 $C3 $C4 $H $WH $REFS) || exit 1; echo "== W $W"
+FROM=$(fresh_deposits "$ROW" $OP "$W" 1 | head -1); [ -n "$FROM" ] || fail "no deposit on W (see the wallet error above)"
 
-# The fraud: $OP locks a depositor's funds with no witness, cld2..cld4 cosign blind.
-for n in cld2 cld3 cld4; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
+# The fraud: $OP locks a depositor's funds with no witness, $C2..$C4 cosign blind.
+for n in $C2 $C3 $C4; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
 cld_ctl $OP "(:forge-lock :ledger \"$W\" :from \"$FROM\" :to \"$FROM\" :msat 1000000)" >/dev/null
 sleep 10
-for n in cld2 cld3 cld4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null; done
-taint "$OP"   # it committed the fraud
+for n in $C2 $C3 $C4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null; done
+taint "$OP" $C2 $C3 $C4   # it committed the fraud; they cosigned it blind
 
 # $WH will dispute, arm, confiscate — but withhold its reveal.
 expect "$(cld_ctl $WH "(:adversary :set :withhold-reveal t)")"

@@ -21,7 +21,7 @@ trap 'start_cld "$HON" >/dev/null 2>&1; for r in ref6 ref7; do ref_running $r ||
 ROW=${REDTEAM_R:-R}
 R=$(COLLATERAL_SATS=25000000 form_ledger "$ROW" $OP "" cld2 cld3 cld4 cld5 $HON ref6 ref7) || exit 1; echo "== R $R ($OP operates; cld2..$HON ref6 ref7 cosign)"
 # A credited deposit on R, so the forged lock is a real over-balance/no-witness fault.
-mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$R" 1); DEP=${DEPS[0]}; [ -n "$DEP" ] || fail "no deposit on R"
+mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$R" 1); DEP=${DEPS[0]:-}; [ -n "$DEP" ] || fail "no deposit on R"
 FROM="$DEP"
 
 # Stop the honest replicas.  Their data dirs persist; they catch up on restart.

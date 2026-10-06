@@ -29,8 +29,8 @@ with the file).  Results of running them live go in docs/REDTEAM.md.
 |---|---|
 | Operator ignores transfer/exit requests with no consequence | **new** `attack-censor-hold.sh` — wallet escalates per DEP-12 (`wallet-escalate` → `delivery_embed`), operator ignores (`:ignore-requests` adversary switch); measures whether anything acts on the embed (today: nothing — `verify-censorship` has no caller; that is the finding). |
 | Fee collection makes an escalated request unservable | **new** same script, second phase: after the embed, operator drains the deposit via forged fees; `verify-censorship`'s servability rule is checked offline by the script (the honest-operator-framing guard). |
-| Lottery goes unclaimed: last revealer withholds | **new** `attack-withhold-reveal.sh` — arm a dispute, confiscate, then one armer (adversary `:withhold-reveal`) never publishes its preimage; measures how long custody waits and whether the recovery sweep (`sweep-lottery`) fires. |
-| Lottery N (committed under Q, armed k) | **have** drive-dispute's full-arming wait; **new** the withhold script also runs with fewer armers than Q. |
+| Lottery goes unclaimed: last revealer withholds | **have** `attack-withhold-reveal.sh` — one armer (adversary `:withhold-reveal`) never publishes its preimage; DEP-06 subset leaves: past the 72-block deadline a revealer claims with the voters' attestation. PASS = claimed by a revealer, never the withholder or the accused. |
+| Lottery N (committed under Q, armed k) | **resolved** (DEP-06): contributions are 1..60 whatever the arming count; veto-pledge and withhold-reveal run with fewer armers than Q. |
 
 ## Honest parties punished
 

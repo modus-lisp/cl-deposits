@@ -8,7 +8,7 @@ source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"; ARM=${1:-honest}; WAIT=${WAIT:-180}
 ROW=${REDTEAM_FL:-FL}
 A=$(COLLATERAL_SATS=25000000 form_ledger "$ROW" cld1 "" cld2 cld3 ref2) || exit 1; AS=${A:0:8}
-mapfile -t DEPS < <(fresh_deposits "$ROW" cld1 "$A" 2); FROM=${DEPS[0]}; TO=${DEPS[1]}
+mapfile -t DEPS < <(fresh_deposits "$ROW" cld1 "$A" 2); FROM=${DEPS[0]:-}; TO=${DEPS[1]:-}
 [ -n "$FROM" ] && [ -n "$TO" ] || fail "no deposits on A"
 bal() { "$CLD_SRC/devnet/cld-wallet.sh" w1 "$A" balance "$1" 2>/dev/null | grep -oE ':BALANCE [0-9]+ :LOCKED [0-9]+'; }
 BAL0=$(bal $FROM); echo "== target A ($AS…, cld1 operates; cld2 cld3 ref2 cosign); victim deposit $FROM: $BAL0"

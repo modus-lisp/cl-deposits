@@ -445,6 +445,10 @@
                                       :ledger-hash (up:chain-hash (tip rec)) :quorum-expiry expiry
                                       :ruleset ruleset :network (intern (string-upcase (node-network node)) :keyword))))
     (when (null staged) (fail "no staged members"))
+    ;; A member whose commitment has already lapsed would make the quorum born
+    ;; expired (every value-moving op refused): say which, rather than pin it.
+    (when (<= expiry (height node))
+      (fail "quorum would be born expired: a member's commitment ends at ~a, height ~a" expiry (height node)))
     (setf (record-pinned rec) (cons reserves expiry))
     reserves))
 
