@@ -956,3 +956,26 @@ keys for good (contagion), hence 48 cl nodes.
   collateral (ticker refill); withhold-reveal needs a cl-only quorum (a mixed one cannot reach the
   confiscation majority with a single honest disputant); veto-pledge read log lines left by earlier
   runs.
+
+### 2026-10-06 — the subset lottery on regtest; two reference liveness bugs
+
+The DEP-06 lottery redesign (a claim leaf per revealer subset, voter-attested; contributions 1..60;
+nothing ever pays the accused) ran on a reset regtest network. Batch 1006-033953: **collude-q7,
+vault-spend and withhold-reveal PASS** — the withholder only removed itself and a revealer claimed
+through its subset leaf. The harness now mints fresh-key cl nodes when too few untainted ones remain
+(`mint_cl`), so contagion no longer exhausts the suite.
+
+Failures, and what they were:
+- *veto-pledge-sole / -reopen*: not the lottery. The three colluders were set `:ignore-fraud`, so they
+  held no fork and never signed the confiscation; with 2 of the 4 signatures needed it could not land
+  at Tier 0. A majority that refuses to sign blocks Tier 0 by design. The modes now have the colluders
+  arm with spent pledges (excluded), leaving the honest armer sole.
+- *"add-member refN: no answer"* (recurring): a reference liveness bug. The run loop made blocking
+  chain-backend calls inline (wallet sync, block-height sync, and a pledge re-check inside
+  `handle_dispute`), each with a 60 s HTTP timeout that a tokio timeout cannot preempt. Against a busy
+  bitcoind ref6 spent 120 s per dispute message and once 3.7 h in a single dispute drain, and every
+  request it routes (consent, cosign) timed out. Fixed in deposits-rust 36961e5 and 60f1a10: those
+  calls run on the blocking pool, bounded, and each drain yields after 2 s; a phase over 5 s is logged.
+- *withhold-reveal `DEPS[0]: unbound variable`*: a wallet open refused on a ledger whose quorum was
+  born expired (a member's commitment had lapsed); prepare-quorum now refuses that, and the harness
+  reports the wallet's error.

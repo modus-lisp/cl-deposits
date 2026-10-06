@@ -26,10 +26,8 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   now self-evident (no embedding) on both sides, and `original_fraud_block_hash` serialises as hex.
   Exercised end to end on the devnet (2026-10-02, `redteam/attack-dereliction.sh`, short
   `dispute_response_blocks`): proof produced, derelict's ledger disputed, acting member untouched.
-- **Lottery recovery after a withheld reveal.** When an armer withholds its preimage, cl's honest
-  armers loop on "missing a reveal" and never take the recovery path; recovery needs 3 signatures
-  and gets 1. Shown live 2026-10-02: the lottery output unspent 187 blocks after confiscation (past
-  CSV-144). Neither the claim nor the recovery leaf moves the funds.
+- ~~**Lottery recovery after a withheld reveal.**~~ **Done (2026-10-06):** DEP-06 subset leaves; past the
+  72-block deadline a revealer claims with the voters' attestation. withhold-reveal PASSes on regtest.
 - ~~**Invalid armer collateral vetoes a confiscation.**~~ **Done (2026-10-02):** DEP-03 makes the
   participant set an eligibility cut (pledge confirmed by, unspent through, and worth its
   declaration at the snapshot E); a failing armer is excluded, not a veto. One eligible armer
@@ -58,19 +56,11 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   operator rotates its vault itself; cl members now rebuild and sign that rotation. Soak ledger B
   (ref2) rotated with four cl cosigners.
 
-- **A lottery made unclaimable by exclusion (found 2026-10-03, regtest).** A committed preimage is
-  sized for n, the quorum's recovery voters (17 + seed mod n bytes, DEP-06 / `derive-preimage`), but the
-  claim leaf bounds it by k, the lottery's actual participants. The DEP-03 eligibility cut excludes
-  armers, so k < n, and each remaining preimage is then out of bounds with probability (n-k)/n: at
-  n = 7, one exclusion makes the lottery unclaimable ~60% of the time. The output then waits for the
-  CSV-144 recovery sweep, which pays the original operator, the fraudster. A colluder that arms and
-  spends its pledge (the veto the cut was meant to close) turns it into a probable refund. Seen live
-  in veto-pledge-reopen ("a preimage is out of the claim leaf's bounds"). Fix candidates: bound the
-  claim leaf by n, not k (changes the lottery script shape; both implementations and the vectors), or
-  re-derive and re-commit preimages for k at the cut. Spec decision.
-- **Withhold-reveal holds custody indefinitely (confirmed on regtest, 2026-10-03).** The confiscation
-  lands, the withholder never reveals, and the lottery output was still unspent ~450 blocks later:
-  no claim and no CSV-144 recovery sweep (recovery collects too few signatures).
+- ~~**A lottery made unclaimable by exclusion; withhold-reveal holds custody.**~~ **Done (2026-10-06):**
+  contributions are 1..60 whatever the arming count, a CSV-72 claim leaf per revealer subset is
+  attested by the recovery voters, and no recovery spend pays the accused (spec 7701a43, cl f788f64,
+  deposits-rust f430f56, shared vector `lottery_subsets.txt`). Open: nobody revealing leaves the output
+  for a re-arm round that neither implementation orchestrates yet.
 - **Past expiry, a quorum confiscates its own vault long before Tier 1 opens.** Every member arms
   on the QuorumExpired proof and the confiscation lands within blocks; Tier 1 (expiry + 720) is
   reachable only while the whole quorum is idle. Correct, but it means the recovery tiers are
@@ -120,8 +110,6 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   rotation exits, nor that the request must still be servable at the deadline.
 - **`UncreditedLightningPayment`** (DEP-03's table) and DEP-11's Lightning credit obligation remain,
   although Lightning is no longer an obligation under DEP-20.
-- **Lottery N** (docs/LOTTERY-N.md): committed under Q, claimed under k. Mitigated in cl, not
-  resolved in the spec.
 - **Accountable signing rounds:** undecided (docs/REDTEAM.md, attack #2).
 
 ## Analysis
