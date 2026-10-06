@@ -90,16 +90,18 @@ for r in $REFS; do grep -h "armer ${VCPK:0:16} excluded from the lottery" "$CLD_
 # it evaluates (later arms move E, so a node logs several).  At any one E all must agree, and the
 # E the confiscation was built at must have been seen by cl and the reference alike.
 sets=$( { for n in $VC $H $C2; do cld_ctl $n "(:log :since $VC_LOG0)" 2>/dev/null | tr '"' '\n' | grep "lottery participants of ${V:0:16}" | sed "s/^/cl $n /"; done
-          for r in $REFS; do grep -h "lottery participants of ${V:0:16}" "$CLD_ROOT/$r/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | sed -E "s/.*(lottery participants of)/ref $r \1/; s/ \([^)]*\)//g" | sort -u; done; } )
+          for r in $REFS; do grep -h "lottery participants of ${V:0:16}" "$CLD_ROOT/$r/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | sed -E "s/.*(lottery participants of)/ref $r \1/; s/ \([^)]*\)//g" | awk '!seen[$0]++'; done; } )
 verdict=$(echo "$sets" | python3 -c '
 import re,sys
-by={}
+# A node can log two sets at one E (an arm at or below E arrived late): its last view at each E counts.
+last={}
 for l in sys.stdin:
     m=re.search(r"^(\S+) (\S+) .*at snapshot (\d+): \[([^\]]*)\]; excluded: \[([^\]]*)\]", l)
     if not m: continue
     impl,node,e=m.group(1),m.group(2),int(m.group(3))
-    key=(tuple(sorted(m.group(4).split())), tuple(sorted(m.group(5).replace(","," ").split())))
-    by.setdefault(e,{}).setdefault(key,set()).add(impl+":"+node)
+    last[(impl+":"+node,e)]=(tuple(sorted(m.group(4).split())), tuple(sorted(m.group(5).replace(","," ").split())))
+by={}
+for (who,e),key in last.items(): by.setdefault(e,{}).setdefault(key,set()).add(who)
 bad=[(e,v) for e,v in by.items() if len(v)>1]
 for e in sorted(by):
     for k,who in by[e].items(): print("   E=%d %d in, %d out: %s" % (e,len(k[0]),len(k[1])," ".join(sorted(who))))
