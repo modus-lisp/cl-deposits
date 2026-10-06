@@ -86,40 +86,34 @@ taint "$VC"
 echo "   pledge spent: ${spent:-not seen}"
 echo "   exclusion:    ${excluded:-not logged by cl members}"
 for r in $REFS; do grep -h "armer ${VCPK:0:16} excluded from the lottery" "$CLD_ROOT/$r/node.log" 2>/dev/null | tail -1 | sed "s/\x1b\[[0-9;]*m//g; s/^/   $r: /"; done
-# Cross-implementation agreement: each implementation logs its participant set at every snapshot E
-# it evaluates (later arms move E, so a node logs several).  At any one E all must agree, and the
-# E the confiscation was built at must have been seen by cl and the reference alike.
-sets=$( { for n in $VC $H $C2; do cld_ctl $n "(:log :since $VC_LOG0)" 2>/dev/null | tr '"' '\n' | grep "lottery participants of ${V:0:16}" | sed "s/^/cl $n /"; done
-          for r in $REFS; do grep -h "lottery participants of ${V:0:16}" "$CLD_ROOT/$r/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | sed -E "s/.*(lottery participants of)/ref $r \1/; s/ \([^)]*\)//g" | awk '!seen[$0]++'; done; } )
-verdict=$(echo "$sets" | python3 -c '
+# Cross-implementation agreement on the final cut.  A member's view at a given E is transient (an arm
+# at or below E can arrive later without moving E), so compare views once every arm has arrived:
+# cl's cut evaluated now, against the reference's latest logged cut.
+sleep 30
+cl_view=$(for n in $H $VC $C2; do cld_ctl $n "(:lottery-set :ledger \"$V\")" 2>/dev/null; done | python3 -c '
 import re,sys
-# A node can log two sets at one E (an arm at or below E arrived late): its last view at each E counts.
-last={}
 for l in sys.stdin:
-    m=re.search(r"^(\S+) (\S+) .*at snapshot (\d+): \[([^\]]*)\]; excluded: \[([^\]]*)\]", l)
-    if not m: continue
-    impl,node,e=m.group(1),m.group(2),int(m.group(3))
-    last[(impl+":"+node,e)]=(tuple(sorted(m.group(4).split())), tuple(sorted(m.group(5).replace(","," ").split())))
-by={}
-for (who,e),key in last.items(): by.setdefault(e,{}).setdefault(key,set()).add(who)
-bad=[(e,v) for e,v in by.items() if len(v)>1]
-for e in sorted(by):
-    for k,who in by[e].items(): print("   E=%d %d in, %d out: %s" % (e,len(k[0]),len(k[1])," ".join(sorted(who))))
-shared=[e for e,v in by.items() if any(w.startswith("cl:") for ws in v.values() for w in ws) and any(w.startswith("ref:") for ws in v.values() for w in ws)]
-print("DISAGREE" if bad else ("AGREE" if shared or not any(w.startswith("ref:") for v in by.values() for ws in v.values() for w in ws) else "NO-SHARED-E"))
-')
-echo "$verdict" | sed '$d'
-case "$(echo "$verdict" | tail -1)" in
-  DISAGREE) fail "implementations disagree on the participant set at the same snapshot";;
-  NO-SHARED-E) echo "   (cl and the reference never evaluated the same snapshot)";;
-esac
+    m=re.search(r":SNAPSHOT (\d+) :PARTICIPANTS \(([^)]*)\) :EXCLUDED (NIL|\(([^)]*)\))", l)
+    if m: print("cl", m.group(1), " ".join(sorted(re.findall(r"[0-9a-f]{16}", m.group(2)))), "|", " ".join(sorted(re.findall(r"[0-9a-f]{16}", m.group(4) or ""))))
+' | sort -u)
+ref_view=$(for r in $REFS; do grep -h "lottery participants of ${V:0:16}" "$CLD_ROOT/$r/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1 | python3 -c '
+import re,sys
+for l in sys.stdin:
+    m=re.search(r"at snapshot (\d+): \[([^\]]*)\]; excluded: \[([^\]]*)\]", l)
+    if m: print("ref", m.group(1), " ".join(sorted(m.group(2).split())), "|", " ".join(sorted(re.findall(r"[0-9a-f]{16}", m.group(3)))))
+'; done | sort -u)
+echo "$cl_view$( [ -n "$ref_view" ] && printf '\n%s' "$ref_view")" | sed '/^$/d; s/^/   final cut: /'
+nviews=$(printf '%s\n%s\n' "$cl_view" "$ref_view" | sed '/^$/d' | cut -d' ' -f2- | sort -u | wc -l)
+[ "$nviews" -le 1 ] || fail "cl and the reference disagree on the final participant set (E, members, excluded)"
+verdict=$(printf '%s\n%s\n' "$cl_view" "$ref_view" | sed '/^$/d; s/^\S* /   E=/')
+sets=$(printf '%s\n%s\n' "$cl_view" "$ref_view" | sed '/^$/d' | sed -E 's/^\S+ ([0-9]+) ([^|]*)\| (.*)/at snapshot \1: [\2]; excluded: [\3]/')
 [ -n "$spent" ] || fail "the adversary never spent its pledge (did $VC arm with one?)"
 [ -n "$conf" ] || fail "no confiscation within ${WAIT}s: a spent pledge still vetoes the dispute"
 # A veto test only if the spend confirmed at or before a snapshot E the members cut at; otherwise
 # the adversary was rightly a participant and the run says nothing about the veto: INVALID, retried.
 spend_tx=$(grep -oE ' in [0-9a-f]{64}' <<<"$spent" | grep -oE '[0-9a-f]{64}')
 spend_h=""; [ -n "$spend_tx" ] && spend_h=$(bcli getrawtransaction "$spend_tx" true 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("blockhash",""))' | xargs -r bcli getblockheader 2>/dev/null | grep -oE '"height": [0-9]+' | grep -oE '[0-9]+')
-cut_e=$(echo "$verdict" | grep -E "^   E=" | while read -r _ e rest; do echo "${e#E=}"; done | sort -n | tail -1)
+cut_e=$(echo "$sets" | grep -oE "snapshot [0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1)
 excluded_at=$(echo "$sets" | grep -E "excluded: \[[^]]*${VCPK:0:16}" | grep -oE 'snapshot [0-9]+' | grep -oE '[0-9]+' | sort -n | head -1)
 echo "   spend confirmed at ${spend_h:-?}; snapshots evaluated up to ${cut_e:-?}; adversary excluded at ${excluded_at:-never}"
 if [ "$MODE" = veto ] && [ -z "$excluded_at" ]; then

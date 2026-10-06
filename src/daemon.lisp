@@ -146,6 +146,12 @@
              (declare (ignore out))
              (unless (zerop code) (error "sendrawtransaction rejected the theft: ~a" (substitute #\Space #\Newline (string-trim '(#\Newline #\Space) err)))))
            (ok :txid (txid-hex (cl-consensus.tx:tx-txid tx)) :sigs n :warning "unauthorised vault spend broadcast")))
+        (:lottery-set   ; (:lottery-set :ledger L) — the eligibility cut over every arm we hold now
+         (let ((id (arg form :ledger)))
+           (multiple-value-bind (in out snapshot) (nd:lottery-armers node id)
+             (ok :snapshot snapshot
+                 :participants (sort (mapcar (lambda (a) (subseq (bytes->hex (first a)) 0 16)) in) #'string<)
+                 :excluded (sort (mapcar (lambda (x) (subseq (bytes->hex (first (car x))) 0 16)) out) #'string<)))))
         (:forks (ok :forks (mapcar (lambda (f) (list :operator (subseq (bytes->hex (nd::record-fork-operator f)) 0 16) :seq (lg:ledger-sequence (nd:record-ledger f))
                                                      :state (lg:ledger-dispute-state (nd:record-ledger f)) :armed (and (nd:record-preimage f) t)))
                                    (nd:forks-of node (arg form :ledger)))))
