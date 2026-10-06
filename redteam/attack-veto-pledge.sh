@@ -82,18 +82,31 @@ taint "$VC"
 echo "   pledge spent: ${spent:-not seen}"
 echo "   exclusion:    ${excluded:-not logged by cl members}"
 for r in $REFS; do grep -h "armer ${VCPK:0:16} excluded from the lottery" "$CLD_ROOT/$r/node.log" 2>/dev/null | tail -1 | sed "s/\x1b\[[0-9;]*m//g; s/^/   $r: /"; done
-# Cross-implementation agreement: every implementation's participant set and snapshot E for V.
-sets=$( { for n in $VC $H $C2; do cld_ctl $n "(:log :since $VC_LOG0)" 2>/dev/null | tr '"' '\n' | grep "lottery participants of ${V:0:16}" | tail -1; done
-          for r in $REFS; do grep -h "lottery participants of ${V:0:16}" "$CLD_ROOT/$r/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1 | sed -E 's/.*(lottery participants of)/\1/; s/ \([^)]*\)//g'; done; } )
-echo "$sets" | sed '/^$/d; s/^/   set: /'
-nsets=$(echo "$sets" | python3 -c '
+# Cross-implementation agreement: each implementation logs its participant set at every snapshot E
+# it evaluates (later arms move E, so a node logs several).  At any one E all must agree, and the
+# E the confiscation was built at must have been seen by cl and the reference alike.
+sets=$( { for n in $VC $H $C2; do cld_ctl $n "(:log :since $VC_LOG0)" 2>/dev/null | tr '"' '\n' | grep "lottery participants of ${V:0:16}" | sed "s/^/cl $n /"; done
+          for r in $REFS; do grep -h "lottery participants of ${V:0:16}" "$CLD_ROOT/$r/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | sed -E "s/.*(lottery participants of)/ref $r \1/; s/ \([^)]*\)//g" | sort -u; done; } )
+verdict=$(echo "$sets" | python3 -c '
 import re,sys
-seen=set()
+by={}
 for l in sys.stdin:
-    m=re.search(r"at snapshot (\d+): \[([^\]]*)\]; excluded: \[([^\]]*)\]", l)
-    if m: seen.add((m.group(1), tuple(sorted(m.group(2).split())), tuple(sorted(m.group(3).replace(",", " ").split()))))
-print(len(seen))')
-[ "$nsets" -le 1 ] || fail "implementations disagree on the participant set or snapshot"
+    m=re.search(r"^(\S+) (\S+) .*at snapshot (\d+): \[([^\]]*)\]; excluded: \[([^\]]*)\]", l)
+    if not m: continue
+    impl,node,e=m.group(1),m.group(2),int(m.group(3))
+    key=(tuple(sorted(m.group(4).split())), tuple(sorted(m.group(5).replace(","," ").split())))
+    by.setdefault(e,{}).setdefault(key,set()).add(impl+":"+node)
+bad=[(e,v) for e,v in by.items() if len(v)>1]
+for e in sorted(by):
+    for k,who in by[e].items(): print("   E=%d %d in, %d out: %s" % (e,len(k[0]),len(k[1])," ".join(sorted(who))))
+shared=[e for e,v in by.items() if any(w.startswith("cl:") for ws in v.values() for w in ws) and any(w.startswith("ref:") for ws in v.values() for w in ws)]
+print("DISAGREE" if bad else ("AGREE" if shared or not any(w.startswith("ref:") for v in by.values() for ws in v.values() for w in ws) else "NO-SHARED-E"))
+')
+echo "$verdict" | sed '$d'
+case "$(echo "$verdict" | tail -1)" in
+  DISAGREE) fail "implementations disagree on the participant set at the same snapshot";;
+  NO-SHARED-E) echo "   (cl and the reference never evaluated the same snapshot)";;
+esac
 [ -n "$spent" ] || fail "the adversary never spent its pledge (did $VC arm with one?)"
 [ -n "$conf" ] || fail "no confiscation within ${WAIT}s: a spent pledge still vetoes the dispute"
 n_out=$(bcli getrawtransaction "$conf" true 2>/dev/null | grep -c '"scriptPubKey"')
