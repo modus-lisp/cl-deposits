@@ -25,6 +25,9 @@ REFS=${REFS-ref6 ref7}
 V=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" $C2 $C3 $C4 $H $VC $REFS) || exit 1; echo "== V $V"
 mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$V" 1); FROM=${DEPS[0]:-}; [ -n "$FROM" ] || fail "no deposit on V"
 
+VCPK=$(pubkey_of "$VC")
+# Everything the adversary logs from here on, however much else floods its log.
+VC_LOG0=$(cld_ctl $VC '(:log :tail 0)' | grep -oE ':COUNT [0-9]+' | grep -oE '[0-9]+'); VC_LOG0=${VC_LOG0:-0}
 # Arm the adversary before the fraud: an honest member disputes (and arms) on sight of it, before a
 # switch set afterwards could take effect (veto-pledge-sole, 2026-10-03: VC armed and kept its pledge).
 expect "$(cld_ctl $VC "(:adversary :set :spend-pledge t)")"
@@ -54,13 +57,12 @@ cld_ctl $VC "(:dispute-enter :ledger \"$V\" :reason \"redteam veto-pledge\")" >/
 # only lines that were not already there when this run started.
 OLD=$(for n in $VC $H $C2; do cld_ctl $n '(:log)' 2>/dev/null; done | tr '"' '\n' | grep "adversary: spent our pledge" | sort -u)
 fresh() { grep -vxF -f <(printf '%s\n' "${OLD:-@@none@@}"); }
-VCPK=$(pubkey_of "$VC")
 echo "== waiting for the confiscation (up to ${WAIT}s)"
 conf=""; spent=""; excluded=""; released=""
 for i in $(seq 1 $WAIT); do
   logs=$(for n in $VC $H $C2; do cld_ctl $n '(:log :tail 400)' 2>/dev/null; done | tr '"' '\n')
   # The adversary's own log, read deep: contagion floods a node's log past a short tail.
-  [ -z "$spent" ] && spent=$(cld_ctl $VC '(:log :tail 5000)' 2>/dev/null | tr '"' '\n' | grep "adversary: spent our pledge" | fresh | head -1)
+  [ -z "$spent" ] && spent=$(cld_ctl $VC "(:log :since $VC_LOG0)" 2>/dev/null | tr '"' '\n' | grep "adversary: spent our pledge" | head -1)
   # The members' exclusion of $VC for a spent pledge is the same evidence, and survives a lost log read.
   [ -z "$spent" ] && spent=$(grep -m1 "armer ${VCPK:0:8} excluded from ${V:0:8}'s lottery: pledge spent" <<<"$logs")
   [ -z "$excluded" ] && excluded=$(grep -m1 "excluded from ${V:0:8}'s lottery" <<<"$logs")
@@ -80,6 +82,18 @@ taint "$VC"
 echo "   pledge spent: ${spent:-not seen}"
 echo "   exclusion:    ${excluded:-not logged by cl members}"
 for r in $REFS; do grep -h "armer ${VCPK:0:16} excluded from the lottery" "$CLD_ROOT/$r/node.log" 2>/dev/null | tail -1 | sed "s/\x1b\[[0-9;]*m//g; s/^/   $r: /"; done
+# Cross-implementation agreement: every implementation's participant set and snapshot E for V.
+sets=$( { for n in $VC $H $C2; do cld_ctl $n "(:log :since $VC_LOG0)" 2>/dev/null | tr '"' '\n' | grep "lottery participants of ${V:0:16}" | tail -1; done
+          for r in $REFS; do grep -h "lottery participants of ${V:0:16}" "$CLD_ROOT/$r/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1 | sed -E 's/.*(lottery participants of)/\1/; s/ \([^)]*\)//g'; done; } )
+echo "$sets" | sed '/^$/d; s/^/   set: /'
+nsets=$(echo "$sets" | python3 -c '
+import re,sys
+seen=set()
+for l in sys.stdin:
+    m=re.search(r"at snapshot (\d+): \[([^\]]*)\]; excluded: \[([^\]]*)\]", l)
+    if m: seen.add((m.group(1), tuple(sorted(m.group(2).split())), tuple(sorted(m.group(3).replace(",", " ").split()))))
+print(len(seen))')
+[ "$nsets" -le 1 ] || fail "implementations disagree on the participant set or snapshot"
 [ -n "$spent" ] || fail "the adversary never spent its pledge (did $VC arm with one?)"
 [ -n "$conf" ] || fail "no confiscation within ${WAIT}s: a spent pledge still vetoes the dispute"
 n_out=$(bcli getrawtransaction "$conf" true 2>/dev/null | grep -c '"scriptPubKey"')

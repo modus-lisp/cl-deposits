@@ -45,8 +45,11 @@
         (:info (ok :pubkey (nd:node-pubkey-hex node) :height (nd:height node)
                    :inbox (getf (nd:inbox-depths node) :inbox) :cosign-inbox (getf (nd:inbox-depths node) :cosign-inbox)
                    :ledgers (loop for rec being the hash-values of (nd:node-ledgers node) collect (ledger-summary node rec))))
-        (:log (let ((n (arg form :tail)))   ; (:log [:tail N]) — the last N entries only
-                (ok :log (reverse (if n (subseq (nd:node-log node) 0 (min n (length (nd:node-log node)))) (nd:node-log node))))))
+        (:log (let* ((all (nd:node-log node)) (len (length all))
+                     ;; (:log [:tail N] [:since K]) — the last N entries, or every entry after the
+                     ;; first K (K from an earlier :count), so a flood cannot push a line out of reach
+                     (n (or (arg form :tail) (let ((k (arg form :since))) (and k (max 0 (- len k)))) len)))
+                (ok :count len :log (reverse (subseq all 0 (min n len))))))
         (:adversary   ; (:adversary :set KEY t|nil ...) / (:adversary) — red team switches, docs/REDTEAM.md
          (loop for (k v) on (cdr (member :set form)) by #'cddr
                do (setf (getf (nd:node-adversary node) k) v))

@@ -1932,6 +1932,14 @@
         (split-armers (armers-of node id-hex) floor-sats (node-pledge-fn node) :tip (height node))
       (dolist (x out)
         (log! node "armer ~a excluded from ~a's lottery: ~a" (subseq (bytes->hex (first (car x))) 0 8) (subseq id-hex 0 8) (cdr x)))
+      ;; Comparable with the reference's "lottery participants of" line: the set and E.
+      (let ((line (format nil "lottery participants of ~a at snapshot ~a: [~{~a~^ ~}]; excluded: [~{~a~^ ~}]"
+                          (subseq id-hex 0 16) snapshot
+                          (sort (mapcar (lambda (a) (subseq (bytes->hex (first a)) 0 16)) in) #'string<)
+                          (sort (mapcar (lambda (x) (subseq (bytes->hex (first (car x))) 0 16)) out) #'string<))))
+        (unless (equal line (gethash (cons :participants id-hex) (node-dispute-notes node)))
+          (setf (gethash (cons :participants id-hex) (node-dispute-notes node)) line)
+          (log! node "~a" line)))
       (values in out snapshot floor-sats))))
 
 (defun collateral-floor-sats (base &key (claim-fee *claim-fee-floor-sats*))
