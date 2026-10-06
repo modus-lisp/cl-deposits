@@ -62,7 +62,11 @@ conf=""; spent=""; excluded=""; released=""
 for i in $(seq 1 $WAIT); do
   logs=$(for n in $VC $H $C2; do cld_ctl $n '(:log :tail 400)' 2>/dev/null; done | tr '"' '\n')
   # The adversary's own log, read deep: contagion floods a node's log past a short tail.
-  [ -z "$spent" ] && spent=$(cld_ctl $VC "(:log :since $VC_LOG0)" 2>/dev/null | tr '"' '\n' | grep "adversary: spent our pledge" | head -1)
+  if [ -z "$spent" ]; then
+    spent=$(cld_ctl $VC "(:log :since $VC_LOG0)" 2>/dev/null | tr '"' '\n' | grep "adversary: spent our pledge" | head -1)
+    # Confirm the spend at once, so it is buried before the later armers move E past it.
+    [ -n "$spent" ] && mine 1 >/dev/null
+  fi
   # The members' exclusion of $VC for a spent pledge is the same evidence, and survives a lost log read.
   [ -z "$spent" ] && spent=$(grep -m1 "armer ${VCPK:0:8} excluded from ${V:0:8}'s lottery: pledge spent" <<<"$logs")
   [ -z "$excluded" ] && excluded=$(grep -m1 "excluded from ${V:0:8}'s lottery" <<<"$logs")
@@ -109,6 +113,19 @@ case "$(echo "$verdict" | tail -1)" in
 esac
 [ -n "$spent" ] || fail "the adversary never spent its pledge (did $VC arm with one?)"
 [ -n "$conf" ] || fail "no confiscation within ${WAIT}s: a spent pledge still vetoes the dispute"
+# A veto test only if the spend confirmed at or before a snapshot E the members cut at; otherwise
+# the adversary was rightly a participant and the run says nothing about the veto: INVALID, retried.
+spend_tx=$(grep -oE ' in [0-9a-f]{64}' <<<"$spent" | grep -oE '[0-9a-f]{64}')
+spend_h=""; [ -n "$spend_tx" ] && spend_h=$(bcli getrawtransaction "$spend_tx" true 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("blockhash",""))' | xargs -r bcli getblockheader 2>/dev/null | grep -oE '"height": [0-9]+' | grep -oE '[0-9]+')
+cut_e=$(echo "$verdict" | grep -E "^   E=" | while read -r _ e rest; do echo "${e#E=}"; done | sort -n | tail -1)
+excluded_at=$(echo "$sets" | grep -E "excluded: \[[^]]*${VCPK:0:16}" | grep -oE 'snapshot [0-9]+' | grep -oE '[0-9]+' | sort -n | head -1)
+echo "   spend confirmed at ${spend_h:-?}; snapshots evaluated up to ${cut_e:-?}; adversary excluded at ${excluded_at:-never}"
+if [ "$MODE" = veto ] && [ -z "$excluded_at" ]; then
+  if [ -z "$spend_h" ] || [ -z "$cut_e" ] || [ "$spend_h" -gt "$cut_e" ]; then
+    echo "INVALID: the spend confirmed at ${spend_h:-?}, after every snapshot (${cut_e:-?}): $VC was rightly a participant"; exit 75
+  fi
+  fail "the spend confirmed at $spend_h <= E $cut_e, yet no member excluded $VC"
+fi
 n_out=$(bcli getrawtransaction "$conf" true 2>/dev/null | grep -c '"scriptPubKey"')
 case "$MODE" in
   veto) echo "PASS: the confiscation $conf landed although $VC spent its pledge; one armer can no longer veto.";;

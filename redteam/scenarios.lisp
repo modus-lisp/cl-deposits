@@ -124,6 +124,7 @@
                  (and in (loop for l = (read-line in nil) while l collect l)))))
     (flet ((starts (p) (find-if (lambda (l) (and (>= (length l) (length p)) (string= p l :end2 (length p)))) lines :from-end t)))
       (cond ((eql exit 124) :timeout)
+            ((starts "INVALID") :invalid)
             ((starts "FAIL") :fail)
             ((starts "SKIP") :skip)
             ((and (starts "PASS") (eql exit 0)) :pass)
@@ -185,7 +186,14 @@
           (dolist (sc chosen) (format t "  would run ~a~%" (sc-name sc)))
           (return-from main 0))
         (ensure-directories-exist (format nil "~a/" dir))
-        (let ((results (mapcar (lambda (sc) (run-one sc run-id dir nodes)) chosen)))
+        (let ((results (mapcar (lambda (sc)
+                                 ;; INVALID: the run could not test what it tests (e.g. a race went the
+                                 ;; other way); retry on a fresh ledger, up to twice.
+                                 (loop for try from 0 to 2
+                                       for r = (run-one sc (if (zerop try) run-id (format nil "~a-r~d" run-id try)) dir nodes)
+                                       unless (eq (second r) :invalid) return r
+                                       finally (return r)))
+                               chosen)))
           (with-open-file (o (format nil "~a/summary.tsv" dir) :direction :output :if-exists :supersede)
             (dolist (r results) (format o "~{~a~^	~}~%" r)))
           (format t "~%~28a ~8a ~6a~%" "scenario" "verdict" "secs")
