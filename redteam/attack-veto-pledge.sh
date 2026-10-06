@@ -59,7 +59,8 @@ echo "== waiting for the confiscation (up to ${WAIT}s)"
 conf=""; spent=""; excluded=""; released=""
 for i in $(seq 1 $WAIT); do
   logs=$(for n in $VC $H $C2; do cld_ctl $n '(:log :tail 400)' 2>/dev/null; done | tr '"' '\n')
-  [ -z "$spent" ] && spent=$(grep "adversary: spent our pledge" <<<"$logs" | fresh | head -1)
+  # The adversary's own log, read deep: contagion floods a node's log past a short tail.
+  [ -z "$spent" ] && spent=$(cld_ctl $VC '(:log :tail 5000)' 2>/dev/null | tr '"' '\n' | grep "adversary: spent our pledge" | fresh | head -1)
   # The members' exclusion of $VC for a spent pledge is the same evidence, and survives a lost log read.
   [ -z "$spent" ] && spent=$(grep -m1 "armer ${VCPK:0:8} excluded from ${V:0:8}'s lottery: pledge spent" <<<"$logs")
   [ -z "$excluded" ] && excluded=$(grep -m1 "excluded from ${V:0:8}'s lottery" <<<"$logs")

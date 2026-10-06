@@ -115,6 +115,9 @@
   ;; forgets its confiscation once the lottery output is spent (the winner's claim), and the vault
   ;; watch must still excuse it.  Persisted in confiscations.txt.
   (known-confiscations (make-hash-table :test (quote equal) :synchronized t))
+  ;; ledger id hex -> ((tx . lottery) ...): every confiscation proposal we signed.  Two
+  ;; proposers can race (cl and reference); whichever lands is one we verified.
+  (signed-confiscations (make-hash-table :test (quote equal) :synchronized t))
   ;; (accused spent-ledger spend-tx governing-seq) -> (universal-time ok why): one theft yields a proof
   ;; per signer, key parity and operated ledger, and verifying fetches the spent ledger's history
   (vault-spend-verdicts (make-hash-table :test (quote equal) :synchronized t))
@@ -1310,9 +1313,12 @@
 (defconstant +max-arms+ 4 "Arms that count per armer: the first and up to three re-arms (DEP-03).")
 
 (defun confiscated-lottery (node id-hex)
-  "The confiscation of ID-HEX that is on chain, rebuilt from public state:
-   (values tx lottery :pending) while its lottery output is unspent, else NIL."
+  "The confiscation of ID-HEX that is on chain: one we signed, or rebuilt from
+   public state.  (values tx lottery :pending) while its lottery output is unspent."
   (when (node-chain-fn node)
+    (loop for (tx . l) in (gethash id-hex (node-signed-confiscations node))
+          when (funcall (node-chain-fn node) (btx:tx-txid tx) 0)
+            do (return-from confiscated-lottery (values tx l :pending)))
     (let ((built (rebuild-confiscation-on-chain node id-hex)))
       (when built (values (first built) (second built) :pending)))))
 
@@ -2222,8 +2228,12 @@
                       (car (aref prevouts 0)) (subseq (bytes->hex (cdr (aref prevouts 0))) 0 16)
                       (lg:ledger-sequence (record-ledger (find-record node id)))
                       (mapcar (lambda (o) (cons (btx:txout-value o) (subseq (bytes->hex (btx:txout-script o)) 0 12))) (btx:tx-outputs tx))))
-              ;; Its txid does not depend on the witness: keep it, the claim spends it.
+              ;; Its txid does not depend on the witness: keep it, the claim spends it.  Keep every
+              ;; one we sign, too: a proposal from another proposer may be the one that lands.
               (dolist (fork (forks-of node id)) (setf (record-lottery fork) lottery (record-confiscation fork) proposed))
+              (unless (find (btx:tx-txid proposed) (gethash id (node-signed-confiscations node))
+                            :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
+                (push (cons proposed lottery) (gethash id (node-signed-confiscations node))))
               (log! node "signed confiscation of ~a proposed by ~a (fee ~a sats)" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8) fee)
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
                                                            "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))))
@@ -2711,6 +2721,7 @@
         (when (and o (eq (op:operation-type o) :quorum-begin)) (push (op:field o :new-outpoint-txid) ids))))
     (dolist (r (cons rec (forks-of node (record-id-hex rec))))
       (when (record-confiscation r) (pushnew (btx:tx-txid (record-confiscation r)) ids :test #'equalp)))
+    (dolist (e (gethash (record-id-hex rec) (node-signed-confiscations node))) (push (btx:tx-txid (car e)) ids))
     (dolist (txid (gethash (record-id-hex rec) (node-known-confiscations node)))
       (pushnew txid ids :test #'equalp))
     ids))
