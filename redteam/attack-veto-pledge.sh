@@ -9,7 +9,7 @@
 # on chain without VC's veto (VC excluded, or a participant that loses the lottery
 # or forfeits as WinnerCollateralDeviation).  FAIL when it never lands.
 # Modes ($1): veto (default) — every other member arms honestly; sole — a cl-only quorum where
-# the colluders who cosigned the fraud never dispute (:ignore-fraud), so one honest armer (H)
+# the colluders who cosigned the fraud arm but spend their pledges, so one honest armer (H)
 # is the only eligible one and must take custody without a draw; reopen — H also spends its
 # pledge (nobody is eligible), then stops, and must re-arm with a fresh pledge and take custody.
 # REDTEAM_VP=name forms a fresh test ledger per run.
@@ -18,7 +18,7 @@ S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-400}
 source "$(dirname "$0")/_lib.sh"
 MODE=${1:-veto}
 pick OP VC C2 C3 C4 H
-trap 'disarm :spend-pledge "$VC" $H; disarm :ignore-fraud $C2 $C3 $C4' EXIT
+trap 'disarm :spend-pledge "$VC" $H $C2 $C3 $C4' EXIT
 case "$MODE" in sole) ROW=${REDTEAM_VPS:-VPS};; reopen) ROW=${REDTEAM_VPR:-VPR};; *) ROW=${REDTEAM_VP:-VP};; esac
 REFS=${REFS-ref6 ref7}
 [ "$MODE" = veto ] || REFS=""   # sole/reopen: count the armers exactly
@@ -30,7 +30,10 @@ mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$V" 1); FROM=${DEPS[0]:-}; [ -n "
 expect "$(cld_ctl $VC "(:adversary :set :spend-pledge t)")"
 [ "$MODE" = reopen ] && expect "$(cld_ctl $H "(:adversary :set :spend-pledge t)")"
 if [ "$MODE" != veto ]; then   # the colluders who cosigned stay out of the dispute
-  for n in $C2 $C3 $C4; do expect "$(cld_ctl $n "(:adversary :set :ignore-fraud t)")"; done
+  # They dispute but spend their pledges, so they are excluded.  As :ignore-fraud they held no
+  # fork and never signed: the confiscation lacked its 4 of 5 signers, a majority refusing
+  # blocks Tier 0 by design, and that is not what this mode tests (1006 runs).
+  for n in $C2 $C3 $C4; do expect "$(cld_ctl $n "(:adversary :set :spend-pledge t)")"; done
 fi
 
 # The fraud: $OP locks a depositor's funds with no witness and a majority of members cosign blind:
