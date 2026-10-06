@@ -134,8 +134,11 @@
   (let* ((log (format nil "~a/~a.log" dir (sc-name sc)))
          (env (append (sc-env sc)
                       (and (sc-ledger-var sc) (list (format nil "~a=~a-~a" (sc-ledger-var sc) (sc-name sc) run-id)))))
-         (cmd (format nil "env ~{~a ~}timeout --kill-after=15 ~a bash redteam/~a~{ ~a~} >~a 2>&1"
-                      env (sc-timeout sc) (sc-script sc) (sc-args sc) log))
+         ;; Its own process group, killed whole when it ends: `timeout` alone kills only the
+         ;; script's bash, and its subshells (control calls, mining, waits) lived on for hours.
+         (pgfile (format nil "~a/~a.pgid" dir (sc-name sc)))
+         (cmd (format nil "setsid bash -c 'echo $$ >~a; exec env ~{~a ~}timeout --kill-after=15 ~a bash redteam/~a~{ ~a~}' >~a 2>&1; rc=$?; pg=$(cat ~a 2>/dev/null); [ -n \"$pg\" ] && kill -KILL -- -$pg 2>/dev/null; rm -f ~a; exit $rc"
+                      pgfile env (sc-timeout sc) (sc-script sc) (sc-args sc) log pgfile pgfile))
          (t0 (now)) exit)
     (format t "~&-- ~a (~{~(~a~)~^,~}) ... " (sc-name sc) (sc-tags sc)) (finish-output)
     (unwind-protect

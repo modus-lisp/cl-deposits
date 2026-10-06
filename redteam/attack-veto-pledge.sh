@@ -54,13 +54,16 @@ cld_ctl $VC "(:dispute-enter :ledger \"$V\" :reason \"redteam veto-pledge\")" >/
 # only lines that were not already there when this run started.
 OLD=$(for n in $VC $H $C2; do cld_ctl $n '(:log)' 2>/dev/null; done | tr '"' '\n' | grep "adversary: spent our pledge" | sort -u)
 fresh() { grep -vxF -f <(printf '%s\n' "${OLD:-@@none@@}"); }
+VCPK=$(pubkey_of "$VC")
 echo "== waiting for the confiscation (up to ${WAIT}s)"
 conf=""; spent=""; excluded=""; released=""
 for i in $(seq 1 $WAIT); do
-  logs=$(for n in $VC $H $C2; do cld_ctl $n '(:log)' 2>/dev/null; done | tr '"' '\n')
-  [ -z "$spent" ] && spent=$(echo "$logs" | grep "adversary: spent our pledge" | fresh | head -1)
-  [ -z "$excluded" ] && excluded=$(echo "$logs" | grep -m1 "excluded from ${V:0:8}'s lottery")
-  conf=$(echo "$logs" | grep -F "dispute ${V:0:8}:" | grep -oE "confiscation [0-9a-f]{64} on chain" | grep -oE '[0-9a-f]{64}' | head -1)
+  logs=$(for n in $VC $H $C2; do cld_ctl $n '(:log :tail 400)' 2>/dev/null; done | tr '"' '\n')
+  [ -z "$spent" ] && spent=$(grep "adversary: spent our pledge" <<<"$logs" | fresh | head -1)
+  # The members' exclusion of $VC for a spent pledge is the same evidence, and survives a lost log read.
+  [ -z "$spent" ] && spent=$(grep -m1 "armer ${VCPK:0:8} excluded from ${V:0:8}'s lottery: pledge spent" <<<"$logs")
+  [ -z "$excluded" ] && excluded=$(grep -m1 "excluded from ${V:0:8}'s lottery" <<<"$logs")
+  conf=$(grep -F "dispute ${V:0:8}:" <<<"$logs" | grep -oE "confiscation [0-9a-f]{64} on chain" | grep -oE '[0-9a-f]{64}' | head -1)
   [ -n "$conf" ] && [ -n "$(bcli getrawtransaction "$conf" 2>/dev/null | head -c1)" ] && break
   conf=""
   # reopen: once the honest armer has spent its pledge too, let it recover and re-arm.
@@ -75,7 +78,7 @@ cld_ctl $VC "(:adversary :set :spend-pledge nil)" >/dev/null
 taint "$VC"
 echo "   pledge spent: ${spent:-not seen}"
 echo "   exclusion:    ${excluded:-not logged by cl members}"
-for r in $REFS; do grep -h "excluded from the lottery" "$CLD_ROOT/$r/node.log" 2>/dev/null | tail -1 | sed "s/^/   $r: /"; done
+for r in $REFS; do grep -h "armer ${VCPK:0:16} excluded from the lottery" "$CLD_ROOT/$r/node.log" 2>/dev/null | tail -1 | sed "s/\x1b\[[0-9;]*m//g; s/^/   $r: /"; done
 [ -n "$spent" ] || fail "the adversary never spent its pledge (did $VC arm with one?)"
 [ -n "$conf" ] || fail "no confiscation within ${WAIT}s: a spent pledge still vetoes the dispute"
 n_out=$(bcli getrawtransaction "$conf" true 2>/dev/null | grep -c '"scriptPubKey"')

@@ -685,9 +685,11 @@
 
 (defun catch-up-all (node)
   "At startup: every replica we cosign, before the first cosign request arrives."
-  (loop for rec being the hash-values of (node-ledgers node)
-        unless (or (record-owned-p rec) (record-fork-p rec))
-          do (ignore-errors (catch-up node rec))))
+  (loop for id being the hash-keys of (node-ledgers node) using (hash-value rec)
+        do (cond ((not (record-p rec)) (log! node "catch-up: ~a holds ~s, not a record; dropped" id rec)
+                                       (remhash id (node-ledgers node)))
+                 ((or (record-owned-p rec) (record-fork-p rec)))
+                 (t (ignore-errors (catch-up node rec))))))
 
 (defun quorum-names-us-p (node id-hex)
   "Cheap membership pre-check from the relay: the newest QuorumBegin (update
