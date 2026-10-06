@@ -59,7 +59,7 @@ OLD=$(for n in $VC $H $C2; do cld_ctl $n '(:log)' 2>/dev/null; done | tr '"' '\n
 fresh() { grep -vxF -f <(printf '%s\n' "${OLD:-@@none@@}"); }
 echo "== waiting for the confiscation (up to ${WAIT}s)"
 conf=""; spent=""; excluded=""; released=""
-for i in $(seq 1 $WAIT); do
+for i in $(seq 1 $((WAIT / 5))); do   # WAIT is seconds; each pass sleeps 5
   logs=$(for n in $VC $H $C2; do cld_ctl $n '(:log :tail 400)' 2>/dev/null; done | tr '"' '\n')
   # The adversary's own log, read deep: contagion floods a node's log past a short tail.
   if [ -z "$spent" ]; then

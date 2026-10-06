@@ -118,6 +118,9 @@
   ;; ledger id hex -> ((tx . lottery) ...): every confiscation proposal we signed.  Two
   ;; proposers can race (cl and reference); whichever lands is one we verified.
   (signed-confiscations (make-hash-table :test (quote equal) :synchronized t))
+  ;; ledger id hex -> proposed confiscation txs we received, signed or not: a proposal we
+  ;; refused (a different view of the cut, a fee we would not pick) may be the one that lands.
+  (seen-confiscations (make-hash-table :test (quote equal) :synchronized t))
   ;; (accused spent-ledger spend-tx governing-seq) -> (universal-time ok why): one theft yields a proof
   ;; per signer, key parity and operated ledger, and verifying fetches the spent ledger's history
   (vault-spend-verdicts (make-hash-table :test (quote equal) :synchronized t))
@@ -1319,8 +1322,31 @@
     (loop for (tx . l) in (gethash id-hex (node-signed-confiscations node))
           when (funcall (node-chain-fn node) (btx:tx-txid tx) 0)
             do (return-from confiscated-lottery (values tx l :pending)))
+    ;; A proposal we saw but did not sign: its lottery output names its participant set, so
+    ;; recover the set from it (DEP-03: final once a confiscation confirms).
+    (loop for tx in (gethash id-hex (node-seen-confiscations node))
+          when (funcall (node-chain-fn node) (btx:tx-txid tx) 0)
+            do (let ((l (lottery-paid-by node id-hex (btx:txout-script (first (btx:tx-outputs tx))))))
+                 (when l (return-from confiscated-lottery (values tx l :pending)))))
     (let ((built (rebuild-confiscation-on-chain node id-hex)))
       (when built (values (first built) (second built) :pending)))))
+
+(defun lottery-paid-by (node id-hex spk)
+  "The lottery over a subset of ID-HEX's armers whose output script is SPK (our cut
+   first, then every subset, largest first), or NIL."
+  (let* ((base (find-record node id-hex)) (voters (recovery-voters base))
+         (threshold (lg:majority-threshold (length voters)))
+         (network (intern (string-upcase (node-network node)) :keyword)))
+    (flet ((try (armers)
+             (let ((ps (loop for (pk c target) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target))))
+               (when ps
+                 (let ((l (ignore-errors (lot:build-lottery ps voters threshold :network network))))
+                   (and l (equalp (lot:lottery-spk l) spk) l))))))
+      (or (try (ignore-errors (lottery-armers node id-hex)))
+          (let ((all (sort (copy-list (armers-of node id-hex)) #'bytes< :key #'first)))
+            (when (<= (length all) 8)
+              (loop for mask from (1- (ash 1 (length all))) downto 1
+                    thereis (try (loop for a in all for i from 0 when (logbitp i mask) collect a)))))))))
 
 (defun reveal-deadline-passed-p (node conf)
   (let ((info (and (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid conf) 0))))
@@ -2212,6 +2238,8 @@
       (return-from handle-confiscation-sign nil))   ; not a disputant: not ours to answer
     (handler-case
         (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (w:jget params "tx_hex") (fail "no unsigned_tx"))))))
+               (_seen (unless (find (btx:tx-txid proposed) (gethash id (node-seen-confiscations node)) :key #'btx:tx-txid :test #'equalp)
+                        (push proposed (gethash id (node-seen-confiscations node)))))
                (outputs-total (reduce #'+ (btx:tx-outputs proposed) :key #'btx:txout-value))
                ;; The reference sends neither fee nor shape: read both off the proposed tx.
                (fee (or (w:jget params "fee_sats")
@@ -2730,6 +2758,10 @@
     (dolist (r (cons rec (forks-of node (record-id-hex rec))))
       (when (record-confiscation r) (pushnew (btx:tx-txid (record-confiscation r)) ids :test #'equalp)))
     (dolist (e (gethash (record-id-hex rec) (node-signed-confiscations node))) (push (btx:tx-txid (car e)) ids))
+    ;; A proposal we saw but refused is still a confiscation if it pays a lottery over the armers.
+    (dolist (tx (gethash (record-id-hex rec) (node-seen-confiscations node)))
+      (when (ignore-errors (lottery-paid-by node (record-id-hex rec) (btx:txout-script (first (btx:tx-outputs tx)))))
+        (pushnew (btx:tx-txid tx) ids :test #'equalp)))
     (dolist (txid (gethash (record-id-hex rec) (node-known-confiscations node)))
       (pushnew txid ids :test #'equalp))
     ids))
