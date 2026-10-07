@@ -44,7 +44,8 @@
      (:new-outpoint-vout 92 :u32) (:amount 2 :u64) (:quorum-expiry 86 :u32)
      (:ledger-hash 42 :bytes32) (:quorum-members 6 :pubkeys) (:collateral-amount 88 :u64)
      (:quorum-member-ledger-ids 276 :ledger-ids :optional) (:protocol-version 286 :string :optional)
-     (:exit-cutoff-height 278 :u32 :optional) (:exit-outputs 280 :exit-outputs :optional))
+     (:exit-cutoff-height 278 :u32 :optional) (:exit-outputs 280 :exit-outputs :optional)
+     (:splice-in-outpoint 282 :bytes :optional) (:splice-in-amount 284 :u64 :optional))
     (20 :deposit-open
      (:deposit-id 200 :deposit-id) (:descriptor 202 :string) (:fees 12 :fees :optional)
      (:transfer-fees 226 :transfer-fees :optional) (:payment-hash 14 :bytes32 :optional)

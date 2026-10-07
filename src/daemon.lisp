@@ -124,7 +124,12 @@
                                                          (op:field o :new-outpoint-vout)))))))
         (:rotate-vault
          (let ((rec (rec! node form)))
-           (multiple-value-bind (txid sats) (nd:rotate-vault node rec :expiry-blocks (arg form :expiry-blocks 4320))
+           (multiple-value-bind (txid sats)
+               ;; DEP-20 §4 :splice "txid:vout" — a confirmed UTXO paying the node key's P2TR (:address).
+               (nd:rotate-vault node rec :expiry-blocks (arg form :expiry-blocks 4320)
+                                         :splice (let ((sp (arg form :splice)))
+                                                   (when sp (let ((c (position #\: sp)))
+                                                              (list (txid-bytes (subseq sp 0 c)) (parse-integer sp :start (1+ c)))))))
              (ok :txid (bytes->hex (reverse txid)) :vout 0 :sats sats))))
         (:begin-quorum
          ;; The first QuorumBegin names its funding outpoint; a later one takes the
@@ -277,7 +282,8 @@
       (when (and (plusp (length out)) (char= (char out 0) #\{))
         (let ((j (js:parse out)))
           (list :value-sats (round (* (gethash "value" j) 100000000))
-                :confirmations (gethash "confirmations" j)))))))
+                :confirmations (gethash "confirmations" j)
+                :spk (let ((spk (gethash "scriptPubKey" j))) (and spk (hex->bytes (gethash "hex" spk))))))))))
 
 (defun bitcoin-cli-broadcast-fn (cli)
   (lambda (bytes) (run-cli cli "sendrawtransaction" (bytes->hex bytes))))

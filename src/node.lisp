@@ -511,12 +511,22 @@
     (values (loop for (nil . e) in due collect (cons (getf e :exit-address) (floor (getf e :amount) 1000)))
             (loop for (nil . e) in due for i from 1 collect (list (getf e :deposit-id) (getf e :amount) i)))))
 
+(defun splice-outpoint-bytes (txid vout) (cat txid (int->be vout 4)))
+
+(defun splice-prevout (node txid vout)
+  "DEP-20 §4: a splice-in outpoint, confirmed to the policy depth and unspent: (values sats spk)."
+  (let ((info (and (node-chain-fn node) (funcall (node-chain-fn node) txid vout))))
+    (unless info (fail "splice-in outpoint ~a:~a is spent or unknown" (bytes->hex txid) vout))
+    (unless (>= (or (getf info :confirmations) 0) 1) (fail "splice-in outpoint is unconfirmed"))
+    (values (getf info :value-sats)
+            (or (getf info :spk) (lot:p2tr-spk (up:x-only (node-pubkey node)) (octets))))))
+
 (defun rotation-collateral (ledger vault-sats fee-sats)
   "DEP-20 §3 Amounts: collateral bears only its share of the rotation fee."
   (let ((old (+ (lg:ledger-reserves-amount ledger) (lg:ledger-collateral-amount ledger))))
     (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) (- vault-sats fee-sats) 1000) old) 0)))
 
-(defun rotate-vault (node rec &key (ruleset "cltv-offset-v2") (expiry-blocks 4320) (timeout 90))
+(defun rotate-vault (node rec &key (ruleset "cltv-offset-v2") (expiry-blocks 4320) (timeout 90) splice)
   "DEP-03 rotation: spend the current vault into the reserves of the staged quorum
    with the shared builder (rot:build-rotation), gather the tier's signatures from
    the current members (rotation_sign; cl and reference members rebuild and verify
@@ -535,12 +545,18 @@
              (tier (nth tier-index (rs:reserves-tiers cur)))
              (cutoff (height node))
              (extras (exit-settlement (record-ledger rec) (height node) cutoff))
+             ;; DEP-20 §4: SPLICE is (txid vout) of a confirmed UTXO paying our key-path P2TR.
+             (splice-in (when splice
+                          (multiple-value-bind (ssats sspk) (splice-prevout node (first splice) (second splice))
+                            (list (first splice) (second splice) ssats sspk))))
              (tx (or (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
                                          :voters (length (rs:reserves-voters cur))
                                          :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk new)
-                                         :extras extras)
+                                         :extras extras :splice (and splice-in (subseq splice-in 0 3)))
                      (fail "the rotation leaves the new vault below dust")))
-             (prevouts (vector (cons sats (rs:reserves-spk cur))))
+             (prevouts (if splice-in
+                           (vector (cons sats (rs:reserves-spk cur)) (cons (third splice-in) (fourth splice-in)))
+                           (vector (cons sats (rs:reserves-spk cur)))))
              (sighash (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves cur))))
              (keys (rs:tier-keys tier))
              (sigs (list (cons (up:x-only (node-pubkey node)) (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))
@@ -548,7 +564,8 @@
                                       (w:json-object "sighash" (bytes->hex sighash) "unsigned_tx" (unsigned-tx-hex tx)
                                                      "tier_index" tier-index
                                                      "ledger_hash" (bytes->hex (rs:reserves-ledger-hash new))
-                                                     "new_quorum_expiry" expiry "exit_cutoff_height" cutoff)
+                                                     "new_quorum_expiry" expiry "exit_cutoff_height" cutoff
+                                                     "splice_in_outpoint" (and splice-in (format nil "~a:~a" (bytes->hex (first splice-in)) (second splice-in))))
                                       :want (max 0 (1- (rs:tier-threshold tier))) :timeout timeout :successes-only t)))
         (dolist (r responses)
           (let ((res (w:jget r "result")))
@@ -561,13 +578,16 @@
         (when (< (length sigs) (rs:tier-threshold tier))
           (fail "rotation: only ~a of ~a signatures" (length sigs) (rs:tier-threshold tier)))
         (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
-               (signed (rot:attach-tier-witness tx 0 cur tier-index ordered))
+               (signed (let ((s (rot:attach-tier-witness tx 0 cur tier-index ordered)))
+                         (if splice-in (attach-key-path-witness s 1 (key-path-signature node s 1 prevouts)) s)))
                (new-sats (btx:txout-value (first (btx:tx-outputs tx)))))
-          (unless (rot:verify-spend signed 0 prevouts) (fail "assembled rotation does not verify"))
+          (dotimes (i (length (btx:tx-inputs signed)))
+            (unless (rot:verify-spend signed i prevouts) (fail "assembled rotation input ~a does not verify" i)))
           ;; DEP-03 Rotation ordering: broadcast only after its QuorumBegin (begin-quorum).
           (let ((rtxid (btx:tx-txid signed)))
             (save-rotation node rec (list :txid (bytes->hex rtxid) :sats new-sats :vault-sats sats :cutoff cutoff
-                                          :fee (- sats (reduce #'+ extras :key #'cdr) new-sats)
+                                          :fee (- (+ sats (if splice-in (third splice-in) 0)) (reduce #'+ extras :key #'cdr) new-sats)
+                                          :splice (and splice-in (list (bytes->hex (first splice-in)) (second splice-in) (third splice-in)))
                                           :tx (bytes->hex (btx:serialize-tx signed))
                                           :ledger-hash (bytes->hex (rs:reserves-ledger-hash new)) :expiry expiry
                                           :ruleset (rs:reserves-ruleset new)
@@ -576,7 +596,7 @@
                   (subseq (bytes->hex rtxid) 0 16) new-sats (subseq (bytes->hex txid) 0 16) vout tier-index)
             (values rtxid new-sats)))))))
 
-(defun begin-quorum (node rec &key funding-txid funding-vout amount-msats collateral-msats
+(defun begin-quorum (node rec &key funding-txid funding-vout amount-msats collateral-msats splice-collateral-msats
                                    (ruleset "cltv-offset-v2") (expiry-blocks 4320) (spending-txid funding-txid))
   "Promote the staged members: chain a QuorumBegin.  The first one points at the
    outpoint funding the reserves output prepared by PREPARE-QUORUM (or built now);
@@ -589,7 +609,12 @@
       (let* ((new-msats (* 1000 (getf rotation :sats)))
              (ledger (record-ledger rec))
              (coll (if (getf rotation :vault-sats)
-                       (rotation-collateral ledger (getf rotation :vault-sats) (getf rotation :fee))
+                       ;; DEP-20 §4: a splice's value goes to collateral unless told otherwise.
+                       (+ (rotation-collateral ledger (getf rotation :vault-sats) (getf rotation :fee))
+                          (if (getf rotation :splice)
+                              (min (* 1000 (third (getf rotation :splice)))
+                                   (or splice-collateral-msats (* 1000 (third (getf rotation :splice)))))
+                              0))
                        ;; a rotation saved before DEP-20 exits: no exits, the proportional split
                        (let ((old (+ (lg:ledger-reserves-amount ledger) (lg:ledger-collateral-amount ledger))))
                          (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) new-msats) old) 0)))))
@@ -617,9 +642,12 @@
                    :quorum-member-ledger-ids (mapcar #'lg:member-ledger-id staged)
                    :protocol-version (rs:reserves-ruleset reserves)))
            (op (if (and rotation (getf rotation :cutoff))
-                   (let ((entries (nth-value 1 (exit-settlement ledger (height node) (getf rotation :cutoff)))))
+                   (let ((entries (nth-value 1 (exit-settlement ledger (height node) (getf rotation :cutoff))))
+                         (sp (getf rotation :splice)))
                      (append op (list :exit-cutoff-height (getf rotation :cutoff))
-                             (when entries (list :exit-outputs entries))))
+                             (when entries (list :exit-outputs entries))
+                             (when sp (list :splice-in-outpoint (splice-outpoint-bytes (hex->bytes (first sp)) (second sp))
+                                            :splice-in-amount (* 1000 (third sp))))))
                    op))
            (update (append-operation node rec op)))
       (setf (record-reserves rec) reserves (record-pinned rec) nil)
@@ -1067,7 +1095,18 @@
   (unless (and (equalp (btx:tx-txid tx) (op:field o :new-outpoint-txid)) (eql (op:field o :new-outpoint-vout) 0))
     (fail "rotation_tx is not the QuorumBegin's new outpoint"))
   (multiple-value-bind (cur txid vout sats) (disputed-reserves node rec)
-    (let ((prevouts (vector (cons sats (rs:reserves-spk cur)))))
+    (let* ((sp (op:field o :splice-in-outpoint))
+           (splice (when sp
+                     (let ((stxid (subseq sp 0 32)) (svout (be->int sp :start 32)))
+                       (multiple-value-bind (ssats sspk) (splice-prevout node stxid svout)
+                         (unless (eql (op:field o :splice-in-amount) (* 1000 ssats))
+                           (fail "splice_in_amount_msats is not the outpoint's value"))
+                         (list stxid svout ssats sspk)))))
+           (prevouts (if splice
+                         (vector (cons sats (rs:reserves-spk cur)) (cons (third splice) (fourth splice)))
+                         (vector (cons sats (rs:reserves-spk cur))))))
+      (when splice
+        (unless (rot:verify-spend tx 1 prevouts) (fail "rotation_tx's splice input does not verify")))
       (multiple-value-bind (signers input tier-index) (fr:vault-spend-signers tx prevouts cur txid vout)
         (declare (ignore input))
         (unless tier-index (fail "rotation_tx does not spend the current vault through a tier leaf"))
@@ -1079,15 +1118,17 @@
                  (extras (exit-settlement ledger height cutoff))
                  (ours (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
                                            :voters (length (rs:reserves-voters cur)) :locktime (rs:tier-locktime tier)
-                                           :new-vault-spk (address-spk node (op:field o :reserves-id)) :extras extras)))
+                                           :new-vault-spk (address-spk node (op:field o :reserves-id)) :extras extras
+                                           :splice (and splice (subseq splice 0 3)))))
             (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx tx :witness nil)))
               (fail "rotation_tx differs from the DEP-03 rotation we build"))
             (let ((new (btx:txout-value (first (btx:tx-outputs tx)))))
               (unless (= new (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000))
                 (fail "QuorumBegin amounts do not sum to the rotation's new vault"))
-              (unless (= (op:field o :collateral-amount)
-                         (rotation-collateral ledger sats (- sats (reduce #'+ extras :key #'cdr) new)))
-                (fail "QuorumBegin collateral is not the DEP-20 §3 share")))))))))
+              (let* ((added (if splice (third splice) 0))
+                     (c0 (rotation-collateral ledger sats (- (+ sats added) (reduce #'+ extras :key #'cdr) new))))
+                (unless (<= c0 (op:field o :collateral-amount) (+ c0 (* 1000 added)))
+                  (fail "QuorumBegin collateral is not the DEP-20 §3-4 share"))))))))))
 
 (defun check-quorum-begin-vault (node rec o params &optional (height (height node)))
   "A QuorumBegin that rotates a current vault is checked against the signed rotation it
@@ -2459,7 +2500,7 @@
 ;;; `rotation_sign` {sighash, unsigned_tx, tier_index, ledger_hash, new_quorum_expiry}.
 ;;; A member rebuilds both ends from the replica it holds and signs only that.
 
-(defun check-rotation (node rec proposed tier-index claimed-hash claimed-expiry &optional cutoff)
+(defun check-rotation (node rec proposed tier-index claimed-hash claimed-expiry &optional cutoff splice)
   "Signal unless PROPOSED is the rotation of REC's current vault at TIER-INDEX into the
    reserves of its next quorum (staged members, else the current ones) under
    CLAIMED-HASH / CLAIMED-EXPIRY.  Returns the script-path sighash to sign."
@@ -2495,11 +2536,20 @@
                             (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
                                                 :voters (length (rs:reserves-voters reserves))
                                                 :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk expected)
-                                                :extras (exit-settlement ledger h cutoff)))))
+                                                :extras (exit-settlement ledger h cutoff)
+                                                :splice (and splice (list (first splice) (second splice) (third splice)))))))
           (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx proposed :witness nil)))
             (fail "rotation tx differs from the DEP-03 rotation we build"))))
-      (rot:tier-sighash proposed 0 (vector (cons sats (rs:reserves-spk reserves)))
+      (rot:tier-sighash proposed 0 (if splice
+                                       (vector (cons sats (rs:reserves-spk reserves)) (cons (third splice) (fourth splice)))
+                                       (vector (cons sats (rs:reserves-spk reserves))))
                         (nth tier-index (rs:reserves-leaves reserves))))))
+
+(defun parse-splice-param (node param)
+  "\"txidhex:vout\" (rotation_sign) -> (txid vout sats spk), looked up on our chain (DEP-20 §4)."
+  (when param
+    (let* ((colon (position #\: param)) (txid (hex->bytes (subseq param 0 colon))) (vout (parse-integer param :start (1+ colon))))
+      (multiple-value-bind (sats spk) (splice-prevout node txid vout) (list txid vout sats spk)))))
 
 (defun handle-rotation-sign (node event params)
   (let* ((id (w:event-ledger-id event)) (rec (find-record node id)))
@@ -2510,7 +2560,8 @@
                (claimed-hash (hex->bytes (or (w:jget params "ledger_hash") (fail "no ledger_hash"))))
                (claimed-expiry (or (w:jget params "new_quorum_expiry") (fail "no new_quorum_expiry")))
                (expected (check-rotation node rec proposed tier-index claimed-hash claimed-expiry
-                                         (w:jget params "exit_cutoff_height"))))
+                                         (w:jget params "exit_cutoff_height")
+                                         (parse-splice-param node (w:jget params "splice_in_outpoint")))))
           (unless (equalp expected (hex->bytes (or (w:jget params "sighash") (fail "no sighash"))))
             (fail "sighash is not the rotation's"))
           (log! node "signing rotation of ~a at tier ~a" (subseq id 0 8) tier-index)
@@ -2873,6 +2924,13 @@
                nil)))))
 
 ;;; Key-path Taproot spend of our own P2TR (replacement collateral inputs).
+
+(defun attach-key-path-witness (tx in-index sig)
+  (let ((witnesses (let ((w (copy-list (btx:tx-witnesses tx)))) (setf (nth in-index w) (list sig)) w)))
+    (btx:parse-tx (bw:make-reader
+                   (btx:serialize-tx
+                    (btx:make-tx :version (btx:tx-version tx) :inputs (btx:tx-inputs tx) :outputs (btx:tx-outputs tx)
+                                 :locktime (btx:tx-locktime tx) :witnesses witnesses :segwit-p t))))))
 
 (defun key-path-signature (node tx in-index prevouts)
   "BIP-341 key-path signature for input IN-INDEX under our tweaked key."

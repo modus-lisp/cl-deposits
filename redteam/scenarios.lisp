@@ -42,6 +42,8 @@
             :ledger-var "REDTEAM_RG" :timeout 900)
    (make-sc :name "rotation" :script "check-rotation.sh" :ledger-var "REDTEAM_ROT" :timeout 1200
             :note "a cl rotation spends its old vault on chain (mixed quorum); no leftovers")
+   (make-sc :name "exit" :script "check-exit.sh" :ledger-var "REDTEAM_EXIT" :timeout 1200
+            :note "DEP-20 exits settle at the rotation (mixed quorum); dust carried; cancel releases")
    (make-sc :name "invalid-credit-collude" :script "attack1-invalid-credit.sh" :args '("collude")
             :ledger-var "REDTEAM_IC"
             :timeout 600 :tags '(:contagion))
