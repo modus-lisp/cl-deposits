@@ -13,7 +13,7 @@
   (:local-nicknames (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation)
                     (#:ev #:cl-nostr.event) (#:k #:cl-nostr.keys) (#:jzon #:com.inuoe.jzon))
   (:export #:+kind-update+ #:+kind-request+ #:+kind-response+ #:+kind-advertisement+
-           #:+kind-fraud-proof+ #:+kind-lottery-reveal+ #:fraud-event #:reveal-event #:reveal-message
+           #:+kind-fraud-proof+ #:+kind-lottery-reveal+ #:+kind-rotation-tx+ #:rotation-tx-event #:fraud-event #:reveal-event #:reveal-message
            #:event-member #:event-d-tag
            #:nostr-keypair #:update-event #:event->update #:ledger-tag
            #:request-event #:response-event #:advertisement-event
@@ -27,6 +27,7 @@
 (defconstant +kind-advertisement+ 39100)
 (defconstant +kind-fraud-proof+ 9101)
 (defconstant +kind-lottery-reveal+ 9106)
+(defconstant +kind-rotation-tx+ 9107 "DEP-03 Rotation ordering: the signed rotation a QuorumBegin names.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys.  A node's protocol key is also its Nostr key.  Nostr sees only the
@@ -133,6 +134,11 @@
                   (json (json-object "member_pubkey" member-pubkey-hex "ledger_id" ledger-id-hex
                                      "preimage_hex" (bytes->hex preimage) "signature" (bytes->hex signature64)))
                   :tags (list (list "l" ledger-id-hex) (list "member" member-pubkey-hex))))
+
+(defun rotation-tx-event (keypair ledger-id-hex sequence tx-hex)
+  (ev:build-event keypair +kind-rotation-tx+
+                  (json (json-object "ledger_id" ledger-id-hex "sequence" sequence "tx" tx-hex))
+                  :tags (list (list "l" ledger-id-hex) (list "d" (subseq ledger-id-hex 0 16)))))
 
 (defun event-member (event) (ev:first-tag-value event "member"))
 (defun event-d-tag (event) (ev:first-tag-value event "d"))

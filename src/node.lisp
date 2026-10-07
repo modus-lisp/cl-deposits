@@ -120,6 +120,7 @@
   ;; proposers can race (cl and reference); whichever lands is one we verified.
   (signed-confiscations (make-hash-table :test (quote equal) :synchronized t))
   (signed-rotations (make-hash-table :test (quote equal) :synchronized t))   ; ledger id hex -> rotation txids we signed
+  (inflight-rotations (make-hash-table :test (quote equalp) :synchronized t)) ; rotation txid -> signed tx bytes, rebroadcast until confirmed
   ;; ledger id hex -> proposed confiscation txs we received, signed or not: a proposal we
   ;; refused (a different view of the cut, a fee we would not pick) may be the one that lands.
   (seen-confiscations (make-hash-table :test (quote equal) :synchronized t))
@@ -172,7 +173,7 @@
           ;; (tens of thousands of events) into this subscription at every start;
           ;; anything we missed while down, catch-up fetches per ledger on demand.
           (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-update+ w:+kind-request+ w:+kind-response+
-                                                              w:+kind-fraud-proof+ w:+kind-lottery-reveal+)
+                                                              w:+kind-fraud-proof+ w:+kind-lottery-reveal+ w:+kind-rotation-tx+)
                                                   :since (if (bus:bus-async-p bus) (- (get-universal-time) 2208988800 60) nil))
                              (lambda (event)
                                (cond ((or (null (node-worker node)) (= (ev:event-kind event) w:+kind-response+))
@@ -306,7 +307,12 @@
                                 "cosign_data_hex" (bytes->hex (up::cosign-data update))
                                 "content_hash_hex" (bytes->hex (up:content-hash update))
                                 "message_type" 32769
-                                "fork_operator" (and (record-fork-p rec) (bytes->hex (record-fork-operator rec)))))
+                                "fork_operator" (and (record-fork-p rec) (bytes->hex (record-fork-operator rec)))
+                                ;; DEP-03 Rotation ordering: cosigners verify the signed rotation itself.
+                                "rotation_tx" (let ((r (record-rotation rec)))
+                                                (and r (getf r :tx)
+                                                     (eq (op:operation-type (op:decode-operation (up:update-message update))) :quorum-begin)
+                                                     (getf r :tx)))))
          (attempt 0))
     (flet ((collect (responses)
              (dolist (r responses)
@@ -542,13 +548,14 @@
                (signed (rot:attach-tier-witness tx 0 cur tier-index ordered))
                (new-sats (btx:txout-value (first (btx:tx-outputs tx)))))
           (unless (rot:verify-spend signed 0 prevouts) (fail "assembled rotation does not verify"))
-          (broadcast node signed)
+          ;; DEP-03 Rotation ordering: broadcast only after its QuorumBegin (begin-quorum).
           (let ((rtxid (btx:tx-txid signed)))
             (save-rotation node rec (list :txid (bytes->hex rtxid) :sats new-sats
+                                          :tx (bytes->hex (btx:serialize-tx signed))
                                           :ledger-hash (bytes->hex (rs:reserves-ledger-hash new)) :expiry expiry
                                           :ruleset (rs:reserves-ruleset new)
                                           :members (mapcar #'bytes->hex (rs:reserves-members new))))
-            (log! node "rotated ~a: ~a:0 (~a sats) spends ~a:~a at tier ~a" (subseq (record-id-hex rec) 0 8)
+            (log! node "rotation of ~a signed: ~a:0 (~a sats) spends ~a:~a at tier ~a; awaiting its QuorumBegin" (subseq (record-id-hex rec) 0 8)
                   (subseq (bytes->hex rtxid) 0 16) new-sats (subseq (bytes->hex txid) 0 16) vout tier-index)
             (values rtxid new-sats)))))))
 
@@ -591,6 +598,14 @@
                    :protocol-version (rs:reserves-ruleset reserves)))
            (update (append-operation node rec op)))
       (setf (record-reserves rec) reserves (record-pinned rec) nil)
+      (let ((r (record-rotation rec)))
+        (when (and r (getf r :tx))
+          (let ((tx (hex->bytes (getf r :tx))))
+            (setf (gethash (hex->bytes (getf r :txid)) (node-inflight-rotations node)) tx)
+            (when (node-broadcast-fn node) (ignore-errors (funcall (node-broadcast-fn node) tx)))
+            (bus:bus-publish (node-bus node) (w:rotation-tx-event (node-keypair node) (record-id-hex rec)
+                                                                   (up:update-seq update) (getf r :tx)))
+            (log! node "rotation of ~a broadcast after its QuorumBegin (seq ~a)" (subseq (record-id-hex rec) 0 8) (up:update-seq update)))))
       (clear-rotation node rec)
       (values update reserves))))
 
@@ -625,7 +640,8 @@
         (#.w:+kind-update+ (unless (string= (ev:event-pubkey event) (k:public-hex (node-keypair node)))
                              (handle-update node event)))
         (#.w:+kind-fraud-proof+ (handle-fraud node event))
-        (#.w:+kind-lottery-reveal+ (handle-reveal node event)))
+        (#.w:+kind-lottery-reveal+ (handle-reveal node event))
+        (#.w:+kind-rotation-tx+ (handle-rotation-tx node event)))
     (error (e) (log! node "event ~a (kind ~a from ~a): ~a" (subseq (ev:event-id event) 0 8) (ev:event-kind event) (subseq (ev:event-pubkey event) 0 8) e))))
 
 (defun handle-response (node event)
@@ -938,7 +954,7 @@
                      (lg:cosign-requirement ledger o (height node))
                    (declare (ignore required signers tier operator-alone))
                    (unless allowed (fail "not cosignable at this height")))
-                 (when (eq (op:operation-type o) :quorum-begin) (check-reserves-outpoint node o)))
+                 (when (eq (op:operation-type o) :quorum-begin) (check-quorum-begin-vault node rec o params)))
                (let* ((mlh (member-ledger-hash node))
                       (c (up:sign-cosignature candidate (node-priv node) (node-pubkey node) mlh)))
                  (log! node "cosigned ~a seq ~a" (subseq (record-id-hex rec) 0 8) seq)
@@ -1009,6 +1025,64 @@
                                             "membership_expires" until "member_ledger_id" (node-member-ledger-hex node)
                                             "member_response" (base64-encode blob) "member_signature" (bytes->hex blob-sig)))))
       (error (e) (log! node "refused consent: ~a" e) (respond node event nil :error (princ-to-string e))))))
+
+(defun address-spk (node address)
+  (multiple-value-bind (witver program)
+      (cl-consensus.encoding:segwit-decode address (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)))
+    (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
+
+(defun check-rotation-tx (node rec o tx)
+  "DEP-03 Rotation ordering: TX (signed) is the rotation QuorumBegin O names, of REC's current
+   vault: its txid and output 0, byte-identical unsigned to the rotation we build, and a
+   witness satisfying a tier of the vault to threshold.  Signals otherwise."
+  (unless (and (equalp (btx:tx-txid tx) (op:field o :new-outpoint-txid)) (eql (op:field o :new-outpoint-vout) 0))
+    (fail "rotation_tx is not the QuorumBegin's new outpoint"))
+  (multiple-value-bind (cur txid vout sats) (disputed-reserves node rec)
+    (let ((prevouts (vector (cons sats (rs:reserves-spk cur)))))
+      (multiple-value-bind (signers input tier-index) (fr:vault-spend-signers tx prevouts cur txid vout)
+        (declare (ignore input))
+        (unless tier-index (fail "rotation_tx does not spend the current vault through a tier leaf"))
+        (let ((tier (nth tier-index (rs:reserves-tiers cur))))
+          (unless (>= (length signers) (rs:tier-threshold tier))
+            (fail "rotation_tx carries ~a of ~a valid signatures" (length signers) (rs:tier-threshold tier)))
+          (let ((ours (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
+                                          :voters (length (rs:reserves-voters cur)) :locktime (rs:tier-locktime tier)
+                                          :new-vault-spk (address-spk node (op:field o :reserves-id)))))
+            (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx tx :witness nil)))
+              (fail "rotation_tx differs from the DEP-03 rotation we build"))
+            (unless (= (btx:txout-value (first (btx:tx-outputs tx)))
+                       (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000))
+              (fail "QuorumBegin amounts do not sum to the rotation's new vault"))))))))
+
+(defun check-quorum-begin-vault (node rec o params)
+  "A QuorumBegin that rotates a current vault is checked against the signed rotation it
+   carries (DEP-03 Rotation ordering), which we then keep rebroadcasting; one with no
+   current vault (the first, or the first after a DisputeAcquire) against the chain."
+  (if (and (has-quorum-begin-p rec) (not (record-fork-p rec)))
+      (let ((hex (or (w:jget params "rotation_tx") (fail "a rotating QuorumBegin must carry rotation_tx"))))
+        (let ((tx (btx:parse-tx (bw:make-reader (hex->bytes hex)))))
+          (check-rotation-tx node rec o tx)
+          (setf (gethash (btx:tx-txid tx) (node-inflight-rotations node)) (hex->bytes hex))))
+      (check-reserves-outpoint node o)))
+
+(defun handle-rotation-tx (node event)
+  "Kind 9107: keep a recorded rotation to (re)broadcast, as any watcher may."
+  (ignore-errors
+   (let* ((c (w:parse-json (ev:event-content event)))
+          (rec (find-record node (w:jget c "ledger_id")))
+          (bytes (hex->bytes (w:jget c "tx")))
+          (txid (btx:tx-txid (btx:parse-tx (bw:make-reader bytes)))))
+     (when (and rec (member txid (authorised-spend-txids node rec) :test #'equalp))
+       (setf (gethash txid (node-inflight-rotations node)) bytes)))))
+
+(defun drive-rotation-rebroadcast (node)
+  "DEP-03: rebroadcast every recorded rotation we hold until it confirms."
+  (when (and (node-broadcast-fn node) (node-chain-fn node))
+    (loop for txid being the hash-keys of (node-inflight-rotations node) using (hash-value bytes)
+          do (let ((info (ignore-errors (funcall (node-chain-fn node) txid 0))))
+               (if (and info (>= (or (getf info :confirmations) 0) 1))
+                   (remhash txid (node-inflight-rotations node))
+                   (ignore-errors (funcall (node-broadcast-fn node) bytes)))))))
 
 (defun check-reserves-outpoint (node o)
   "DEP-03: a cosigner verifies the QuorumBegin outpoint against its own chain
@@ -1653,7 +1727,8 @@
                                    (ignore-errors (dispute-expired-quorums node))
                                    (ignore-errors (drive-disputes node))
                                    (ignore-errors (drive-dereliction node))
-                                   (ignore-errors (drive-vault-watch node))))
+                                   (ignore-errors (drive-vault-watch node))
+                                   (ignore-errors (drive-rotation-rebroadcast node))))
                   :name "cld-expiry"))
 
 (defun start-invoice-poller (node &key (interval 3))
