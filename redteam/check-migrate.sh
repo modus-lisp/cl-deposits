@@ -40,12 +40,15 @@ expect "$r" "begin-quorum"; mine 3 >/dev/null; sleep 15
 tx=$(bcli getrawtransaction "$RT" true) || fail "rotation $RT is not on chain"
 pays() { python3 -c "import json,sys; t=json.loads(sys.argv[1]); print([o['n'] for o in t['vout'] if o['scriptPubKey'].get('address')==sys.argv[2]][0])" "$tx" "$1"; }
 V1=$(pays "$A1") || fail "the rotation does not pay D1's offer"; V2=$(pays "$A2") || fail "the rotation does not pay D2's offer"
-echo "   rotation $RT pays D1 at vout $V1 and D2 at vout $V2"
+val() { python3 -c "import json,sys; t=json.loads(sys.argv[1]); print(round(t['vout'][int(sys.argv[2])]['value']*1e8))" "$tx" "$1"; }
+S1=$(val "$V1"); S2=$(val "$V2")
+echo "   rotation $RT pays D1 $S1 sats at vout $V1 and D2 $S2 sats at vout $V2 (each less its own cost)"
 b=$(w "$X" balance "$DEP"); [ "$(sx "$b" ":BALANCE")" = 1500000 ] || fail "source not debited by 1500000: $b"
 expect "$(w "$D1" complete-offer "$O1" "$RT" "$V1")" "complete D1"
 c2=$(w "$D2" complete-offer "$O2" "$RT" "$V2"); echo "   D2 completion: $c2" | cut -c1-160
 sleep 10
-b1=$(w "$D1" balance "$DEP"); [ "$(sx "$b1" ":BALANCE")" = 1000000 ] || fail "D1 credited $b1, not 1000000"
-b2=$(w "$D2" balance "$DEP"); [ "$(sx "$b2" ":BALANCE")" = 500000 ] || fail "D2 credited $b2, not 500000"
-echo "   D1 (cl) credited 1000000, D2 (reference) credited 500000"
+bal() { local i b; for i in 1 2 3 4 5; do b=$(w "$1" balance "$DEP"); case "$b" in *":BALANCE "*) echo "$b"; return;; esac; sleep 10; done; echo "$b"; }
+b1=$(bal "$D1"); [ "$(sx "$b1" ":BALANCE")" = $((S1 * 1000)) ] || fail "D1 credited $b1, not $((S1 * 1000))"
+b2=$(bal "$D2"); [ "$(sx "$b2" ":BALANCE")" = $((S2 * 1000)) ] || fail "D2 credited $b2, not $((S2 * 1000))"
+echo "   D1 (cl) credited $((S1 * 1000)), D2 (reference) credited $((S2 * 1000)): each its output's value"
 echo "PASS: two migrations in one rotation landed on a cl and a reference destination, each credited on completion."

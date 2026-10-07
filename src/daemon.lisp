@@ -19,7 +19,7 @@
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:js #:json-simple))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
-           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn))
+           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn #:bitcoin-cli-feerate-fn))
 (in-package #:cl-deposits.daemon)
 
 (defun arg (form key &optional default) (getf (cdr form) key default))
@@ -103,7 +103,8 @@
          (let ((rec (rec! node form)))
            (nd:add-member node rec (hex->bytes (arg form :member)) :member-ledger-id (arg form :member-ledger)
                           :membership-blocks (arg form :membership-blocks 4320)
-                          :dispute-response-blocks (arg form :dispute-response-blocks))
+                          :dispute-response-blocks (arg form :dispute-response-blocks)
+                          :dormancy-blocks (arg form :dormancy-blocks) :dormancy-notice-blocks (arg form :dormancy-notice-blocks))
            (ok :staged (length (lg:ledger-next-quorum-members (nd:record-ledger rec))))))
         (:prepare-quorum
          (let* ((rec (rec! node form))
@@ -122,6 +123,11 @@
                                        when (eq (op:operation-type o) :quorum-begin)
                                          collect (format nil "~a:~a" (bytes->hex (reverse (op:field o :new-outpoint-txid)))
                                                          (op:field o :new-outpoint-vout)))))))
+        (:dormancy-notice
+         ;; DEP-20 §8.1: :rotation-height N (>= height + dormancy_notice_blocks)
+         (let ((rec (rec! node form)))
+           (let ((u (nd:append-operation node rec (list :type :dormancy-notice :rotation-height (arg form :rotation-height)))))
+             (ok :seq (up:update-seq u)))))
         (:rotate-vault
          (let ((rec (rec! node form)))
            (multiple-value-bind (txid sats)
@@ -377,6 +383,14 @@
                                                                          :value-sats (round (* (gethash "value" pv) 100000000))
                                                                          :spend (list :at h)))))))
                (list :created 0 :value-sats most-positive-fixnum :spend :before)))))))
+
+(defun bitcoin-cli-feerate-fn (cli)
+  "Height -> the block's feerate, floor(4 x total fee / total weight) over its non-coinbase
+   transactions (getblockstats avgfeerate; DEP-03 Reference feerate), or NIL."
+  (lambda (height)
+    (let ((out (run-cli cli "getblockstats" (princ-to-string height) "[\"avgfeerate\"]")))
+      (when (and (plusp (length out)) (char= (char out 0) #\{))
+        (gethash "avgfeerate" (js:parse out))))))
 
 (defun bitcoin-cli-height-of-block-fn (cli)
   "Block hash -> confirmed height, or NIL (fraud-proof anchors)."

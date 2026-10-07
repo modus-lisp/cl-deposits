@@ -111,6 +111,7 @@
   (dispute-notes (make-hash-table :test #'equal))   ; ledger id -> the last dispute-driver state we logged
   (refused (make-hash-table :test #'equal :synchronized t))   ; ledger id -> seq whose update the rules rejected
   (spender-fn nil)                             ; (lambda (from to outpoints)) -> spend plists (:txid :vout :tx :prevouts :block-hash :height)
+  (feerate-fn nil)                             ; (lambda (height)) -> block feerate (DEP-03 Reference feerate)
   (vault-scanned nil)                          ; the last block height scanned for vault spends
   (reported-vault-spend (make-hash-table :test (quote equal) :synchronized t))
   ;; ledger id hex -> txids of confiscations we saw confirmed.  Kept apart from the forks: a fork
@@ -146,13 +147,14 @@
   (let ((o (op:decode-operation (up:update-message update))))
     (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn pledge-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn pledge-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn feerate-fn)
   (let* ((priv (w:even-y-privkey priv))
          (pub (up:compressed-pubkey priv))
          (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
                            :chain-fn chain-fn :pledge-fn pledge-fn :spender-fn spender-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
+                           :feerate-fn feerate-fn
                            :broadcast-fn broadcast-fn :height-of-block height-of-block :block-hash-fn block-hash-fn
                            ;; We subscribe below, before the caller loads the data dir.  A
                            ;; cosign request handled then found no record, took the ledger
@@ -400,7 +402,7 @@
   "How much of the history a consent request carries: the reference's nostr client drops any
    event over 70 KB (~70 updates), and it needs LedgerOpen; the rest is gap-filled from the relay.")
 
-(defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) (ruleset "cltv-offset-v2") (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016) dispute-response-blocks)
+(defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) (ruleset "cltv-offset-v2") (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016) dispute-response-blocks dormancy-blocks dormancy-notice-blocks)
   "Ask MEMBER-PUBKEY to join REC's quorum; on consent, stage them with QuorumAddMember.
    The request is addressed (tag l) to MEMBER-LEDGER-ID — the member's own ledger —
    as the reference does; its nodes only answer requests for ledgers they operate."
@@ -439,6 +441,7 @@
       (append-operation node rec
                         (%strip-nil-fields
                                 (list :type :quorum-add-member :quorum-member member-pubkey
+                                      :dormancy-blocks dormancy-blocks :dormancy-notice-blocks dormancy-notice-blocks
                                       :quorum-member-signature consent
                                       :member-ledger-id (or (w:jget res "member_ledger_id") member-ledger-id "")
                                       :min-fee-bps min-fee-bps :min-fee-fixed min-fee-fixed :max-fee-period max-fee-period
@@ -506,11 +509,41 @@
         when (<= (rs:tier-locktime tier) height) maximize i))
 
 (defun exit-settlement (ledger height cutoff)
-  "DEP-20 §3: the due exits at HEIGHT under CUTOFF as (values extras entries): EXTRAS the
-   rotation's exit outputs ((spk . sats) ...), ENTRIES the QuorumBegin's exit_outputs."
-  (let ((due (lg:due-exits ledger height cutoff)))
-    (values (loop for (nil . e) in due collect (cons (getf e :exit-address) (floor (getf e :amount) 1000)))
-            (loop for (nil . e) in due for i from 1 collect (list (getf e :deposit-id) (getf e :amount) i)))))
+  "DEP-20 §3: the due exits at HEIGHT under CUTOFF as (values extras entries exits-cost): EXTRAS the
+   rotation's exit outputs ((spk . sats) ...), each less its own cost, ENTRIES the QuorumBegin's
+   exit_outputs, EXITS-COST the sum of those costs (the part of the fee the exits pay)."
+  (let ((due (lg:due-exits ledger height cutoff)) (f (lg:rotation-feerate ledger)))
+    (values (loop for (nil . e) in due
+                  collect (cons (getf e :exit-address)
+                                (- (floor (getf e :amount) 1000) (lg:exit-cost (getf e :exit-address) f))))
+            (loop for (nil . e) in due for i from 1 collect (list (getf e :deposit-id) (getf e :amount) i))
+            (loop for (nil . e) in due sum (lg:exit-cost (getf e :exit-address) f)))))
+
+(defun dormancy-settlement (ledger height nexits)
+  "DEP-20 §8.2: the spin-outs a rotating QuorumBegin at HEIGHT must pay, as (values extras entries
+   cost): EXTRAS ((spk . sats) ...) after NEXITS exit outputs, ENTRIES the dormancy_outputs, COST
+   the operator's (collateral's) share of the fee for them."
+  (let ((spins (lg:dormancy-spin-outs ledger height)))
+    (values (loop for (nil bal spk) in spins collect (cons spk (floor bal 1000)))
+            (loop for (id bal) in spins for j from 1 collect (list id bal (+ nexits j)))
+            (* (length spins) (lg:dormancy-cost ledger)))))
+
+(defun settlement (ledger height cutoff)
+  "Every DEP-20 output a rotation at HEIGHT pays: (values extras exit-entries dormancy-entries
+   exits-cost dormancy-cost)."
+  (multiple-value-bind (ex ee ec) (exit-settlement ledger height cutoff)
+    (multiple-value-bind (dx de dc) (dormancy-settlement ledger height (length ee))
+      (values (append ex dx) ee de ec dc))))
+
+(defun median-feerate (node height)
+  "DEP-03 Reference feerate: m = floor((s3 + s4) / 2) over the block feerates of heights h-6..h-1,
+   or NIL without a feerate source."
+  (when (node-feerate-fn node)
+    (let ((fs (loop for b from (- height 6) below height collect (funcall (node-feerate-fn node) b))))
+      (unless (member nil fs)
+        (let ((s (sort fs #'<))) (floor (+ (nth 2 s) (nth 3 s)) 2))))))
+
+(defun feerate-bounds (m) (values (max 1 (floor m 2)) (max 2 (* 2 m))))
 
 (defun splice-outpoint-bytes (txid vout) (cat txid (int->be vout 4)))
 
@@ -523,7 +556,8 @@
             (or (getf info :spk) (lot:p2tr-spk (up:x-only (node-pubkey node)) (octets))))))
 
 (defun rotation-collateral (ledger vault-sats fee-sats)
-  "DEP-20 §3 Amounts: collateral bears only its share of the rotation fee."
+  "DEP-20 §3 Amounts: collateral bears only its share of FEE-SATS, the vault's part of the
+   rotation fee (the fee less what the exits paid themselves)."
   (let ((old (+ (lg:ledger-reserves-amount ledger) (lg:ledger-collateral-amount ledger))))
     (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) (- vault-sats fee-sats) 1000) old) 0)))
 
@@ -545,13 +579,16 @@
       (let* ((tier-index (rotation-tier-index cur (height node)))
              (tier (nth tier-index (rs:reserves-tiers cur)))
              (cutoff (height node))
-             (extras (exit-settlement (record-ledger rec) (height node) cutoff))
+             (exits-cost (nth-value 3 (settlement (record-ledger rec) (height node) cutoff)))
+             (dorm-cost (nth-value 4 (settlement (record-ledger rec) (height node) cutoff)))
+             (extras (settlement (record-ledger rec) (height node) cutoff))
              ;; DEP-20 §4: SPLICE is (txid vout) of a confirmed UTXO paying our key-path P2TR.
              (splice-in (when splice
                           (multiple-value-bind (ssats sspk) (splice-prevout node (first splice) (second splice))
                             (list (first splice) (second splice) ssats sspk))))
              (tx (or (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
                                          :voters (length (rs:reserves-voters cur))
+                                         :feerate (lg:rotation-feerate (record-ledger rec))
                                          :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk new)
                                          :extras extras :splice (and splice-in (subseq splice-in 0 3)))
                      (fail "the rotation leaves the new vault below dust")))
@@ -587,7 +624,8 @@
           ;; DEP-03 Rotation ordering: broadcast only after its QuorumBegin (begin-quorum).
           (let ((rtxid (btx:tx-txid signed)))
             (save-rotation node rec (list :txid (bytes->hex rtxid) :sats new-sats :vault-sats sats :cutoff cutoff
-                                          :fee (- (+ sats (if splice-in (third splice-in) 0)) (reduce #'+ extras :key #'cdr) new-sats)
+                                          :fee (- (+ sats (if splice-in (third splice-in) 0)) (reduce #'+ extras :key #'cdr) new-sats exits-cost dorm-cost)
+                                          :dormancy-cost dorm-cost
                                           :splice (and splice-in (list (bytes->hex (first splice-in)) (second splice-in) (third splice-in)))
                                           :tx (bytes->hex (btx:serialize-tx signed))
                                           :ledger-hash (bytes->hex (rs:reserves-ledger-hash new)) :expiry expiry
@@ -612,6 +650,7 @@
              (coll (if (getf rotation :vault-sats)
                        ;; DEP-20 §4: a splice's value goes to collateral unless told otherwise.
                        (+ (rotation-collateral ledger (getf rotation :vault-sats) (getf rotation :fee))
+                          (- (* 1000 (or (getf rotation :dormancy-cost) 0)))
                           (if (getf rotation :splice)
                               (min (* 1000 (third (getf rotation :splice)))
                                    (or splice-collateral-msats (* 1000 (third (getf rotation :splice)))))
@@ -643,10 +682,13 @@
                    :quorum-member-ledger-ids (mapcar #'lg:member-ledger-id staged)
                    :protocol-version (rs:reserves-ruleset reserves)))
            (op (if (and rotation (getf rotation :cutoff))
-                   (let ((entries (nth-value 1 (exit-settlement ledger (height node) (getf rotation :cutoff))))
+                   (let ((entries (nth-value 1 (settlement ledger (height node) (getf rotation :cutoff))))
+                         (dentries (nth-value 2 (settlement ledger (height node) (getf rotation :cutoff))))
                          (sp (getf rotation :splice)))
                      (append op (list :exit-cutoff-height (getf rotation :cutoff))
+                             (let ((m (median-feerate node (height node)))) (when m (list :reference-feerate (max 2 m))))
                              (when entries (list :exit-outputs entries))
+                             (when dentries (list :dormancy-outputs dentries))
                              (when sp (list :splice-in-outpoint (splice-outpoint-bytes (hex->bytes (first sp)) (second sp))
                                             :splice-in-amount (* 1000 (third sp))))))
                    op))
@@ -1117,8 +1159,11 @@
             (fail "rotation_tx carries ~a of ~a valid signatures" (length signers) (rs:tier-threshold tier)))
           (let* ((ledger (record-ledger rec))
                  (cutoff (or (op:field o :exit-cutoff-height) (- height lg:+exit-cutoff-margin+)))
-                 (extras (exit-settlement ledger height cutoff))
+                 (extras (settlement ledger height cutoff))
+                 (exits-cost (nth-value 3 (settlement ledger height cutoff)))
+                 (dorm-cost (nth-value 4 (settlement ledger height cutoff)))
                  (ours (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
+                                           :feerate (lg:rotation-feerate ledger)
                                            :voters (length (rs:reserves-voters cur)) :locktime (rs:tier-locktime tier)
                                            :new-vault-spk (address-spk node (op:field o :reserves-id)) :extras extras
                                            :splice (and splice (subseq splice 0 3)))))
@@ -1128,9 +1173,17 @@
               (unless (= new (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000))
                 (fail "QuorumBegin amounts do not sum to the rotation's new vault"))
               (let* ((added (if splice (third splice) 0))
-                     (c0 (rotation-collateral ledger sats (- (+ sats added) (reduce #'+ extras :key #'cdr) new))))
+                     (c0 (- (rotation-collateral ledger sats (- (+ sats added) (reduce #'+ extras :key #'cdr) new exits-cost dorm-cost))
+                            (* 1000 dorm-cost))))
                 (unless (<= c0 (op:field o :collateral-amount) (+ c0 (* 1000 added)))
                   (fail "QuorumBegin collateral is not the DEP-20 §3-4 share"))))))))))
+
+(defun check-reference-feerate (node o height)
+  "DEP-03: a recorded reference feerate must lie within the bounds the last 6 blocks give."
+  (let ((f (op:field o :reference-feerate)) (m (median-feerate node height)))
+    (when (and f m)
+      (multiple-value-bind (lo hi) (feerate-bounds m)
+        (unless (<= lo f hi) (fail "reference feerate ~a outside [~a, ~a] (median ~a)" f lo hi m))))))
 
 (defun check-quorum-begin-vault (node rec o params &optional (height (height node)))
   "A QuorumBegin that rotates a current vault is checked against the signed rotation it
@@ -1140,8 +1193,9 @@
       (let ((hex (or (w:jget params "rotation_tx") (fail "a rotating QuorumBegin must carry rotation_tx"))))
         (let ((tx (btx:parse-tx (bw:make-reader (hex->bytes hex)))))
           (check-rotation-tx node rec o tx height)
+          (check-reference-feerate node o height)
           (setf (gethash (btx:tx-txid tx) (node-inflight-rotations node)) (hex->bytes hex))))
-      (check-reserves-outpoint node o)))
+      (progn (check-reserves-outpoint node o) (check-reference-feerate node o height))))
 
 (defun handle-rotation-tx (node event)
   "Kind 9107: keep a recorded rotation to (re)broadcast, as any watcher may."
@@ -2048,7 +2102,7 @@
    TO-LEDGER-HEX: a cosigned offer there, then an exit here paying its address that is released
    if not settled 6 blocks before the offer's deadline.  Returns (values request-id offer)."
   (let* ((sats (floor amount-msats 1000))
-         (offer (wallet-make-offer wal to-ledger-hex sats :min-sats (max 1 (1- sats)) :blocks-valid blocks-valid))
+         (offer (wallet-make-offer wal to-ledger-hex sats :min-sats 1 :blocks-valid blocks-valid))   ; the output is sats less its own cost
          (address (or (w:jget offer "funding_address") (fail "offer without funding_address")))
          (deadline (or (w:jget offer "deadline_block") (fail "offer without deadline_block"))))
     (when (<= (- deadline 6) height) (fail "offer deadline ~a leaves no room to settle" deadline))
@@ -2674,9 +2728,10 @@
                (ours (progn (unless (<= (- h lg:+exit-cutoff-margin+) cutoff h)
                               (fail "exit_cutoff_height ~a outside [~a, ~a]" cutoff (- h lg:+exit-cutoff-margin+) h))
                             (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
+                                                :feerate (lg:rotation-feerate ledger)
                                                 :voters (length (rs:reserves-voters reserves))
                                                 :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk expected)
-                                                :extras (exit-settlement ledger h cutoff)
+                                                :extras (settlement ledger h cutoff)
                                                 :splice (and splice (list (first splice) (second splice) (third splice)))))))
           (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx proposed :witness nil)))
             (fail "rotation tx differs from the DEP-03 rotation we build"))))

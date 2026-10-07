@@ -10,7 +10,8 @@
 
 (defpackage #:cl-deposits.ledger
   (:use #:cl #:cl-deposits.util)
-  (:local-nicknames (#:op #:cl-deposits.operation) (#:up #:cl-deposits.update))
+  (:local-nicknames (#:op #:cl-deposits.operation) (#:up #:cl-deposits.update)
+                    (#:tr #:cl-consensus.taproot-script))
   (:export #:ledger #:make-ledger #:ledger-error
            #:ledger-id #:ledger-genesis-block #:ledger-operator-key #:ledger-reserves-key
            #:ledger-reserves-amount #:ledger-collateral-amount #:ledger-quorum-state
@@ -19,7 +20,9 @@
            #:ledger-pending-withdrawals #:ledger-credited-payments #:ledger-fees-accumulated
            #:ledger-sequence #:ledger-chain-tip #:ledger-joined-quorums #:ledger-dispute-state
            #:ledger-active-ruleset #:ledger-pending-exits #:ledger-vault-current-p #:due-exits #:+exit-cutoff-margin+
-           #:exit-dust-msats #:*update-seq*
+           #:exit-dust-msats #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
+           #:ledger-dormancy-notice #:dormancy-spin-outs #:dormancy-amount-msats #:deposit-last-signed-activity
+           #:pk-key-path-spk #:dormancy-cost
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
@@ -50,6 +53,7 @@
   (receive-requires-sig nil) fee-change-after-blocks fee-change-notice-blocks fee-change-limit-bps
   (opened-at-block 0) pending-fee-change (last-fee-assessment 0)
   (last-activity-block 0) (last-received-block 0)
+  (last-signed-activity 0)                     ; DEP-20 §8: latest depositor-signed op's height
   (seen-nonces '()))
 
 (defun deposit-available-balance (d) (max 0 (- (deposit-balance d) (deposit-locked-balance d))))
@@ -58,6 +62,7 @@
   pubkey (ledger-id "") min-fee-bps min-fee-fixed max-fee-period membership-until min-collateral-bps
   dispute-response-blocks dispute-arm-blocks service-response-blocks max-transfer-timeout-blocks
   max-descriptor-bytes compensation-bps compensation-deposit-id compensation-frequency-blocks
+  dormancy-blocks dormancy-notice-blocks
   member-response)
 
 (defstruct (ledger (:constructor %make-ledger) (:copier nil))   ; COPY-LEDGER is the deep copy below
@@ -77,7 +82,10 @@
   (dispute-state :normal)
   ;; DEP-20 §3: request id (chain_hash of the ExitRequest update) -> plist
   (pending-exits (make-hash-table :test #'equalp))
-  (vault-current-p nil))            ; a QuorumBegin vault the next QuorumBegin rotates
+  (vault-current-p nil)             ; a QuorumBegin vault the next QuorumBegin rotates
+  (reference-feerate nil)           ; the governing QuorumBegin's reference_feerate_sat_vb (DEP-03)
+  (dormancy-blocks 26280) (dormancy-notice-blocks 2016)   ; DEP-20 §8, from the promoted members
+  (dormancy-notice nil))            ; outstanding DormancyNotice: (:height h :rotation-height r)
 
 (defun make-ledger () (%make-ledger))
 
@@ -118,12 +126,56 @@
 (defparameter +exit-cutoff-margin+ 144 "DEP-20 §3 exit_cutoff_margin_blocks (DEP-11 default).")
 (defparameter exit-dust-msats 330000 "DEP-20 §3: requests below 330 sats are carried, not settled.")
 
+(defun rotation-feerate (ledger)
+  "DEP-03: the governing QuorumBegin's reference feerate, or 2 sat/vB when none is recorded."
+  (or (ledger-reference-feerate ledger) 2))
+
+(defun exit-cost (address feerate)
+  "DEP-20 §3: an exit output's own marginal cost, feerate x (9 + len(spk)) sats."
+  (* feerate (+ 9 (length address))))
+
+(defun dormancy-amount-msats (ledger)
+  "DEP-20 §8: 10 x 34 vB x the governing feerate, in msat."
+  (* 10 34 (rotation-feerate ledger) 1000))
+
+(defun pk-key-path-spk (descriptor)
+  "DEP-20 §8: a pk(K) deposit's address, the key-path P2TR with K's x-only key internal; else NIL."
+  (let ((start (search "pk(" descriptor)))
+    (when (and start (= start 0) (= (length descriptor) 70) (char= (char descriptor 69) #\)))
+      (let ((k (ignore-errors (hex->bytes (subseq descriptor 3 69)))))
+        (and k (= (length k) 33) (member (aref k 0) '(2 3))
+             (values (tr::taproot-output-spk-from-root (subseq k 1 33) (make-array 0 :element-type '(unsigned-byte 8)))))))))
+
+(defun dormancy-cost (ledger) "An addressable spin-out's output cost, sats." (* (rotation-feerate ledger) (+ 9 34)))
+
+(defun dormancy-spin-outs (ledger height)
+  "DEP-20 §8.2: if a rotating QuorumBegin at HEIGHT consumes the outstanding notice, the
+   addressable bucket deposits at or above the floor, ascending deposit id, as
+   ((deposit-id balance spk) ...); else NIL."
+  (let ((n (ledger-dormancy-notice ledger)))
+    (when (and n (ledger-vault-current-p ledger) (>= height (getf n :rotation-height)))
+      (let ((bound (- (getf n :height) (ledger-dormancy-blocks ledger))) (floor-msat (dormancy-amount-msats ledger))
+            (pending (let ((h (make-hash-table :test #'equalp)))
+                       (maphash (lambda (k e) (declare (ignore k)) (setf (gethash (getf e :deposit-id) h) t)) (ledger-pending-exits ledger))
+                       h))
+            (out '()))
+        (maphash (lambda (id d)
+                   (let ((spk (pk-key-path-spk (deposit-descriptor d))))
+                     (when (and spk (plusp (deposit-balance d)) (zerop (deposit-locked-balance d))
+                                (not (gethash id pending))
+                                (<= (deposit-last-signed-activity d) bound)
+                                (>= (deposit-balance d) floor-msat))
+                       (push (list id (deposit-balance d) spk) out))))
+                 (ledger-deposits ledger))
+        (sort out #'bytes< :key #'first)))))
+
 (defun due-exits (ledger height cutoff)
-  "DEP-20 §3 due set: pending requests appended at block_height <= CUTOFF, at least the dust
-   floor, in append order, as a list of (id . plist)."
-  (let ((due '()))
+  "DEP-20 §3 due set: pending requests appended at block_height <= CUTOFF whose output clears the
+   330-sat floor after its own cost, unexpired, in append order, as a list of (id . plist)."
+  (let ((due '()) (f (rotation-feerate ledger)))
     (maphash (lambda (id e)
-               (when (and (<= (getf e :block-height) cutoff) (>= (getf e :amount) exit-dust-msats)
+               (when (and (<= (getf e :block-height) cutoff)
+                          (>= (- (floor (getf e :amount) 1000) (exit-cost (getf e :exit-address) f)) 330)
                           (or (null (getf e :expires-at)) (> (getf e :expires-at) height)))
                  (push (cons id e) due)))
              (ledger-pending-exits ledger))
@@ -167,7 +219,14 @@
       (when d (setf (deposit-last-activity-block d) *block-height*))))
   (when (member (op:operation-type o) '(:invoice-credit :onchain-credit))
     (let ((d (gethash (op:field o :deposit-id) (ledger-deposits ledger))))
-      (when d (setf (deposit-last-received-block d) *block-height*)))))
+      (when d (setf (deposit-last-received-block d) *block-height*))))
+  ;; DEP-20 §8 signed activity: depositor-signed operations only.
+  (let ((spender (case (op:operation-type o)
+                   ((:invoice-lock :onchain-lock :deposit-key-rotate :exit-request :exit-cancel) (op:field o :deposit-id))
+                   (:transfer-lock (op:field o :source-deposit-id)))))
+    (when spender
+      (let ((d (gethash spender (ledger-deposits ledger))))
+        (when d (setf (deposit-last-signed-activity d) *block-height*))))))
 
 (defun apply-operation (ledger o)
   "Fold one operation into LEDGER, or signal LEDGER-ERROR leaving it untouched
@@ -199,7 +258,24 @@
            (unless (collateral-meets-floor-p (f :amount) (f :collateral-amount) floor)
              (fail :collateral-below-floor
                    (format nil "collateral ~a is below ~a bps of the vault (reserves ~a)" (f :collateral-amount) floor (f :amount)))))
-         (%settle-exits ledger o)
+         (let ((spins (dormancy-spin-outs ledger *block-height*))
+               (nexits (length (op:field o :exit-outputs))))
+           (%settle-exits ledger o)
+           (let ((entries (op:field o :dormancy-outputs)))
+             (unless (and (= (length spins) (length entries))
+                          (loop for (id bal) in spins for (eid eamt vout) in entries for j from 1
+                                always (and (equalp id eid) (= bal eamt) (= vout (+ nexits j)))))
+               (fail :dormancy-outputs (format nil "~a spin-outs due, ~a recorded or mismatched" (length spins) (length entries))))
+             (loop for (id) in spins do (setf (deposit-balance (find-deposit ledger id)) 0))
+             (when (and (ledger-dormancy-notice ledger) (ledger-vault-current-p ledger)
+                        (>= *block-height* (getf (ledger-dormancy-notice ledger) :rotation-height)))
+               (setf (ledger-dormancy-notice ledger) nil))))
+         (setf (ledger-reference-feerate ledger) (f :reference-feerate)
+               ;; DEP-20 §8: the largest declared value applies; the default only when none is declared.
+               (ledger-dormancy-blocks ledger) (let ((v (remove nil (mapcar #'member-dormancy-blocks promoted))))
+                                                 (if v (reduce #'max v) 26280))
+               (ledger-dormancy-notice-blocks ledger) (let ((v (remove nil (mapcar #'member-dormancy-notice-blocks promoted))))
+                                                        (if v (reduce #'max v) 2016)))
          (setf (ledger-next-quorum-members ledger) '()
                (ledger-vault-current-p ledger) t
                (ledger-reserves-key ledger) (f :reserves-id)
@@ -213,7 +289,7 @@
        (let ((id (f :deposit-id)))
          (when (gethash id (ledger-deposits ledger)) (fail :deposit-exists))
          (let ((d (make-deposit :id id :descriptor (f :descriptor) :opened-at-block *block-height*
-                                :last-activity-block *block-height*)))
+                                :last-activity-block *block-height* :last-signed-activity *block-height*)))
            (when (f :fees) (setf (deposit-fees d) (f :fees)))
            (when (f :transfer-fees) (setf (deposit-transfer-fees d) (f :transfer-fees)))
            (setf (deposit-receive-requires-sig d) (f :receive-requires-sig)
@@ -311,6 +387,7 @@
                              :compensation-deposit-id (f :compensation-deposit-id)
                              :compensation-frequency-blocks (f :compensation-frequency-blocks)
                              :min-collateral-bps (f :min-collateral-bps)
+                             :dormancy-blocks (f :dormancy-blocks) :dormancy-notice-blocks (f :dormancy-notice-blocks)
                              :member-response (f :member-response))))
          (setf (ledger-next-quorum-members ledger)
                (append (remove (f :quorum-member) (ledger-next-quorum-members ledger)
@@ -334,8 +411,14 @@
       (:dispute-enter (setf (ledger-dispute-state ledger) :disputed))
       (:dispute-armed (setf (ledger-dispute-state ledger) :armed))
       (:dispute-acquire (setf (ledger-operator-key ledger) (f :new-custodian)
-                              (ledger-vault-current-p ledger) nil
+                              (ledger-vault-current-p ledger) nil (ledger-dormancy-notice ledger) nil
                               (ledger-dispute-state ledger) :normal))
+      (:dormancy-notice
+       (when (ledger-dormancy-notice ledger) (fail :dormancy-notice "a notice is already outstanding"))
+       (unless (>= (f :rotation-height) (+ *block-height* (ledger-dormancy-notice-blocks ledger)))
+         (fail :dormancy-notice (format nil "rotation_height ~a is less than ~a blocks ahead" (f :rotation-height)
+                                        (ledger-dormancy-notice-blocks ledger))))
+       (setf (ledger-dormancy-notice ledger) (list :height *block-height* :rotation-height (f :rotation-height))))
       (:exit-request
        (let ((d (find-deposit ledger (f :deposit-id))))
          (unless (plusp (f :amount)) (fail :exit-amount "zero"))

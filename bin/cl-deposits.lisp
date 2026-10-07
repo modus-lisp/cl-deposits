@@ -27,6 +27,7 @@
                 :chain-fn (and cli (cl-deposits.daemon:bitcoin-cli-chain-fn cli))
                 :pledge-fn (and cli (cl-deposits.daemon:bitcoin-cli-pledge-fn cli))
                 :spender-fn (and cli (cl-deposits.daemon:bitcoin-cli-spender-fn cli))
+                :feerate-fn (and cli (cl-deposits.daemon:bitcoin-cli-feerate-fn cli))
                 :utxos-fn (and cli (cl-deposits.daemon:bitcoin-cli-utxos-fn cli))
                 :broadcast-fn (and cli (cl-deposits.daemon:bitcoin-cli-broadcast-fn cli))
                 :height-of-block (and cli (cl-deposits.daemon:bitcoin-cli-height-of-block-fn cli))

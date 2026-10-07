@@ -1390,12 +1390,13 @@
                  (outs (btx:tx-outputs tx)))
             (check-equal "the rotation pays the due exit after the new vault" (length outs) 2)
             (check-bytes "to the request's address" (btx:txout-script (second outs)) (nd:address->spk addr1))
-            (check-equal "floor(amount / 1000) sats" (btx:txout-value (second outs)) 1000)
-            (check-equal "the vault pays the exit and the fee"
-                         sats (- 39000 1000 (* 2 (rot:rotation-vsize 4 '(34 34) nil)))))
+            (check-equal "floor(amount / 1000) sats less the exit's own cost (DEP-20 §3)"
+                         (btx:txout-value (second outs)) (- 1000 (* 2 (+ 9 34))))
+            (check-equal "the vault pays the exit output and the rest of the fee"
+                         sats (- 39000 (- 1000 (* 2 (+ 9 34))) (* 2 (rot:rotation-vsize 4 '(34 34) nil)))))
           (let* ((u (nd:begin-quorum a la))
                  (o (op:decode-operation (up:update-message u)))
-                 (fee (- 39000 1000 sats)))
+                 (fee (- 39000 (- 1000 (* 2 (+ 9 34))) sats (* 2 (+ 9 34)))))
             (check-bytes "the QuorumBegin names the rotation" (op:field o :new-outpoint-txid) txid)
             (check-equal "and records its exit outputs" (op:field o :exit-outputs) (list (list dep 1000000 1)))
             (check "with its cutoff" (integerp (op:field o :exit-cutoff-height)))
@@ -1481,17 +1482,19 @@
           (nd:begin-quorum a la)
           (let* ((tx (btx:parse-tx (cl-consensus.wire:make-reader (gethash txid (nd::node-inflight-rotations a)))))
                  (out (second (btx:tx-outputs tx))))
-            (check-equal "the rotation pays 1000 sats to the offer's address" (btx:txout-value out) 1000)
+            (check-equal "the rotation pays 1000 sats less the exit's own cost to the offer's address"
+                         (btx:txout-value out) (- 1000 (* 2 (+ 9 34))))
             (check-bytes "(that address)" (btx:txout-script out) (nd:address->spk (w:jget offer "funding_address")))
-            (setf (gethash (cons txid 1) chain) (list :value-sats 1000 :confirmations 2 :spk (btx:txout-script out)))
+            (setf (gethash (cons txid 1) chain) (list :value-sats (btx:txout-value out) :confirmations 2 :spk (btx:txout-script out)))
             (let ((r (nd:wallet-complete-offer w dst (w:jget offer "offer_id") (u:bytes->hex (reverse txid)) 1)))
               (check "the destination credits the migration on completion" r))
             (let ((d2 (lg:find-deposit (nd:record-ledger lb) (op:deposit-id (nd::wallet-descriptor w)))))
-              (check-equal "with the output's value" (lg:deposit-balance d2) 1000000))
+              (check-equal "with the output's value" (lg:deposit-balance d2) (* 1000 (- 1000 (* 2 (+ 9 34))))))
             (check-equal "and the source debited it" (lg:deposit-balance (lg:find-deposit (nd:record-ledger la) dep)) 2000000)
             (nd::complete-offer b lb (u:hex->bytes (w:jget offer "offer_id")) txid 1)
             (check-equal "a second completion credits nothing more"
-                         (lg:deposit-balance (lg:find-deposit (nd:record-ledger lb) (op:deposit-id (nd::wallet-descriptor w)))) 1000000)))))))
+                         (lg:deposit-balance (lg:find-deposit (nd:record-ledger lb) (op:deposit-id (nd::wallet-descriptor w))))
+                         (* 1000 (- 1000 (* 2 (+ 9 34)))))))))))
 
 (with-gate ("DEP-10 offer cosign digest: the shared vector (deposits-rust generated)")
   (let ((cur nil) (cases '()))
@@ -1506,6 +1509,59 @@
                      (u:bytes->hex (nd::offer-cosign-digest (f "ledger") (u:hex->bytes (f "offer")) (u:hex->bytes (f "operator"))
                                                             (f "address") (parse-integer (f "deadline")) (u:hex->bytes (f "member_ledger_hash"))))
                      (f "digest"))))))
+
+(with-gate ("DEP-20 §8 dormancy: a notice; at the rotation large dormant pk() deposits are spun out")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111151 :bus bus :height-fn hf :broadcast-fn (lambda (b) b t)))
+         (b (nd:make-node :priv 22222222222222222252 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333353 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444454 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:dorm" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la))
+         (w1 (nd:make-wallet :priv 77777777777777777751 :bus bus))
+         (w2 (nd:make-wallet :priv 77777777777777777752 :bus bus))
+         (w3 (nd:make-wallet :priv 77777777777777777753 :bus bus))
+         (h0 *height*))
+    (flet ((stage () (dolist (m (list b c d))
+                       (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)
+                                      :dormancy-blocks 5 :dormancy-notice-blocks 3))))
+      (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+      (stage)
+      (nd:begin-quorum a la :funding-txid (u:sha256 (hx "d0f0")) :funding-vout 1 :amount-msats 15600000 :collateral-msats 23400000)
+      (let ((d1 (nd:wallet-open-deposit w1 id)) (d2 (nd:wallet-open-deposit w2 id)) (d3 (nd:wallet-open-deposit w3 id))
+            (ledger (lambda () (nd:record-ledger la))))
+        (nd:credit-onchain a la d1 3000000 :txid (u:sha256 (hx "d0c1")))
+        (nd:credit-onchain a la d2 300000 :txid (u:sha256 (hx "d0c2")))     ; below the 680000 msat floor at 2 sat/vB
+        (nd:credit-onchain a la d3 2000000 :txid (u:sha256 (hx "d0c3")))
+        (setf *height* (+ h0 10))
+        (check-signals "a notice less than dormancy_notice_blocks ahead is refused" error
+          (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 12))))
+        (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)))
+        (check-signals "a second notice while one is outstanding is refused" error
+          (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 20))))
+        (let ((r (nd:wallet-exit w3 id d3 1000000 (cl-consensus.encoding:segwit-encode "bcrt" 1 (u:sha256 (hx "e3"))) :height *height*)))
+          (nd:wallet-exit-cancel w3 id d3 (u:hex->bytes r) :height *height*))   ; signed activity after the notice
+        (setf *height* (+ h0 14))
+        (check-equal "the bucket's spin-outs: only the large, dormant pk() deposit"
+                     (mapcar #'first (lg:dormancy-spin-outs (funcall ledger) *height*)) (list d1))
+        (stage)
+        (multiple-value-bind (txid sats) (nd:rotate-vault a la :timeout 20)
+          (declare (ignore txid))
+          (let* ((tx (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes (getf (nd:pending-rotation a la) :tx)))))
+                 (out (second (btx:tx-outputs tx))))
+            (check-equal "the rotation pays the full balance to the deposit's key" (btx:txout-value out) 3000)
+            (check-bytes "at the key-path P2TR of its pk() key"
+                         (btx:txout-script out) (lg:pk-key-path-spk (nd::wallet-descriptor w1)))
+            (let* ((u (nd:begin-quorum a la)) (o (op:decode-operation (up:update-message u))))
+              (check-equal "the QuorumBegin records the spin-out" (op:field o :dormancy-outputs) (list (list d1 3000000 1)))
+              (check-equal "the deposit is debited to zero" (lg:deposit-balance (lg:find-deposit (funcall ledger) d1)) 0)
+              (check-equal "the small and the active deposits stay"
+                           (list (lg:deposit-balance (lg:find-deposit (funcall ledger) d2)) (lg:deposit-balance (lg:find-deposit (funcall ledger) d3)))
+                           '(300000 2000000))
+              (check "the notice is consumed" (null (lg:ledger-dormancy-notice (funcall ledger))))
+              (let* ((fee (- 39000 3000 sats)) (fv (- fee 86)))
+                (check-equal "collateral pays the spin-out's own cost (DEP-20 §8.4)"
+                             (op:field o :collateral-amount) (- (floor (* 23400000 (- 39000 fv) 1000) 39000000) 86000)))
+              (check "members cosigned it" (>= (length (up:update-cosignatures u)) 2)))))))))
 
 (with-gate ("arming waits for its pledge's height: a stale cached height never excludes the armer")
   ;; regtest smoke flake: each pledge mined, then armed at once with a cached height one

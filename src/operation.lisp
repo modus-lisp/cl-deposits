@@ -45,7 +45,8 @@
      (:ledger-hash 42 :bytes32) (:quorum-members 6 :pubkeys) (:collateral-amount 88 :u64)
      (:quorum-member-ledger-ids 276 :ledger-ids :optional) (:protocol-version 286 :string :optional)
      (:exit-cutoff-height 278 :u32 :optional) (:exit-outputs 280 :exit-outputs :optional)
-     (:splice-in-outpoint 282 :bytes :optional) (:splice-in-amount 284 :u64 :optional))
+     (:splice-in-outpoint 282 :bytes :optional) (:splice-in-amount 284 :u64 :optional)
+     (:reference-feerate 292 :u32 :optional) (:dormancy-outputs 336 :exit-outputs :optional))
     (20 :deposit-open
      (:deposit-id 200 :deposit-id) (:descriptor 202 :string) (:fees 12 :fees :optional)
      (:transfer-fees 226 :transfer-fees :optional) (:payment-hash 14 :bytes32 :optional)
@@ -96,6 +97,7 @@
      (:max-transfer-timeout-blocks 258 :u32 :optional) (:max-descriptor-bytes 262 :u32 :optional)
      (:compensation-bps 264 :u16 :optional) (:compensation-deposit-id 266 :deposit-id :optional)
      (:compensation-frequency-blocks 268 :u32 :optional) (:min-collateral-bps 314 :u16 :optional)
+     (:dormancy-blocks 318 :u32 :optional) (:dormancy-notice-blocks 332 :u32 :optional)
      (:member-response 288 :bytes :optional)
      (:member-signature 290 :bytes64 :optional))
     (44 :quorum-remove-member (:quorum-member 44 :pubkey) (:operator-signature 48 :bytes64))
@@ -134,6 +136,8 @@
      (:deposit-id 200 :deposit-id) (:amount 2 :u64) (:exit-address 300 :bytes)
      (:expires-at-height 302 :u32 :optional) (:nonce 288 :u64) (:expiry 290 :u32) (:witness 204 :witness)
      (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))
+    (102 :dormancy-notice (:rotation-height 306 :u32) (:migration-receiver 288 :pubkey :optional)
+     (:manifest-hash 308 :bytes32 :optional))
     (101 :exit-cancel
      (:deposit-id 200 :deposit-id) (:exit-request-id 304 :bytes32) (:nonce 288 :u64) (:expiry 290 :u32)
      (:witness 204 :witness) (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))))
