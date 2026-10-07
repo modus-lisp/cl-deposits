@@ -151,7 +151,12 @@
            (multiple-value-bind (in out snapshot) (nd:lottery-armers node id)
              (ok :snapshot snapshot
                  :participants (sort (mapcar (lambda (a) (subseq (bytes->hex (first a)) 0 16)) in) #'string<)
-                 :excluded (sort (mapcar (lambda (x) (subseq (bytes->hex (first (car x))) 0 16)) out) #'string<)))))
+                 :excluded (sort (mapcar (lambda (x) (subseq (bytes->hex (first (car x))) 0 16)) out) #'string<)
+                 ;; the set the confirmed confiscation's lottery commits to (x-only keys), once one has
+                 :landed (let ((l (nth-value 1 (ignore-errors (nd::fork-lottery node id)))))
+                           (and l (sort (mapcar (lambda (p) (subseq (bytes->hex (cl-deposits.lottery:participant-pubkey p)) 0 14))
+                                                (cl-deposits.lottery:lottery-participants l))
+                                        #'string<)))))))
         (:forks (ok :forks (mapcar (lambda (f) (list :operator (subseq (bytes->hex (nd::record-fork-operator f)) 0 16) :seq (lg:ledger-sequence (nd:record-ledger f))
                                                      :state (lg:ledger-dispute-state (nd:record-ledger f)) :armed (and (nd:record-preimage f) t)))
                                    (nd:forks-of node (arg form :ledger)))))

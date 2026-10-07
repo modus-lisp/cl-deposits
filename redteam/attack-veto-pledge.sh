@@ -86,27 +86,44 @@ taint "$VC"
 echo "   pledge spent: ${spent:-not seen}"
 echo "   exclusion:    ${excluded:-not logged by cl members}"
 for r in $REFS; do grep -h "armer ${VCPK:0:16} excluded from the lottery" "$CLD_ROOT/$r/node.log" 2>/dev/null | tail -1 | sed "s/\x1b\[[0-9;]*m//g; s/^/   $r: /"; done
-# Cross-implementation agreement on the final cut.  A member's view at a given E is transient (an arm
-# at or below E can arrive later without moving E), so compare views once every arm has arrived:
-# cl's cut evaluated now, against the reference's latest logged cut.
-sleep 30
-cl_view=$(for n in $H $VC $C2; do cld_ctl $n "(:lottery-set :ledger \"$V\")" 2>/dev/null; done | python3 -c '
+# Cross-implementation agreement.  Views of the cut at one moment are not comparable (arms reach
+# members at different times, and the set is final only once a confiscation confirms, DEP-03), so the
+# live test is the landed confiscation's own witness: if both a cl member and a reference member
+# signed it, each derived the same participant set (and the same bytes) independently.
+cl_view=""; ref_view=""
+signers=$(bcli getrawtransaction "$conf" true 2>/dev/null | python3 -c '
+import json,sys
+tx=json.load(sys.stdin); w=tx["vin"][0].get("txinwitness",[])
+leaf=bytes.fromhex(w[-2]); keys=[]; i=0
+while i < len(leaf):
+    op=leaf[i]
+    if op==0x20: keys.append(leaf[i+1:i+33].hex()); i+=33
+    elif 1<=op<=0x4b: i+=1+op
+    else: i+=1
+sigs=w[:-2]
+for j,sig in enumerate(sigs):
+    k=len(sigs)-1-j
+    if sig and k < len(keys): print(keys[k][:16])
+')
+roles=""
+for k in $signers; do
+  who=$(for f in "$S"/pubkey.*; do [ "$(cut -c3-18 "$f")" = "$k" ] && basename "$f" | cut -d. -f2; done | head -1)
+  roles="$roles ${who:-?$k}"
+done
+echo "   confiscation $conf signed by:${roles:- (unreadable witness)}"
+case "$roles" in *cld*) ;; *) [ -n "$REFS" ] && echo "   (no cl signer: cross-implementation agreement not shown by this run)";; esac
+case "$roles" in *ref*) ;; *) [ -n "$REFS" ] && echo "   (no reference signer: cross-implementation agreement not shown by this run)";; esac
+both=""; case "$roles" in *cld*ref*|*ref*cld*) both=1;; esac
+sets=$(for n in $H $VC $C2; do cld_ctl $n "(:lottery-set :ledger \"$V\")" 2>/dev/null; done | python3 -c '
 import re,sys
 for l in sys.stdin:
     m=re.search(r":SNAPSHOT (\d+) :PARTICIPANTS \(([^)]*)\) :EXCLUDED (NIL|\(([^)]*)\))", l)
-    if m: print("cl", m.group(1), " ".join(sorted(re.findall(r"[0-9a-f]{16}", m.group(2)))), "|", " ".join(sorted(re.findall(r"[0-9a-f]{16}", m.group(4) or ""))))
+    if m: print("at snapshot %s: [%s]; excluded: [%s]" % (m.group(1), " ".join(re.findall(r"[0-9a-f]{16}", m.group(2))), " ".join(re.findall(r"[0-9a-f]{16}", m.group(4) or ""))))
 ' | sort -u)
-ref_view=$(for r in $REFS; do grep -h "lottery participants of ${V:0:16}" "$CLD_ROOT/$r/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1 | python3 -c '
-import re,sys
-for l in sys.stdin:
-    m=re.search(r"at snapshot (\d+): \[([^\]]*)\]; excluded: \[([^\]]*)\]", l)
-    if m: print("ref", m.group(1), " ".join(sorted(m.group(2).split())), "|", " ".join(sorted(re.findall(r"[0-9a-f]{16}", m.group(3)))))
-'; done | sort -u)
-echo "$cl_view$( [ -n "$ref_view" ] && printf '\n%s' "$ref_view")" | sed '/^$/d; s/^/   final cut: /'
-nviews=$(printf '%s\n%s\n' "$cl_view" "$ref_view" | sed '/^$/d' | cut -d' ' -f2- | sort -u | wc -l)
-[ "$nviews" -le 1 ] || fail "cl and the reference disagree on the final participant set (E, members, excluded)"
-verdict=$(printf '%s\n%s\n' "$cl_view" "$ref_view" | sed '/^$/d; s/^\S* /   E=/')
-sets=$(printf '%s\n%s\n' "$cl_view" "$ref_view" | sed '/^$/d' | sed -E 's/^\S+ ([0-9]+) ([^|]*)\| (.*)/at snapshot \1: [\2]; excluded: [\3]/')
+echo "$sets" | sed '/^$/d; s/^/   cl cut now: /'
+landed=$(cld_ctl $H "(:lottery-set :ledger \"$V\")" 2>/dev/null | grep -oE ':LANDED \([^)]*\)' | grep -oE '[0-9a-f]{14}' | tr '\n' ' ')
+echo "   landed confiscation's participants (x-only): ${landed:-unknown}"
+in_landed=""; [ -n "$landed" ] && [[ " $landed " == *" ${VCPK:2:14} "* ]] && in_landed=1
 [ -n "$spent" ] || fail "the adversary never spent its pledge (did $VC arm with one?)"
 [ -n "$conf" ] || fail "no confiscation within ${WAIT}s: a spent pledge still vetoes the dispute"
 # A veto test only if the spend confirmed at or before a snapshot E the members cut at; otherwise
@@ -116,6 +133,10 @@ spend_h=""; [ -n "$spend_tx" ] && spend_h=$(bcli getrawtransaction "$spend_tx" t
 cut_e=$(echo "$sets" | grep -oE "snapshot [0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1)
 excluded_at=$(echo "$sets" | grep -E "excluded: \[[^]]*${VCPK:0:16}" | grep -oE 'snapshot [0-9]+' | grep -oE '[0-9]+' | sort -n | head -1)
 echo "   spend confirmed at ${spend_h:-?}; snapshots evaluated up to ${cut_e:-?}; adversary excluded at ${excluded_at:-never}"
+# The adversary in the landed set although its spend confirmed by the snapshot: the cut failed.
+if [ "$MODE" = veto ] && [ -n "$in_landed" ] && [ -n "$spend_h" ] && [ -n "$cut_e" ] && [ "$spend_h" -le "$cut_e" ]; then
+  fail "the landed confiscation includes $VC although its spend confirmed at $spend_h <= E $cut_e"
+fi
 if [ "$MODE" = veto ] && [ -z "$excluded_at" ]; then
   if [ -z "$spend_h" ] || [ -z "$cut_e" ] || [ "$spend_h" -gt "$cut_e" ]; then
     echo "INVALID: the spend confirmed at ${spend_h:-?}, after every snapshot (${cut_e:-?}): $VC was rightly a participant"; exit 75
