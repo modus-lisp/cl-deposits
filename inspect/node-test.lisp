@@ -1067,9 +1067,7 @@
   ;; equivocation proof accusing itself.  Only the operator's equivocation is
   ;; fraud on a ledger: C and D must not dispute A.
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
-         (sent '())
-         (a (nd:make-node :priv 11111111111111111181 :bus bus :height-fn hf
-                          :broadcast-fn (lambda (bytes) (push (btx:tx-txid (btx:parse-tx (cl-consensus.wire:make-reader bytes))) sent) t)))
+         (a (nd:make-node :priv 11111111111111111181 :bus bus :height-fn hf))
          (b (nd:make-node :priv 22222222222222222282 :bus bus :height-fn hf))
          (c (nd:make-node :priv 33333333333333333383 :bus bus :height-fn hf))
          (d (nd:make-node :priv 44444444444444444484 :bus bus :height-fn hf))
@@ -1304,7 +1302,9 @@
 
 (with-gate ("DEP-03 rotation: a cl operator spends the old vault into the new one, members sign it")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
-         (a (nd:make-node :priv 11111111111111111181 :bus bus :height-fn hf))
+         (sent '())
+         (a (nd:make-node :priv 11111111111111111181 :bus bus :height-fn hf
+                          :broadcast-fn (lambda (bytes) (push (btx:tx-txid (btx:parse-tx (cl-consensus.wire:make-reader bytes))) sent) t)))
          (b (nd:make-node :priv 22222222222222222282 :bus bus :height-fn hf))
          (c (nd:make-node :priv 33333333333333333383 :bus bus :height-fn hf))
          (d (nd:make-node :priv 44444444444444444484 :bus bus :height-fn hf))
