@@ -32,8 +32,8 @@ spender=$(bcli getrawtransaction "$RT" true | python3 -c "import json,sys; t=jso
 NEW=$(cld_ctl $OP "(:vaults)" | grep -oE "\"$X\" \([^)]*\)" | grep -oE '[0-9a-f]{64}:[0-9]+' | tail -1)
 [ "$NEW" = "$RT:0" ] || fail "the QuorumBegin names $NEW, not the rotation's output $RT:0"
 [ -n "$(bcli gettxout "$RT" 0)" ] || fail "the new vault $RT:0 is not unspent"
-signers=$(grep -l "signing rotation of ${X:0:8}" "$CLD_ROOT"/{$C1,$R1,$R2}/node.log 2>/dev/null | wc -l)
-echo "   rotation signed: cl member log hits $signers; reference responses in $(grep -lc "rotation_sign" "$CLD_ROOT/$R1/node.log" "$CLD_ROOT/$R2/node.log" 2>/dev/null | wc -l) logs"
+signers=$(cld_ctl $C1 "(:log :n 2000)" | grep -c "signing rotation of ${X:0:8}")
+echo "   rotation signed: cl member signed $signers; reference successes $(cat "$CLD_ROOT/$R1/node.log" "$CLD_ROOT/$R2/node.log" 2>/dev/null | grep -c "action=rotation_sign, ledger=${X:0:16}.*success=true")"
 echo "== mixed-quorum rotation on chain: $OLD -> $RT:0"
 # Leftovers: across every cl node's owned ledgers.
 leftover=0 legacy=0 checked=0
