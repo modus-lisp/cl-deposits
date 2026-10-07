@@ -109,10 +109,12 @@ TAINTED="$S/redteam-tainted"
 taint() { local n; for n in "$@"; do grep -qx "$n" "$TAINTED" 2>/dev/null || echo "$n" >>"$TAINTED"; done; }
 tainted() { grep -qx "$1" "$TAINTED" 2>/dev/null; }
 clean_cl() {
-  local n; for n in $(cld_names | sort -t d -k2 -nr); do
+  local n info; for n in $(cld_names | sort -t d -k2 -nr); do
     tainted "$n" && continue
     [[ " ${REDTEAM_AVOID:-} " == *" $n "* ]] && continue   # clean but busy (e.g. still in an earlier scenario's dispute)
-    if cld_ctl "$n" '(:info)' 2>/dev/null | grep -qE ':OWNED T [^)]*:DISPUTED [1-9]'; then taint "$n"; continue; fi
+    info=$(cld_ctl "$n" '(:info)' 2>/dev/null)
+    [[ "$info" == *":STATUS :OK"* ]] || continue   # not answering (still loading, or down): not an actor
+    if grep -qE ':OWNED T [^)]*:DISPUTED [1-9]' <<<"$info"; then taint "$n"; continue; fi
     echo "$n"
   done
 }
@@ -127,7 +129,8 @@ mint_cl() {
   echo $(( $(cat "$CLD_ROOT/minted-cl" 2>/dev/null || echo 0) + k )) >"$CLD_ROOT/minted-cl"
   source "$CLD_SRC/devnet/_common.sh" >/dev/null 2>&1
   for i in $(seq $((have + 1)) $((have + k))); do
-    n=cld$i; start_cld "$n" >&2 || return 1
+    n=cld$i; start_cld "$n" >&2   # may report "did not come up" while still loading under load
+    local w; for w in $(seq 1 60); do cld_ctl "$n" '(:info)' 2>/dev/null | grep -q ":STATUS :OK" && break; sleep 5; done
     pubkey_of "$n" >/dev/null
     a=$(sx "$(cld_ctl "$n" '(:address)')" ":ADDRESS") || return 1
     for j in 1 2 3 4 5 6 7 8; do wcli sendtoaddress "$a" 0.01 >/dev/null; done
