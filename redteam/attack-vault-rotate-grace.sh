@@ -26,7 +26,8 @@ disarm :theft-sign $C1 $C2 $C3
 # cld1 is the thief in the other vault scenarios.  Once accused, contagion disputes every ledger it
 # operates, this one included, and it stands down: the rotation cannot be recorded at all.
 begin() {
-  local r; r=$(cld_ctl $OP "(:begin-quorum :ledger \"$X\" :txid \"$SPEND\" :vout 0 :sats $(out_sats "$SPEND" 0) :collateral-sats 0)")
+  local v r; v=$(out_sats "$SPEND" 0)   # half collateral: DEP-05's floor is 20% of the vault
+  r=$(cld_ctl $OP "(:begin-quorum :ledger \"$X\" :txid \"$SPEND\" :vout 0 :sats $(( v - v / 2 )) :collateral-sats $(( v / 2 )))")
   case "$r" in *"ledger disputed"*) echo "SKIP: the operator ($OP) is already accused of an earlier theft, so its members disputed this ledger and it cannot rotate: $r"; exit 0;; esac
   expect "$r"
 }
@@ -40,7 +41,7 @@ case $ARM in
     mine 5 >/dev/null; sleep 5
     if accused $H2 "$X"; then r=0; else r=1; fi
     taint $OP $C1 $C2 $C3
-    cld_ctl $OP "(:begin-quorum :ledger \"$X\" :txid \"$SPEND\" :vout 0 :sats $(out_sats "$SPEND" 0) :collateral-sats 0)" >/dev/null   # too late either way
+    v=$(out_sats "$SPEND" 0); cld_ctl $OP "(:begin-quorum :ledger \"$X\" :txid \"$SPEND\" :vout 0 :sats $(( v - v / 2 )) :collateral-sats $(( v / 2 )))" >/dev/null   # too late either way
     [ $r -eq 0 ] && echo "PASS (bound): a rotation recorded after the ${GRACE:-3}-block grace was reported as a theft." || fail "late rotation not reported";;
   *) fail "arm: inside | late";;
 esac

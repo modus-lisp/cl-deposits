@@ -22,7 +22,7 @@
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
-           #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
+           #:collateral-floor-bps #:collateral-meets-floor-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
            #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
 (in-package #:cl-deposits.ledger)
@@ -54,7 +54,7 @@
 (defun deposit-available-balance (d) (max 0 (- (deposit-balance d) (deposit-locked-balance d))))
 
 (defstruct (quorum-member (:conc-name member-))
-  pubkey (ledger-id "") min-fee-bps min-fee-fixed max-fee-period membership-until
+  pubkey (ledger-id "") min-fee-bps min-fee-fixed max-fee-period membership-until min-collateral-bps
   dispute-response-blocks dispute-arm-blocks service-response-blocks max-transfer-timeout-blocks
   max-descriptor-bytes compensation-bps compensation-deposit-id compensation-frequency-blocks
   member-response)
@@ -143,6 +143,12 @@
            (fail :quorum-size-invalid (format nil "Q=~a not in ~a" (length declared) +valid-quorum-sizes+)))
          (unless (member (f :protocol-version) +rulesets+ :test #'equal)
            (fail :unknown-ruleset (format nil "QuorumBegin protocol_version ~s is not a known ruleset" (f :protocol-version))))
+         ;; DEP-05 "Collateral floor": collateral is at least the strictest member's share of
+         ;; the vault, never below 20%.  Collateral is a floor, not a cap on credits.
+         (let ((floor (collateral-floor-bps promoted)))
+           (unless (collateral-meets-floor-p (f :amount) (f :collateral-amount) floor)
+             (fail :collateral-below-floor
+                   (format nil "collateral ~a is below ~a bps of the vault (reserves ~a)" (f :collateral-amount) floor (f :amount)))))
          (setf (ledger-next-quorum-members ledger) '()
                (ledger-reserves-key ledger) (f :reserves-id)
                (ledger-reserves-amount ledger) (f :amount)
@@ -252,6 +258,7 @@
                              :compensation-bps (f :compensation-bps)
                              :compensation-deposit-id (f :compensation-deposit-id)
                              :compensation-frequency-blocks (f :compensation-frequency-blocks)
+                             :min-collateral-bps (f :min-collateral-bps)
                              :member-response (f :member-response))))
          (setf (ledger-next-quorum-members ledger)
                (append (remove (f :quorum-member) (ledger-next-quorum-members ledger)
@@ -334,6 +341,15 @@
 
 (defun establishment-p (op)
   (member (cl-deposits.operation:operation-type op) '(:quorum-add-member :quorum-remove-member :quorum-begin)))
+
+(defconstant +min-collateral-bps-floor+ 2000 "DEP-05: no quorum lets collateral fall below 20% of the vault.")
+
+(defun collateral-floor-bps (members)
+  "The strictest member's min_collateral_bps, never below +min-collateral-bps-floor+."
+  (reduce #'max (remove nil (mapcar #'member-min-collateral-bps members)) :initial-value +min-collateral-bps-floor+))
+
+(defun collateral-meets-floor-p (reserves collateral floor-bps)
+  (>= (* collateral 10000) (* floor-bps (+ reserves collateral))))
 
 (defun lifecycle-tier (ledger height)
   (let ((expiry (ledger-quorum-expiry ledger)))

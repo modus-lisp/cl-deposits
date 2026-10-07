@@ -260,6 +260,17 @@
                                      :witnesses nil)))
                (check-equal (format nil "~a confiscation tx" name) (u:bytes->hex (btx:serialize-tx tx)) (funcall vec name))))))
 
+(with-gate ("ledger: the DEP-05 collateral floor against the shared vector")
+  (let ((v (com.inuoe.jzon:parse (uiop:read-file-string (vector-path "collateral_floor.json")))))
+    (loop for case across (gethash "cases" v)
+          do (let* ((members (map 'list (lambda (b) (lg::make-quorum-member :min-collateral-bps (and (integerp b) b)))
+                                  (gethash "member_bps" case)))
+                    (floor (lg:collateral-floor-bps members)))
+               (check-equal (format nil "~a: floor" (gethash "name" case)) floor (gethash "floor_bps" case))
+               (check-equal (format nil "~a: verdict" (gethash "name" case))
+                            (lg:collateral-meets-floor-p (gethash "reserves" case) (gethash "collateral" case) floor)
+                            (gethash "ok" case))))))
+
 ;;; inspect/vectors/armer_eligibility.json: the DEP-03 replacement-collateral cut,
 ;;; shared with deposits-rust (deposits-node/tests/vectors/armer_eligibility.json).
 (with-gate ("lottery: armer eligibility cut against the shared vector")
