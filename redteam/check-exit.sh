@@ -41,7 +41,11 @@ echo "   output 1 pays 1000 sats to the requested address"
 b=$(w balance "$D"); echo "   after the rotation: $b"
 [ "$(sx "$b" ":BALANCE")" = 2000000 ] || fail "the deposit was not debited by exactly the settled exit: $b"
 [ "$(sx "$b" ":LOCKED")" = 200000 ] || fail "the dust request is not still locked: $b"
+refsigned=0
 for m in $R1 $R2; do
-  grep -q "Refusing cosign.*${X:0:16}\|rotation tx differs" "$CLD_ROOT/$m/node.log" 2>/dev/null && echo "   note: $m logged a refusal for $X"
+  if sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" 2>/dev/null | grep -q "action=rotation_sign, ledger=${X:0:16}.*success=true"; then refsigned=$((refsigned+1))
+  else echo "   $m did not sign the rotation: $(sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" | grep "action=rotation_sign, ledger=${X:0:16}" | tail -1 | grep -oE 'error=.*' | cut -c1-120)"; fi
 done
+[ $refsigned -ge 1 ] || fail "no reference member signed the rotation with its exit: a reference-majority quorum could not rotate"
+echo "   reference members that signed the rotation: $refsigned of 2"
 echo "PASS: the due exit settled on chain at the rotation (mixed quorum), the dust request was carried, the cancel released its lock."
