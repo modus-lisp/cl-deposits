@@ -40,6 +40,8 @@
             :note "finding: the escalation lands and nothing acts on it")
    (make-sc :name "vault-rotate-grace" :script "attack-vault-rotate-grace.sh" :args '("inside")
             :ledger-var "REDTEAM_RG" :timeout 900)
+   (make-sc :name "rotation" :script "check-rotation.sh" :ledger-var "REDTEAM_ROT" :timeout 1200
+            :note "a cl rotation spends its old vault on chain (mixed quorum); no leftovers")
    (make-sc :name "invalid-credit-collude" :script "attack1-invalid-credit.sh" :args '("collude")
             :ledger-var "REDTEAM_IC"
             :timeout 600 :tags '(:contagion))
@@ -53,7 +55,7 @@
    (make-sc :name "vault-recovery-tier" :script "attack-vault-recovery-tier.sh" :ledger-var "REDTEAM_RT"
             :timeout 1800 :tags '(:contagion :disruptive :slow) :note "mines past expiry + 720")
    (make-sc :name "vault-rotate-late" :script "attack-vault-rotate-grace.sh" :args '("late")
-            :ledger-var "REDTEAM_RG" :timeout 900 :tags '(:contagion) :note "documents the grace bound")
+            :ledger-var "REDTEAM_RG" :timeout 900 :tags '(:contagion) :note "signers remember the rotation; a non-signer reports a late one")
    (make-sc :name "vault-missed-confiscation" :script "attack-vault-missed-confiscation.sh"
             :ledger-var "REDTEAM_MC" :env '("WAIT=900") :timeout 1500 :tags '(:contagion :slow))
    (make-sc :name "withhold-reveal" :script "attack-withhold-reveal.sh" :ledger-var "REDTEAM_W"

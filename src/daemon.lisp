@@ -110,6 +110,18 @@
                 (r (nd:prepare-quorum node rec :expiry-blocks (arg form :expiry-blocks 4320) :ruleset (arg form :ruleset "cltv-offset-v2"))))
            (ok :address (rs:reserves-address r) :expiry (cdr (nd:record-pinned rec))
                :ledger-hash (bytes->hex (rs:reserves-ledger-hash r)))))
+        (:vaults
+         ;; Every vault each owned base ledger's QuorumBegins named, oldest first, as
+         ;; "txid:vout" (display order): the rotation check proves each but the last spent.
+         (ok :ledgers
+             (loop for rec being the hash-values of (nd:node-ledgers node)
+                   when (and (nd:record-owned-p rec) (not (nd::record-fork-p rec)))
+                   collect (list (nd:record-id-hex rec)
+                                 (loop for u in (reverse (nd:record-history rec))
+                                       for o = (op:decode-operation (up:update-message u))
+                                       when (eq (op:operation-type o) :quorum-begin)
+                                         collect (format nil "~a:~a" (bytes->hex (reverse (op:field o :new-outpoint-txid)))
+                                                         (op:field o :new-outpoint-vout)))))))
         (:rotate-vault
          (let ((rec (rec! node form)))
            (multiple-value-bind (txid sats) (nd:rotate-vault node rec :expiry-blocks (arg form :expiry-blocks 4320))
