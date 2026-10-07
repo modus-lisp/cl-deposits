@@ -36,7 +36,7 @@
            #:open-ledger #:append-operation #:add-member #:prepare-quorum #:begin-quorum #:credit-onchain
            #:node-chain-fn #:node-pledge-fn #:lottery-armers #:split-armers #:eligibility-floor-sats #:node-min-confs #:node-data-dir #:record-pinned #:height #:tip
            #:node-error #:request #:wallet #:make-wallet #:wallet-pubkey #:wallet-request
-           #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer #:wallet-exit #:wallet-exit-cancel #:address->spk
+           #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer #:wallet-exit #:wallet-exit-cancel #:wallet-migrate #:wallet-make-offer #:wallet-complete-offer #:address->spk
            #:wallet-make-invoice #:wallet-pay-invoice #:credit-paid-invoices #:start-invoice-poller #:node-ln #:node-invoices
            #:enter-dispute #:arm-dispute #:fork-key #:find-fork #:forks-of #:armers-of #:disputed-reserves
            #:rotate-vault #:pending-rotation #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
@@ -66,7 +66,8 @@
   (persisted 0)                                ; how many history entries the file on disk holds (append-only save)
   (append-lock (bt:make-lock "append"))        ; one append at a time per owned ledger, cosign wait included
   preimage lottery confiscation                ; our lottery secret; the built lottery; the confiscation tx
-  rotation)                                    ; broadcast rotation awaiting its QuorumBegin (plist; persisted)
+  rotation                                     ; broadcast rotation awaiting its QuorumBegin (plist; persisted)
+  (offers (make-hash-table :test #'equalp)))   ; DEP-10 funding offers we made: offer id -> plist
 
 (defstruct (node (:constructor %make-node))
   priv pubkey pubkey-hex keypair bus network
@@ -726,6 +727,7 @@
           ((string= action "confiscation_sign") (handle-confiscation-sign node event params))
           ((string= action "theft_sign") (handle-theft-sign node event params))
           ((string= action "rotation_sign") (handle-rotation-sign node event params))
+          ((string= action "cosign_offer") (handle-cosign-offer node event params))
           ((string= action "lottery_subset_attest") (handle-lottery-subset-attest node event params))
           ((string= action "lottery_reveal") (handle-lottery-reveal-request node event params))
           ((string= action "consent_request") (handle-consent node event params))
@@ -1191,6 +1193,98 @@
                  (and (integerp until) (cons 13 (int->be until 4)))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; DEP-10 funding offers (we are the operator, or a member cosigning one)
+
+(defun offer-cosign-digest (ledger-id-hex offer-id operator33 address deadline member-ledger-hash)
+  "DEP-10 offer cosign digest: ledger_id is the hex text, len(address) one byte, deadline LE32."
+  (let ((tag (sha256 (ascii->bytes "deposits/offer_cosign"))))
+    (sha256 (cat tag tag (ascii->bytes ledger-id-hex) offer-id (up:x-only operator33)
+                 (octets (length address)) (ascii->bytes address) (int->le deadline 4) member-ledger-hash))))
+
+(defun offer-address (node offer-id)
+  "A key-path P2TR of our key committing OFFER-ID (tweaked by it), so each offer's payments are its own."
+  (let ((spk (lot:p2tr-spk (up:x-only (node-pubkey node)) (sha256 offer-id))))
+    (values (cl-consensus.encoding:segwit-encode (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)) 1
+                                                 (subseq spk 2))
+            spk)))
+
+(defun make-offer (node rec descriptor max-sats min-sats blocks-valid)
+  "DEP-10: a funding offer for DESCRIPTOR's deposit, cosigned by a member once the quorum is
+   active.  Returns the response object."
+  (unless (< 0 min-sats max-sats) (fail "need 0 < min_sats < max_sats"))
+  (let* ((offer-id (random-aux)) (deadline (+ (height node) blocks-valid)))
+    (multiple-value-bind (address spk) (offer-address node offer-id)
+      (let ((offer (list :offer-id offer-id :descriptor descriptor :deposit-id (op:deposit-id descriptor)
+                         :address address :spk spk :deadline deadline :min min-sats :max max-sats :status :pending))
+            (cosign nil))
+        (when (eq (lg:ledger-quorum-state (record-ledger rec)) :active)
+          (let ((r (first (send-request node (record-id-hex rec) "cosign_offer"
+                                        (w:json-object "offer_id" (bytes->hex offer-id) "operator_id" (node-pubkey-hex node)
+                                                       "funding_address" address "deadline_block" deadline)
+                                        :want 1 :successes-only t))))
+            (let ((res (and r (w:jget r "result"))))
+              (when (stringp res) (setf res (w:parse-json res)))
+              (unless res (fail "no member cosigned the offer"))
+              (let ((pk (hex->bytes (w:jget res "cosigner_pubkey"))) (sig (hex->bytes (w:jget res "signature_hex")))
+                    (mlh (hex->bytes (w:jget res "member_ledger_hash_hex"))))
+                (unless (schnorr:schnorr-verify (up:x-only pk)
+                                                (offer-cosign-digest (record-id-hex rec) offer-id (node-pubkey node) address deadline mlh) sig)
+                  (fail "offer cosignature does not verify"))
+                (setf cosign res)))))
+        (setf (gethash offer-id (record-offers rec)) offer)
+        (apply #'w:json-object "offer_id" (bytes->hex offer-id) "operator_id" (node-pubkey-hex node)
+               "funding_address" address "deadline_block" deadline "max_sats" max-sats "min_sats" min-sats
+               "cosign_required" (and cosign t)
+               (when cosign (list "cosigner_pubkey" (w:jget cosign "cosigner_pubkey")
+                                  "cosigner_ledger_hash" (w:jget cosign "member_ledger_hash_hex")
+                                  "cosign_signature" (w:jget cosign "signature_hex"))))))))
+
+(defun complete-offer (node rec offer-id txid vout)
+  "DEP-10 §Completion: credit output VOUT of TXID if it pays the offer's address and confirmed at
+   a height <= its deadline; the credit is the output's value (capped at the maximum)."
+  (let ((offer (or (gethash offer-id (record-offers rec)) (fail "unknown offer"))))
+    (when (eq (getf offer :status) :completed) (return-from complete-offer (getf offer :credited)))
+    (let ((info (or (and (node-chain-fn node) (funcall (node-chain-fn node) txid vout)) (fail "no such unspent output"))))
+      (unless (equalp (getf info :spk) (getf offer :spk)) (fail "the output does not pay the offer's address"))
+      (let ((confs (or (getf info :confirmations) 0)))
+        (unless (plusp confs) (fail "the funding output is unconfirmed"))
+        (when (> (- (height node) (1- confs)) (getf offer :deadline))
+          (fail "funding confirmed after the offer's deadline ~a" (getf offer :deadline))))
+      (let ((sats (getf info :value-sats)))
+        (when (< sats (getf offer :min)) (fail "funding ~a sats below the minimum ~a" sats (getf offer :min)))
+        (let ((msat (* 1000 (min sats (getf offer :max)))) (id (getf offer :deposit-id)))
+          (unless (gethash id (lg:ledger-deposits (record-ledger rec)))
+            (append-operation node rec (list :type :deposit-open :deposit-id id :descriptor (getf offer :descriptor)
+                                             :fees (op:make-fees :frequency-blocks 2016) :receive-requires-sig nil)))
+          (credit-onchain node rec id msat :txid txid :vout vout :funding-address (getf offer :address))
+          (setf (getf (gethash offer-id (record-offers rec)) :status) :completed
+                (getf (gethash offer-id (record-offers rec)) :credited) msat)
+          msat)))))
+
+(defun handle-cosign-offer (node event params)
+  "A member: cosign an operator's funding offer (DEP-10) unless its operator is deposed."
+  (let* ((id (w:event-ledger-id event)) (rec (find-record node id)))
+    (unless rec (return-from handle-cosign-offer nil))
+    (handler-case
+        (progn
+          (check-not-deposed node rec)
+          (unless (member (node-pubkey node) (mapcar #'lg:member-pubkey (lg:ledger-quorum-members (record-ledger rec))) :test #'equalp)
+            (fail "not a quorum member"))
+          (let* ((offer-id (hex->bytes (w:jget params "offer_id")))
+                 (operator (hex->bytes (w:jget params "operator_id")))
+                 (address (w:jget params "funding_address")) (deadline (w:jget params "deadline_block"))
+                 (mlh (member-ledger-hash node)))
+            (unless (equalp operator (lg:ledger-operator-key (record-ledger rec))) (fail "not this ledger's operator"))
+            (unless (and (= (length offer-id) 32) (stringp address) (integerp deadline)) (fail "malformed offer"))
+            (respond node event t
+                     :result (w:json-object "signature_hex" (bytes->hex (schnorr:schnorr-sign (node-priv node)
+                                                                                            (offer-cosign-digest id offer-id operator address deadline mlh)
+                                                                                            (random-aux)))
+                                            "cosigner_pubkey" (node-pubkey-hex node)
+                                            "member_ledger_hash_hex" (bytes->hex mlh)))))
+      (error (e) (respond node event nil :error (princ-to-string e))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Inbound: wallet requests (we are the operator)
 
 (defun handle-wallet-request (node rec event action params)
@@ -1272,6 +1366,18 @@
              (fail "completion script not satisfied"))
            (append-operation node rec o)
            (respond node event t :result (w:json-object "transfer_id" (bytes->hex (op:field o :transfer-id))))))
+        ((string= action "make_offer")
+         (respond node event t :result (make-offer node rec (or (w:jget params "descriptor") (fail "descriptor required"))
+                                                   (or (w:jget params "max_sats") (fail "max_sats required"))
+                                                   (or (w:jget params "min_sats") 1) (or (w:jget params "blocks_valid") 144))))
+        ((string= action "complete_offer")
+         (let* ((tx (w:jget params "txid"))
+                ;; display or internal hex: try the display order (what wallets print) first
+                (raw (hex->bytes tx))
+                (oid (hex->bytes (w:jget params "offer_id"))) (vout (or (w:jget params "vout") (fail "vout required")))
+                (msat (handler-case (complete-offer node rec oid (reverse raw) vout)
+                        (error () (complete-offer node rec oid raw vout)))))
+           (respond node event t :result (w:json-object "status" "SUCCESS" "credited_msats" msat))))
         ((string= action "make_invoice") (handle-make-invoice node rec event params))
         ((string= action "pay_invoice") (handle-pay-invoice node rec event params))
         (t (respond node event nil :error (format nil "unknown action ~a" action))))
@@ -1918,6 +2024,36 @@
         (wallet-request wal ledger-id-hex "exit_request" (w:json-object "operation" (base64-encode (op:encode-operation o))))
       (unless ok (fail "exit_request: ~a" err))
       (w:jget res "exit_request_id"))))
+
+(defun wallet-make-offer (wal ledger-id-hex max-sats &key (min-sats 1) (blocks-valid 144))
+  "DEP-10: ask LEDGER-ID-HEX's operator for a cosigned funding offer crediting our pk() deposit.
+   Returns the response object (funding_address, deadline_block, offer_id, cosign...)."
+  (multiple-value-bind (ok res err)
+      (wallet-request wal ledger-id-hex "make_offer"
+                      (w:json-object "descriptor" (wallet-descriptor wal) "max_sats" max-sats
+                                     "min_sats" min-sats "blocks_valid" blocks-valid))
+    (unless ok (fail "make_offer: ~a" err))
+    (if (stringp res) (w:parse-json res) res)))
+
+(defun wallet-complete-offer (wal ledger-id-hex offer-id-hex txid-hex vout)
+  "DEP-10 §Completion: name the payment (TXID-HEX display order, VOUT) of an offer on LEDGER-ID-HEX."
+  (multiple-value-bind (ok res err)
+      (wallet-request wal ledger-id-hex "complete_offer"
+                      (w:json-object "offer_id" offer-id-hex "txid" txid-hex "vout" vout "amount_sats" 0))
+    (unless ok (fail "complete_offer: ~a" err))
+    res))
+
+(defun wallet-migrate (wal from-ledger-hex deposit-id amount-msats to-ledger-hex &key (height 0) (blocks-valid 288))
+  "DEP-20 §10: move AMOUNT-MSATS from DEPOSIT-ID on FROM-LEDGER-HEX to our deposit on
+   TO-LEDGER-HEX: a cosigned offer there, then an exit here paying its address that is released
+   if not settled 6 blocks before the offer's deadline.  Returns (values request-id offer)."
+  (let* ((sats (floor amount-msats 1000))
+         (offer (wallet-make-offer wal to-ledger-hex sats :min-sats (max 1 (1- sats)) :blocks-valid blocks-valid))
+         (address (or (w:jget offer "funding_address") (fail "offer without funding_address")))
+         (deadline (or (w:jget offer "deadline_block") (fail "offer without deadline_block"))))
+    (when (<= (- deadline 6) height) (fail "offer deadline ~a leaves no room to settle" deadline))
+    (values (wallet-exit wal from-ledger-hex deposit-id amount-msats address :expires-at (- deadline 6) :height height)
+            offer)))
 
 (defun wallet-exit-cancel (wal ledger-id-hex deposit-id request-id &key (height 0))
   (let ((o (list :type :exit-cancel :deposit-id deposit-id :exit-request-id request-id

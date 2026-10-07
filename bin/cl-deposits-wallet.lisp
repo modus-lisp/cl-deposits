@@ -51,6 +51,17 @@
                                   (cl-deposits.node:wallet-exit wal ledger (funcall hx (first rest)) (parse-integer (second rest))
                                                                 (third rest) :height (parse-integer (or (fourth rest) "0"))
                                                                 :expires-at (and (fifth rest) (parse-integer (fifth rest)))))))
+          ((string= action "migrate")   ; migrate DEPOSIT MSAT TO-LEDGER HEIGHT [BLOCKS-VALID]
+           (multiple-value-bind (id offer)
+               (cl-deposits.node:wallet-migrate wal ledger (funcall hx (first rest)) (parse-integer (second rest)) (third rest)
+                                                :height (parse-integer (fourth rest))
+                                                :blocks-valid (parse-integer (or (fifth rest) "288")))
+             (format t "~s~%" (list :exit-request id :offer-id (cl-deposits.wire:jget offer "offer_id")
+                                    :funding-address (cl-deposits.wire:jget offer "funding_address")
+                                    :deadline (cl-deposits.wire:jget offer "deadline_block")))))
+          ((string= action "complete-offer")   ; complete-offer OFFER-ID TXID VOUT  (LEDGER = the offer's ledger)
+           (format t "~s~%" (list :status :ok :result (format nil "~a" (cl-deposits.node:wallet-complete-offer
+                                                                    wal ledger (first rest) (second rest) (parse-integer (third rest)))))))
           ((string= action "exit-cancel")   ; exit-cancel DEPOSIT REQUEST-ID [HEIGHT]
            (cl-deposits.node:wallet-exit-cancel wal ledger (funcall hx (first rest)) (funcall hx (second rest))
                                                 :height (parse-integer (or (third rest) "0")))

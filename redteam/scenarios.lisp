@@ -46,6 +46,8 @@
             :note "DEP-20 exits settle at the rotation (mixed quorum); dust carried; cancel releases")
    (make-sc :name "splice" :script "check-splice.sh" :ledger-var "REDTEAM_SPLICE" :timeout 2400
             :note "DEP-20 splice-in at rotation, cl and reference operators, signed across implementations")
+   (make-sc :name "migrate" :script "check-migrate.sh" :ledger-var "REDTEAM_MIGRATE" :timeout 3000
+            :note "DEP-20 §10 migration: exits pay a cl and a reference destination's offers, each credited")
    (make-sc :name "invalid-credit-collude" :script "attack1-invalid-credit.sh" :args '("collude")
             :ledger-var "REDTEAM_IC"
             :timeout 600 :tags '(:contagion))
