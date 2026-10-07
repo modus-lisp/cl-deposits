@@ -662,6 +662,9 @@
   (let ((to (ev:first-tag-value event "p")))
     (when (and to (string/= to (k:public-hex (node-keypair node))))
       (return-from handle-request nil)))
+  ;; ADVERSARY :mute — a member that answers nothing at all (no cosign, no rotation_sign):
+  ;; a watcher that only replicates.
+  (when (getf (node-adversary node) :mute) (return-from handle-request nil))
   (let ((action (w:event-action event)) (params (w:parse-json (ev:event-content event))))
     (cond ((and (ev:first-tag-value event "p") (string= (ev:first-tag-value event "p") (k:public-hex (node-keypair node)))
                 (gethash action (extra-actions node)))

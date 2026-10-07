@@ -71,7 +71,7 @@
    (make-sc :name "rollback-depth" :script "attack-rollback-depth.sh" :ledger-var "REDTEAM_R"
             :timeout 2400 :tags '(:contagion :disruptive :slow))))
 
-(defparameter *switches* '(:cosign-blind :ignore-fraud :ignore-requests :sign-invalid :spend-pledge :theft-sign :withhold-reveal))
+(defparameter *switches* '(:cosign-blind :ignore-fraud :ignore-requests :mute :sign-invalid :spend-pledge :theft-sign :withhold-reveal))
 
 ;;; --- the devnet, as devnet/_common.sh describes it -------------------------------------
 

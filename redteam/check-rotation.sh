@@ -24,14 +24,14 @@ OLD=$(cld_ctl $OP "(:vaults)" | grep -oE "\"$X\" \(\"[0-9a-f]{64}:[0-9]+\"" | gr
 echo "== ledger $X, vault $OLD"
 consent "$X" $OP $C1 $C2 $W $R1 $R2
 # W watches without taking part: it answers no request (no rotation_sign, no cosign).
-trap 'disarm :ignore-requests $W' EXIT
-arm :ignore-requests $W
+trap 'disarm :mute $W' EXIT
+arm :mute $W
 r=$(cld_ctl $OP "(:rotate-vault :ledger \"$X\" :expiry-blocks 4320)"); expect "$r" "rotate-vault"
 RT=$(sx "$r" ":TXID"); echo "== rotation $RT ($(sx "$r" ":SATS") sats)"
 mine 3 >/dev/null; sleep 20
 for i in 1 2 3; do r=$(cld_ctl $OP "(:begin-quorum :ledger \"$X\")"); case "$r" in *":STATUS :OK"*) break;; esac; echo "   begin-quorum retry $i: $r"; mine 1 >/dev/null; sleep 15; done
 expect "$r" "begin-quorum"
-disarm :ignore-requests $W
+disarm :mute $W
 # DEP-03 Rotation ordering: the QuorumBegin was published before the rotation was broadcast,
 # so the watcher that signed nothing authorises it at once; mine past the grace and judge.
 mine 6 >/dev/null; sleep 10
