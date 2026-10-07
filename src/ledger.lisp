@@ -148,12 +148,12 @@
 
 (defun dormancy-cost (ledger) "An addressable spin-out's output cost, sats." (* (rotation-feerate ledger) (+ 9 34)))
 
-(defun dormancy-spin-outs (ledger height)
-  "DEP-20 §8.2: if a rotating QuorumBegin at HEIGHT consumes the outstanding notice, the
+(defun dormancy-spin-outs (ledger cutoff)
+  "DEP-20 §8.2: if a rotating QuorumBegin with exit_cutoff_height CUTOFF consumes the outstanding notice, the
    addressable bucket deposits at or above the floor, ascending deposit id, as
    ((deposit-id balance spk) ...); else NIL."
   (let ((n (ledger-dormancy-notice ledger)))
-    (when (and n (ledger-vault-current-p ledger) (>= height (getf n :rotation-height)))
+    (when (and n (ledger-vault-current-p ledger) (>= cutoff (getf n :rotation-height)))
       (let ((bound (- (getf n :height) (ledger-dormancy-blocks ledger))) (floor-msat (dormancy-amount-msats ledger))
             (pending (let ((h (make-hash-table :test #'equalp)))
                        (maphash (lambda (k e) (declare (ignore k)) (setf (gethash (getf e :deposit-id) h) t)) (ledger-pending-exits ledger))
@@ -176,7 +176,7 @@
     (maphash (lambda (id e)
                (when (and (<= (getf e :block-height) cutoff)
                           (>= (- (floor (getf e :amount) 1000) (exit-cost (getf e :exit-address) f)) 330)
-                          (or (null (getf e :expires-at)) (> (getf e :expires-at) height)))
+                          (or (null (getf e :expires-at)) (> (getf e :expires-at) cutoff)))
                  (push (cons id e) due)))
              (ledger-pending-exits ledger))
     (sort due #'< :key (lambda (c) (getf (cdr c) :seq)))))
@@ -258,8 +258,9 @@
            (unless (collateral-meets-floor-p (f :amount) (f :collateral-amount) floor)
              (fail :collateral-below-floor
                    (format nil "collateral ~a is below ~a bps of the vault (reserves ~a)" (f :collateral-amount) floor (f :amount)))))
-         (let ((spins (dormancy-spin-outs ledger *block-height*))
-               (nexits (length (op:field o :exit-outputs))))
+         (let* ((cutoff (or (op:field o :exit-cutoff-height) (- *block-height* +exit-cutoff-margin+)))
+                (spins (dormancy-spin-outs ledger cutoff))
+                (nexits (length (op:field o :exit-outputs))))
            (%settle-exits ledger o)
            (let ((entries (op:field o :dormancy-outputs)))
              (unless (and (= (length spins) (length entries))
@@ -268,8 +269,9 @@
                (fail :dormancy-outputs (format nil "~a spin-outs due, ~a recorded or mismatched" (length spins) (length entries))))
              (loop for (id) in spins do (setf (deposit-balance (find-deposit ledger id)) 0))
              (when (and (ledger-dormancy-notice ledger) (ledger-vault-current-p ledger)
-                        (>= *block-height* (getf (ledger-dormancy-notice ledger) :rotation-height)))
+                        (>= cutoff (getf (ledger-dormancy-notice ledger) :rotation-height)))
                (setf (ledger-dormancy-notice ledger) nil))))
+         (%release-expired-exits ledger *block-height*)   ; after settlement (DEP-20 §3 Expiry)
          (setf (ledger-reference-feerate ledger) (f :reference-feerate)
                ;; DEP-20 §8: the largest declared value applies; the default only when none is declared.
                (ledger-dormancy-blocks ledger) (let ((v (remove nil (mapcar #'member-dormancy-blocks promoted))))
@@ -480,8 +482,9 @@
       (fail :chain-break (format nil "at sequence ~a" (up:update-seq update)))))
   (let ((*block-height* (up:update-block-height update))
         (*update-seq* (up:update-seq update)))
-    (%release-expired-exits ledger *block-height*)
-    (apply-operation ledger (op:decode-operation (up:update-message update))))
+    (let ((o (op:decode-operation (up:update-message update))))
+      (unless (eq (op:operation-type o) :quorum-begin) (%release-expired-exits ledger *block-height*))
+      (apply-operation ledger o)))
   (setf (ledger-sequence ledger) (up:update-seq update)
         (ledger-chain-tip ledger) (up:chain-hash update))
   ledger)

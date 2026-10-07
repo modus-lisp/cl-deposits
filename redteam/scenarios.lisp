@@ -48,6 +48,8 @@
             :note "DEP-20 splice-in at rotation, cl and reference operators, signed across implementations")
    (make-sc :name "migrate" :script "check-migrate.sh" :ledger-var "REDTEAM_MIGRATE" :timeout 3000
             :note "DEP-20 §10 migration: exits pay a cl and a reference destination's offers, each credited")
+   (make-sc :name "dormancy" :script "check-dormancy.sh" :ledger-var "REDTEAM_DORMANCY" :timeout 3000
+            :note "DEP-20 §8 dormancy: a large dormant pk() deposit is spun out at the notice's rotation")
    (make-sc :name "invalid-credit-collude" :script "attack1-invalid-credit.sh" :args '("collude")
             :ledger-var "REDTEAM_IC"
             :timeout 600 :tags '(:contagion))

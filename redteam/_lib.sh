@@ -29,7 +29,7 @@ consent() {         # consent LEDGER OPERATOR MEMBER... — a reference member's
   local l=$1 op=$2 m r i; shift 2
   for m in "$@"; do
     for i in 1 2 3 4 5 6; do   # a reference node can hang and be restarted by the devnet watchdog: ride it out
-      r=$(cld_ctl "$op" "(:add-member :ledger \"$l\" :member \"$(pubkey_of $m)\" :member-ledger \"$(own_ledger "$m")\"${RESP:+ :dispute-response-blocks $RESP})")
+      r=$(cld_ctl "$op" "(:add-member :ledger \"$l\" :member \"$(pubkey_of $m)\" :member-ledger \"$(own_ledger "$m")\"${RESP:+ :dispute-response-blocks $RESP}${DORM:+ :dormancy-blocks $DORM :dormancy-notice-blocks ${DORM_NOTICE:-3}})")
       [[ "$r" == *":STATUS :OK"* ]] && break; sleep 20
     done; expect "$r" "add-member $m"
   done

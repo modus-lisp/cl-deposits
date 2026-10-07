@@ -519,11 +519,11 @@
             (loop for (nil . e) in due for i from 1 collect (list (getf e :deposit-id) (getf e :amount) i))
             (loop for (nil . e) in due sum (lg:exit-cost (getf e :exit-address) f)))))
 
-(defun dormancy-settlement (ledger height nexits)
+(defun dormancy-settlement (ledger cutoff nexits)
   "DEP-20 §8.2: the spin-outs a rotating QuorumBegin at HEIGHT must pay, as (values extras entries
    cost): EXTRAS ((spk . sats) ...) after NEXITS exit outputs, ENTRIES the dormancy_outputs, COST
    the operator's (collateral's) share of the fee for them."
-  (let ((spins (lg:dormancy-spin-outs ledger height)))
+  (let ((spins (lg:dormancy-spin-outs ledger cutoff)))
     (values (loop for (nil bal spk) in spins collect (cons spk (floor bal 1000)))
             (loop for (id bal) in spins for j from 1 collect (list id bal (+ nexits j)))
             (* (length spins) (lg:dormancy-cost ledger)))))
@@ -532,7 +532,7 @@
   "Every DEP-20 output a rotation at HEIGHT pays: (values extras exit-entries dormancy-entries
    exits-cost dormancy-cost)."
   (multiple-value-bind (ex ee ec) (exit-settlement ledger height cutoff)
-    (multiple-value-bind (dx de dc) (dormancy-settlement ledger height (length ee))
+    (multiple-value-bind (dx de dc) (dormancy-settlement ledger cutoff (length ee))
       (values (append ex dx) ee de ec dc))))
 
 (defun median-feerate (node height)
@@ -2725,8 +2725,8 @@
         ;; DEP-03 "Rotation transaction": shape and fee are rules; sign only the one we build.
         (let* ((h (height node))
                (cutoff (or cutoff (- h lg:+exit-cutoff-margin+)))
-               (ours (progn (unless (<= (- h lg:+exit-cutoff-margin+) cutoff h)
-                              (fail "exit_cutoff_height ~a outside [~a, ~a]" cutoff (- h lg:+exit-cutoff-margin+) h))
+               (ours (progn (unless (<= (- h lg:+exit-cutoff-margin+ 6) cutoff (+ h 6))
+                              (fail "exit_cutoff_height ~a outside [~a, ~a]" cutoff (- h lg:+exit-cutoff-margin+ 6) (+ h 6)))
                             (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
                                                 :feerate (lg:rotation-feerate ledger)
                                                 :voters (length (rs:reserves-voters reserves))
