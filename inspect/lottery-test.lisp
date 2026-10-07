@@ -302,4 +302,49 @@
                                 (coerce (gethash "participants" (gethash "expect" case)) 'list))
                    (check-equal (format nil "~a: snapshot" (gethash "name" case)) snapshot (gethash "snapshot" (gethash "expect" case)))))))))
 
+;;; inspect/vectors/cosign_refusal.json: DEP-05 "Deposed operator", shared with deposits-rust
+;;; (deposits-node/tests/vectors/cosign_refusal.json).
+(with-gate ("DEP-05 deposed operator: cosign refusal against the shared vector")
+  (let ((v (com.inuoe.jzon:parse (uiop:read-file-string (vector-path "cosign_refusal.json")))))
+    (check "the vector has cases" (>= (length (gethash "cases" v)) 10))
+    (loop for c across (gethash "cases" v)
+          for members = (loop for i below (gethash "members" c) collect (format nil "m~a" i))
+          for disputes = (loop for d across (gethash "disputes" c)
+                               collect (list :by (gethash "by" d) :last-valid (gethash "last_valid_sequence" d)
+                                             :reason (gethash "reason" d) :acquired (gethash "acquired" d)))
+          do (check-equal (gethash "name" c)
+                          (and (cl-deposits.node::cosign-refusal "m0" members (gethash "latest_quorum_begin_seq" c) disputes) t)
+                          (gethash "refuse" c)))))
+
+;;; inspect/vectors/rotation_tx.txt: DEP-03 "Rotation transaction", shared with deposits-rust
+;;; (deposits-core/tests/vectors/rotation_tx.txt).  Txids there are display (reversed) hex.
+(with-gate ("DEP-03 rotation transaction: byte for byte against the shared vector")
+  (let ((cases '()) (cur nil))
+    (with-open-file (in (vector-path "rotation_tx.txt"))
+      (loop for line = (read-line in nil) while line
+            for words = (uiop:split-string line :separator " ")
+            for key = (first words)
+            do (cond ((or (zerop (length line)) (char= (char line 0) #\#)))
+                     ((string= key "case") (setf cur (list :name (second words) :extras '())) (push cur cases))
+                     (t (let ((outpoint (lambda (s) (let ((c (position #\: s)))
+                                                      (list (reverse (u:hex->bytes (subseq s 0 c))) (parse-integer s :start (1+ c)))))))
+                          (cond ((string= key "vault") (setf (getf (car cases) :vault) (append (funcall outpoint (second words)) (list (parse-integer (third words))))))
+                                ((string= key "splice") (setf (getf (car cases) :splice) (append (funcall outpoint (second words)) (list (parse-integer (third words))))))
+                                ((string= key "out") (setf (getf (car cases) :extras) (append (getf (car cases) :extras) (list (cons (u:hex->bytes (second words)) (parse-integer (third words)))))))
+                                ((string= key "new_vault_spk") (setf (getf (car cases) :spk) (u:hex->bytes (second words))))
+                                ((string= key "tx") (setf (getf (car cases) :tx) (second words)))
+                                (t (setf (getf (car cases) (intern (string-upcase key) :keyword)) (parse-integer (second words))))))))))
+    (check-equal "four shapes" (length cases) 4)
+    (dolist (c (reverse cases))
+      (destructuring-bind (txid vout sats) (getf c :vault)
+        (let ((tx (cl-deposits.rotation:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
+                                                       :voters (getf c :voters) :feerate (getf c :feerate) :locktime (getf c :locktime)
+                                                       :new-vault-spk (getf c :spk) :splice (getf c :splice) :extras (getf c :extras))))
+          (check-equal (format nil "~a rotation tx" (getf c :name))
+                       (and tx (u:bytes->hex (btx:serialize-tx tx :witness nil))) (getf c :tx)))))
+    (check "a rotation leaving the vault below dust is refused"
+           (null (cl-deposits.rotation:build-rotation :vault-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
+                                                      :vault-vout 0 :vault-sats 900 :voters 8
+                                                      :new-vault-spk (make-array 34 :element-type '(unsigned-byte 8) :initial-element 0))))))
+
 (report)

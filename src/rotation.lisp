@@ -12,7 +12,8 @@
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire) (#:bs #:cl-consensus.script)
                     (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:build-spend #:op-return-script #:tier-sighash #:sign-tier #:attach-tier-witness
-           #:estimate-fee #:+sequence-rbf+ #:verify-spend))
+           #:estimate-fee #:+sequence-rbf+ #:verify-spend
+           #:rotation-vsize #:build-rotation #:+default-feerate+))
 (in-package #:cl-deposits.rotation)
 
 (defconstant +sequence-rbf+ #xfffffffd "ENABLE_RBF_NO_LOCKTIME: RBF on, CLTV usable.")
@@ -44,6 +45,31 @@
                                       (list (btx:make-txout :value (- reserves-amount consumed) :script destination-spk)))
                      :witnesses (list nil)))))
      fee)))
+
+(defconstant +default-feerate+ 2 "sat/vB while no reference_feerate_sat_vb is recorded (DEP-03).")
+
+(defun rotation-vsize (voters spk-lengths splice-p)
+  "DEP-03 \"Rotation transaction\": 46 + 30 x VOTERS + sum (9 + len spk) + 68 x [splice-in]."
+  (+ 46 (* 30 voters) (reduce #'+ spk-lengths :key (lambda (l) (+ 9 l))) (if splice-p 68 0)))
+
+(defun build-rotation (&key vault-txid vault-vout vault-sats voters (feerate +default-feerate+) (locktime 0)
+                            new-vault-spk splice extras)
+  "DEP-03 \"Rotation transaction\", unsigned: version 2, nLockTime the tier's CLTV;
+   input 0 the vault and input 1 SPLICE (txid vout sats), both #xfffffffd; output 0
+   the new vault, then EXTRAS ((spk . sats) ...: the exits in recorded order, then the
+   migration).  Fee feerate x rotation-vsize.  NIL if the new vault falls below 330."
+  (let* ((fee (* feerate (rotation-vsize voters (cons (length new-vault-spk) (mapcar (lambda (e) (length (car e))) extras))
+                                         (and splice t))))
+         (new (- (+ vault-sats (if splice (third splice) 0)) (reduce #'+ extras :key #'cdr) fee)))
+    (when (>= new 330)
+      (btx:make-tx :version 2 :locktime locktime :segwit-p t
+                   :inputs (cons (btx:make-txin :prev-hash vault-txid :prev-index vault-vout :script (octets) :sequence +sequence-rbf+)
+                                 (when splice
+                                   (list (btx:make-txin :prev-hash (first splice) :prev-index (second splice) :script (octets)
+                                                        :sequence +sequence-rbf+))))
+                   :outputs (cons (btx:make-txout :value new :script new-vault-spk)
+                                  (loop for (spk . sats) in extras collect (btx:make-txout :value sats :script spk)))
+                   :witnesses (make-list (if splice 2 1))))))
 
 (defun tier-sighash (tx in-index prevouts leaf)
   "BIP-341 script-path sighash (SIGHASH_DEFAULT) for LEAF.  PREVOUTS is a vector

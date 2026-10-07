@@ -1283,9 +1283,9 @@
         (let* ((next (rs:build-reserves :operator operator :members (rs:reserves-members cur) :ledger-hash hash
                                         :quorum-expiry expiry :network :signet))
                (prevouts (vector (cons sats (rs:reserves-spk cur)))))
-          (flet ((tx (&key (spk (rs:reserves-spk next)) (prev txid) (locktime 0) (fee-rate 5))
-                   (rot:build-spend :prev-txid prev :prev-vout vout :reserves-amount sats :destination-spk spk
-                                    :fee-rate fee-rate :locktime locktime))
+          (flet ((tx (&key (spk (rs:reserves-spk next)) (prev txid) (locktime 0) (feerate 2) extras)
+                   (rot:build-rotation :vault-txid prev :vault-vout vout :vault-sats sats :voters (length (rs:reserves-voters cur))
+                                       :feerate feerate :locktime locktime :new-vault-spk spk :extras extras))
                  (refused (tx) (handler-case (progn (nd::check-rotation b rb tx 0 hash expiry) nil) (error () t))))
             (check-equal "the rotation's tier-0 sighash is what the member signs"
                          (nd::check-rotation b rb (tx) 0 hash expiry)
@@ -1293,6 +1293,9 @@
             (check "a different destination is refused" (refused (tx :spk (rs:reserves-spk cur))))
             (check "a different input is refused" (refused (tx :prev (u:sha256 (hx "beef")))))
             (check "a lock_time not the tier's is refused" (refused (tx :locktime 99)))
+            (check "a fee other than DEP-03's is refused" (refused (tx :feerate 5)))
+            (check "an output the replica records no exit for is refused"
+                   (refused (tx :extras (list (cons (rs:reserves-spk cur) 1000)))))
             (check "a claimed expiry the output was not built for is refused"
                    (handler-case (progn (nd::check-rotation b rb (tx) 0 hash (1+ expiry)) nil) (error () t)))))))))
 

@@ -1767,22 +1767,42 @@
         when (and o (not (equalp (op:field o :new-custodian) (node-pubkey node))))
           return (op:field o :new-custodian)))
 
+(defun cosign-refusal (own members qb-seq disputes)
+  "DEP-05 \"Deposed operator\": a reason string when member OWN of MEMBERS must refuse to
+   co-sign the operator's chain, else NIL.  DISPUTES are plists (:by :last-valid :reason
+   :acquired), one per fork of the ledger.  Pinned by inspect/vectors/cosign_refusal.json,
+   shared with deposits-rust."
+  (when (some (lambda (d) (getf d :acquired)) disputes)
+    (return-from cosign-refusal "custody moved by DisputeAcquire"))
+  (let ((freezing (remove-duplicates
+                   (loop for d in disputes
+                         when (and (>= (getf d :last-valid) qb-seq)
+                                   (not (expiry-reason-p (getf d :reason)))
+                                   (member (getf d :by) members :test #'equalp))
+                           collect (getf d :by))
+                   :test #'equalp)))
+    (cond ((member own freezing :test #'equalp) "we disputed it; not extending the operator's chain")
+          ((> (* 2 (length freezing)) (length members))
+           (format nil "~a of ~a members disputed it" (length freezing) (length members))))))
+
 (defun check-not-deposed (node rec)
-  "A member refuses to extend REC's base chain once its operator is deposed: custody
-   moved by a DisputeAcquire (to anyone, us included), or we, or a majority of the
-   quorum, disputed it since the latest QuorumBegin other than for expiry.  The
-   reference refuses any cosign while its replica's dispute_state is not Normal."
-  (let ((acquired (loop for f in (forks-of node (record-id-hex rec))
-                        for o = (nth-value 1 (fork-op f :dispute-acquire))
-                        when o return (op:field o :new-custodian)))
-        (disputing (disputing-members node rec))
-        (members (lg:ledger-quorum-members (record-ledger rec))))
-    (when acquired
-      (fail "ledger disputed: custody moved to ~a by DisputeAcquire" (subseq (bytes->hex acquired) 0 16)))
-    (when (member (node-pubkey node) disputing :test #'equalp)
-      (fail "ledger disputed: we disputed it; not extending the operator's chain"))
-    (when (> (* 2 (length disputing)) (length members))
-      (fail "ledger disputed: ~a of ~a members forked it" (length disputing) (length members)))))
+  "A member refuses to extend REC's base chain once its operator is deposed (DEP-05):
+   custody moved by a DisputeAcquire, or we, or a majority of the quorum, disputed it
+   at or after the latest QuorumBegin other than for expiry."
+  (let* ((qb-seq (or (loop for u in (record-history rec)
+                           when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
+                             return (up:update-seq u))
+                     0))
+         (disputes (loop for f in (forks-of node (record-id-hex rec))
+                         for o = (nth-value 1 (fork-op f :dispute-enter))
+                         when o collect (list :by (record-fork-operator f)
+                                              :last-valid (or (op:field o :last-valid-sequence) -1)
+                                              :reason (op:field o :reason)
+                                              :acquired (and (fork-op f :dispute-acquire) t))))
+         (why (cosign-refusal (node-pubkey node)
+                              (mapcar #'lg:member-pubkey (lg:ledger-quorum-members (record-ledger rec)))
+                              qb-seq disputes)))
+    (when why (fail "ledger disputed: ~a" why))))
 
 (defun make-fork (node rec last-valid-seq operator33)
   "A fork of REC's ledger from LAST-VALID-SEQ, operated by OPERATOR33: the
@@ -2178,16 +2198,12 @@
 ;;; `rotation_sign` {sighash, unsigned_tx, tier_index, ledger_hash, new_quorum_expiry}.
 ;;; A member rebuilds both ends from the replica it holds and signs only that.
 
-(defparameter *max-rotation-fee-sats* 100000)
-
 (defun check-rotation (node rec proposed tier-index claimed-hash claimed-expiry)
   "Signal unless PROPOSED is the rotation of REC's current vault at TIER-INDEX into the
    reserves of its next quorum (staged members, else the current ones) under
    CLAIMED-HASH / CLAIMED-EXPIRY.  Returns the script-path sighash to sign."
   (when (record-fork-p rec) (fail "not a base ledger"))
   (check-not-deposed node rec)
-  (unless (and (= (length (btx:tx-inputs proposed)) 1) (= (length (btx:tx-outputs proposed)) 1))
-    (fail "rotation tx must be 1-in/1-out"))
   (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node rec)
     (let* ((ledger (record-ledger rec))
            (me (node-pubkey node))
@@ -2209,10 +2225,13 @@
                                          :ruleset (or (lg:ledger-active-ruleset ledger) "cltv-offset-v2")
                                          :network (intern (string-upcase (node-network node)) :keyword))))
         (unless (equalp (btx:txout-script out) (rs:reserves-spk expected))
-          (fail "output is not the next quorum's reserves")))
-      (let ((value (btx:txout-value out)))
-        (when (> value sats) (fail "output ~a exceeds the vault's ~a" value sats))
-        (when (> (- sats value) *max-rotation-fee-sats*) (fail "rotation fee ~a sats over ~a" (- sats value) *max-rotation-fee-sats*)))
+          (fail "output is not the next quorum's reserves"))
+        ;; DEP-03 "Rotation transaction": shape and fee are rules; sign only the one we build.
+        (let ((ours (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
+                                        :voters (length (rs:reserves-voters reserves))
+                                        :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk expected))))
+          (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx proposed :witness nil)))
+            (fail "rotation tx differs from the DEP-03 rotation we build"))))
       (rot:tier-sighash proposed 0 (vector (cons sats (rs:reserves-spk reserves)))
                         (nth tier-index (rs:reserves-leaves reserves))))))
 
