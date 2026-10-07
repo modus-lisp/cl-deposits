@@ -2,15 +2,15 @@
 # devnet/soak-rotate.sh — DEP-11 §Quorum Rotation, done from outside for the cl
 # operators (the reference operators rotate themselves): every SOAK_ROTATE_EVERY
 # seconds, any cl-operated soak ledger within SOAK_ROTATE_MARGIN blocks of its
-# quorum_expiry (or past it) is rotated: members re-consent, a fresh reserves
-# output is funded from the miner, and a QuorumBegin is appended.  The funding
+# quorum_expiry (or past it) is rotated: members re-consent, the operator spends
+# the old vault into the new reserves, and a QuorumBegin is appended.  The vault
 # outpoint in ledgers.tsv is replaced (credits reference it).
 #
 # A cl operator that does not rotate loses value-moving operations at expiry
 # ("not cosignable at TIER0-POST-EXPIRY") — the soak's first night.  The
 # expiry is the SHORTEST member commitment; with a reference member it is
-# ~950 blocks, i.e. ~16 h at a block a minute.  Node-side auto-rotation, and a
-# rotation that SPENDS the old vault rather than funding a new one, are open.
+# ~950 blocks, i.e. ~16 h at a block a minute.  The rotation spends the old vault
+# into the new one (DEP-03, :rotate-vault); node-side auto-rotation is open.
 source "$(dirname "$0")/_common.sh"; source "$CLD_ROOT/soak/env"
 SOAK="$CLD_ROOT/soak"; EVERY=${SOAK_ROTATE_EVERY:-600}; MARGIN=${SOAK_ROTATE_MARGIN:-300}
 # A rotates to cld4 in place of ref2: ref2 forked A at 81026 (docs/REDTEAM.md
@@ -26,13 +26,17 @@ rotate() {   # rotate NAME ID OPERATOR "m1,m2,m3"
     r=$(cld_ctl "$op" "(:add-member :ledger \"$id\" :member \"$(pubkey_of "$m")\" :member-ledger \"$(own_ledger_of "$m")\")")
     [[ "$r" == *":STATUS :OK"* ]] || { echo "   $m consent: $r"; return 1; }
   done
-  prep=$(cld_ctl "$op" "(:prepare-quorum :ledger \"$id\" :expiry-blocks 4320)"); [[ "$prep" == *":STATUS :OK"* ]] || { echo "   prepare: $prep"; return 1; }
-  addr=$(sx "$prep" ":ADDRESS"); txid=$(wcli sendtoaddress "$addr" 0.5) || return 1; mine 3
-  vout=$(bcli getrawtransaction "$txid" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$addr'][0])")
+  # DEP-03: the rotation spends the old vault into the new one (no fresh funding); a
+  # rotation already broadcast but not yet recorded is resumed by :begin-quorum.
+  r=$(cld_ctl "$op" "(:rotate-vault :ledger \"$id\" :expiry-blocks 4320)")
+  if [[ "$r" == *":STATUS :OK"* ]]; then txid=$(sx "$r" ":TXID"); vout=0
+  elif [[ "$r" == *"already broadcast"* ]]; then txid=""; vout=0
+  else echo "   rotate-vault: $r"; return 1; fi
+  mine 3
   sleep 25   # reference members' wallets see the outpoint through the shim on a timer
-  r=$(cld_ctl "$op" "(:begin-quorum :ledger \"$id\" :txid \"$txid\" :vout $vout :sats 20000000 :collateral-sats 30000000)")
+  r=$(cld_ctl "$op" "(:begin-quorum :ledger \"$id\")")
   [[ "$r" == *":STATUS :OK"* ]] || { echo "   begin-quorum: $r"; return 1; }
-  python3 - "$SOAK/ledgers.tsv" "$name" "$txid" "$vout" <<'PY'
+  [ -n "$txid" ] && python3 - "$SOAK/ledgers.tsv" "$name" "$txid" "$vout" <<'PY'
 import sys; p,name,txid,vout=sys.argv[1:]
 rows=[l.rstrip('\n').split('\t') for l in open(p)]
 for r in rows:

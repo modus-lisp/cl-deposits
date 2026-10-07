@@ -110,11 +110,17 @@
                 (r (nd:prepare-quorum node rec :expiry-blocks (arg form :expiry-blocks 4320) :ruleset (arg form :ruleset "cltv-offset-v2"))))
            (ok :address (rs:reserves-address r) :expiry (cdr (nd:record-pinned rec))
                :ledger-hash (bytes->hex (rs:reserves-ledger-hash r)))))
+        (:rotate-vault
+         (let ((rec (rec! node form)))
+           (multiple-value-bind (txid sats) (nd:rotate-vault node rec :expiry-blocks (arg form :expiry-blocks 4320))
+             (ok :txid (bytes->hex (reverse txid)) :vout 0 :sats sats))))
         (:begin-quorum
+         ;; The first QuorumBegin names its funding outpoint; a later one takes the
+         ;; rotation :rotate-vault broadcast (DEP-03) and ignores :txid / :sats.
          (let ((rec (rec! node form)))
            (multiple-value-bind (u r)
-               (nd:begin-quorum node rec :funding-txid (txid-bytes (arg form :txid)) :funding-vout (arg form :vout 0)
-                                :amount-msats (* 1000 (arg form :sats)) :collateral-msats (* 1000 (arg form :collateral-sats 0)))
+               (nd:begin-quorum node rec :funding-txid (and (arg form :txid) (txid-bytes (arg form :txid))) :funding-vout (arg form :vout 0)
+                                :amount-msats (* 1000 (arg form :sats 0)) :collateral-msats (* 1000 (arg form :collateral-sats 0)))
              (ok :seq (up:update-seq u) :cosigs (length (up:update-cosignatures u)) :address (rs:reserves-address r)))))
         (:deposit-open
          (let* ((rec (rec! node form)) (d (arg form :descriptor)) (id (op:deposit-id d)))

@@ -685,8 +685,8 @@
       (let* ((reserves (nd:prepare-quorum a la :ruleset "fee-cap-v3")) (anchor (rs:reserves-ledger-hash reserves)))
         (nd:credit-onchain a la dw 1000 :txid (u:sha256 (hx "79")))
         (check "the ledger moved after prepare" (not (equalp anchor (up:chain-hash (nd::tip la)))))
-        (multiple-value-bind (qb r2) (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00da")) :funding-vout 0
-                                                          :amount-msats 15600000 :collateral-msats 23400000)
+        (nd:rotate-vault a la :timeout 20)
+        (multiple-value-bind (qb r2) (nd:begin-quorum a la)
           (let ((o (op:decode-operation (up:update-message qb))))
             (check "rotation commits" (eq (op:operation-type o) :quorum-begin))
             (check-equal "QuorumBegin anchors the prepared hash" (op:field o :ledger-hash) anchor)
@@ -727,7 +727,8 @@
         (let ((*height* (+ expiry 5)))
           (dolist (m (list c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
           (nd:add-member a la (nd:node-pubkey b) :member-ledger-id (nd::node-member-ledger-hex b))
-          (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00dbb")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+          (nd:rotate-vault a la :timeout 20)
+          (nd:begin-quorum a la)
           (check "the quorum was re-established" (> (lg:ledger-quorum-expiry (nd:record-ledger (nd:find-record b id))) *height*))
           (nd:drive-disputes b)
           (check-equal "the DisputeEnter reason is the reference's" 
@@ -1298,6 +1299,37 @@
                    (refused (tx :extras (list (cons (rs:reserves-spk cur) 1000)))))
             (check "a claimed expiry the output was not built for is refused"
                    (handler-case (progn (nd::check-rotation b rb (tx) 0 hash (1+ expiry)) nil) (error () t)))))))))
+
+(with-gate ("DEP-03 rotation: a cl operator spends the old vault into the new one, members sign it")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111181 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222282 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333383 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444484 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:rot" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "70f0")) :funding-vout 1 :amount-msats 15600000 :collateral-msats 23400000)
+    (check-signals "a second QuorumBegin without a rotation is refused (no fresh vault)" nd:node-error
+      (nd:begin-quorum a la :funding-txid (u:sha256 (hx "70f1")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000))
+    (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (multiple-value-bind (txid sats) (nd:rotate-vault a la :timeout 20)
+      (check "the rotation was signed to threshold and assembled" (and txid t))
+      (check-equal "the new vault is the old less the DEP-03 fee (4 voters, one P2TR output)"
+                   sats (- 39000 (* 2 (rot:rotation-vsize 4 '(34) nil))))
+      (check "it is remembered until its QuorumBegin" (nd:pending-rotation a la))
+      (check "a member that signed treats it as authorised before the QuorumBegin"
+             (member txid (nd::authorised-spend-txids b (nd:find-record b id)) :test #'equalp))
+      (check-signals "a second rotation is refused while one awaits its QuorumBegin" nd:node-error (nd:rotate-vault a la :timeout 5))
+      (let* ((u (nd:begin-quorum a la))
+             (o (op:decode-operation (up:update-message u))))
+        (check-bytes "the QuorumBegin names the rotation's output" (op:field o :new-outpoint-txid) txid)
+        (check-equal "at vout 0" (op:field o :new-outpoint-vout) 0)
+        (check-equal "and its amounts sum to the new vault" (+ (op:field o :amount) (op:field o :collateral-amount)) (* 1000 sats))
+        (check "the rotation is no longer pending" (null (nd:pending-rotation a la)))
+        (check "cosigned by the members" (>= (length (up:update-cosignatures u)) 2))
+        (check "the rotation txid is authorised by every replica once recorded"
+               (every (lambda (m) (member txid (nd::authorised-spend-txids m (nd:find-record m id)) :test #'equalp)) (list b c d)))))))
 
 (with-gate ("arming waits for its pledge's height: a stale cached height never excludes the armer")
   ;; regtest smoke flake: each pledge mined, then armed at once with a cached height one

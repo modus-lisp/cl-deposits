@@ -39,7 +39,7 @@
            #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer
            #:wallet-make-invoice #:wallet-pay-invoice #:credit-paid-invoices #:start-invoice-poller #:node-ln #:node-invoices
            #:enter-dispute #:arm-dispute #:fork-key #:find-fork #:forks-of #:armers-of #:disputed-reserves
-           #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
+           #:rotate-vault #:pending-rotation #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
            #:node-height-of-block #:equivocate #:node-spender-fn #:drive-vault-watch #:node-reported-vault-spend
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
@@ -65,7 +65,8 @@
   last-event-id                                ; Nostr id of the last update we published
   (persisted 0)                                ; how many history entries the file on disk holds (append-only save)
   (append-lock (bt:make-lock "append"))        ; one append at a time per owned ledger, cosign wait included
-  preimage lottery confiscation)               ; our lottery secret; the built lottery; the confiscation tx
+  preimage lottery confiscation                ; our lottery secret; the built lottery; the confiscation tx
+  rotation)                                    ; broadcast rotation awaiting its QuorumBegin (plist; persisted)
 
 (defstruct (node (:constructor %make-node))
   priv pubkey pubkey-hex keypair bus network
@@ -118,6 +119,7 @@
   ;; ledger id hex -> ((tx . lottery) ...): every confiscation proposal we signed.  Two
   ;; proposers can race (cl and reference); whichever lands is one we verified.
   (signed-confiscations (make-hash-table :test (quote equal) :synchronized t))
+  (signed-rotations (make-hash-table :test (quote equal) :synchronized t))   ; ledger id hex -> rotation txids we signed
   ;; ledger id hex -> proposed confiscation txs we received, signed or not: a proposal we
   ;; refused (a different view of the cut, a fee we would not pick) may be the one that lands.
   (seen-confiscations (make-hash-table :test (quote equal) :synchronized t))
@@ -458,23 +460,127 @@
     (setf (record-pinned rec) (cons reserves expiry))
     reserves))
 
+(defun rotation-file (node rec)
+  (and (node-data-dir node)
+       (merge-pathnames (format nil "rotation_~a.sexp" (subseq (record-id-hex rec) 0 16)) (node-data-dir node))))
+
+(defun save-rotation (node rec plist)
+  "Persist a broadcast rotation: the old vault is spent, and a restart before its
+   QuorumBegin must still know where the reserves went."
+  (setf (record-rotation rec) plist)
+  (let ((f (rotation-file node rec)))
+    (when f
+      (ensure-directories-exist f)
+      (with-open-file (out f :direction :output :if-exists :supersede)
+        (with-standard-io-syntax (prin1 plist out))))))
+
+(defun pending-rotation (node rec)
+  (or (record-rotation rec)
+      (let ((f (rotation-file node rec)))
+        (when (and f (probe-file f))
+          (setf (record-rotation rec) (with-open-file (in f) (with-standard-io-syntax (read in))))))))
+
+(defun clear-rotation (node rec)
+  (setf (record-rotation rec) nil)
+  (let ((f (rotation-file node rec))) (when (and f (probe-file f)) (delete-file f))))
+
+(defun has-quorum-begin-p (rec)
+  "REC holds a vault its next QuorumBegin must rotate: a QuorumBegin with no DisputeAcquire
+   after it (an acquisition's first QuorumBegin is funded by the lottery claim instead)."
+  (loop for u in (record-history rec)                 ; newest first
+        for type = (op:operation-type (op:decode-operation (up:update-message u)))
+        when (eq type :dispute-acquire) return nil
+        when (eq type :quorum-begin) return t))
+
+(defun rotation-tier-index (reserves height)
+  "The highest-numbered tier whose CLTV is satisfied at HEIGHT (Tier 0 before expiry)."
+  (loop for tier in (rs:reserves-tiers reserves) for i from 0
+        when (<= (rs:tier-locktime tier) height) maximize i))
+
+(defun rotate-vault (node rec &key (ruleset "cltv-offset-v2") (expiry-blocks 4320) (timeout 90))
+  "DEP-03 rotation: spend the current vault into the reserves of the staged quorum
+   with the shared builder (rot:build-rotation), gather the tier's signatures from
+   the current members (rotation_sign; cl and reference members rebuild and verify
+   it identically), assemble, broadcast, and remember it for BEGIN-QUORUM.
+   Returns (values txid new-vault-sats)."
+  (unless (record-owned-p rec) (fail "not our ledger"))
+  (unless (has-quorum-begin-p rec) (fail "no vault yet: the first QuorumBegin is funded, not rotated"))
+  (when (pending-rotation node rec) (fail "a rotation is already broadcast and awaits its QuorumBegin"))
+  (let* ((staged (mapcar #'lg:member-pubkey (lg:ledger-next-quorum-members (record-ledger rec))))
+         (new (if (and (record-pinned rec) (equalp (rs:reserves-members (car (record-pinned rec))) staged))
+                  (car (record-pinned rec))       ; prepared already (prepare-quorum)
+                  (prepare-quorum node rec :ruleset ruleset :expiry-blocks expiry-blocks)))
+         (expiry (cdr (record-pinned rec))))
+    (multiple-value-bind (cur txid vout sats) (disputed-reserves node rec)
+      (let* ((tier-index (rotation-tier-index cur (height node)))
+             (tier (nth tier-index (rs:reserves-tiers cur)))
+             (tx (or (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
+                                         :voters (length (rs:reserves-voters cur))
+                                         :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk new))
+                     (fail "the rotation leaves the new vault below dust")))
+             (prevouts (vector (cons sats (rs:reserves-spk cur))))
+             (sighash (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves cur))))
+             (keys (rs:tier-keys tier))
+             (sigs (list (cons (up:x-only (node-pubkey node)) (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))
+             (responses (send-request node (record-id-hex rec) "rotation_sign"
+                                      (w:json-object "sighash" (bytes->hex sighash) "unsigned_tx" (unsigned-tx-hex tx)
+                                                     "tier_index" tier-index
+                                                     "ledger_hash" (bytes->hex (rs:reserves-ledger-hash new))
+                                                     "new_quorum_expiry" expiry)
+                                      :want (max 0 (1- (rs:tier-threshold tier))) :timeout timeout :successes-only t)))
+        (dolist (r responses)
+          (let ((res (w:jget r "result")))
+            (when (and (w:jget r "success") res)
+              (let ((res (if (stringp res) (w:parse-json res) res)))
+                (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
+                  (when (and (member pk keys :test #'equalp) (schnorr:schnorr-verify pk sighash sig)
+                             (not (assoc pk sigs :test #'equalp)))
+                    (push (cons pk sig) sigs)))))))
+        (when (< (length sigs) (rs:tier-threshold tier))
+          (fail "rotation: only ~a of ~a signatures" (length sigs) (rs:tier-threshold tier)))
+        (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
+               (signed (rot:attach-tier-witness tx 0 cur tier-index ordered))
+               (new-sats (btx:txout-value (first (btx:tx-outputs tx)))))
+          (unless (rot:verify-spend signed 0 prevouts) (fail "assembled rotation does not verify"))
+          (broadcast node signed)
+          (let ((rtxid (btx:tx-txid signed)))
+            (save-rotation node rec (list :txid (bytes->hex rtxid) :sats new-sats
+                                          :ledger-hash (bytes->hex (rs:reserves-ledger-hash new)) :expiry expiry
+                                          :ruleset (rs:reserves-ruleset new)
+                                          :members (mapcar #'bytes->hex (rs:reserves-members new))))
+            (log! node "rotated ~a: ~a:0 (~a sats) spends ~a:~a at tier ~a" (subseq (record-id-hex rec) 0 8)
+                  (subseq (bytes->hex rtxid) 0 16) new-sats (subseq (bytes->hex txid) 0 16) vout tier-index)
+            (values rtxid new-sats)))))))
+
 (defun begin-quorum (node rec &key funding-txid funding-vout amount-msats collateral-msats
                                    (ruleset "cltv-offset-v2") (expiry-blocks 4320) (spending-txid funding-txid))
-  "Promote the staged members: chain a QuorumBegin pointing at the on-chain
-   outpoint funding the reserves output prepared by PREPARE-QUORUM (or built
-   now).  Returns (values update reserves)."
+  "Promote the staged members: chain a QuorumBegin.  The first one points at the
+   outpoint funding the reserves output prepared by PREPARE-QUORUM (or built now);
+   every later one at the rotation ROTATE-VAULT broadcast (DEP-03): a vault is
+   never replaced by a fresh one while the old lingers.  Returns (values update reserves)."
+  (let ((rotation (and (has-quorum-begin-p rec)
+                       (or (pending-rotation node rec)
+                           (fail "a rotation must spend the old vault: rotate-vault first")))))
+    (when rotation
+      (let* ((new-msats (* 1000 (getf rotation :sats)))
+             (ledger (record-ledger rec))
+             (old (+ (lg:ledger-reserves-amount ledger) (lg:ledger-collateral-amount ledger)))
+             (coll (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) new-msats) old) 0)))
+        (setf funding-txid (hex->bytes (getf rotation :txid)) funding-vout 0 spending-txid funding-txid
+              amount-msats (- new-msats coll) collateral-msats coll)
+        (unless (record-pinned rec)
+          (setf (record-pinned rec)
+                (cons (rs:build-reserves :operator (node-pubkey node) :members (mapcar #'hex->bytes (getf rotation :members))
+                                         :ledger-hash (hex->bytes (getf rotation :ledger-hash)) :quorum-expiry (getf rotation :expiry)
+                                         :ruleset (getf rotation :ruleset)
+                                         :network (intern (string-upcase (node-network node)) :keyword))
+                      (getf rotation :expiry)))))))
   (let* ((ledger (record-ledger rec))
          (staged (lg:ledger-next-quorum-members ledger))
          (members (mapcar #'lg:member-pubkey staged))
          (pinned (or (record-pinned rec) (progn (prepare-quorum node rec :ruleset ruleset :expiry-blocks expiry-blocks)
                                                  (record-pinned rec))))
          (reserves (car pinned)) (expiry (cdr pinned)))
-    ;; The QuorumBegin's ledger_hash is a state ANCHOR committed in the reserves
-    ;; script, not a chain link (the reference: "a state anchor, not a chain
-    ;; link"), so it is the tip the reserves were prepared on.  Requiring the tip
-    ;; not to have moved meant a ledger under traffic — funding needs three
-    ;; confirmations — never rotated until it expired and went quiet.  What must
-    ;; still hold is that the reserves were built for the quorum being promoted.
     (unless (equalp (rs:reserves-members reserves) members)
       (fail "staged members changed since the reserves were prepared; prepare again"))
     (let* ((op (list :type :quorum-begin :reserves-id (rs:reserves-address reserves)
@@ -485,6 +591,7 @@
                    :protocol-version (rs:reserves-ruleset reserves)))
            (update (append-operation node rec op)))
       (setf (record-reserves rec) reserves (record-pinned rec) nil)
+      (clear-rotation node rec)
       (values update reserves))))
 
 (defun credit-onchain (node rec deposit-id amount-msats &key txid (vout 0) (funding-address ""))
@@ -2247,6 +2354,9 @@
           (unless (equalp expected (hex->bytes (or (w:jget params "sighash") (fail "no sighash"))))
             (fail "sighash is not the rotation's"))
           (log! node "signing rotation of ~a at tier ~a" (subseq id 0 8) tier-index)
+          ;; Its QuorumBegin follows only once the rotation confirms; until then the
+          ;; vault watch must not take our own signature for a theft.
+          (pushnew (btx:tx-txid proposed) (gethash id (node-signed-rotations node)) :test #'equalp)
           (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
                                                        "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))
       (error (e) (log! node "refused rotation_sign for ~a: ~a" (subseq id 0 8) e)
@@ -2785,6 +2895,9 @@
     (dolist (r (cons rec (forks-of node (record-id-hex rec))))
       (when (record-confiscation r) (pushnew (btx:tx-txid (record-confiscation r)) ids :test #'equalp)))
     (dolist (e (gethash (record-id-hex rec) (node-signed-confiscations node))) (push (btx:tx-txid (car e)) ids))
+    ;; Rotations we signed or broadcast whose QuorumBegin has not landed yet.
+    (dolist (txid (gethash (record-id-hex rec) (node-signed-rotations node))) (pushnew txid ids :test #'equalp))
+    (let ((r (record-rotation rec))) (when r (pushnew (hex->bytes (getf r :txid)) ids :test #'equalp)))
     ;; A proposal we saw but refused is still a confiscation if it pays a lottery over the armers.
     (dolist (tx (gethash (record-id-hex rec) (node-seen-confiscations node)))
       (when (ignore-errors (lottery-paid-by node (record-id-hex rec) (btx:txout-script (first (btx:tx-outputs tx)))))
