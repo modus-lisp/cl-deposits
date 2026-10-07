@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # redteam/check-exit.sh — DEP-20 §3 exits settle at the next rotation, on chain.
 #
-# A fresh ledger operated by a cl node with a mixed quorum (two cl members, two reference
+# A fresh ledger operated by a cl node with a mixed quorum (three cl members, two reference
 # members).  A depositor asks for three exits: one above the dust floor, one below it (200 sats),
 # and one it then cancels.  The operator rotates: every member rebuilds the rotation with the due
 # exits and cosigns its QuorumBegin.
@@ -9,12 +9,12 @@
 #        carried (still locked and pending), the cancelled one is released, and the deposit is
 #        debited by exactly the settled amount.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
-pick OP C1 C2
+pick OP C1 C2 C3
 R1=${R1:-ref6}; R2=${R2:-ref7}
-for n in $OP $C1 $C2; do cld_running $n || continue; stop_cld $n >/dev/null; start_cld $n >/dev/null & done; wait
+for n in $OP $C1 $C2 $C3; do cld_running $n || continue; stop_cld $n >/dev/null; start_cld $n >/dev/null & done; wait
 NAME=${REDTEAM_EXIT:-EXIT$RANDOM}
-X=$(form_ledger "$NAME" $OP "" $C1 $C2 $R1 $R2) || exit 1
-await_active "$X" $OP $C1 $C2
+X=$(form_ledger "$NAME" $OP "" $C1 $C2 $C3 $R1 $R2) || exit 1
+await_active "$X" $OP $C1 $C2 $C3
 D=$(fresh_deposits "$NAME" $OP "$X" 1 3000000) || exit 1
 echo "== ledger $X, deposit $D (3000000 msat)"
 H=$(bcli getblockcount)
@@ -26,7 +26,7 @@ r3=$(w exit "$D" 500000 "$A2" "$H");  id3=$(sx "$r3" ":EXIT-REQUEST"); [ -n "$id
 expect "$(w exit-cancel "$D" "$id3" "$H")" "exit-cancel"
 b=$(w balance "$D"); echo "   after three requests and one cancel: $b"
 [ "$(sx "$b" ":LOCKED")" = 1200000 ] || fail "expected 1200000 locked (1000000 + 200000 dust), got: $b"
-consent "$X" $OP $C1 $C2 $R1 $R2
+consent "$X" $OP $C1 $C2 $C3 $R1 $R2
 r=$(cld_ctl $OP "(:rotate-vault :ledger \"$X\" :expiry-blocks 4320)"); expect "$r" "rotate-vault"
 RT=$(sx "$r" ":TXID"); echo "== rotation $RT"
 for i in 1 2 3; do r=$(cld_ctl $OP "(:begin-quorum :ledger \"$X\")"); case "$r" in *":STATUS :OK"*) break;; esac; echo "   begin-quorum retry $i: $r"; sleep 15; done

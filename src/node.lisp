@@ -1258,7 +1258,7 @@
              (fail "nonce replayed"))
            (let ((u (append-operation node rec o)))
              (respond node event t :result (w:json-object "exit_request_id" (bytes->hex (if (eq want :exit-request)
-                                                                                          (up:chain-hash u)
+                                                                                          (sha256 (op:encode-operation o))
                                                                                           (op:field o :exit-request-id)))
                                                           "sequence" (up:update-seq u))))))
         ((string= action "transfer_complete")

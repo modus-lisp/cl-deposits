@@ -19,7 +19,7 @@
            #:ledger-pending-withdrawals #:ledger-credited-payments #:ledger-fees-accumulated
            #:ledger-sequence #:ledger-chain-tip #:ledger-joined-quorums #:ledger-dispute-state
            #:ledger-active-ruleset #:ledger-pending-exits #:ledger-vault-current-p #:due-exits #:+exit-cutoff-margin+
-           #:exit-dust-msats #:*update-hash* #:*update-seq*
+           #:exit-dust-msats #:*update-seq*
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
@@ -113,7 +113,6 @@
     (incf (ledger-fees-accumulated ledger) charged)))
 
 (defvar *block-height* 0 "The block height of the update being applied (for descriptor snapshots).")
-(defvar *update-hash* nil "The chain_hash of the update being applied (an ExitRequest's id).")
 (defvar *update-seq* 0 "The sequence of the update being applied.")
 
 (defparameter +exit-cutoff-margin+ 144 "DEP-20 §3 exit_cutoff_margin_blocks (DEP-11 default).")
@@ -342,7 +341,7 @@
          (unless (plusp (f :amount)) (fail :exit-amount "zero"))
          (%lock d (f :amount))
          (push (cons (f :nonce) (f :expiry)) (deposit-seen-nonces d))
-         (setf (gethash *update-hash* (ledger-pending-exits ledger))
+         (setf (gethash (sha256 (op:encode-operation o)) (ledger-pending-exits ledger))
                (list :deposit-id (f :deposit-id) :amount (f :amount) :exit-address (f :exit-address)
                      :expires-at (f :expires-at-height) :block-height *block-height* :seq *update-seq*))))
       (:exit-cancel
@@ -397,7 +396,6 @@
     (unless (equalp (up:update-prev-hash update) (ledger-chain-tip ledger))
       (fail :chain-break (format nil "at sequence ~a" (up:update-seq update)))))
   (let ((*block-height* (up:update-block-height update))
-        (*update-hash* (up:chain-hash update))
         (*update-seq* (up:update-seq update)))
     (%release-expired-exits ledger *block-height*)
     (apply-operation ledger (op:decode-operation (up:update-message update))))

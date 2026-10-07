@@ -116,6 +116,7 @@
           (cond ((member name '("exit_request" "exit_request_no_expiry" "exit_cancel") :test #'string=)
                  (let* ((tlv (u:hex->bytes (field c "tlv"))) (o (op:decode-operation tlv)))
                    (check-bytes (format nil "~a re-encodes byte for byte" name) (op:encode-operation o) tlv)
+                   (check-equal (format nil "~a request id = SHA256(tlv)" name) (u:bytes->hex (u:sha256 tlv)) (field c "id"))
                    (multiple-value-bind (id type args nonce expiry) (d17:operation->dep16 o)
                      (check-equal (format nil "~a DEP-17 sighash" name)
                                   (u:bytes->hex (d17:operation-sighash (d17:operation-preimage id type args nonce expiry)))
