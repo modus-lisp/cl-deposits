@@ -347,4 +347,43 @@
                                                       :vault-vout 0 :vault-sats 900 :voters 8
                                                       :new-vault-spk (make-array 34 :element-type '(unsigned-byte 8) :initial-element 0))))))
 
+(with-gate ("DEP-06 recovery voters: the shared vector (deposits-rust generated, cl reproduces)")
+  (let ((cases '()) (cur nil))
+    (with-open-file (in (vector-path "lottery_recovery_voters.txt"))
+      (loop for line = (read-line in nil) while line
+            unless (or (zerop (length line)) (char= (char line 0) #\#))
+              do (if (and (> (length line) 5) (string= (subseq line 0 5) "case "))
+                     (push (setf cur (list (subseq line 5))) cases)
+                     (setf (cdr (last cur)) (list line)))))
+    (dolist (c (reverse cases))
+      (let ((history '()) (voters nil) (threshold nil))
+        (dolist (line (cdr c))
+          (let ((f (uiop:split-string line :separator " ")))
+            (cond ((string= (first f) "upd")
+                   (destructuring-bind (seq author kind &rest args) (rest f)
+                     (let ((o (cond ((string= kind "open")
+                                     (list :type :ledger-open :operator-id (u:hex->bytes author) :reserves-id "x"
+                                           :genesis-block 0 :reserves-amount 0 :collateral-amount 0))
+                                    ((string= kind "qb")
+                                     (list :type :quorum-begin :reserves-id "x" :spending-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                           :new-outpoint-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                           :new-outpoint-vout 0 :amount 0 :quorum-expiry 1000
+                                           :ledger-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                           :quorum-members (mapcar #'u:hex->bytes args) :collateral-amount 0
+                                           :protocol-version "cltv-offset-v2"))
+                                    (t (list :type :dispute-enter :last-valid-sequence (parse-integer (first args)) :reason "test")))))
+                       (push (up:make-signed-update :operator-id (u:hex->bytes author) :seq (parse-integer seq)
+                                                    :message (op:encode-operation o))
+                             history))))
+                  ((string= (first f) "voters") (setf voters (rest f)))
+                  ((string= (first f) "threshold") (setf threshold (parse-integer (second f)))))))
+        ;; history is newest first, as a record keeps it
+        (let* ((rec (nd::make-record :id-hex "00" :ledger (lg:make-ledger) :history history))
+               (enters (loop for u in history
+                             for o = (op:decode-operation (up:update-message u))
+                             when (eq (op:operation-type o) :dispute-enter) collect (op:field o :last-valid-sequence)))
+               (ours (sort (mapcar #'u:bytes->hex (nd::recovery-voters rec (and enters (reduce #'min enters)))) #'string<)))
+          (check-equal (format nil "~a: voters" (car c)) ours voters)
+          (check-equal (format nil "~a: threshold" (car c)) (lg:majority-threshold (length ours)) threshold))))))
+
 (report)

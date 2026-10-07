@@ -1617,7 +1617,7 @@
 (defun lottery-paid-by (node id-hex spk)
   "The lottery over a subset of ID-HEX's armers whose output script is SPK (our cut
    first, then every subset, largest first), or NIL."
-  (let* ((base (find-record node id-hex)) (voters (recovery-voters base))
+  (let* ((base (find-record node id-hex)) (voters (recovery-voters base (dispute-last-valid-seq node id-hex)))
          (threshold (lg:majority-threshold (length voters)))
          (network (intern (string-upcase (node-network node)) :keyword)))
     (flet ((try (armers)
@@ -1796,7 +1796,7 @@
               (t
                (let* ((closes (dispute-arm-closes node base))
                       (armers (sort (mapcar #'first (armers-of node id)) #'bytes<))
-                      (q (dispute-lottery-n base)) (k (length armers)))
+                      (q (dispute-lottery-n base (dispute-last-valid-seq node id))) (k (length armers)))
                  (cond ((< k 1) (note-dispute node id "armed; waiting for an armer"))
                        ((< h closes) (note-dispute node id "armed; arm window closes at ~a" closes))
                        ((or (equalp (first armers) (node-pubkey node)) (>= h (+ closes *proposer-grace-blocks*)))
@@ -2128,19 +2128,23 @@
                                                           :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height))))
     fork))
 
-(defun dispute-lottery-n (rec)
-  "N disputants = the latest QuorumBegin's members minus the original operator."
-  (length (recovery-voters rec)))
+(defun dispute-lottery-n (rec &optional fork-point)
+  "N disputants = the DEP-06 recovery voters."
+  (length (recovery-voters rec fork-point)))
 
-(defun recovery-voters (rec)
-  "x-only keys of the latest QuorumBegin's members other than the original operator."
+(defun recovery-voters (rec &optional fork-point)
+  "DEP-06 recovery voters: x-only keys, other than the original operator's (the author of
+   sequence 0), of the members of the latest QuorumBegin the original operator authored at a
+   sequence <= FORK-POINT (the dispute's lowest last_valid_sequence; NIL = every sequence)."
   (let ((operator nil) (members '()))
     (dolist (u (reverse (record-history rec)))
-      (let ((o (op:decode-operation (up:update-message u))))
-        (case (op:operation-type o)
-          (:ledger-open (setf operator (op:field o :operator-id)))
-          (:quorum-begin (setf members (op:field o :quorum-members))))))
-    (mapcar #'up:x-only (remove operator members :test #'equalp))))
+      (when (zerop (up:update-seq u)) (setf operator (up:update-operator-id u)))
+      (when (and operator (equalp (up:update-operator-id u) operator)
+                 (or (null fork-point) (<= (up:update-seq u) fork-point)))
+        (let ((o (op:decode-operation (up:update-message u))))
+          (when (eq (op:operation-type o) :quorum-begin)
+            (setf members (op:field o :quorum-members))))))
+    (remove-duplicates (mapcar #'up:x-only (remove operator members :test #'equalp)) :test #'equalp)))
 
 (defun our-target-address (node)
   (cl-consensus.encoding:segwit-encode (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)) 1
@@ -2346,7 +2350,7 @@
    (lottery-armers).  Returns (values tx lottery prevouts reserves tier-index)."
   (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
          (armers (sort (copy-list (or armers (lottery-armers node id-hex))) #'bytes< :key #'first))
-         (voters (recovery-voters base))
+         (voters (recovery-voters base (dispute-last-valid-seq node id-hex)))
          (threshold (lg:majority-threshold (length voters)))
          (participants (loop for (pk c target) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target)))
          (lottery (progn (when (null participants) (fail "no armer is a lottery participant"))
