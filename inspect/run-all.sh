@@ -14,7 +14,9 @@ run_gate () {
 }
 lisp_gate () {  # name, then test files
   local name="$1"; shift
-  local args=(--non-interactive --eval '(require :asdf)' --eval '(handler-bind ((warning #'"'"'muffle-warning)) (asdf:load-system "cl-deposits"))' --load inspect/harness.lisp)
+  local args=(--non-interactive --eval '(require :asdf)' --eval '(handler-bind ((warning #'"'"'muffle-warning)) (asdf:load-system "cl-deposits"))'
+              --eval "(let ((d (namestring (truename (asdf:system-source-directory \"cl-deposits\"))))) (unless (string= d \"$ROOT/\") (format t \"~&gate loaded cl-deposits from ~a, not $ROOT/~%\" d) (uiop:quit 3)))"
+              --load inspect/harness.lisp)
   for f in "$@"; do args+=(--load "$f"); done
   run_gate "$name" "$SBCL" "${args[@]}"
 }
