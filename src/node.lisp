@@ -567,9 +567,20 @@
       (cond
         ;; The operator's own chain.
         ((and (not (record-owned-p rec)) (equalp signer (lg:ledger-operator-key (record-ledger rec))))
-         (when (and (not (record-fork-p rec)) (> (up:update-seq update) (1+ (lg:ledger-sequence (record-ledger rec)))))
-           (catch-up node rec))
-         (accept-update node rec update))
+         (let ((ledger (record-ledger rec)))
+           (cond
+             ;; DEP-02 §Sequence: chained onto our tip but numbered past tip+1 is a skip, a
+             ;; NonConformingUpdate provable on sight, not a gap to backfill.
+             ((and (not (record-fork-p rec))
+                   (> (up:update-seq update) (1+ (lg:ledger-sequence ledger)))
+                   (equalp (up:update-prev-hash update) (lg:ledger-chain-tip ledger))
+                   (up:verify-operator-signature update))
+              (report-non-conforming node rec update
+                                     (format nil "sequence skip: ~a follows ~a" (up:update-seq update) (lg:ledger-sequence ledger))))
+             (t
+              (when (and (not (record-fork-p rec)) (> (up:update-seq update) (1+ (lg:ledger-sequence ledger))))
+                (catch-up node rec))
+              (accept-update node rec update)))))
         ;; A quorum member's dispute fork (or its continuation).
         ((not (equalp signer (node-pubkey node)))
          (let ((fork (find-fork node id signer))
@@ -2599,7 +2610,7 @@
   (let ((id (record-id-hex rec)) (ledger (record-ledger rec)))
     (when (and (not (record-owned-p rec)) (not (record-fork-p rec))
                (equalp (up:update-prev-hash update) (lg:ledger-chain-tip ledger))
-               (= (up:update-seq update) (1+ (lg:ledger-sequence ledger)))
+               (> (up:update-seq update) (lg:ledger-sequence ledger))
                (not (find-fork node id (node-pubkey node))))
       (log! node "NON-CONFORMING cosigned update on ~a at seq ~a: ~a" (subseq id 0 8) (up:update-seq update) condition)
       (let ((proof (fr:make-non-conforming-update-proof (up:update-operator-id update) (up:update-ledger-id update) update)))

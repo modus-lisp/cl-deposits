@@ -224,14 +224,20 @@
                (values nil "accused is not the signer"))
               ((not (string= (bytes->hex id) (getf proof :ledger-id))) (values nil "ledger id mismatch"))
               ((not (up:verify-operator-signature fault)) (values nil "fault update is not validly signed"))
-              ((not (accused-operates-p (getf proof :accused) history seq))
+              ;; Who operates is judged where the fault attaches: after the update it chains onto
+              ;; (a skip claims a later sequence than any the verifier holds).
+              ((not (accused-operates-p (getf proof :accused) history
+                                        (let ((pred (and (plusp seq) (gethash (up:update-prev-hash fault) bound))))
+                                          (if pred (1+ pred) seq))))
                (values nil "the accused does not operate the ledger at that sequence"))
               ((/= seq (e proof :fault-sequence)) (values nil "sequence mismatch"))
               ((not (update-binds-to-ledger-p fault id bound))
                (values nil "fault follows no update of this ledger: nothing binds it here (ledger_id is unsigned)"))
-              ((/= (length prefix) seq) (values nil "history does not reach the fault's predecessor"))
+              ;; A skip or rewind (DEP-02 §Sequence) is proven by the update it chains onto alone;
+              ;; a skip's verifier never holds the sequences it claims to have passed.
               ((and (plusp seq) (/= (gethash (up:update-prev-hash fault) bound) (1- seq)))
                (values t (format nil "fault at seq ~a follows seq ~a" seq (gethash (up:update-prev-hash fault) bound))))
+              ((/= (length prefix) seq) (values nil "history does not reach the fault's predecessor"))
               (t
                ;; It chains onto its predecessor, so it must break a rule: the fold's,
                ;; or the depositor's (authorization, nonce window, expiry).

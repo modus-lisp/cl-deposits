@@ -86,6 +86,16 @@
                (null (fr:vault-spend-signers tx prevouts r (u:sha256 (hx "beef")) 0)))
         (let ((proof (fr:make-unauthorized-vault-spend-proof (first pubs) (u:sha256 (hx "01")) (u:sha256 (hx "02")) 7 tx prevouts (u:sha256 (hx "03")))))
           (check-equal "discriminant is 10" (fr:proof-discriminant :unauthorized-vault-spend) 10)
+          ;; DEP-06 proof_type_byte table, pinned by the vector shared with deposits-rust.
+          (with-open-file (in "inspect/vectors/proof_types.txt")
+            (let ((n 0))
+              (loop for line = (read-line in nil) while line
+                    unless (or (zerop (length line)) (char= (char line 0) #\#))
+                      do (let* ((sp (position #\Space line)) (byte (parse-integer line :end sp)) (name (subseq line (1+ sp)))
+                                (type (car (rassoc name fr::+type-names+ :test #'string=))))
+                           (incf n)
+                           (check-equal (format nil "wire discriminant of ~a" name) (and type (fr:proof-discriminant type)) byte)))
+              (check-equal "the shared vector names all ten proof types" n 10)))
           (check "no embedding required" (not (fr:requires-embedding-p :unauthorized-vault-spend)))
           (let ((back (fr:json->proof (fr:proof->json proof))))
             (check "JSON round trip keeps the proof hash" (equalp (fr:proof-hash proof) (fr:proof-hash back)))
