@@ -2338,7 +2338,7 @@
 
 (defun reveals-of (node id-hex) (gethash id-hex (node-reveals node)))
 
-(defun claim-or-yield (node id-hex &key confiscation-txid (fee 400))
+(defun claim-or-yield (node id-hex &key confiscation-txid (fee lot:+claim-fee-floor+))
   "The drawn winner claims the lottery output and takes custody (DisputeAcquire);
    everyone else yields.  Every participant revealed: the full-set leaf.  Past the
    reveal deadline with some missing: the leaf of the revealers we hold, with the
@@ -2377,14 +2377,9 @@
                  ;; Our declared replacement collateral (a key-path P2TR of our key) comes along as input 1.
                  (coll (fourth (find (node-pubkey node) (armers-of node id-hex) :key #'first :test #'equalp)))
                  (coll-spk (and coll (lot:key-path-spk (up:x-only (node-pubkey node)))))
-                 (seq0 (if full rot:+sequence-rbf+ lot:+reveal-csv+))
-                 (inputs (append (list (btx:make-txin :prev-hash txid :prev-index 0 :script (octets) :sequence seq0))
-                                 (and coll (list (btx:make-txin :prev-hash (first coll) :prev-index (second coll) :script (octets) :sequence rot:+sequence-rbf+)))))
-                 (total (+ amount (if coll (third coll) 0)))
+                 ;; DEP-03: the shared claim shape (deposits-core build_lottery_claim_tx).
                  (tx (btx:parse-tx (bw:make-reader
-                                    (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs inputs
-                                                                   :outputs (list (btx:make-txout :value (- total fee) :script spk))
-                                                                   :witnesses (make-list (length inputs) :initial-element nil))))))
+                                    (btx:serialize-tx (lot:claim-tx txid 0 amount coll spk :fee fee :subset (not full))))))
                  (prevouts (coerce (append (list (cons amount (lot:lottery-spk lottery))) (and coll (list (cons (third coll) coll-spk)))) 'vector))
                  (leaf (if full (first (lot:lottery-leaves lottery))
                            (nth (lot:subset-leaf-index lottery idx) (lot:lottery-leaves lottery))))
@@ -2397,7 +2392,7 @@
                  (signed (btx:parse-tx (bw:make-reader
                                         (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs (btx:tx-inputs tx) :outputs (btx:tx-outputs tx)
                                                                        :witnesses witnesses))))))
-            (dotimes (i (length inputs))
+            (dotimes (i (length (btx:tx-inputs signed)))
               (unless (rot:verify-spend signed i prevouts) (fail "claim input ~a does not verify" i)))
             (broadcast node signed)
             (commit-update node fork (new-update node fork (list :type :dispute-acquire :new-custodian (node-pubkey node)

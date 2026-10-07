@@ -15,7 +15,7 @@
 (defpackage #:cl-deposits.lottery
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:rs #:cl-deposits.reserves) (#:tr #:cl-consensus.taproot-script)
-                    (#:enc #:cl-consensus.encoding) (#:up #:cl-deposits.update))
+                    (#:enc #:cl-consensus.encoding) (#:up #:cl-deposits.update) (#:btx #:cl-consensus.tx))
   (:export #:participant #:make-participant #:participant-pubkey #:participant-commitment #:participant-target
            #:lottery-script #:subset-leaves #:claim-body #:recovery-script #:build-lottery #:lottery-subsets
            #:subset-leaf-index #:subset-witness #:subset-winner #:attest-voters
@@ -26,7 +26,7 @@
            #:armer-share-leaves #:armer-share-control-block #:forfeit-sweep-outputs
            #:confiscation-outputs #:revealers-from-witness #:tapbuilder-tree #:p2tr-spk #:key-path-spk
            #:+reveal-csv+ #:+armer-sweep-csv+ #:+max-disputants+ #:+timeout-recovery-csv+
-           #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+))
+           #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+ #:claim-tx #:+claim-fee-floor+))
 (in-package #:cl-deposits.lottery)
 
 (defconstant +max-disputants+ 7 "MAX_LOTTERY_PARTICIPANTS: the subset tree has 2^k - 1 claim leaves.")
@@ -282,6 +282,20 @@
   "DEP-03 \"Confiscation fee\": feerate x (120 + 30 x VOTERS) sats, VOTERS counting the
    vault's members and operator.  Deterministic, so every cosigner builds the same tx."
   (* feerate (+ 120 (* 30 voters))))
+
+(defconstant +claim-fee-floor+ 5000 "DEP-03 claim_fee_floor with no reference_feerate_sat_vb recorded.")
+
+(defun claim-tx (lottery-txid lottery-vout lottery-sats collateral destination-spk &key (fee +claim-fee-floor+) subset)
+  "DEP-03: the unsigned lottery claim.  Input 0 the lottery output (nSequence +reveal-csv+
+   for a revealer-subset leaf, else #xfffffffd), input 1 COLLATERAL (txid vout sats) at its
+   declared value, one output to DESTINATION-SPK of the inputs less FEE."
+  (btx:make-tx :version 2 :locktime 0 :segwit-p t
+               :inputs (append (list (btx:make-txin :prev-hash lottery-txid :prev-index lottery-vout :script (octets)
+                                                    :sequence (if subset +reveal-csv+ #xfffffffd)))
+                               (and collateral (list (btx:make-txin :prev-hash (first collateral) :prev-index (second collateral)
+                                                                    :script (octets) :sequence #xfffffffd))))
+               :outputs (list (btx:make-txout :value (- (+ lottery-sats (if collateral (third collateral) 0)) fee) :script destination-spk))
+               :witnesses (make-list (if collateral 2 1) :initial-element nil)))
 
 (defun confiscation-outputs (lottery-spk reserves-sats fee-sats &key respectful obligations-sats operator-pubkey33)
   "A list of (spk . sats).  Punitive: everything to the lottery output.

@@ -593,7 +593,7 @@
             (check-equal "claim has two inputs: lottery output + replacement collateral" (length (btx:tx-inputs claim)) 2)
             (check-equal "claim pays lottery + collateral - fee into the new vault"
                          (btx:txout-value (first (btx:tx-outputs claim)))
-                         (- (+ (btx:txout-value (first (btx:tx-outputs ctx))) (+ floor-sats 1000)) 400))
+                         (- (+ (btx:txout-value (first (btx:tx-outputs ctx))) (+ floor-sats 1000)) lot:+claim-fee-floor+))
             (check "second input is a key-path spend with a 64-byte signature" (= 64 (length (first (second (btx:tx-witnesses claim))))))))
         ;; DEP-03: a pledge spent before the snapshot excludes its armer; it no
         ;; longer blocks the confiscation (one armer could veto the dispute).

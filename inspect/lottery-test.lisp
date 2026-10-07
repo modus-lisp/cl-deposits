@@ -222,7 +222,18 @@
       (check-equal (format nil "derived preimage ~a" i) (u:bytes->hex (lot:derive-preimage (u:sha256 (u:int->be i 4)))) (funcall vec (format nil "preimage[~a]" i))))
     (check-equal "armer share address"
                  (lot:armer-share-address (lot:build-armer-share (xonly-of (funcall seed-priv 1)) (make-array 20 :element-type '(unsigned-byte 8) :initial-element 1) voters 2 :network :signet))
-                 (funcall vec "armer_share"))))
+                 (funcall vec "armer_share"))
+    ;; The unsigned claim (DEP-03), legacy serialization as the reference pins it.
+    (let ((fill (lambda (b) (make-array 32 :element-type '(unsigned-byte 8) :initial-element b)))
+          (dest (u:cat (u:octets #x51 #x20) (xonly-of (funcall seed-priv 1)))))
+      (loop for (name subset coll) in (list (list "claim_full" nil (list (funcall fill #x33) 1 600000))
+                                            (list "claim_subset" t (list (funcall fill #x33) 1 600000))
+                                            (list "claim_sole_no_collateral" nil nil))
+            do (let ((tx (lot:claim-tx (funcall fill #x22) 0 1000000 coll dest :subset subset)))
+                 (check-equal (format nil "~a tx" name)
+                              (u:bytes->hex (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p nil :inputs (btx:tx-inputs tx)
+                                                                           :outputs (btx:tx-outputs tx) :witnesses nil)))
+                              (funcall vec name)))))))
 
 (with-gate ("lottery: the unsigned confiscation, byte for byte against the reference")
   ;; inspect/vectors/confiscation_tx.txt: deposits-node's confiscation_tx_vector_is_pinned.
