@@ -18,7 +18,8 @@
            #:ledger-deposits #:ledger-pending-transfers #:ledger-open-invoice-locks
            #:ledger-pending-withdrawals #:ledger-credited-payments #:ledger-fees-accumulated
            #:ledger-sequence #:ledger-chain-tip #:ledger-joined-quorums #:ledger-dispute-state
-           #:ledger-active-ruleset
+           #:ledger-active-ruleset #:ledger-pending-exits #:ledger-vault-current-p #:due-exits #:+exit-cutoff-margin+
+           #:exit-dust-msats #:*update-hash* #:*update-seq*
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
@@ -73,7 +74,10 @@
   (sequence -1)                     ; sequence of the last applied update; -1 = empty
   (chain-tip (make-array 32 :element-type '(unsigned-byte 8)))
   (joined-quorums '())
-  (dispute-state :normal))
+  (dispute-state :normal)
+  ;; DEP-20 §3: request id (chain_hash of the ExitRequest update) -> plist
+  (pending-exits (make-hash-table :test #'equalp))
+  (vault-current-p nil))            ; a QuorumBegin vault the next QuorumBegin rotates
 
 (defun make-ledger () (%make-ledger))
 
@@ -109,6 +113,53 @@
     (incf (ledger-fees-accumulated ledger) charged)))
 
 (defvar *block-height* 0 "The block height of the update being applied (for descriptor snapshots).")
+(defvar *update-hash* nil "The chain_hash of the update being applied (an ExitRequest's id).")
+(defvar *update-seq* 0 "The sequence of the update being applied.")
+
+(defparameter +exit-cutoff-margin+ 144 "DEP-20 §3 exit_cutoff_margin_blocks (DEP-11 default).")
+(defparameter exit-dust-msats 330000 "DEP-20 §3: requests below 330 sats are carried, not settled.")
+
+(defun due-exits (ledger height cutoff)
+  "DEP-20 §3 due set: pending requests appended at block_height <= CUTOFF, at least the dust
+   floor, in append order, as a list of (id . plist)."
+  (let ((due '()))
+    (maphash (lambda (id e)
+               (when (and (<= (getf e :block-height) cutoff) (>= (getf e :amount) exit-dust-msats)
+                          (or (null (getf e :expires-at)) (> (getf e :expires-at) height)))
+                 (push (cons id e) due)))
+             (ledger-pending-exits ledger))
+    (sort due #'< :key (lambda (c) (getf (cdr c) :seq)))))
+
+(defun %release-expired-exits (ledger height)
+  (let ((gone '()))
+    (maphash (lambda (id e) (when (and (getf e :expires-at) (<= (getf e :expires-at) height)) (push (cons id e) gone)))
+             (ledger-pending-exits ledger))
+    (loop for (id . e) in gone
+          do (let ((d (gethash (getf e :deposit-id) (ledger-deposits ledger))))
+               (when d (%unlock d (getf e :amount))))
+             (remhash id (ledger-pending-exits ledger)))))
+
+(defun %settle-exits (ledger o)
+  "DEP-20 §3 settlement on a QuorumBegin: EXIT-OUTPUTS must be exactly the due set (rotating
+   QuorumBegins only); each entry's deposit is debited and its request removed."
+  (let* ((entries (op:field o :exit-outputs))
+         (h *block-height*)
+         (cutoff (or (op:field o :exit-cutoff-height) (- h +exit-cutoff-margin+))))
+    (unless (ledger-vault-current-p ledger)
+      (when entries (fail :exit-outputs "a QuorumBegin with no current vault settles no exits"))
+      (return-from %settle-exits))
+    (unless (<= (- h +exit-cutoff-margin+) cutoff h)
+      (fail :exit-cutoff (format nil "cutoff ~a outside [~a, ~a]" cutoff (- h +exit-cutoff-margin+) h)))
+    (let ((due (due-exits ledger h cutoff)))
+      (unless (= (length due) (length entries))
+        (fail :exit-outputs (format nil "~a due exits, ~a settled" (length due) (length entries))))
+      (loop for (id . e) in due for (dep amount vout) in entries for i from 1
+            do (unless (and (equalp dep (getf e :deposit-id)) (= amount (getf e :amount)) (= vout i))
+                 (fail :exit-outputs (format nil "entry ~a does not match due request ~a" i (bytes->hex id))))
+               (let ((d (find-deposit ledger dep)))
+                 (%unlock d amount)
+                 (setf (deposit-balance d) (max 0 (- (deposit-balance d) amount))))
+               (remhash id (ledger-pending-exits ledger))))))
 
 (defun %touch (ledger o)
   "Record activity heights on the deposits an operation moves."
@@ -149,7 +200,9 @@
            (unless (collateral-meets-floor-p (f :amount) (f :collateral-amount) floor)
              (fail :collateral-below-floor
                    (format nil "collateral ~a is below ~a bps of the vault (reserves ~a)" (f :collateral-amount) floor (f :amount)))))
+         (%settle-exits ledger o)
          (setf (ledger-next-quorum-members ledger) '()
+               (ledger-vault-current-p ledger) t
                (ledger-reserves-key ledger) (f :reserves-id)
                (ledger-reserves-amount ledger) (f :amount)
                (ledger-collateral-amount ledger) (f :collateral-amount)
@@ -282,7 +335,24 @@
       (:dispute-enter (setf (ledger-dispute-state ledger) :disputed))
       (:dispute-armed (setf (ledger-dispute-state ledger) :armed))
       (:dispute-acquire (setf (ledger-operator-key ledger) (f :new-custodian)
+                              (ledger-vault-current-p ledger) nil
                               (ledger-dispute-state ledger) :normal))
+      (:exit-request
+       (let ((d (find-deposit ledger (f :deposit-id))))
+         (unless (plusp (f :amount)) (fail :exit-amount "zero"))
+         (%lock d (f :amount))
+         (push (cons (f :nonce) (f :expiry)) (deposit-seen-nonces d))
+         (setf (gethash *update-hash* (ledger-pending-exits ledger))
+               (list :deposit-id (f :deposit-id) :amount (f :amount) :exit-address (f :exit-address)
+                     :expires-at (f :expires-at-height) :block-height *block-height* :seq *update-seq*))))
+      (:exit-cancel
+       (let* ((d (find-deposit ledger (f :deposit-id)))
+              (e (gethash (f :exit-request-id) (ledger-pending-exits ledger))))
+         (unless (and e (equalp (getf e :deposit-id) (f :deposit-id)))
+           (fail :exit-cancel "names no pending exit request of this deposit"))
+         (push (cons (f :nonce) (f :expiry)) (deposit-seen-nonces d))
+         (%unlock d (getf e :amount))
+         (remhash (f :exit-request-id) (ledger-pending-exits ledger))))
       (:dispute-yield (setf (ledger-dispute-state ledger) :tombstoned))
       (:transfer-lock
        (let* ((d (find-deposit ledger (f :source-deposit-id)))
@@ -326,7 +396,10 @@
       (fail :sequence (format nil "expected ~a, got ~a" (1+ (ledger-sequence ledger)) (up:update-seq update))))
     (unless (equalp (up:update-prev-hash update) (ledger-chain-tip ledger))
       (fail :chain-break (format nil "at sequence ~a" (up:update-seq update)))))
-  (let ((*block-height* (up:update-block-height update)))
+  (let ((*block-height* (up:update-block-height update))
+        (*update-hash* (up:chain-hash update))
+        (*update-seq* (up:update-seq update)))
+    (%release-expired-exits ledger *block-height*)
     (apply-operation ledger (op:decode-operation (up:update-message update))))
   (setf (ledger-sequence ledger) (up:update-seq update)
         (ledger-chain-tip ledger) (up:chain-hash update))

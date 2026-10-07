@@ -46,6 +46,15 @@
                (cl-deposits.node:wallet-pay-invoice wal ledger (funcall hx (first rest)) (second rest) (parse-integer (third rest))
                                                     :fee (parse-integer (or (fourth rest) "0")) :height (parse-integer (or (fifth rest) "0")))
              (format t "~s~%" (if ok (list :status :ok :preimage (funcall hex pre)) (list :status :error :message err)))))
+          ((string= action "exit")      ; exit DEPOSIT MSAT ADDRESS [HEIGHT] [EXPIRES-AT]
+           (format t "~s~%" (list :exit-request
+                                  (cl-deposits.node:wallet-exit wal ledger (funcall hx (first rest)) (parse-integer (second rest))
+                                                                (third rest) :height (parse-integer (or (fourth rest) "0"))
+                                                                :expires-at (and (fifth rest) (parse-integer (fifth rest)))))))
+          ((string= action "exit-cancel")   ; exit-cancel DEPOSIT REQUEST-ID [HEIGHT]
+           (cl-deposits.node:wallet-exit-cancel wal ledger (funcall hx (first rest)) (funcall hx (second rest))
+                                                :height (parse-integer (or (third rest) "0")))
+           (format t "~s~%" (list :status :ok)))
           ((string= action "complete")
            (cl-deposits.node:wallet-complete-transfer wal ledger (funcall hx (first rest)) (funcall hx (second rest)))
            (format t "~s~%" (list :status :ok)))

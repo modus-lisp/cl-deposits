@@ -36,7 +36,7 @@
            #:open-ledger #:append-operation #:add-member #:prepare-quorum #:begin-quorum #:credit-onchain
            #:node-chain-fn #:node-pledge-fn #:lottery-armers #:split-armers #:eligibility-floor-sats #:node-min-confs #:node-data-dir #:record-pinned #:height #:tip
            #:node-error #:request #:wallet #:make-wallet #:wallet-pubkey #:wallet-request
-           #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer
+           #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer #:wallet-exit #:wallet-exit-cancel #:address->spk
            #:wallet-make-invoice #:wallet-pay-invoice #:credit-paid-invoices #:start-invoice-poller #:node-ln #:node-invoices
            #:enter-dispute #:arm-dispute #:fork-key #:find-fork #:forks-of #:armers-of #:disputed-reserves
            #:rotate-vault #:pending-rotation #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
@@ -356,7 +356,8 @@
     ;; ADVERSARY :sign-invalid — an operator that asks its quorum to cosign an
     ;; operation its own validator rejects (red team #1).
     (unless (getf (node-adversary node) :sign-invalid)
-      (lg:apply-operation (lg:copy-ledger (record-ledger rec)) op))
+      (let ((lg:*block-height* height) (lg:*update-seq* (1+ (lg:ledger-sequence (record-ledger rec)))))
+        (lg:apply-operation (lg:copy-ledger (record-ledger rec)) op)))
     (let ((update (new-update node rec op :height height)))
       (multiple-value-bind (required signers tier operator-alone allowed)
           (lg:cosign-requirement (record-ledger rec) op height)
@@ -503,6 +504,18 @@
   (loop for tier in (rs:reserves-tiers reserves) for i from 0
         when (<= (rs:tier-locktime tier) height) maximize i))
 
+(defun exit-settlement (ledger height cutoff)
+  "DEP-20 §3: the due exits at HEIGHT under CUTOFF as (values extras entries): EXTRAS the
+   rotation's exit outputs ((spk . sats) ...), ENTRIES the QuorumBegin's exit_outputs."
+  (let ((due (lg:due-exits ledger height cutoff)))
+    (values (loop for (nil . e) in due collect (cons (getf e :exit-address) (floor (getf e :amount) 1000)))
+            (loop for (nil . e) in due for i from 1 collect (list (getf e :deposit-id) (getf e :amount) i)))))
+
+(defun rotation-collateral (ledger vault-sats fee-sats)
+  "DEP-20 §3 Amounts: collateral bears only its share of the rotation fee."
+  (let ((old (+ (lg:ledger-reserves-amount ledger) (lg:ledger-collateral-amount ledger))))
+    (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) (- vault-sats fee-sats) 1000) old) 0)))
+
 (defun rotate-vault (node rec &key (ruleset "cltv-offset-v2") (expiry-blocks 4320) (timeout 90))
   "DEP-03 rotation: spend the current vault into the reserves of the staged quorum
    with the shared builder (rot:build-rotation), gather the tier's signatures from
@@ -520,9 +533,12 @@
     (multiple-value-bind (cur txid vout sats) (disputed-reserves node rec)
       (let* ((tier-index (rotation-tier-index cur (height node)))
              (tier (nth tier-index (rs:reserves-tiers cur)))
+             (cutoff (height node))
+             (extras (exit-settlement (record-ledger rec) (height node) cutoff))
              (tx (or (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
                                          :voters (length (rs:reserves-voters cur))
-                                         :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk new))
+                                         :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk new)
+                                         :extras extras)
                      (fail "the rotation leaves the new vault below dust")))
              (prevouts (vector (cons sats (rs:reserves-spk cur))))
              (sighash (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves cur))))
@@ -532,7 +548,7 @@
                                       (w:json-object "sighash" (bytes->hex sighash) "unsigned_tx" (unsigned-tx-hex tx)
                                                      "tier_index" tier-index
                                                      "ledger_hash" (bytes->hex (rs:reserves-ledger-hash new))
-                                                     "new_quorum_expiry" expiry)
+                                                     "new_quorum_expiry" expiry "exit_cutoff_height" cutoff)
                                       :want (max 0 (1- (rs:tier-threshold tier))) :timeout timeout :successes-only t)))
         (dolist (r responses)
           (let ((res (w:jget r "result")))
@@ -550,7 +566,8 @@
           (unless (rot:verify-spend signed 0 prevouts) (fail "assembled rotation does not verify"))
           ;; DEP-03 Rotation ordering: broadcast only after its QuorumBegin (begin-quorum).
           (let ((rtxid (btx:tx-txid signed)))
-            (save-rotation node rec (list :txid (bytes->hex rtxid) :sats new-sats
+            (save-rotation node rec (list :txid (bytes->hex rtxid) :sats new-sats :vault-sats sats :cutoff cutoff
+                                          :fee (- sats (reduce #'+ extras :key #'cdr) new-sats)
                                           :tx (bytes->hex (btx:serialize-tx signed))
                                           :ledger-hash (bytes->hex (rs:reserves-ledger-hash new)) :expiry expiry
                                           :ruleset (rs:reserves-ruleset new)
@@ -571,8 +588,11 @@
     (when rotation
       (let* ((new-msats (* 1000 (getf rotation :sats)))
              (ledger (record-ledger rec))
-             (old (+ (lg:ledger-reserves-amount ledger) (lg:ledger-collateral-amount ledger)))
-             (coll (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) new-msats) old) 0)))
+             (coll (if (getf rotation :vault-sats)
+                       (rotation-collateral ledger (getf rotation :vault-sats) (getf rotation :fee))
+                       ;; a rotation saved before DEP-20 exits: no exits, the proportional split
+                       (let ((old (+ (lg:ledger-reserves-amount ledger) (lg:ledger-collateral-amount ledger))))
+                         (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) new-msats) old) 0)))))
         (setf funding-txid (hex->bytes (getf rotation :txid)) funding-vout 0 spending-txid funding-txid
               amount-msats (- new-msats coll) collateral-msats coll)
         (unless (record-pinned rec)
@@ -581,7 +601,7 @@
                                          :ledger-hash (hex->bytes (getf rotation :ledger-hash)) :quorum-expiry (getf rotation :expiry)
                                          :ruleset (getf rotation :ruleset)
                                          :network (intern (string-upcase (node-network node)) :keyword))
-                      (getf rotation :expiry)))))))
+                      (getf rotation :expiry))))))
   (let* ((ledger (record-ledger rec))
          (staged (lg:ledger-next-quorum-members ledger))
          (members (mapcar #'lg:member-pubkey staged))
@@ -596,6 +616,11 @@
                    :quorum-members members :collateral-amount collateral-msats
                    :quorum-member-ledger-ids (mapcar #'lg:member-ledger-id staged)
                    :protocol-version (rs:reserves-ruleset reserves)))
+           (op (if (and rotation (getf rotation :cutoff))
+                   (let ((entries (nth-value 1 (exit-settlement ledger (height node) (getf rotation :cutoff)))))
+                     (append op (list :exit-cutoff-height (getf rotation :cutoff))
+                             (when entries (list :exit-outputs entries))))
+                   op))
            (update (append-operation node rec op)))
       (setf (record-reserves rec) reserves (record-pinned rec) nil)
       (let ((r (record-rotation rec)))
@@ -607,7 +632,7 @@
                                                                    (up:update-seq update) (getf r :tx)))
             (log! node "rotation of ~a broadcast after its QuorumBegin (seq ~a)" (subseq (record-id-hex rec) 0 8) (up:update-seq update)))))
       (clear-rotation node rec)
-      (values update reserves))))
+      (values update reserves)))))
 
 (defun credit-onchain (node rec deposit-id amount-msats &key txid (vout 0) (funding-address ""))
   (append-operation node rec (list :type :onchain-credit :txid txid :vout vout :deposit-id deposit-id
@@ -952,12 +977,13 @@
                  (unless (getf (node-adversary node) :cosign-blind)
                    ;; Depositor authorization, nonce window, expiry: at the height we sign.
                    (let ((v (cf:violation (record-ledger rec) o block-height))) (when v (fail "~a" v)))
-                   (lg:apply-operation (lg:copy-ledger (record-ledger rec)) o))
+                   (let ((lg:*block-height* block-height) (lg:*update-seq* seq))
+                     (lg:apply-operation (lg:copy-ledger (record-ledger rec)) o)))
                  (multiple-value-bind (required signers tier operator-alone allowed)
                      (lg:cosign-requirement ledger o (height node))
                    (declare (ignore required signers tier operator-alone))
                    (unless allowed (fail "not cosignable at this height")))
-                 (when (eq (op:operation-type o) :quorum-begin) (check-quorum-begin-vault node rec o params)))
+                 (when (eq (op:operation-type o) :quorum-begin) (check-quorum-begin-vault node rec o params block-height)))
                (let* ((mlh (member-ledger-hash node))
                       (c (up:sign-cosignature candidate (node-priv node) (node-pubkey node) mlh)))
                  (log! node "cosigned ~a seq ~a" (subseq (record-id-hex rec) 0 8) seq)
@@ -1034,7 +1060,7 @@
       (cl-consensus.encoding:segwit-decode address (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)))
     (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
 
-(defun check-rotation-tx (node rec o tx)
+(defun check-rotation-tx (node rec o tx &optional (height (height node)))
   "DEP-03 Rotation ordering: TX (signed) is the rotation QuorumBegin O names, of REC's current
    vault: its txid and output 0, byte-identical unsigned to the rotation we build, and a
    witness satisfying a tier of the vault to threshold.  Signals otherwise."
@@ -1048,23 +1074,29 @@
         (let ((tier (nth tier-index (rs:reserves-tiers cur))))
           (unless (>= (length signers) (rs:tier-threshold tier))
             (fail "rotation_tx carries ~a of ~a valid signatures" (length signers) (rs:tier-threshold tier)))
-          (let ((ours (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
-                                          :voters (length (rs:reserves-voters cur)) :locktime (rs:tier-locktime tier)
-                                          :new-vault-spk (address-spk node (op:field o :reserves-id)))))
+          (let* ((ledger (record-ledger rec))
+                 (cutoff (or (op:field o :exit-cutoff-height) (- height lg:+exit-cutoff-margin+)))
+                 (extras (exit-settlement ledger height cutoff))
+                 (ours (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
+                                           :voters (length (rs:reserves-voters cur)) :locktime (rs:tier-locktime tier)
+                                           :new-vault-spk (address-spk node (op:field o :reserves-id)) :extras extras)))
             (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx tx :witness nil)))
               (fail "rotation_tx differs from the DEP-03 rotation we build"))
-            (unless (= (btx:txout-value (first (btx:tx-outputs tx)))
-                       (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000))
-              (fail "QuorumBegin amounts do not sum to the rotation's new vault"))))))))
+            (let ((new (btx:txout-value (first (btx:tx-outputs tx)))))
+              (unless (= new (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000))
+                (fail "QuorumBegin amounts do not sum to the rotation's new vault"))
+              (unless (= (op:field o :collateral-amount)
+                         (rotation-collateral ledger sats (- sats (reduce #'+ extras :key #'cdr) new)))
+                (fail "QuorumBegin collateral is not the DEP-20 §3 share")))))))))
 
-(defun check-quorum-begin-vault (node rec o params)
+(defun check-quorum-begin-vault (node rec o params &optional (height (height node)))
   "A QuorumBegin that rotates a current vault is checked against the signed rotation it
    carries (DEP-03 Rotation ordering), which we then keep rebroadcasting; one with no
    current vault (the first, or the first after a DisputeAcquire) against the chain."
   (if (and (has-quorum-begin-p rec) (not (record-fork-p rec)))
       (let ((hex (or (w:jget params "rotation_tx") (fail "a rotating QuorumBegin must carry rotation_tx"))))
         (let ((tx (btx:parse-tx (bw:make-reader (hex->bytes hex)))))
-          (check-rotation-tx node rec o tx)
+          (check-rotation-tx node rec o tx height)
           (setf (gethash (btx:tx-txid tx) (node-inflight-rotations node)) (hex->bytes hex))))
       (check-reserves-outpoint node o)))
 
@@ -1173,6 +1205,21 @@
              (fail "nonce replayed"))
            (append-operation node rec o)
            (respond node event t :result (w:json-object "transfer_id" (bytes->hex (op:field o :transfer-id))))))
+        ((member action '("exit_request" "exit_cancel") :test #'string=)
+         ;; DEP-20 §3: a depositor-signed ExitRequest / ExitCancel, appended as signed.
+         (let* ((o (op:decode-operation (base64-decode (or (w:jget params "operation") (fail "operation required")))))
+                (want (if (string= action "exit_request") :exit-request :exit-cancel))
+                (d (lg:find-deposit (record-ledger rec) (op:field o :deposit-id))))
+           (unless (eq (op:operation-type o) want) (fail "not an ~a" want))
+           (unless (authorized-p node rec o d (op:field o :witness)) (fail "witness does not authorize this operation"))
+           (when (> (height node) (op:field o :expiry)) (fail "operation expired"))
+           (when (member (cons (op:field o :nonce) (op:field o :expiry)) (lg:deposit-seen-nonces d) :test #'equal)
+             (fail "nonce replayed"))
+           (let ((u (append-operation node rec o)))
+             (respond node event t :result (w:json-object "exit_request_id" (bytes->hex (if (eq want :exit-request)
+                                                                                          (up:chain-hash u)
+                                                                                          (op:field o :exit-request-id)))
+                                                          "sequence" (up:update-seq u))))))
         ((string= action "transfer_complete")
          (let* ((o (if (w:jget params "operation")
                        (op:decode-operation (base64-decode (w:jget params "operation")))
@@ -1812,6 +1859,35 @@
       (unless ok (fail "transfer_lock: ~a" err))
       (values transfer-id preimage))))
 
+(defun address->spk (address)
+  "The scriptPubKey of a segwit ADDRESS (any network: the hrp is read off the address)."
+  (let ((hrp (subseq address 0 (position #\1 address :from-end t))))
+    (multiple-value-bind (witver program) (cl-consensus.encoding:segwit-decode address hrp)
+      (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program))))
+
+(defun wallet-exit (wal ledger-id-hex deposit-id amount-msats address &key expires-at (height 0))
+  "DEP-20 §3: request an exit of AMOUNT-MSATS from DEPOSIT-ID to ADDRESS at the next rotation.
+   Returns the request id (the ExitRequest update's chain_hash, hex)."
+  (let ((o (append (list :type :exit-request :deposit-id deposit-id :amount amount-msats
+                         :exit-address (address->spk address))
+                   (when expires-at (list :expires-at-height expires-at))
+                   (list :nonce (incf (wallet-nonce wal)) :expiry (+ height 144) :witness '()))))
+    (setf (getf o :witness) (d17:sign-operation o (wallet-priv wal)))
+    (multiple-value-bind (ok res err)
+        (wallet-request wal ledger-id-hex "exit_request" (w:json-object "operation" (base64-encode (op:encode-operation o))))
+      (unless ok (fail "exit_request: ~a" err))
+      (w:jget res "exit_request_id"))))
+
+(defun wallet-exit-cancel (wal ledger-id-hex deposit-id request-id &key (height 0))
+  (let ((o (list :type :exit-cancel :deposit-id deposit-id :exit-request-id request-id
+                 :nonce (incf (wallet-nonce wal)) :expiry (+ height 144) :witness '())))
+    (setf (getf o :witness) (d17:sign-operation o (wallet-priv wal)))
+    (multiple-value-bind (ok res err)
+        (wallet-request wal ledger-id-hex "exit_cancel" (w:json-object "operation" (base64-encode (op:encode-operation o))))
+      (declare (ignore res))
+      (unless ok (fail "exit_cancel: ~a" err))
+      t)))
+
 (defun wallet-complete-transfer (wal ledger-id-hex transfer-id preimage)
   (let ((o (list :type :transfer-complete :transfer-id transfer-id :script-witness (list preimage))))
     (multiple-value-bind (ok res err)
@@ -2383,7 +2459,7 @@
 ;;; `rotation_sign` {sighash, unsigned_tx, tier_index, ledger_hash, new_quorum_expiry}.
 ;;; A member rebuilds both ends from the replica it holds and signs only that.
 
-(defun check-rotation (node rec proposed tier-index claimed-hash claimed-expiry)
+(defun check-rotation (node rec proposed tier-index claimed-hash claimed-expiry &optional cutoff)
   "Signal unless PROPOSED is the rotation of REC's current vault at TIER-INDEX into the
    reserves of its next quorum (staged members, else the current ones) under
    CLAIMED-HASH / CLAIMED-EXPIRY.  Returns the script-path sighash to sign."
@@ -2412,9 +2488,14 @@
         (unless (equalp (btx:txout-script out) (rs:reserves-spk expected))
           (fail "output is not the next quorum's reserves"))
         ;; DEP-03 "Rotation transaction": shape and fee are rules; sign only the one we build.
-        (let ((ours (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
-                                        :voters (length (rs:reserves-voters reserves))
-                                        :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk expected))))
+        (let* ((h (height node))
+               (cutoff (or cutoff (- h lg:+exit-cutoff-margin+)))
+               (ours (progn (unless (<= (- h lg:+exit-cutoff-margin+) cutoff h)
+                              (fail "exit_cutoff_height ~a outside [~a, ~a]" cutoff (- h lg:+exit-cutoff-margin+) h))
+                            (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
+                                                :voters (length (rs:reserves-voters reserves))
+                                                :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk expected)
+                                                :extras (exit-settlement ledger h cutoff)))))
           (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx proposed :witness nil)))
             (fail "rotation tx differs from the DEP-03 rotation we build"))))
       (rot:tier-sighash proposed 0 (vector (cons sats (rs:reserves-spk reserves)))
@@ -2428,7 +2509,8 @@
                (tier-index (or (w:jget params "tier_index") 0))
                (claimed-hash (hex->bytes (or (w:jget params "ledger_hash") (fail "no ledger_hash"))))
                (claimed-expiry (or (w:jget params "new_quorum_expiry") (fail "no new_quorum_expiry")))
-               (expected (check-rotation node rec proposed tier-index claimed-hash claimed-expiry)))
+               (expected (check-rotation node rec proposed tier-index claimed-hash claimed-expiry
+                                         (w:jget params "exit_cutoff_height"))))
           (unless (equalp expected (hex->bytes (or (w:jget params "sighash") (fail "no sighash"))))
             (fail "sighash is not the rotation's"))
           (log! node "signing rotation of ~a at tier ~a" (subseq id 0 8) tier-index)

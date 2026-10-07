@@ -43,7 +43,8 @@
      (:reserves-id 58 :string) (:spending-txid 90 :bytes32) (:new-outpoint-txid 84 :bytes32)
      (:new-outpoint-vout 92 :u32) (:amount 2 :u64) (:quorum-expiry 86 :u32)
      (:ledger-hash 42 :bytes32) (:quorum-members 6 :pubkeys) (:collateral-amount 88 :u64)
-     (:quorum-member-ledger-ids 276 :ledger-ids :optional) (:protocol-version 286 :string :optional))
+     (:quorum-member-ledger-ids 276 :ledger-ids :optional) (:protocol-version 286 :string :optional)
+     (:exit-cutoff-height 278 :u32 :optional) (:exit-outputs 280 :exit-outputs :optional))
     (20 :deposit-open
      (:deposit-id 200 :deposit-id) (:descriptor 202 :string) (:fees 12 :fees :optional)
      (:transfer-fees 226 :transfer-fees :optional) (:payment-hash 14 :bytes32 :optional)
@@ -127,7 +128,14 @@
      (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))
     (80 :delivery-embed
      (:request-hash 270 :bytes32) (:target-ledger-id 272 :bytes32) (:target-operator 274 :pubkey))
-    (90 :batch (:ops 298 :bytes))))
+    (90 :batch (:ops 298 :bytes))
+    (100 :exit-request
+     (:deposit-id 200 :deposit-id) (:amount 2 :u64) (:exit-address 300 :bytes)
+     (:expires-at-height 302 :u32 :optional) (:nonce 288 :u64) (:expiry 290 :u32) (:witness 204 :witness)
+     (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))
+    (101 :exit-cancel
+     (:deposit-id 200 :deposit-id) (:exit-request-id 304 :bytes32) (:nonce 288 :u64) (:expiry 290 :u32)
+     (:witness 204 :witness) (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))))
 
 (defun discriminant (type)
   (or (first (find type *operations* :key #'second))
@@ -212,6 +220,16 @@
 (defun encode-ledger-ids (ids)
   (apply #'cat (loop for id in ids collect (cat (octets (length id)) (ascii->bytes id)))))
 
+(defun decode-exit-outputs (bytes)
+  "DEP-02 type 280: repeated deposit_id(16) || amount_msats(8) || vout(4), as ((id amount vout) ...)."
+  (unless (zerop (mod (length bytes) 28)) (error 'op-error :detail "exit_outputs not a multiple of 28"))
+  (loop for i from 0 below (length bytes) by 28
+        collect (list (subseq bytes i (+ i 16)) (be->int bytes :start (+ i 16) :end (+ i 24))
+                      (be->int bytes :start (+ i 24) :end (+ i 28)))))
+
+(defun encode-exit-outputs (entries)
+  (apply #'cat (loop for (id amount vout) in entries collect (cat id (int->be amount 8) (int->be vout 4)))))
+
 (defun decode-kind (kind bytes name)
   (ecase kind
     (:u8 (%int bytes 1 name)) (:u16 (%int bytes 2 name)) (:u32 (%int bytes 4 name)) (:u64 (%int bytes 8 name))
@@ -220,7 +238,8 @@
     (:pubkey (%fixed bytes 33 name)) (:deposit-id (%fixed bytes 16 name))
     (:string (bytes->ascii bytes))
     (:witness (decode-witness bytes)) (:fees (decode-fees bytes)) (:transfer-fees (decode-transfer-fees bytes))
-    (:pubkeys (decode-pubkeys bytes)) (:ledger-ids (decode-ledger-ids bytes))))
+    (:pubkeys (decode-pubkeys bytes)) (:ledger-ids (decode-ledger-ids bytes))
+    (:exit-outputs (decode-exit-outputs bytes))))
 
 (defun encode-kind (kind value)
   (ecase kind
@@ -229,7 +248,8 @@
     ((:bytes :bytes20 :bytes32 :bytes64 :pubkey :deposit-id) value)
     (:string (ascii->bytes value))
     (:witness (encode-witness value)) (:fees (encode-fees value)) (:transfer-fees (encode-transfer-fees value))
-    (:pubkeys (apply #'cat value)) (:ledger-ids (encode-ledger-ids value))))
+    (:pubkeys (apply #'cat value)) (:ledger-ids (encode-ledger-ids value))
+    (:exit-outputs (encode-exit-outputs value))))
 
 ;;; ---------------------------------------------------------------------------
 

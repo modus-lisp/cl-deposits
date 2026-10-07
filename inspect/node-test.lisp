@@ -1324,7 +1324,8 @@
       (let* ((rb (nd:find-record b id))
              (o (list :type :quorum-begin :new-outpoint-txid txid :new-outpoint-vout 0
                       :reserves-id (rs:reserves-address (car (nd:record-pinned la)))
-                      :amount (* 600 sats) :collateral-amount (* 400 sats)))
+                      :amount (- (* 1000 sats) (floor (* 23400000 sats 1000) 39000000))
+                      :collateral-amount (floor (* 23400000 sats 1000) 39000000)))
              (hex (getf (nd:pending-rotation a la) :tx))
              (bad (let ((b (u:hex->bytes hex))) (setf (aref b (- (length b) 40)) (logxor 1 (aref b (- (length b) 40)))) (u:bytes->hex b))))
         (check-signals "a member refuses a rotating QuorumBegin without its rotation_tx" nd:node-error
@@ -1348,6 +1349,66 @@
         (check "cosigned by the members" (>= (length (up:update-cosignatures u)) 2))
         (check "the rotation txid is authorised by every replica once recorded"
                (every (lambda (m) (member txid (nd::authorised-spend-txids m (nd:find-record m id)) :test #'equalp)) (list b c d)))))))
+
+(with-gate ("DEP-20 exits: a request settles at the next rotation; cancel, dust and expiry release")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111191 :bus bus :height-fn hf :broadcast-fn (lambda (bytes) bytes t)))
+         (b (nd:make-node :priv 22222222222222222292 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333393 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444494 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:exit" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la))
+         (w (nd:make-wallet :priv 77777777777777777797 :bus bus))
+         (addr1 (cl-consensus.encoding:segwit-encode "bcrt" 0 (u:sha256 (hx "a1"))))   ; 32-byte program: p2wsh
+         (addr2 (cl-consensus.encoding:segwit-encode "bcrt" 1 (u:sha256 (hx "a2")))))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "e0f0")) :funding-vout 1 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((dep (nd:wallet-open-deposit w id))
+           (ledger (lambda () (nd:record-ledger la)))
+           (bal (lambda () (let ((x (lg:find-deposit (funcall ledger) dep))) (list (lg:deposit-balance x) (lg:deposit-locked-balance x))))))
+      (nd:credit-onchain a la dep 3000000 :txid (u:sha256 (hx "e0c1")))
+      (let ((r1 (nd:wallet-exit w id dep 1000000 addr1 :height *height*))
+            (r2 (nd:wallet-exit w id dep 200000 addr2 :height *height*))          ; 200 sats: dust, carried
+            (r3 (nd:wallet-exit w id dep 500000 addr2 :height *height*)))
+        (check "exit requests are appended and return their ids" (and r1 r2 r3 t))
+        (check-equal "requests lock their amounts" (funcall bal) '(3000000 1700000))
+        (check-signals "an exit beyond the available balance is refused" nd:node-error
+          (nd:wallet-exit w id dep 1400000 addr1 :height *height*))
+        (nd:wallet-exit-cancel w id dep (u:hex->bytes r3) :height *height*)
+        (check-equal "a cancel releases its lock" (funcall bal) '(3000000 1200000))
+        (check-signals "cancelling it twice is refused" nd:node-error
+          (nd:wallet-exit-cancel w id dep (u:hex->bytes r3) :height *height*))
+        (let ((r4 (nd:wallet-exit w id dep 400000 addr1 :height *height* :expires-at (+ *height* 2))))
+          (declare (ignore r4))
+          (check-equal "an expiring request locks too" (funcall bal) '(3000000 1600000))
+          (incf *height* 3)
+          (nd:wallet-open-deposit (nd:make-wallet :priv 88888888888888888898 :bus bus) id)   ; any update past its height
+          (check-equal "past expires_at_height it is released by the next update" (funcall bal) '(3000000 1200000)))
+        (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+        (multiple-value-bind (txid sats) (nd:rotate-vault a la :timeout 20)
+          (let* ((tx (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes (getf (nd:pending-rotation a la) :tx)))))
+                 (outs (btx:tx-outputs tx)))
+            (check-equal "the rotation pays the due exit after the new vault" (length outs) 2)
+            (check-bytes "to the request's address" (btx:txout-script (second outs)) (nd:address->spk addr1))
+            (check-equal "floor(amount / 1000) sats" (btx:txout-value (second outs)) 1000)
+            (check-equal "the vault pays the exit and the fee"
+                         sats (- 39000 1000 (* 2 (rot:rotation-vsize 4 '(34 34) nil)))))
+          (let* ((u (nd:begin-quorum a la))
+                 (o (op:decode-operation (up:update-message u)))
+                 (fee (- 39000 1000 sats)))
+            (check-bytes "the QuorumBegin names the rotation" (op:field o :new-outpoint-txid) txid)
+            (check-equal "and records its exit outputs" (op:field o :exit-outputs) (list (list dep 1000000 1)))
+            (check "with its cutoff" (integerp (op:field o :exit-cutoff-height)))
+            (check-equal "collateral bears only its share of the fee (DEP-20 §3)"
+                         (op:field o :collateral-amount) (floor (* 23400000 (- 39000 fee) 1000) 39000000))
+            (check-equal "the settled exit is debited; the dust stays locked and pending" (funcall bal) '(2000000 200000))
+            (check-equal "one request still pending (the dust)" (hash-table-count (lg:ledger-pending-exits (funcall ledger))) 1)
+            (check "cosigned by members who rebuilt the same exits" (>= (length (up:update-cosignatures u)) 2))
+            (check "every replica settled it identically"
+                   (every (lambda (m) (equal (let ((x (lg:find-deposit (nd:record-ledger (nd:find-record m id)) dep)))
+                                               (list (lg:deposit-balance x) (lg:deposit-locked-balance x)))
+                                             '(2000000 200000)))
+                          (list b c d)))))))))
 
 (with-gate ("arming waits for its pledge's height: a stale cached height never excludes the armer")
   ;; regtest smoke flake: each pledge mined, then armed at once with a cached height one

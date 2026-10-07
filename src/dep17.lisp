@@ -92,6 +92,16 @@
                `(("sub_op" . (:symbol "replace"))
                  ("new_descriptor_source" . (:bytes ,(ascii->bytes (f :new-descriptor)))))
                (f :nonce) (f :expiry)))
+      (:exit-request
+       (values (pad-deposit-id (f :deposit-id)) "spend"
+               (append `(("amount" . (:int ,(f :amount))) ("destination" . (:bytes ,(f :exit-address)))
+                         ("kind" . (:symbol "exit")))
+                       (when (f :expires-at-height) `(("expires_at_height" . (:int ,(f :expires-at-height))))))
+               (f :nonce) (f :expiry)))
+      (:exit-cancel
+       (values (pad-deposit-id (f :deposit-id)) "spend"
+               `(("exit_request_id" . (:bytes ,(f :exit-request-id))) ("kind" . (:symbol "exit_cancel")))
+               (f :nonce) (f :expiry)))
       (:transfer-complete
        (values (f :transfer-id) "transfer_release"
                `(("transfer_id" . (:bytes ,(f :transfer-id)))) 0 #xffffffff))

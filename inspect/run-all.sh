@@ -8,7 +8,7 @@ export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$ROOT\") (:tree \"$ROOT/..
 pass=0; fail=0; failed=()
 run_gate () {
   local name="$1"; shift
-  local log="/tmp/cl-deposits-gate-$name.log"; local start=$SECONDS
+  local log="${GATE_LOG_DIR:-/tmp}/cl-deposits-gate-$name.log"; local start=$SECONDS
   if "$@" >"$log" 2>&1; then printf "  %-22s PASS  (%ds)\n" "$name" "$((SECONDS-start))"; pass=$((pass+1))
   else printf "  %-22s FAIL  (%ds)  -> %s\n" "$name" "$((SECONDS-start))" "$log"; fail=$((fail+1)); failed+=("$name"); fi
 }
