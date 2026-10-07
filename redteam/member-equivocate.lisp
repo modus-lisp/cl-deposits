@@ -12,7 +12,7 @@
        (priv (cl-deposits.wire:even-y-privkey priv))
        (pub (cl-deposits.update:compressed-pubkey priv))
        (updates (sort (mapcar (lambda (b) (cl-deposits.update:decode-update (cl-deposits.util:base64-decode b)))
-                              (coerce (com.inuoe.jzon:parse (uiop:read-file-string (second args))) 'list))
+                              (coerce (json-simple:parse (uiop:read-file-string (second args))) 'list))
                       #'> :key #'cl-deposits.update:update-seq))
        (tip (first updates)) (id (cl-deposits.util:hex->bytes (third args))) (height (parse-integer (fourth args)))
        (mk (lambda (tag)

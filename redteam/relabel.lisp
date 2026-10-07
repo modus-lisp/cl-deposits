@@ -12,7 +12,7 @@
        (source (first args)) (target (cl-deposits.util:hex->bytes (second args)))
        (seqs (mapcar #'parse-integer (cddr args)))
        (updates (mapcar (lambda (b64) (cl-deposits.update:decode-update (cl-deposits.util:base64-decode b64)))
-                        (coerce (com.inuoe.jzon:parse (uiop:read-file-string source)) 'list)))
+                        (coerce (json-simple:parse (uiop:read-file-string source)) 'list)))
        (bus (cl-deposits.nostr-bus:make-nostr-bus
              (uiop:split-string (or (uiop:getenv "CLD_RELAYS") "ws://127.0.0.1:7777") :separator ",")))
        (keypair (cl-deposits.wire:nostr-keypair (cl-deposits.util:be->int (cl-deposits.node::random-aux))))

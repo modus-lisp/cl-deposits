@@ -17,7 +17,7 @@
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:nd #:cl-deposits.node) (#:lg #:cl-deposits.ledger) (#:up #:cl-deposits.update)
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
-                    (#:bus #:cl-deposits.bus) (#:jzon #:com.inuoe.jzon))
+                    (#:bus #:cl-deposits.bus) (#:js #:json-simple))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
            #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn))
 (in-package #:cl-deposits.daemon)
@@ -275,7 +275,7 @@
   (lambda (txid vout)
     (let ((out (run-cli cli "gettxout" (txid-hex txid) (princ-to-string vout))))   ; wire bytes -> display hex
       (when (and (plusp (length out)) (char= (char out 0) #\{))
-        (let ((j (jzon:parse out)))
+        (let ((j (js:parse out)))
           (list :value-sats (round (* (gethash "value" j) 100000000))
                 :confirmations (gethash "confirmations" j)))))))
 
@@ -309,7 +309,7 @@
     (loop repeat retries
           for out = (run-cli cli "scantxoutset" "start" (format nil "[\"addr(~a)\"]" address))
           when (and (plusp (length out)) (char= (char out 0) #\{))
-            do (let* ((j (jzon:parse out)) (tip (gethash "height" j)))
+            do (let* ((j (js:parse out)) (tip (gethash "height" j)))
                  (return (map 'list (lambda (u)
                                       (list :txid (txid-bytes (gethash "txid" u)) :vout (gethash "vout" u)
                                             :sats (round (* (gethash "amount" u) 100000000))
@@ -327,7 +327,7 @@
       (dolist (o outpoints) (setf (gethash (format nil "~a:~a" (txid-hex (car o)) (cdr o)) want) o))
       (loop for h from from to to
             for hash = (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string h)))
-            for blk = (let ((out (run-cli cli "getblock" hash "3"))) (and (plusp (length out)) (char= (char out 0) #\{) (jzon:parse out)))
+            for blk = (let ((out (run-cli cli "getblock" hash "3"))) (and (plusp (length out)) (char= (char out 0) #\{) (js:parse out)))
             do (when blk
                  (loop for tx across (gethash "tx" blk)
                        do (loop for i across (gethash "vin" tx)
@@ -350,7 +350,7 @@
    output is neither: spent earlier, unconfirmed, or unknown.  All three exclude the pledge."
   (lambda (txid vout scan-from)
     (let* ((hex (txid-hex txid))
-           (json (lambda (out) (and (plusp (length out)) (char= (char out 0) #\{) (jzon:parse out))))
+           (json (lambda (out) (and (plusp (length out)) (char= (char out 0) #\{) (js:parse out))))
            (tip (parse-integer (string-trim '(#\Newline #\Space) (run-cli cli "getblockcount")) :junk-allowed t))
            (utxo (funcall json (run-cli cli "gettxout" hex (princ-to-string vout) "false"))))
       (cond
@@ -377,5 +377,5 @@
   (lambda (hash32)
     (let ((out (run-cli cli "getblockheader" (txid-hex hash32))))
       (when (and (plusp (length out)) (char= (char out 0) #\{))
-        (let ((j (jzon:parse out)))
+        (let ((j (js:parse out)))
           (and (> (or (gethash "confirmations" j) 0) 0) (gethash "height" j)))))))

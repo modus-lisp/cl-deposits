@@ -11,7 +11,7 @@
        (bus (cl-deposits.nostr-bus:make-nostr-bus (uiop:split-string (or (uiop:getenv "CLD_RELAYS") "ws://127.0.0.1:7777") :separator ",")))
        (kp (cl-deposits.wire:nostr-keypair (cl-deposits.util:be->int (cl-deposits.node::random-aux))))
        (hexs (lambda (n) (make-string n :initial-element #\a)))
-       (valid (com.inuoe.jzon:stringify
+       (valid (json-simple:stringify
                (cl-deposits.fraud:broadcast->json
                 (list :type :equivocation :accused opx :ledger-id lid
                       :evidence (list :sequence 5 :update-a-hex "00" :update-b-hex "00")))))

@@ -261,7 +261,7 @@
                (check-equal (format nil "~a confiscation tx" name) (u:bytes->hex (btx:serialize-tx tx)) (funcall vec name))))))
 
 (with-gate ("ledger: the DEP-05 collateral floor against the shared vector")
-  (let ((v (com.inuoe.jzon:parse (uiop:read-file-string (vector-path "collateral_floor.json")))))
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "collateral_floor.json")))))
     (loop for case across (gethash "cases" v)
           do (let* ((members (map 'list (lambda (b) (lg::make-quorum-member :min-collateral-bps (and (integerp b) b)))
                                   (gethash "member_bps" case)))
@@ -274,7 +274,7 @@
 ;;; inspect/vectors/armer_eligibility.json: the DEP-03 replacement-collateral cut,
 ;;; shared with deposits-rust (deposits-node/tests/vectors/armer_eligibility.json).
 (with-gate ("lottery: armer eligibility cut against the shared vector")
-  (let ((v (com.inuoe.jzon:parse (uiop:read-file-string (vector-path "armer_eligibility.json")))))
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "armer_eligibility.json")))))
     (loop for case across (gethash "cases" v)
           do (let ((facts (make-hash-table :test #'equalp)) (names (make-hash-table :test #'equalp)) (armers '()))
                (loop for a across (gethash "armers" case) for i from 1
@@ -305,7 +305,7 @@
 ;;; inspect/vectors/cosign_refusal.json: DEP-05 "Deposed operator", shared with deposits-rust
 ;;; (deposits-node/tests/vectors/cosign_refusal.json).
 (with-gate ("DEP-05 deposed operator: cosign refusal against the shared vector")
-  (let ((v (com.inuoe.jzon:parse (uiop:read-file-string (vector-path "cosign_refusal.json")))))
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "cosign_refusal.json")))))
     (check "the vector has cases" (>= (length (gethash "cases" v)) 10))
     (loop for c across (gethash "cases" v)
           for members = (loop for i below (gethash "members" c) collect (format nil "m~a" i))

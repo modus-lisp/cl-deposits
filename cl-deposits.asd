@@ -8,7 +8,7 @@
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("secp256k1-fast" "ironclad" "bordeaux-threads" "cl-consensus" "cl-nostr" "com.inuoe.jzon" "usocket")
+  :depends-on ("secp256k1-fast" "ironclad" "bordeaux-threads" "cl-consensus" "cl-nostr" "json-simple" "usocket")
   :serial t
   :components
   ((:module "src"

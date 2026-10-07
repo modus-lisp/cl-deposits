@@ -64,14 +64,14 @@
     (let ((back (up:decode-update (up:encode-update u))))
       (check-bytes "decode/encode round trip preserves the chain hash" (up:chain-hash back) (up:chain-hash u)))
     (if (probe-file path)
-        (let ((theirs (com.inuoe.jzon:parse (uiop:read-file-string path))))
+        (let ((theirs (json-simple:parse (uiop:read-file-string path))))
           (dolist (k '("cosign_data" "operator_digest" "operator_signature" "current_hash" "chain_hash" "update_tlv"))
             (check-equal (format nil "~a matches the reference" k) (pget ours k) (gethash k theirs)))
           (loop for c in (pget ours "cosigners") for tc across (gethash "cosigners" theirs) for i from 1
                 do (dolist (k '("pubkey" "member_ledger_hash" "digest" "signature"))
                      (check-equal (format nil "cosigner ~a ~a matches the reference" i k) (pget c k) (gethash k tc)))))
         (progn (format t "      no ~a yet: ours is~%" path)
-               (format t "~a~%" (com.inuoe.jzon:stringify
+               (format t "~a~%" (json-simple:stringify
                                  (let ((h (make-hash-table :test #'equal)))
                                    (loop for (k v) on ours by #'cddr
                                          do (setf (gethash k h)

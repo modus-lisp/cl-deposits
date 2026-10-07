@@ -11,7 +11,7 @@
 (defpackage #:cl-deposits.wire
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:up #:cl-deposits.update) (#:op #:cl-deposits.operation)
-                    (#:ev #:cl-nostr.event) (#:k #:cl-nostr.keys) (#:jzon #:com.inuoe.jzon))
+                    (#:ev #:cl-nostr.event) (#:k #:cl-nostr.keys) (#:js #:json-simple))
   (:export #:+kind-update+ #:+kind-request+ #:+kind-response+ #:+kind-advertisement+
            #:+kind-fraud-proof+ #:+kind-lottery-reveal+ #:+kind-rotation-tx+ #:rotation-tx-event #:fraud-event #:reveal-event #:reveal-message
            #:event-member #:event-d-tag
@@ -45,7 +45,7 @@
 (defun hex-of (bytes) (bytes->hex bytes))
 
 ;;; ---------------------------------------------------------------------------
-;;; JSON helpers (jzon: objects are hash tables with string keys).
+;;; JSON helpers (json-simple, jzon-compatible: objects are hash tables with string keys).
 
 (defun json-object (&rest kvs)
   "(json-object \"a\" 1 \"b\" \"x\") -> hash table.  NIL values are omitted."
@@ -54,8 +54,8 @@
           when value do (setf (gethash key ht) value))
     ht))
 
-(defun json (object) (jzon:stringify object))
-(defun parse-json (string) (jzon:parse string))
+(defun json (object) (js:stringify object))
+(defun parse-json (string) (js:parse string))
 (defun jget (object &rest keys)
   (let ((o object))
     (dolist (key keys o)
@@ -101,7 +101,7 @@
 
 (defun response-event (keypair request-id ledger-id-hex success &key result error)
   (let ((body (json-object "result" result "error" error)))
-    (setf (gethash "success" body) (and success t))   ; jzon: T -> true, NIL -> false
+    (setf (gethash "success" body) (and success t))   ; T -> true, NIL -> false
     (ev:build-event keypair +kind-response+ (json body)
                     :tags (list (list "e" request-id) (list "l" ledger-id-hex)))))
 
