@@ -28,6 +28,7 @@ mapfile -t DEPS < <(fresh_deposits "$ROW" $OP "$V" 1); FROM=${DEPS[0]:-}; [ -n "
 VCPK=$(pubkey_of "$VC")
 # Everything the adversary logs from here on, however much else floods its log.
 VC_LOG0=$(cld_ctl $VC '(:log :tail 0)' | grep -oE ':COUNT [0-9]+' | grep -oE '[0-9]+'); VC_LOG0=${VC_LOG0:-0}
+H_LOG0=$(cld_ctl $H '(:log :tail 0)' | grep -oE ':COUNT [0-9]+' | grep -oE '[0-9]+'); H_LOG0=${H_LOG0:-0}
 # Arm the adversary before the fraud: an honest member disputes (and arms) on sight of it, before a
 # switch set afterwards could take effect (veto-pledge-sole, 2026-10-03: VC armed and kept its pledge).
 expect "$(cld_ctl $VC "(:adversary :set :spend-pledge t)")"
@@ -74,7 +75,7 @@ for i in $(seq 1 $((WAIT / 5))); do   # WAIT is seconds; each pass sleeps 5
   [ -n "$conf" ] && [ -n "$(bcli getrawtransaction "$conf" 2>/dev/null | head -c1)" ] && break
   conf=""
   # reopen: once the honest armer has spent its pledge too, let it recover and re-arm.
-  if [ "$MODE" = reopen ] && [ -z "$released" ] && cld_ctl $H '(:log)' 2>/dev/null | tr '"' '\n' | grep "adversary: spent our pledge" | fresh | grep -q .; then
+  if [ "$MODE" = reopen ] && [ -z "$released" ] && cld_ctl $H "(:log :since $H_LOG0)" 2>/dev/null | tr '"' '\n' | grep "adversary: spent our pledge" | fresh | grep -q .; then
     mine 2 >/dev/null; cld_ctl $H "(:adversary :set :spend-pledge nil)" >/dev/null; released=1
     echo "  [$i] $H spent its pledge too (nobody eligible); it may now re-arm"
   fi
@@ -149,7 +150,7 @@ case "$MODE" in
   sole|reopen)
     # A re-arm is logged "re-armed: ..." when the first arm is replaced, or as a plain "armed, pledging"
     # with a coin other than the one spent when the spend overtook the first arm (regtest's 10 s blocks).
-    c5=$(cld_ctl $H '(:log)' 2>/dev/null | tr '"' '\n')
+    c5=$(cld_ctl $H "(:log :since $H_LOG0)" 2>/dev/null | tr '"' '\n')
     gone=$(echo "$c5" | grep "adversary: spent our pledge" | fresh | grep -oE '[0-9a-f]{64}:[0-9]+' | head -1)
     rearm=$(echo "$c5" | grep -m1 "re-armed")
     [ -z "$rearm" ] && rearm=$(echo "$c5" | grep -F "dispute ${V:0:8}: armed, pledging" | grep -vF "${gone:-none}" | head -1)
