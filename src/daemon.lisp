@@ -124,10 +124,38 @@
                                          collect (format nil "~a:~a" (bytes->hex (reverse (op:field o :new-outpoint-txid)))
                                                          (op:field o :new-outpoint-vout)))))))
         (:dormancy-notice
-         ;; DEP-20 §8.1: :rotation-height N (>= height + dormancy_notice_blocks)
+         ;; DEP-20 §8.1: :rotation-height N (>= height + dormancy_notice_blocks).  §8.3 adds
+         ;; :receiver "pubkey hex" :manifest "hex" :accept "signed update hex" [:premium msat].
+         (let* ((rec (rec! node form))
+                (m (arg form :manifest))
+                (u (nd:append-operation node rec
+                                        (nd::%strip-nil-fields
+                                         (list :type :dormancy-notice :rotation-height (arg form :rotation-height)
+                                               :migration-receiver (and (arg form :receiver) (hex->bytes (arg form :receiver)))
+                                               :manifest-hash (and m (sha256 (hex->bytes m)))
+                                               :migration-manifest (and m (op:decode-manifest (hex->bytes m)))
+                                               :dormancy-accept (and (arg form :accept) (hex->bytes (arg form :accept)))
+                                               :premium (arg form :premium))))))
+           (ok :seq (up:update-seq u))))
+        (:dormancy-offer
+         ;; DEP-20 §8.3: the manifest a notice now would migrate (to hand to a receiver).
+         (multiple-value-bind (m hash total) (nd::dormancy-offer node (rec! node form))
+           (ok :manifest (bytes->hex (op:encode-manifest m)) :hash (bytes->hex hash) :total total :count (length m))))
+        (:dormancy-accept
+         ;; DEP-20 §8.3 receiver: :manifest "hex" :total msat [:offer "event id hex"] [:expiry-blocks N] [:premium-deposit "hex"]
+         (let* ((rec (rec! node form))
+                (u (nd::dormancy-accept node rec (op:decode-manifest (hex->bytes (arg form :manifest)))
+                                        (if (arg form :offer) (hex->bytes (arg form :offer)) (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+                                        (arg form :total) :expiry-blocks (arg form :expiry-blocks 288)
+                                        :premium-deposit (and (arg form :premium-deposit) (hex->bytes (arg form :premium-deposit))))))
+           (ok :seq (up:update-seq u) :accept (bytes->hex (up:encode-update u))
+               :address (nd::accept-address node (sha256 (hex->bytes (arg form :manifest)))))))
+        (:dormancy-credit
+         ;; DEP-20 §8.3 receiver: :manifest "hex" :txid "display hex" :vout N [:premium msat]
          (let ((rec (rec! node form)))
-           (let ((u (nd:append-operation node rec (list :type :dormancy-notice :rotation-height (arg form :rotation-height)))))
-             (ok :seq (up:update-seq u)))))
+           (nd::dormancy-credit node rec (op:decode-manifest (hex->bytes (arg form :manifest))) (txid-bytes (arg form :txid))
+                                (arg form :vout) :premium (arg form :premium 0))
+           (ok :credited t)))
         (:rotate-vault
          (let ((rec (rec! node form)))
            (multiple-value-bind (txid sats)

@@ -55,8 +55,12 @@
         (:stale-cosignature (cat (s :stale-update-hash) (s :declared-member-hash) (s :member-later-hash)))
         (:uncredited-lightning-payment (cat (s :payment-hash) (b :deposit-id) (int->le (getf ev :amount-msat) 8) (s :preimage)))
         (:uncredited-onchain-payment
+         (if (getf ev :source-qb-update)
+             ;; DEP-20 §8.3 migration evidence (the reference's UncreditedMigration).
+             (cat (s :source-notice-update) (s :source-qb-update) (b :confirmed-at-block-hash)
+                  (int->le (getf ev :proof-sequence) 8))
          (cat (s :offer-id) (int->le (getf ev :deadline-block) 4) (s :txid) (int->le (getf ev :vout) 4)
-              (int->le (getf ev :amount-sats) 8) (b :confirmed-at-block-hash)))
+              (int->le (getf ev :amount-sats) 8) (b :confirmed-at-block-hash))))
         (:dispute-dereliction (cat (s :original-fraud-hash) (b :original-fraud-block-hash) (s :member-ledger-id) (s :member-pubkey)))
         (:unauthorized-vault-spend
          (cat (s :spent-ledger-id) (int->le (getf ev :governing-quorumbegin-seq) 8) (s :spend-tx-hex) (b :spend-block-hash)))
@@ -377,12 +381,79 @@
                            (t (values t nil))))))))
     (error (c) (values nil (princ-to-string c)))))
 
+(defun verify-uncredited-migration (proof history height-of-block)
+  "DEP-20 §8.3: the accused (receiver) signed a DormancyAccept the source's notice carries, over
+   the notice's manifest; the source's QuorumBegin migrated entries of it to the accused before
+   the accept expired; the rotation confirmed; the accused signed PROOF-SEQUENCE at least
+   SERVICE-RESPONSE-BLOCKS later without crediting every migrated entry (deposit, exact amount,
+   rotation txid, migration_vout).  HISTORY is the accused's; (values ok reason)."
+  (handler-case
+      (flet ((dec (hex what)
+               (let ((u (up:decode-update (hex->bytes hex))))
+                 (unless (up:verify-operator-signature u) (error "~a: bad operator signature" what))
+                 (values u (op:decode-operation (up:update-message u))))))
+        (multiple-value-bind (nu notice) (dec (e proof :source-notice-update) "source notice")
+          (multiple-value-bind (qu qb) (dec (e proof :source-qb-update) "source QuorumBegin")
+            (let* ((au (and (eq (op:operation-type notice) :dormancy-notice) (op:field notice :dormancy-accept)
+                            (up:decode-update (op:field notice :dormancy-accept))))
+                   (accept (and au (op:decode-operation (up:update-message au))))
+                   (offered (and au (op:field notice :migration-manifest)))
+                   (migrated (and (eq (op:operation-type qb) :quorum-begin) (op:field qb :migration-manifest)))
+                   (vout (and migrated (op:field qb :migration-vout)))
+                   (txid (and migrated (op:field qb :new-outpoint-txid)))
+                   (confirmed (funcall height-of-block (e proof :confirmed-at-block-hash)))
+                   (pu (find (e proof :proof-sequence) history :key #'up:update-seq))
+                   (ph (and pu (funcall height-of-block (up:update-block-hash pu)))))
+              (cond
+                ((not (and (equalp (up:update-operator-id nu) (up:update-operator-id qu))
+                           (equalp (up:update-ledger-id nu) (up:update-ledger-id qu))
+                           (< (up:update-seq nu) (up:update-seq qu))))
+                 (values nil "the notice and QuorumBegin are not one source ledger's, in order"))
+                ((not (and accept (eq (op:operation-type accept) :dormancy-accept) (up:verify-operator-signature au)))
+                 (values nil "the notice carries no signed DormancyAccept"))
+                ((not (and (equalp (up:update-operator-id au) (op:field notice :migration-receiver))
+                           (string-equal (bytes->hex (up:update-operator-id au)) (getf proof :accused))
+                           (string-equal (bytes->hex (up:update-ledger-id au)) (getf proof :ledger-id))))
+                 (values nil "the accept is not the accused's, on the proof's ledger"))
+                ((not (equalp (op:field accept :manifest-hash) (op:field notice :manifest-hash)))
+                 (values nil "the accept is for another manifest"))
+                ((not (and migrated vout (equalp (op:field qb :migration-receiver) (up:update-operator-id au))))
+                 (values nil "the source QuorumBegin migrates nothing to the accused"))
+                ((notevery (lambda (m) (find (getf m :deposit-id) offered :key (lambda (o) (getf o :deposit-id)) :test #'equalp)) migrated)
+                 (values nil "the QuorumBegin migrates deposits the accepted manifest does not list"))
+                ((>= (up:update-block-height qu) (op:field accept :expires-at-height))
+                 (values nil "the accept had expired when the source rotated"))
+                ((null confirmed) (values nil "confirmed_at_block_hash not in the verifier's chain"))
+                ((null pu) (values nil "proof_sequence not in the accused's history"))
+                ((null ph) (values nil "the proof_sequence update's block is not in the verifier's chain"))
+                ((< (- ph confirmed) (e proof :service-response-blocks))
+                 (values nil "the proof_sequence update is too soon after the migration confirmed"))
+                (t
+                 (let ((credited '()))
+                   (labels ((walk (o)
+                              (case (op:operation-type o)
+                                (:onchain-credit
+                                 (when (and (equalp (op:field o :txid) txid) (eql (op:field o :vout) vout))
+                                   (push (cons (op:field o :deposit-id) (op:field o :amount)) credited)))
+                                (:batch (mapc #'walk (op:field o :operations))))))
+                     (dolist (u history)
+                       (when (<= (up:update-seq u) (e proof :proof-sequence))
+                         (ignore-errors (walk (op:decode-operation (up:update-message u)))))))
+                   (if (every (lambda (m) (member (cons (getf m :deposit-id) (getf m :amount)) credited :test #'equalp)) migrated)
+                       (values nil "every migrated deposit was credited: not fraud")
+                       (values t nil)))))))))
+    (error (c) (values nil (princ-to-string c)))))
+
 (defun verify-proof (proof &key history height-of-block)
   (case (getf proof :type)
     (:equivocation (verify-equivocation proof history))
     (:quorum-expired (verify-quorum-expired proof history height-of-block))
     (:non-conforming-update (verify-non-conforming-update proof history))
     (:dispute-dereliction (verify-dispute-dereliction proof history height-of-block))
+    (:uncredited-onchain-payment
+     (if (e proof :source-qb-update)
+         (verify-uncredited-migration proof history height-of-block)
+         (values nil "cannot verify offer evidence here")))
     (t (values nil (format nil "cannot verify ~a here" (getf proof :type))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -397,7 +468,7 @@
           do (setf (gethash (kebab->snake k) ev) (if (typep v '(vector (unsigned-byte 8))) (bytes->hex v) v)))
     (w:json-object "proof_type" (cdr (assoc (getf proof :type) +type-names+))
                    "accused" (getf proof :accused) "ledger_id" (getf proof :ledger-id)
-                   "evidence" (w:json-object (evidence-variant (getf proof :type)) ev))))
+                   "evidence" (w:json-object (if (e proof :source-qb-update) "UncreditedMigration" (evidence-variant (getf proof :type))) ev))))
 
 (defun evidence-variant (type)
   (case type (:uncredited-onchain-payment "UncreditedOnchain") (:uncredited-lightning-payment "UncreditedLightning")

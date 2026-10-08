@@ -1563,6 +1563,75 @@
                              (op:field o :collateral-amount) (- (floor (* 23400000 (- 39000 fv) 1000) 39000000) 86000)))
               (check "members cosigned it" (>= (length (up:update-cosignatures u)) 2)))))))))
 
+(with-gate ("DEP-20 §8.3 dormancy migration: offer, accept, notice, migration output, credit, splice")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (chain (make-hash-table :test #'equalp))
+         (cf (lambda (txid vout) (or (gethash (cons txid vout) chain) (list :value-sats 39000 :confirmations 6))))
+         (a (nd:make-node :priv 11111111111111111141 :bus bus :height-fn hf :chain-fn cf :broadcast-fn (lambda (b) b t)))
+         (b (nd:make-node :priv 22222222222222222242 :bus bus :height-fn hf :chain-fn cf :broadcast-fn (lambda (b) b t)))
+         (c (nd:make-node :priv 33333333333333333343 :bus bus :height-fn hf :chain-fn cf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf :chain-fn cf))
+         (la (nd:open-ledger a :reserves-id "genesis:msrc" :reserves 15600000 :collateral 23400000)) (src (nd:record-id-hex la))
+         (lb (nd:open-ledger b :reserves-id "genesis:mdst" :reserves 15600000 :collateral 23400000))
+         (w1 (nd:make-wallet :priv 77777777777777777741 :bus bus))
+         (h0 *height*))
+    (dolist (m (list c d)) (nd:open-ledger m :reserves-id (format nil "genesis:x~a" (nd:node-pubkey-hex m))))
+    (flet ((stage-a () (dolist (m (list b c d))
+                         (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)
+                                        :dormancy-blocks 5 :dormancy-notice-blocks 3)))
+           (stage-b () (dolist (m (list a c d)) (nd:add-member b lb (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))))
+      (stage-a) (nd:begin-quorum a la :funding-txid (u:sha256 (hx "e1f0")) :funding-vout 1 :amount-msats 15600000 :collateral-msats 23400000)
+      (stage-b) (nd:begin-quorum b lb :funding-txid (u:sha256 (hx "e2f0")) :funding-vout 1 :amount-msats 15600000 :collateral-msats 23400000)
+      (let ((d1 (nd:wallet-open-deposit w1 src)))
+        (nd:credit-onchain a la d1 400000 :txid (u:sha256 (hx "e1c1")))      ; below the floor: migrates, not spun out
+        (setf *height* (+ h0 10))
+        (multiple-value-bind (manifest hash total) (nd::dormancy-offer a la)
+          (check-equal "the offer lists the small dormant deposit" (mapcar (lambda (e) (getf e :deposit-id)) manifest) (list d1))
+          (let* ((acc (nd::dormancy-accept b lb manifest (u:sha256 (hx "0f")) total))
+                 (accept-hex (up:encode-update acc)))
+            (check "the receiver's members cosigned the accept" (>= (length (up:update-cosignatures acc)) 2))
+            (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
+                                            :migration-receiver (nd:node-pubkey b) :manifest-hash hash
+                                            :migration-manifest manifest :dormancy-accept accept-hex))
+            (check-signals "a notice with another receiver's key is refused" error
+              (progn (setf (lg:ledger-dormancy-notice (nd:record-ledger la)) nil)
+                     (unwind-protect
+                          (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
+                                                          :migration-receiver (nd:node-pubkey c) :manifest-hash hash
+                                                          :migration-manifest manifest :dormancy-accept accept-hex))
+                       nil)))
+            ;; restore the good notice (the probe above cleared it locally)
+            (setf (lg:ledger-dormancy-notice (nd:record-ledger la))
+                  (list :height (+ h0 10) :rotation-height (+ h0 13) :receiver (nd:node-pubkey b) :manifest manifest
+                        :spk (op:field (op:decode-operation (up:update-message acc)) :exit-address) :total total :premium nil))
+            (setf *height* (+ h0 14))
+            (stage-a)
+            (multiple-value-bind (txid sats) (nd:rotate-vault a la :timeout 20)
+              (declare (ignore sats))
+              (let* ((tx (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes (getf (nd:pending-rotation a la) :tx)))))
+                     (out (second (btx:tx-outputs tx)))
+                     (u (nd:begin-quorum a la)) (o (op:decode-operation (up:update-message u))))
+                (check-equal "the rotation pays the manifest total to the receiver's accept address"
+                             (list (btx:txout-value out) (btx:txout-script out))
+                             (list 400 (op:field (op:decode-operation (up:update-message acc)) :exit-address)))
+                (check-equal "the QuorumBegin records the migration"
+                             (list (length (op:field o :migration-manifest)) (op:field o :migration-vout)) '(1 1))
+                (check-equal "the source debits the migrated deposit" (lg:deposit-balance (lg:find-deposit (nd:record-ledger la) d1)) 0)
+                (nd::dormancy-credit b lb (op:field o :migration-manifest) txid 1)
+                (check-equal "the receiver credits the deposit under its descriptor"
+                             (lg:deposit-balance (lg:find-deposit (nd:record-ledger lb) d1)) 400000)
+                (setf (gethash (cons txid 1) chain)
+                      (list :value-sats 400 :confirmations 3 :spk (btx:txout-script out)))
+                (stage-b)
+                (check-signals "the receiver's next rotation without the splice is refused" error
+                  (progn (nd:rotate-vault b lb :timeout 20) (nd:begin-quorum b lb)))
+                (nd::clear-rotation b lb)
+                (stage-b)
+                (nd:rotate-vault b lb :timeout 20 :splice (list txid 1))
+                (let* ((ub (nd:begin-quorum b lb)) (ob (op:decode-operation (up:update-message ub))))
+                  (check "the receiver's rotation splices the migration output in" (op:field ob :splice-in-outpoint))
+                  (check "and closes the accept" (null (lg:ledger-dormancy-accept (nd:record-ledger lb)))))))))))))
+
 (with-gate ("arming waits for its pledge's height: a stale cached height never excludes the armer")
   ;; regtest smoke flake: each pledge mined, then armed at once with a cached height one
   ;; block behind, so every arm named a height before its own pledge and the cut dropped all.

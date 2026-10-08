@@ -304,9 +304,12 @@
   "A cosigner refuses an update whose (signed) block_height is further than this
    from its own chain tip: the height decides the lifecycle tier.")
 
+(defvar *extra-cosign-params* nil
+  "Extra (key value ...) for the cosign request of the update being appended (DEP-20 §8.3's manifest).")
+
 (defun solicit-cosignatures (node rec update signers required)
   "Ask the quorum; return when REQUIRED valid cosignatures are in the update."
-  (let* ((params (w:json-object "sequence_number" (up:update-seq update)
+  (let* ((params (apply #'w:json-object "sequence_number" (up:update-seq update)
                                 "cosign_data_hex" (bytes->hex (up::cosign-data update))
                                 "content_hash_hex" (bytes->hex (up:content-hash update))
                                 "message_type" 32769
@@ -315,7 +318,8 @@
                                 "rotation_tx" (let ((r (record-rotation rec)))
                                                 (and r (getf r :tx)
                                                      (eq (op:operation-type (op:decode-operation (up:update-message update))) :quorum-begin)
-                                                     (getf r :tx)))))
+                                                     (getf r :tx)))
+                                *extra-cosign-params*))
          (attempt 0))
     (flet ((collect (responses)
              (dolist (r responses)
@@ -530,10 +534,19 @@
 
 (defun settlement (ledger height cutoff)
   "Every DEP-20 output a rotation at HEIGHT pays: (values extras exit-entries dormancy-entries
-   exits-cost dormancy-cost)."
+   exits-cost dormancy-cost migration premium), DORMANCY-COST including the migration output's
+   own cost (a fee), MIGRATION (:entries :vout) or NIL, PREMIUM the sats the migration output
+   carries beyond the deposits (not a fee); collateral pays the dormancy cost and the premium."
   (multiple-value-bind (ex ee ec) (exit-settlement ledger height cutoff)
     (multiple-value-bind (dx de dc) (dormancy-settlement ledger cutoff (length ee))
-      (values (append ex dx) ee de ec dc))))
+      (multiple-value-bind (mentries mspk msats) (lg:dormancy-migration ledger cutoff (length de))
+        (if mentries
+            (let ((premium-msat (or (getf (lg:ledger-dormancy-notice ledger) :premium) 0)))
+              (values (append ex dx (list (cons mspk msats))) ee de ec
+                      (+ dc (* (lg:rotation-feerate ledger) (+ 9 (length mspk))))
+                      (list :entries mentries :vout (+ 1 (length ee) (length de)))
+                      (floor premium-msat 1000)))
+            (values (append ex dx) ee de ec dc nil 0))))))
 
 (defun median-feerate (node height)
   "DEP-03 Reference feerate: m = floor((s3 + s4) / 2) over the block feerates of heights h-6..h-1,
@@ -617,7 +630,15 @@
           (fail "rotation: only ~a of ~a signatures" (length sigs) (rs:tier-threshold tier)))
         (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
                (signed (let ((s (rot:attach-tier-witness tx 0 cur tier-index ordered)))
-                         (if splice-in (attach-key-path-witness s 1 (key-path-signature node s 1 prevouts)) s)))
+                         (if splice-in
+                             (attach-key-path-witness
+                              s 1 (key-path-signature node s 1 prevouts
+                                                      ;; DEP-20 §8.3: a migration output sits at our accept address.
+                                                      (let ((a (lg:ledger-dormancy-accept (record-ledger rec))))
+                                                        (if (and a (equalp (fourth splice-in) (getf a :spk)))
+                                                            (sha256 (getf a :hash))
+                                                            (octets)))))
+                             s)))
                (new-sats (btx:txout-value (first (btx:tx-outputs tx)))))
           (dotimes (i (length (btx:tx-inputs signed)))
             (unless (rot:verify-spend signed i prevouts) (fail "assembled rotation input ~a does not verify" i)))
@@ -626,6 +647,7 @@
             (save-rotation node rec (list :txid (bytes->hex rtxid) :sats new-sats :vault-sats sats :cutoff cutoff
                                           :fee (- (+ sats (if splice-in (third splice-in) 0)) (reduce #'+ extras :key #'cdr) new-sats exits-cost dorm-cost)
                                           :dormancy-cost dorm-cost
+                                          :premium (nth-value 6 (settlement (record-ledger rec) (height node) cutoff))
                                           :splice (and splice-in (list (bytes->hex (first splice-in)) (second splice-in) (third splice-in)))
                                           :tx (bytes->hex (btx:serialize-tx signed))
                                           :ledger-hash (bytes->hex (rs:reserves-ledger-hash new)) :expiry expiry
@@ -650,7 +672,7 @@
              (coll (if (getf rotation :vault-sats)
                        ;; DEP-20 §4: a splice's value goes to collateral unless told otherwise.
                        (+ (rotation-collateral ledger (getf rotation :vault-sats) (getf rotation :fee))
-                          (- (* 1000 (or (getf rotation :dormancy-cost) 0)))
+                          (- (* 1000 (+ (or (getf rotation :dormancy-cost) 0) (or (getf rotation :premium) 0))))
                           (if (getf rotation :splice)
                               (min (* 1000 (third (getf rotation :splice)))
                                    (or splice-collateral-msats (* 1000 (third (getf rotation :splice)))))
@@ -684,11 +706,15 @@
            (op (if (and rotation (getf rotation :cutoff))
                    (let ((entries (nth-value 1 (settlement ledger (height node) (getf rotation :cutoff))))
                          (dentries (nth-value 2 (settlement ledger (height node) (getf rotation :cutoff))))
+                         (mig (nth-value 5 (settlement ledger (height node) (getf rotation :cutoff))))
                          (sp (getf rotation :splice)))
                      (append op (list :exit-cutoff-height (getf rotation :cutoff))
                              (let ((m (median-feerate node (height node)))) (when m (list :reference-feerate (max 2 m))))
                              (when entries (list :exit-outputs entries))
                              (when dentries (list :dormancy-outputs dentries))
+                             (when mig (list :migration-manifest (getf mig :entries)
+                                             :migration-receiver (getf (lg:ledger-dormancy-notice ledger) :receiver)
+                                             :migration-vout (getf mig :vout)))
                              (when sp (list :splice-in-outpoint (splice-outpoint-bytes (hex->bytes (first sp)) (second sp))
                                             :splice-in-amount (* 1000 (third sp))))))
                    op))
@@ -1055,7 +1081,8 @@
                      (lg:cosign-requirement ledger o (height node))
                    (declare (ignore required signers tier operator-alone))
                    (unless allowed (fail "not cosignable at this height")))
-                 (when (eq (op:operation-type o) :quorum-begin) (check-quorum-begin-vault node rec o params block-height)))
+                 (when (eq (op:operation-type o) :quorum-begin) (check-quorum-begin-vault node rec o params block-height))
+                 (when (eq (op:operation-type o) :dormancy-accept) (check-dormancy-accept node rec o params)))
                (let* ((mlh (member-ledger-hash node))
                       (c (up:sign-cosignature candidate (node-priv node) (node-pubkey node) mlh)))
                  (log! node "cosigned ~a seq ~a" (subseq (record-id-hex rec) 0 8) seq)
@@ -1174,7 +1201,7 @@
                 (fail "QuorumBegin amounts do not sum to the rotation's new vault"))
               (let* ((added (if splice (third splice) 0))
                      (c0 (- (rotation-collateral ledger sats (- (+ sats added) (reduce #'+ extras :key #'cdr) new exits-cost dorm-cost))
-                            (* 1000 dorm-cost))))
+                            (* 1000 (+ dorm-cost (nth-value 6 (settlement ledger height cutoff)))))))
                 (unless (<= c0 (op:field o :collateral-amount) (+ c0 (* 1000 added)))
                   (fail "QuorumBegin collateral is not the DEP-20 §3-4 share"))))))))))
 
@@ -1314,6 +1341,70 @@
           (setf (getf (gethash offer-id (record-offers rec)) :status) :completed
                 (getf (gethash offer-id (record-offers rec)) :credited) msat)
           msat)))))
+
+(defun dormancy-offer (node rec)
+  "DEP-20 §8.3: the bucket remainder (small or non-addressable dormant deposits) a notice now would
+   migrate, as (values manifest-entries hash total): what a DormancyOffer (Kind 9110) offers."
+  (let* ((l (record-ledger rec)) (bound (- (height node) (lg::ledger-dormancy-blocks l)))
+         (floor-msat (lg:dormancy-amount-msats l)) (out '()))
+    (maphash (lambda (id d)
+               (when (and (plusp (lg:deposit-balance d)) (zerop (lg:deposit-locked-balance d))
+                          (<= (lg:deposit-last-signed-activity d) bound)
+                          (or (null (lg:pk-key-path-spk (lg:deposit-descriptor d))) (< (lg:deposit-balance d) floor-msat)))
+                 (push (list :deposit-id id :amount (lg:deposit-balance d) :fees (lg:deposit-fees d)
+                             :descriptor (lg:deposit-descriptor d))
+                       out)))
+             (lg:ledger-deposits l))
+    (let ((m (sort out #'bytes< :key (lambda (e) (getf e :deposit-id)))))
+      (values m (sha256 (op:encode-manifest m)) (reduce #'+ m :key (lambda (e) (getf e :amount)))))))
+
+(defun accept-address (node manifest-hash)
+  "DEP-20 §8.3: the funding address a cl receiver names, a DEP-10 offer-style address (our key
+   tweaked by the manifest hash).  (values address spk root)."
+  (multiple-value-bind (address spk) (offer-address node manifest-hash)
+    (values address spk (sha256 manifest-hash))))
+
+(defun dormancy-accept (node rec manifest offer-event-id total &key (expiry-blocks 288) premium-deposit)
+  "DEP-20 §8.3 receiver: accept a manifest.  Cosigners check its hash, our capacity and fee floors.
+   Returns the signed update (its bytes go into the source's DormancyNotice)."
+  (let ((hash (sha256 (op:encode-manifest manifest))))
+    (multiple-value-bind (address spk) (accept-address node hash)
+      (declare (ignore address))
+      (let ((*extra-cosign-params* (list "migration_manifest" (bytes->hex (op:encode-manifest manifest)))))
+        (append-operation node rec (%strip-nil-fields
+                                    (list :type :dormancy-accept :deposit-id premium-deposit :exit-address spk
+                                          :expires-at-height (+ (height node) expiry-blocks) :manifest-hash hash
+                                          :offer-event-id offer-event-id :accepted-total total)))))))
+
+(defun check-dormancy-accept (node rec o params)
+  "A receiver's cosigner: the manifest the request carries hashes to the accept's, and our
+   quorum's fee floors are at or below every deposit's schedule (DEP-20 §8.3)."
+  (declare (ignore node))
+  (let* ((hex (or (w:jget params "migration_manifest") (fail "a DormancyAccept cosign must carry the manifest")))
+         (m (op:decode-manifest (hex->bytes hex))))
+    (unless (equalp (sha256 (hex->bytes hex)) (op:field o :manifest-hash)) (fail "manifest does not hash to the accept's"))
+    (dolist (mem (lg:ledger-quorum-members (record-ledger rec)))
+      (dolist (e m)
+        (let ((f (getf e :fees)))
+          (when (or (and (lg::member-min-fee-bps mem) (< (op:fees-annualized-bps f) (lg::member-min-fee-bps mem)))
+                    (and (lg::member-min-fee-fixed mem) (< (op:fees-annualized-msats f) (lg::member-min-fee-fixed mem))))
+            (fail "deposit ~a's fees are below a member's floor" (bytes->hex (getf e :deposit-id)))))))))
+
+(defun dormancy-credit (node rec manifest txid vout &key (premium 0))
+  "DEP-20 §8.3 receiver: credit each manifest deposit (opening it with its descriptor and fees if
+   new) and the premium, naming the migration outpoint."
+  (let* ((l (record-ledger rec)) (a (or (lg:ledger-dormancy-accept l) (fail "no outstanding accept")))
+         (marker (lg:migration-marker (getf a :hash))))
+    (dolist (e manifest)
+      (unless (gethash (getf e :deposit-id) (lg:ledger-deposits (record-ledger rec)))
+        (append-operation node rec (list :type :deposit-open :deposit-id (getf e :deposit-id) :descriptor (getf e :descriptor)
+                                         :fees (getf e :fees) :receive-requires-sig nil)))
+      (append-operation node rec (list :type :onchain-credit :txid txid :vout vout :deposit-id (getf e :deposit-id)
+                                       :amount (getf e :amount) :funding-address marker)))
+    (when (and (plusp premium) (getf a :premium-deposit))
+      (append-operation node rec (list :type :onchain-credit :txid txid :vout vout :deposit-id (getf a :premium-deposit)
+                                       :amount premium :funding-address marker)))
+    t))
 
 (defun handle-cosign-offer (node event params)
   "A member: cosign an operator's funding offer (DEP-10) unless its operator is deposed."
@@ -3127,13 +3218,16 @@
                     (btx:make-tx :version (btx:tx-version tx) :inputs (btx:tx-inputs tx) :outputs (btx:tx-outputs tx)
                                  :locktime (btx:tx-locktime tx) :witnesses witnesses :segwit-p t))))))
 
-(defun key-path-signature (node tx in-index prevouts)
-  "BIP-341 key-path signature for input IN-INDEX under our tweaked key."
+(defun key-path-signature (node tx in-index prevouts &optional (root (octets)))
+  "BIP-341 key-path signature for input IN-INDEX under our key tweaked by ROOT (empty: no tree;
+   an offer or accept address commits a 32-byte root)."
   (let* ((xonly (up:x-only (node-pubkey node)))
-         (tweak (cl-consensus.wallet::taproot-tweak xonly))
-         (d (mod (+ (node-priv node) tweak) secp256k1-fast:*secp256k1-n*))
+         (n secp256k1-fast:*secp256k1-n*)
+         (d0 (if (= (aref (node-pubkey node) 0) 2) (node-priv node) (- n (node-priv node))))
+         (tweak (mod (be->int (tagged-hash "TapTweak" (cat xonly root))) n))
+         (d (mod (+ d0 tweak) n))
          (sighash (cl-consensus.script:taproot-sighash tx in-index prevouts 0 :ext-flag 0)))
-    (multiple-value-bind (spk parity) (lot:p2tr-spk xonly (octets))
+    (multiple-value-bind (spk parity) (lot:p2tr-spk xonly root)
       (declare (ignore spk))
       (schnorr:schnorr-sign (if (= parity 1) (- secp256k1-fast:*secp256k1-n* d) d) sighash (random-aux)))))
 

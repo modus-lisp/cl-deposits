@@ -21,7 +21,8 @@
            #:fees #:transfer-fees #:make-fees #:make-transfer-fees
            #:fees-annualized-msats #:fees-annualized-bps #:fees-frequency-blocks
            #:transfer-fees-fixed-msats #:transfer-fees-rate-bps
-           #:member-ref #:make-member-ref #:member-ref-pubkey #:member-ref-ledger-id))
+           #:member-ref #:make-member-ref #:member-ref-pubkey #:member-ref-ledger-id
+           #:encode-manifest #:decode-manifest))
 (in-package #:cl-deposits.operation)
 
 (define-condition op-error (error)
@@ -46,7 +47,9 @@
      (:quorum-member-ledger-ids 276 :ledger-ids :optional) (:protocol-version 286 :string :optional)
      (:exit-cutoff-height 278 :u32 :optional) (:exit-outputs 280 :exit-outputs :optional)
      (:splice-in-outpoint 282 :bytes :optional) (:splice-in-amount 284 :u64 :optional)
-     (:reference-feerate 292 :u32 :optional) (:dormancy-outputs 336 :exit-outputs :optional))
+     (:reference-feerate 292 :u32 :optional) (:dormancy-outputs 336 :exit-outputs :optional)
+     (:migration-manifest 316 :manifest :optional) (:migration-receiver 288 :pubkey :optional)
+     (:migration-vout 290 :u32 :optional))
     (20 :deposit-open
      (:deposit-id 200 :deposit-id) (:descriptor 202 :string) (:fees 12 :fees :optional)
      (:transfer-fees 226 :transfer-fees :optional) (:payment-hash 14 :bytes32 :optional)
@@ -137,7 +140,11 @@
      (:expires-at-height 302 :u32 :optional) (:nonce 288 :u64) (:expiry 290 :u32) (:witness 204 :witness)
      (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))
     (102 :dormancy-notice (:rotation-height 306 :u32) (:migration-receiver 288 :pubkey :optional)
-     (:manifest-hash 308 :bytes32 :optional))
+     (:manifest-hash 308 :bytes32 :optional) (:migration-manifest 316 :manifest :optional)
+     (:dormancy-accept 338 :bytes :optional) (:premium 340 :u64 :optional))
+    (103 :dormancy-accept
+     (:deposit-id 200 :deposit-id :optional) (:exit-address 300 :bytes) (:expires-at-height 302 :u32)
+     (:manifest-hash 308 :bytes32) (:offer-event-id 310 :bytes32) (:accepted-total 312 :u64))
     (101 :exit-cancel
      (:deposit-id 200 :deposit-id) (:exit-request-id 304 :bytes32) (:nonce 288 :u64) (:expiry 290 :u32)
      (:witness 204 :witness) (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))))
@@ -235,6 +242,32 @@
 (defun encode-exit-outputs (entries)
   (apply #'cat (loop for (id amount vout) in entries collect (cat id (int->be amount 8) (int->be vout 4)))))
 
+(defun decode-manifest (bytes)
+  "DEP-02 type 316: repeated deposit_id(16) amount(8) annualized_msats(8) annualized_bps(2)
+   frequency_blocks(4) u16 len descriptor, as plists."
+  (let ((pos 0) (out '()))
+    (loop while (< pos (length bytes))
+          do (when (> (+ pos 40) (length bytes)) (error 'op-error :detail "truncated manifest"))
+             (let* ((id (subseq bytes pos (+ pos 16)))
+                    (amount (be->int bytes :start (+ pos 16) :end (+ pos 24)))
+                    (am (be->int bytes :start (+ pos 24) :end (+ pos 32)))
+                    (bps (be->int bytes :start (+ pos 32) :end (+ pos 34)))
+                    (freq (be->int bytes :start (+ pos 34) :end (+ pos 38)))
+                    (len (be->int bytes :start (+ pos 38) :end (+ pos 40))))
+               (when (> (+ pos 40 len) (length bytes)) (error 'op-error :detail "truncated manifest descriptor"))
+               (push (list :deposit-id id :amount amount :fees (make-fees :annualized-msats am :annualized-bps bps :frequency-blocks freq)
+                           :descriptor (bytes->ascii (subseq bytes (+ pos 40) (+ pos 40 len))))
+                     out)
+               (incf pos (+ 40 len))))
+    (nreverse out)))
+
+(defun encode-manifest (entries)
+  (apply #'cat (loop for e in entries
+                     collect (let ((f (getf e :fees)) (d (ascii->bytes (getf e :descriptor))))
+                               (cat (getf e :deposit-id) (int->be (getf e :amount) 8)
+                                    (int->be (fees-annualized-msats f) 8) (int->be (fees-annualized-bps f) 2)
+                                    (int->be (fees-frequency-blocks f) 4) (int->be (length d) 2) d)))))
+
 (defun decode-kind (kind bytes name)
   (ecase kind
     (:u8 (%int bytes 1 name)) (:u16 (%int bytes 2 name)) (:u32 (%int bytes 4 name)) (:u64 (%int bytes 8 name))
@@ -244,7 +277,7 @@
     (:string (bytes->ascii bytes))
     (:witness (decode-witness bytes)) (:fees (decode-fees bytes)) (:transfer-fees (decode-transfer-fees bytes))
     (:pubkeys (decode-pubkeys bytes)) (:ledger-ids (decode-ledger-ids bytes))
-    (:exit-outputs (decode-exit-outputs bytes))))
+    (:exit-outputs (decode-exit-outputs bytes)) (:manifest (decode-manifest bytes))))
 
 (defun encode-kind (kind value)
   (ecase kind
@@ -254,7 +287,7 @@
     (:string (ascii->bytes value))
     (:witness (encode-witness value)) (:fees (encode-fees value)) (:transfer-fees (encode-transfer-fees value))
     (:pubkeys (apply #'cat value)) (:ledger-ids (encode-ledger-ids value))
-    (:exit-outputs (encode-exit-outputs value))))
+    (:exit-outputs (encode-exit-outputs value)) (:manifest (encode-manifest value))))
 
 ;;; ---------------------------------------------------------------------------
 

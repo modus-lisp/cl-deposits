@@ -75,9 +75,14 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
 
 ## Ledger operations
 
-- **`ExitRequest`, `ExitCancel`, splice-in (DEP-20 §3–4).** Absent from both implementations.
-  The rotation splice-out, one of the two censorship-protected obligations, has nothing to act
-  on.
+- ~~**`ExitRequest`, `ExitCancel`, splice-in (DEP-20 §3–4).**~~ **Done (2026-10-07):** exits (§3),
+  splice-in (§4), DEP-10 migration (§10) and dormancy (§8: notice, spin-outs, §8.3 migration to an
+  accepting receiver) in both implementations, with shared vectors and live mixed-quorum checks
+  (`redteam/check-{exit,splice,migrate,dormancy}.sh`). Still open: a Rust *operator* cannot issue a
+  DormancyNotice, DormancyAccept or migration credits (Rust members fold, verify and cosign them);
+  no node produces the §8.3 uncredited-migration proof yet (both verify it); cosigners do not check
+  a migration credit against the source's QuorumBegin; the proof takes `service_response_blocks`
+  from the evidence rather than the receiver's quorum.
 - ~~**Operator stand-down after confiscation.**~~ **Done (2026-10-01):** a cl operator stands down
   once custody moves or a majority of its quorum disputes it (cl 9b1a6d4), and cl members refuse
   to extend a deposed operator's chain (3e1ad0f), as the reference's members already did.
