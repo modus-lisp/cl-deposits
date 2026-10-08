@@ -32,6 +32,11 @@ up() {
   start_bitcoind || exit 1
   [ "$(bcli getblockcount)" -ge 400 ] || mine 300          # coins for 12 vaults, collateral, scenarios
   start_relay || exit 1; start_esplora || exit 1
+  # Compile once first: nodes started in parallel on a fresh tree raced on its fasls
+  # ("Couldn't load .../fraud.fasl: file does not exist").
+  ( cd "$CLD_SRC" && CL_SOURCE_REGISTRY="(:source-registry (:tree \"$CLD_SRC\") :inherit-configuration)" \
+      "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --non-interactive --eval '(require :asdf)' \
+      --eval '(handler-bind ((warning (function muffle-warning))) (asdf:load-system "cl-deposits"))' >/dev/null 2>&1 ) || { echo "cl-deposits does not compile at $CLD_SRC" >&2; exit 1; }
   local n pids=(); for n in $(cld_names); do start_cld "$n" & pids+=($!); done; wait "${pids[@]}"   # ~40 s each: in parallel (not a bare wait: the relay is a child too)
   for n in $(cld_names); do cld_running "$n" || { echo "$n did not start" >&2; exit 1; }; done
   for n in $(ref_names); do start_ref "$n" || exit 1; done
