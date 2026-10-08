@@ -57,8 +57,7 @@
         (:uncredited-onchain-payment
          (if (getf ev :source-qb-update)
              ;; DEP-20 §8.3 migration evidence (the reference's UncreditedMigration).
-             (cat (s :source-notice-update) (s :source-qb-update) (b :confirmed-at-block-hash)
-                  (int->le (getf ev :proof-sequence) 8))
+             (cat (s :source-notice-update) (s :source-qb-update) (s :proof-update) (b :confirmed-at-block-hash))
          (cat (s :offer-id) (int->le (getf ev :deadline-block) 4) (s :txid) (int->le (getf ev :vout) 4)
               (int->le (getf ev :amount-sats) 8) (b :confirmed-at-block-hash))))
         (:dispute-dereliction (cat (s :original-fraud-hash) (b :original-fraud-block-hash) (s :member-ledger-id) (s :member-pubkey)))
@@ -393,44 +392,68 @@
                (setf notice u) (return)))))
     (when (and qb notice) (values qb notice (op:decode-operation (up:update-message qb))))))
 
-(defun uncredited-migration-proof (source-history receiver-history confirmed-block-hash confirmed-height
-                                   &key (service-response-blocks 72))
+(defparameter +default-service-response-blocks+ 72
+  "DEP-05: the service deadline when no member of the governing quorum declared one.")
+
+(defun governing-service-response-blocks (history at-seq)
+  "The receiver's own terms at AT-SEQ: the largest service_response_blocks its members declared
+   (QuorumAddMember) among the members of the QuorumBegin governing AT-SEQ; the default if none.
+   Never a value carried by a proof."
+  (let ((declared (make-hash-table :test #'equalp)) (members '()))
+    (dolist (u history)
+      (when (<= (up:update-seq u) at-seq)
+        (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+          (case (and o (op:operation-type o))
+            (:quorum-add-member
+             (when (op:field o :service-response-blocks)
+               (setf (gethash (op:field o :quorum-member) declared) (op:field o :service-response-blocks))))
+            (:quorum-begin (setf members (op:field o :quorum-members)))))))
+    (or (loop for m in members for v = (gethash m declared) when v maximize v) +default-service-response-blocks+)))
+
+(defun uncredited-migration-proof (source-history receiver-history confirmed-block-hash confirmed-height)
   "DEP-20 §8.3 producer: an UncreditedOnchainPayment (migration evidence) against the receiver of
-   SOURCE-HISTORY's latest migration, if RECEIVER-HISTORY (ascending) has an update signed
-   SERVICE-RESPONSE-BLOCKS or more after CONFIRMED-HEIGHT (the rotation's block) while some
+   SOURCE-HISTORY's latest migration, if RECEIVER-HISTORY (ascending) has an update signed its own
+   service_response_blocks or more after CONFIRMED-HEIGHT (the rotation's block) while some
    migrated entry is uncredited.  NIL otherwise."
   (multiple-value-bind (qu nu qb) (latest-migration source-history)
     (when qu
       (let* ((notice (op:decode-operation (up:update-message nu)))
              (au (up:decode-update (op:field notice :dormancy-accept)))
+             (srb (governing-service-response-blocks receiver-history (up:update-seq au)))
              (txid (op:field qb :new-outpoint-txid)) (vout (op:field qb :migration-vout))
-             (late (remove-if (lambda (u) (< (up:update-block-height u) (+ confirmed-height service-response-blocks)))
-                              receiver-history))
-             (pu (car (last late))))
-        (when pu
-          (let ((credited '()))
-            (dolist (u receiver-history)
-              (when (<= (up:update-seq u) (up:update-seq pu))
-                (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-                  (when (and o (eq (op:operation-type o) :onchain-credit)
-                             (equalp (op:field o :txid) txid) (eql (op:field o :vout) vout))
-                    (push (cons (op:field o :deposit-id) (op:field o :amount)) credited)))))
-            (unless (every (lambda (m) (member (cons (getf m :deposit-id) (getf m :amount)) credited :test #'equalp))
-                           (op:field qb :migration-manifest))
-              (list :type :uncredited-onchain-payment
-                    :accused (bytes->hex (up:update-operator-id au)) :ledger-id (bytes->hex (up:update-ledger-id au))
-                    :evidence (list :source-notice-update (bytes->hex (up:encode-update nu))
-                                    :source-qb-update (bytes->hex (up:encode-update qu))
-                                    :confirmed-at-block-hash confirmed-block-hash
-                                    :proof-sequence (up:update-seq pu)
-                                    :service-response-blocks service-response-blocks)))))))))
+             (pu (car (last (remove-if (lambda (u) (< (up:update-block-height u) (+ confirmed-height srb)))
+                                       receiver-history)))))
+        (when (and pu (not (migration-credited-p qb receiver-history (up:update-seq pu) txid vout)))
+          (list :type :uncredited-onchain-payment
+                :accused (bytes->hex (up:update-operator-id au)) :ledger-id (bytes->hex (up:update-ledger-id au))
+                :evidence (list :source-notice-update (bytes->hex (up:encode-update nu))
+                                :source-qb-update (bytes->hex (up:encode-update qu))
+                                :proof-update (bytes->hex (up:encode-update pu))
+                                :confirmed-at-block-hash confirmed-block-hash)))))))
+
+(defun migration-credited-p (qb history upto-seq txid vout)
+  "Every entry QB migrated has an OnchainCredit (deposit, exact amount, TXID:VOUT) in HISTORY at or
+   before UPTO-SEQ."
+  (let ((credited '()))
+    (labels ((walk (o)
+               (case (op:operation-type o)
+                 (:onchain-credit
+                  (when (and (equalp (op:field o :txid) txid) (eql (op:field o :vout) vout))
+                    (push (cons (op:field o :deposit-id) (op:field o :amount)) credited)))
+                 (:batch (mapc #'walk (op:field o :operations))))))
+      (dolist (u history)
+        (when (<= (up:update-seq u) upto-seq)
+          (ignore-errors (walk (op:decode-operation (up:update-message u)))))))
+    (every (lambda (m) (member (cons (getf m :deposit-id) (getf m :amount)) credited :test #'equalp))
+           (op:field qb :migration-manifest))))
 
 (defun verify-uncredited-migration (proof history height-of-block)
   "DEP-20 §8.3: the accused (receiver) signed a DormancyAccept the source's notice carries, over
    the notice's manifest; the source's QuorumBegin migrated entries of it to the accused before
-   the accept expired; the rotation confirmed; the accused signed PROOF-SEQUENCE at least
-   SERVICE-RESPONSE-BLOCKS later without crediting every migrated entry (deposit, exact amount,
-   rotation txid, migration_vout).  HISTORY is the accused's; (values ok reason)."
+   the accept expired; the rotation confirmed; the accused signed PROOF-UPDATE (carried, in its
+   history) at least its own service_response_blocks later (its governing terms at the accept,
+   never a carried value) without crediting every migrated entry (deposit, exact amount, rotation
+   txid, migration_vout) by then.  HISTORY is the accused's; (values ok reason)."
   (handler-case
       (flet ((dec (hex what)
                (let ((u (up:decode-update (hex->bytes hex))))
@@ -446,8 +469,10 @@
                    (vout (and migrated (op:field qb :migration-vout)))
                    (txid (and migrated (op:field qb :new-outpoint-txid)))
                    (confirmed (funcall height-of-block (e proof :confirmed-at-block-hash)))
-                   (pu (find (e proof :proof-sequence) history :key #'up:update-seq))
-                   (ph (and pu (funcall height-of-block (up:update-block-hash pu)))))
+                   (pu (up:decode-update (hex->bytes (e proof :proof-update))))
+                   (ours (find (up:update-seq pu) history :key #'up:update-seq))
+                   (ph (funcall height-of-block (up:update-block-hash pu)))
+                   (srb (and au (governing-service-response-blocks history (up:update-seq au)))))
               (cond
                 ((not (and (equalp (up:update-operator-id nu) (up:update-operator-id qu))
                            (equalp (up:update-ledger-id nu) (up:update-ledger-id qu))
@@ -468,24 +493,18 @@
                 ((>= (up:update-block-height qu) (op:field accept :expires-at-height))
                  (values nil "the accept had expired when the source rotated"))
                 ((null confirmed) (values nil "confirmed_at_block_hash not in the verifier's chain"))
-                ((null pu) (values nil "proof_sequence not in the accused's history"))
-                ((null ph) (values nil "the proof_sequence update's block is not in the verifier's chain"))
-                ((< (- ph confirmed) (e proof :service-response-blocks))
-                 (values nil "the proof_sequence update is too soon after the migration confirmed"))
-                (t
-                 (let ((credited '()))
-                   (labels ((walk (o)
-                              (case (op:operation-type o)
-                                (:onchain-credit
-                                 (when (and (equalp (op:field o :txid) txid) (eql (op:field o :vout) vout))
-                                   (push (cons (op:field o :deposit-id) (op:field o :amount)) credited)))
-                                (:batch (mapc #'walk (op:field o :operations))))))
-                     (dolist (u history)
-                       (when (<= (up:update-seq u) (e proof :proof-sequence))
-                         (ignore-errors (walk (op:decode-operation (up:update-message u)))))))
-                   (if (every (lambda (m) (member (cons (getf m :deposit-id) (getf m :amount)) credited :test #'equalp)) migrated)
-                       (values nil "every migrated deposit was credited: not fraud")
-                       (values t nil)))))))))
+                ((not (and (up:verify-operator-signature pu) (equalp (up:update-operator-id pu) (up:update-operator-id au))
+                           (equalp (up:update-ledger-id pu) (up:update-ledger-id au))))
+                 (values nil "the proof update is not the accused's signed update on its ledger"))
+                ((not (and ours (equalp (up:chain-hash ours) (up:chain-hash pu))))
+                 (values nil "the proof update is not in the accused's history"))
+                ((null ph) (values nil "the proof update's block is not in the verifier's chain"))
+                ((/= ph (up:update-block-height pu)) (values nil "the proof update's signed height is not its block's"))
+                ((< (- ph confirmed) srb)
+                 (values nil (format nil "the proof update is fewer than ~a blocks (the accused's terms) after the migration confirmed" srb)))
+                ((migration-credited-p qb history (up:update-seq pu) txid vout)
+                 (values nil "every migrated deposit was credited: not fraud"))
+                (t (values t nil)))))))
     (error (c) (values nil (princ-to-string c)))))
 
 (defun verify-proof (proof &key history height-of-block)

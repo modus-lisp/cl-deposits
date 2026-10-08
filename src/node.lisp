@@ -3436,13 +3436,10 @@
                 (error (e) (log! node "vault watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e))))))
         (setf (node-vault-scanned node) to)))))
 
-(defparameter *migration-service-response-blocks* 72
-  "DEP-20 §8.3: blocks a receiver has to credit a confirmed migration before it is provable.")
-
 (defun drive-migration-watch (node)
   "DEP-20 §8.3: for each ledger we hold whose latest rotation migrated deposits, note the block
    the migration output confirmed in (while it is still unspent), and once the receiver has signed
-   an update *MIGRATION-SERVICE-RESPONSE-BLOCKS* later without crediting every migrated entry,
+   an update its own service_response_blocks later without crediting every migrated entry,
    broadcast the UncreditedOnchainPayment proof against it."
   (loop for rec being the hash-values of (node-ledgers node)
         unless (record-fork-p rec)
@@ -3459,13 +3456,12 @@
                                               (let* ((h (- (height node) (getf info :confirmations) -1))
                                                      (b (funcall (node-block-hash-fn node) h)))
                                                 (when b (setf (gethash key (node-migrations-watched node)) (list :height h :hash b)))))))))
-                           (when (and conf (>= (height node) (+ (getf conf :height) *migration-service-response-blocks*)))
+                           (when conf
                              (let* ((au (up:decode-update (op:field (op:decode-operation (up:update-message nu)) :dormancy-accept)))
                                     (rid (bytes->hex (up:update-ledger-id au)))
                                     (rrec (find-record node rid))
                                     (rhist (if (and rrec (not (record-fork-p rrec))) (reverse (record-history rrec)) (ledger-updates-from-relays node rid)))
-                                    (proof (fr:uncredited-migration-proof source rhist (getf conf :hash) (getf conf :height)
-                                                                          :service-response-blocks *migration-service-response-blocks*)))
+                                    (proof (fr:uncredited-migration-proof source rhist (getf conf :hash) (getf conf :height))))
                                (cond (proof
                                       (multiple-value-bind (ok why)
                                           (fr:verify-proof proof :history rhist
@@ -3477,8 +3473,11 @@
                                                    (broadcast-fraud node proof))
                                             (log! node "uncredited-migration proof against ~a does not verify: ~a" (subseq rid 0 8) why))))
                                      ;; nothing late enough yet, or all credited: done only when all are
-                                     ((null (fr:uncredited-migration-proof source rhist (getf conf :hash) 0 :service-response-blocks 0))
-                                      (when rhist (setf (gethash key (node-migrations-watched node)) :done)))))))
+                                     ((and rhist (multiple-value-bind (q n qbo) (fr:latest-migration source)
+                                                   (declare (ignore q n))
+                                                   (fr::migration-credited-p qbo rhist (up:update-seq (car (last rhist)))
+                                                                             (op:field qbo :new-outpoint-txid) (op:field qbo :migration-vout))))
+                                      (setf (gethash key (node-migrations-watched node)) :done))))))
                        (error (e) (log! node "migration watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e)))))))))
 
 (defun report-vault-spend (node rec spend)

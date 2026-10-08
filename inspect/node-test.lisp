@@ -1618,13 +1618,13 @@
                              (list (length (op:field o :migration-manifest)) (op:field o :migration-vout)) '(1 1))
                 (check-equal "the source debits the migrated deposit" (lg:deposit-balance (lg:find-deposit (nd:record-ledger la) d1)) 0)
                 (let ((p (fr:uncredited-migration-proof (reverse (nd:record-history la)) (reverse (nd:record-history lb))
-                                                        (u:sha256 (hx "b1")) (+ h0 10) :service-response-blocks 0)))
+                                                        (u:sha256 (hx "b1")) (- h0 200))))
                   (check-equal "before crediting, the producer accuses the receiver"
                                (list (getf p :type) (getf p :accused)) (list :uncredited-onchain-payment (nd:node-pubkey-hex b))))
                 (nd::dormancy-credit b lb (op:field o :migration-manifest) txid 1)
                 (check "after crediting, the producer accuses no one"
                        (null (fr:uncredited-migration-proof (reverse (nd:record-history la)) (reverse (nd:record-history lb))
-                                                            (u:sha256 (hx "b1")) (+ h0 10) :service-response-blocks 0)))
+                                                            (u:sha256 (hx "b1")) (- h0 200))))
                 (check-equal "the receiver credits the deposit under its descriptor"
                              (lg:deposit-balance (lg:find-deposit (nd:record-ledger lb) d1)) 400000)
                 (setf (gethash (cons txid 1) chain)
