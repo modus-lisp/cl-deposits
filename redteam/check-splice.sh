@@ -14,7 +14,7 @@ R1=${R1:-ref6}; R2=${R2:-ref7}
 for n in $OP $C1 $C2 $C3; do cld_running $n || continue; stop_cld $n >/dev/null; start_cld $n >/dev/null & done; wait
 SPLICE_BTC=0.0007; SPLICE_SATS=70000
 info() { cld_ctl "$1" "(:info)" | grep -oE "\(:ID \"$2\"[^)]*\)"; }
-coll() { info "$1" "$2" | grep -oE ':COLLATERAL [0-9]+' | grep -oE '[0-9]+'; }
+coll() { info "$1" "$2" | grep -oE ':COLLATERAL [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1; }   # :info lists a ledger once per record (base, forks)
 ref_signed() { sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$1/node.log" 2>/dev/null | grep -q "action=rotation_sign, ledger=${2:0:16}.*success=true"; }
 check_rotation() {   # check_rotation LABEL ROTATION_TXID OLD_VAULT SPLICE_TXID:VOUT
   local tx ins
