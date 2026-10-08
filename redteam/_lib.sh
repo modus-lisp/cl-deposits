@@ -1,5 +1,13 @@
 # redteam/_lib.sh — shared by the scenario scripts.  Source after devnet/_common.sh and $S/env.
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# Every check times out instead of hanging: CHECK_TIMEOUT seconds (default 2700), then FAIL.
+if [ -z "${CHECK_WATCHDOG:-}" ]; then
+  export CHECK_WATCHDOG=1
+  trap 'echo "FAIL: $(basename "$0") timed out after ${CHECK_TIMEOUT:-2700}s" >&2; exit 124' TERM
+  ( sleep "${CHECK_TIMEOUT:-2700}"; kill -TERM $$ 2>/dev/null; pkill -TERM -P $$ 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  CHECK_WATCHDOG_PID=$!; disown $CHECK_WATCHDOG_PID   # a script's bare `wait` must not wait for it
+  trap 'kill $CHECK_WATCHDOG_PID 2>/dev/null' EXIT
+fi
 pubkey_of() {   # pubkey_of NODE — its protocol key, cached in $S/pubkey.NODE (a key never changes)
   local c="$S/pubkey.$1" k i; [ -s "$c" ] && { cat "$c"; return 0; }
   for i in 1 2 3 4 5 6; do

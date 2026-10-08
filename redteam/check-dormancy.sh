@@ -2,12 +2,12 @@
 # redteam/check-dormancy.sh — DEP-20 §8.1-8.3 dormancy, live, mixed quorums.
 #
 # A cl operator's ledger with cl and reference members agreeing dormancy_blocks 5 and
-# dormancy_notice_blocks 3. Two pk() deposits of 3000000 msat each and a small one (300000 msat,
+# dormancy_notice_blocks 3. Two pk() deposits of 3000000 msat each and a small one (335000 msat,
 # below the spin-out floor); after a DormancyNotice the second shows signed activity (an exit
 # request and its cancel). The notice names a receiver (§8.3): a second cl operator's ledger, same
 # mixed members, that accepted the offered manifest (the small deposit). At the notice's rotation:
 # PASS = the rotation pays the dormant deposit's full balance (3000 sats) to the key-path P2TR of
-#        its key and the small deposit's 300 sats to the receiver's accept address, both are zero
+#        its key and the small deposit's 335 sats to the receiver's accept address, both are zero
 #        on the source, the active deposit keeps its balance; the receiver credits the small
 #        deposit (its members cosigning) and splices the migration output in at its next
 #        rotation; reference members signed and cosigned every step.
@@ -26,7 +26,7 @@ D3=$(cat "$S/redteam-$NAME.small" 2>/dev/null)
 if [ -z "$D3" ]; then
   read -r ftx fvout <"$S/redteam-$NAME.outpoint"
   D3=$(sx "$(w w3 "$X" open)" ":DEPOSIT"); [ -n "$D3" ] || fail "w3 open"
-  expect "$(cld_ctl $OP "(:credit :ledger \"$X\" :deposit \"$D3\" :msat 300000 :txid \"$ftx\" :vout $fvout)")" "credit small"
+  expect "$(cld_ctl $OP "(:credit :ledger \"$X\" :deposit \"$D3\" :msat 335000 :txid \"$ftx\" :vout $fvout)")" "credit small"
   echo "$D3" >"$S/redteam-$NAME.small"
 fi
 Y=$(form_ledger "${NAME}R" $OP2 "" $C1 $C2 $C3 $R1 $R2) || exit 1
@@ -36,7 +36,7 @@ mine 7 >/dev/null; sleep 5
 H=$(bcli getblockcount)
 r=$(cld_ctl $OP "(:dormancy-offer :ledger \"$X\")"); expect "$r" "dormancy-offer"
 M=$(sx "$r" ":MANIFEST"); [ "$(sx "$r" ":COUNT")" = 1 ] || fail "the offer should list only the small deposit: $r"
-r=$(cld_ctl $OP2 "(:dormancy-accept :ledger \"$Y\" :manifest \"$M\" :total 300000)"); expect "$r" "dormancy-accept (receiver's members cosign)"
+r=$(cld_ctl $OP2 "(:dormancy-accept :ledger \"$Y\" :manifest \"$M\" :total 335000)"); expect "$r" "dormancy-accept (receiver's members cosign)"
 ACC=$(sx "$r" ":ACCEPT"); MA=$(sx "$r" ":ADDRESS")
 expect "$(cld_ctl $OP "(:dormancy-notice :ledger \"$X\" :rotation-height $((H + 4)) :receiver \"$(pubkey_of $OP2)\" :manifest \"$M\" :accept \"$ACC\")")" "dormancy-notice with migration"
 A=$(wcli getnewaddress "" bech32m)
@@ -54,8 +54,8 @@ paid=$(python3 -c "import json,sys; t=json.loads(sys.argv[1]); print(sum(round(o
 [ "$paid" = 3000 ] || fail "the rotation pays $paid sats to $TR, expected the dormant deposit's 3000"
 echo "   rotation $RT pays 3000 sats to the dormant deposit's key ($TR)"
 MV=$(outpoint_vout "$RT" "$MA") || fail "the rotation pays nothing to the receiver's accept address $MA"
-[ "$(out_sats "$RT" "$MV")" = 300 ] || fail "the migration output carries $(out_sats "$RT" "$MV") sats, expected 300"
-echo "   rotation pays the migration output $RT:$MV (300 sats) to the receiver's accept address"
+[ "$(out_sats "$RT" "$MV")" = 335 ] || fail "the migration output carries $(out_sats "$RT" "$MV") sats, expected 335"
+echo "   rotation pays the migration output $RT:$MV (335 sats) to the receiver's accept address"
 bal_on() { local i b; for i in 1 2 3 4 5; do b=$(w "$1" "$2" balance "$3"); case "$b" in *":BALANCE "*) echo "$b"; return;; esac; sleep 10; done; echo "$b"; }
 bal() { bal_on "$1" "$X" "$2"; }
 [ "$(sx "$(bal w1 "$D1")" ":BALANCE")" = 0 ] || fail "the dormant deposit was not debited: $(bal w1 "$D1")"
@@ -69,8 +69,8 @@ cos=0; for m in $R1 $R2; do sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" 2>
 echo "   reference members: $signed signed the rotation, $cos cosigned its QuorumBegin"
 # §8.3 receiver: credit the migrated deposit, then splice the migration output at the next rotation.
 expect "$(cld_ctl $OP2 "(:dormancy-credit :ledger \"$Y\" :manifest \"$M\" :txid \"$RT\" :vout $MV)")" "dormancy-credit"
-[ "$(sx "$(bal_on w3 "$Y" "$D3")" ":BALANCE")" = 300000 ] || fail "the receiver did not credit the migrated deposit: $(bal_on w3 "$Y" "$D3")"
-echo "   receiver credited the migrated deposit (300000 msat) under its own ledger"
+[ "$(sx "$(bal_on w3 "$Y" "$D3")" ":BALANCE")" = 335000 ] || fail "the receiver did not credit the migrated deposit: $(bal_on w3 "$Y" "$D3")"
+echo "   receiver credited the migrated deposit (335000 msat) under its own ledger"
 mine 2 >/dev/null; sleep 5
 consent "$Y" $OP2 $C1 $C2 $C3 $R1 $R2
 r=$(cld_ctl $OP2 "(:rotate-vault :ledger \"$Y\" :expiry-blocks 4320 :splice \"$RT:$MV\")"); expect "$r" "receiver rotate-vault splicing the migration"; RT2=$(sx "$r" ":TXID")

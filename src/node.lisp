@@ -724,7 +724,9 @@
         (when (and r (getf r :tx))
           (let ((tx (hex->bytes (getf r :tx))))
             (setf (gethash (hex->bytes (getf r :txid)) (node-inflight-rotations node)) tx)
-            (when (node-broadcast-fn node) (ignore-errors (funcall (node-broadcast-fn node) tx)))
+            (when (node-broadcast-fn node)
+              (handler-case (funcall (node-broadcast-fn node) tx)
+                (error (c) (log! node "rotation ~a broadcast failed: ~a" (getf r :txid) c))))
             (bus:bus-publish (node-bus node) (w:rotation-tx-event (node-keypair node) (record-id-hex rec)
                                                                    (up:update-seq update) (getf r :tx)))
             (log! node "rotation of ~a broadcast after its QuorumBegin (seq ~a)" (subseq (record-id-hex rec) 0 8) (up:update-seq update)))))
@@ -2697,7 +2699,9 @@
 
 (defun broadcast (node tx)
   (push tx (node-broadcasts node))
-  (when (node-broadcast-fn node) (funcall (node-broadcast-fn node) (btx:serialize-tx tx))))
+  (when (node-broadcast-fn node)
+    (handler-case (funcall (node-broadcast-fn node) (btx:serialize-tx tx))
+      (error (c) (log! node "broadcast of ~a failed: ~a" (bytes->hex (reverse (btx:tx-txid tx))) c) nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Red team: unauthorised vault spend (DEP-06 type 7, the gap docs/MISSING.md

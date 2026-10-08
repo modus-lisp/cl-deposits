@@ -181,7 +181,9 @@ start_cld() {
   ( cd "$CLD_SRC" && setsid nohup env CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=$CLD_CHAIN \
       CLD_BITCOIN_CLI="$BCLI" CLD_MIN_CONFS=1 "${lnenv[@]}" \
       CL_SOURCE_REGISTRY="(:source-registry (:tree \"$CLD_SRC\") :inherit-configuration)" \
-      "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --dynamic-space-size "${CLD_HEAP_MB:-32768}" --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 & )
+      "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --dynamic-space-size "${CLD_HEAP_MB:-32768}" --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 & ) </dev/null >/dev/null 2>&1
+      # The wrapper subshell outlives this call as the node's parent: it must not hold the
+      # caller's stdout/stderr, or a check piped to tail/a log reader never sees EOF (2026-10-08).
       # A pinned SBCL, not whatever is first on PATH: under the 2.6.8 in ~/.local/bin
       # secp256k1-fast derives a WRONG public key and no signature verifies — a node
       # started with it comes back as a stranger to its own ledgers (2026-09-24 night).

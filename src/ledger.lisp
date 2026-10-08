@@ -198,7 +198,8 @@
             (push (list :deposit-id (deposit-id d) :amount (deposit-balance d) :fees (deposit-fees d)
                         :descriptor (deposit-descriptor d))
                   out)))
-        (when out
+        ;; Below the 330-sat dust floor the output would not relay: nothing migrates.
+        (when (and out (>= (floor (+ total premium) 1000) 330))
           (values (nreverse out) (getf n :spk) (floor (+ total premium) 1000)))))))
 
 (defun due-exits (ledger height cutoff)

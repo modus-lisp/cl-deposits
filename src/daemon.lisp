@@ -320,7 +320,14 @@
                 :spk (let ((spk (gethash "scriptPubKey" j))) (and spk (hex->bytes (gethash "hex" spk))))))))))
 
 (defun bitcoin-cli-broadcast-fn (cli)
-  (lambda (bytes) (run-cli cli "sendrawtransaction" (bytes->hex bytes))))
+  "sendrawtransaction; signals with bitcoind's reason when it refuses (callers log it)."
+  (lambda (bytes)
+    (multiple-value-bind (out err code)
+        (uiop:run-program (append (uiop:split-string cli :separator " ") (list "sendrawtransaction" (bytes->hex bytes)))
+                          :output :string :error-output :string :ignore-error-status t)
+      (unless (or (zerop code) (search "already" err))   ; known/in the chain: nothing to do
+        (error "sendrawtransaction refused: ~a" (string-trim '(#\Newline #\Space) err)))
+      (string-trim '(#\Newline #\Space) out))))
 
 (defun bitcoin-cli-block-hash-fn (cli)
   "Height -> block hash (32 bytes, internal byte order), or NIL.  getblockhash prints
