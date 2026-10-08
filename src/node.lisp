@@ -2167,9 +2167,12 @@
   "DEP-10: ask LEDGER-ID-HEX's operator for a cosigned funding offer crediting our pk() deposit.
    Returns the response object (funding_address, deadline_block, offer_id, cosign...)."
   (multiple-value-bind (ok res err)
+      ;; An offer waits on the operator's own cosign round with its quorum (DEP-10): give it
+      ;; that round plus slack, not one cosign timeout (a reference operator took 14 s).
       (wallet-request wal ledger-id-hex "make_offer"
                       (w:json-object "descriptor" (wallet-descriptor wal) "max_sats" max-sats
-                                     "min_sats" min-sats "blocks_valid" blocks-valid))
+                                     "min_sats" min-sats "blocks_valid" blocks-valid)
+                      :timeout (* 4 *cosign-timeout*))
     (unless ok (fail "make_offer: ~a" err))
     (if (stringp res) (w:parse-json res) res)))
 
