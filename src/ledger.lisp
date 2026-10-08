@@ -22,7 +22,7 @@
            #:ledger-active-ruleset #:ledger-pending-exits #:ledger-vault-current-p #:due-exits #:+exit-cutoff-margin+
            #:exit-dust-msats #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
            #:ledger-dormancy-notice #:dormancy-spin-outs #:dormancy-amount-msats #:deposit-last-signed-activity
-           #:pk-key-path-spk #:dormancy-cost #:dormancy-migration #:ledger-dormancy-accept #:migration-marker
+           #:pk-key-path-spk #:dormancy-cost #:dormancy-migration #:ledger-dormancy-accept #:migration-marker #:dormancy-offer-entries
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
@@ -169,6 +169,22 @@
                        (push (list id (deposit-balance d) spk) out))))
                  (ledger-deposits ledger))
         (sort out #'bytes< :key #'first)))))
+
+(defun dormancy-offer-entries (ledger height)
+  "DEP-20 §8.3: the dormant deposits a spin-out would not pay at HEIGHT (no key-path address, or
+   below the floor), ascending deposit id, as manifest entries."
+  (let ((bound (- height (ledger-dormancy-blocks ledger))) (floor-msat (dormancy-amount-msats ledger))
+        (pending (let ((h (make-hash-table :test #'equalp)))
+                   (maphash (lambda (k e) (declare (ignore k)) (setf (gethash (getf e :deposit-id) h) t)) (ledger-pending-exits ledger))
+                   h))
+        (out '()))
+    (maphash (lambda (id d)
+               (when (and (plusp (deposit-balance d)) (zerop (deposit-locked-balance d)) (not (gethash id pending))
+                          (<= (deposit-last-signed-activity d) bound)
+                          (or (null (pk-key-path-spk (deposit-descriptor d))) (< (deposit-balance d) floor-msat)))
+                 (push (list :deposit-id id :amount (deposit-balance d) :fees (deposit-fees d) :descriptor (deposit-descriptor d)) out)))
+             (ledger-deposits ledger))
+    (sort out #'bytes< :key (lambda (e) (getf e :deposit-id)))))
 
 (defun migration-marker (manifest-hash) (format nil "migration:~a" (bytes->hex manifest-hash)))
 

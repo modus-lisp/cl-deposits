@@ -16,7 +16,7 @@
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
            #:proof->json #:json->proof #:requires-embedding-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
-           #:make-quorum-expired-proof #:make-non-conforming-update-proof #:verify-censorship
+           #:make-quorum-expired-proof #:make-non-conforming-update-proof #:uncredited-migration-proof #:latest-migration #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
            #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers))
@@ -381,6 +381,50 @@
                            (t (values t nil))))))))
     (error (c) (values nil (princ-to-string c)))))
 
+(defun latest-migration (source-history)
+  "DEP-20 §8.3: the newest QuorumBegin in SOURCE-HISTORY (ascending) that migrated, and the
+   DormancyNotice before it carrying the accept: (values qb-update notice-update qb-op), or NIL."
+  (let ((qb nil) (notice nil))
+    (dolist (u (reverse source-history))
+      (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+        (cond ((and (null qb) o (eq (op:operation-type o) :quorum-begin) (op:field o :migration-manifest))
+               (setf qb u))
+              ((and qb o (eq (op:operation-type o) :dormancy-notice) (op:field o :dormancy-accept))
+               (setf notice u) (return)))))
+    (when (and qb notice) (values qb notice (op:decode-operation (up:update-message qb))))))
+
+(defun uncredited-migration-proof (source-history receiver-history confirmed-block-hash confirmed-height
+                                   &key (service-response-blocks 72))
+  "DEP-20 §8.3 producer: an UncreditedOnchainPayment (migration evidence) against the receiver of
+   SOURCE-HISTORY's latest migration, if RECEIVER-HISTORY (ascending) has an update signed
+   SERVICE-RESPONSE-BLOCKS or more after CONFIRMED-HEIGHT (the rotation's block) while some
+   migrated entry is uncredited.  NIL otherwise."
+  (multiple-value-bind (qu nu qb) (latest-migration source-history)
+    (when qu
+      (let* ((notice (op:decode-operation (up:update-message nu)))
+             (au (up:decode-update (op:field notice :dormancy-accept)))
+             (txid (op:field qb :new-outpoint-txid)) (vout (op:field qb :migration-vout))
+             (late (remove-if (lambda (u) (< (up:update-block-height u) (+ confirmed-height service-response-blocks)))
+                              receiver-history))
+             (pu (car (last late))))
+        (when pu
+          (let ((credited '()))
+            (dolist (u receiver-history)
+              (when (<= (up:update-seq u) (up:update-seq pu))
+                (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                  (when (and o (eq (op:operation-type o) :onchain-credit)
+                             (equalp (op:field o :txid) txid) (eql (op:field o :vout) vout))
+                    (push (cons (op:field o :deposit-id) (op:field o :amount)) credited)))))
+            (unless (every (lambda (m) (member (cons (getf m :deposit-id) (getf m :amount)) credited :test #'equalp))
+                           (op:field qb :migration-manifest))
+              (list :type :uncredited-onchain-payment
+                    :accused (bytes->hex (up:update-operator-id au)) :ledger-id (bytes->hex (up:update-ledger-id au))
+                    :evidence (list :source-notice-update (bytes->hex (up:encode-update nu))
+                                    :source-qb-update (bytes->hex (up:encode-update qu))
+                                    :confirmed-at-block-hash confirmed-block-hash
+                                    :proof-sequence (up:update-seq pu)
+                                    :service-response-blocks service-response-blocks)))))))))
+
 (defun verify-uncredited-migration (proof history height-of-block)
   "DEP-20 §8.3: the accused (receiver) signed a DormancyAccept the source's notice carries, over
    the notice's manifest; the source's QuorumBegin migrated entries of it to the accused before
@@ -505,6 +549,8 @@
   (w:json-object "proof" (proof->json proof)
                  "embedding" (or embedding
                                  (and (requires-embedding-p (getf proof :type))
+                                      ;; DEP-20 §8.3 migration evidence is self-evident (DEP-06)
+                                      (not (e proof :source-qb-update))
                                       (w:json-object "ledger_id" (getf proof :ledger-id) "sequence" 0 "update_hash" "" "field" "inline")))
                  "causal_chain" (coerce causal-chain 'vector)))
 

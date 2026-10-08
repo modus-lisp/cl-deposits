@@ -1617,7 +1617,14 @@
                 (check-equal "the QuorumBegin records the migration"
                              (list (length (op:field o :migration-manifest)) (op:field o :migration-vout)) '(1 1))
                 (check-equal "the source debits the migrated deposit" (lg:deposit-balance (lg:find-deposit (nd:record-ledger la) d1)) 0)
+                (let ((p (fr:uncredited-migration-proof (reverse (nd:record-history la)) (reverse (nd:record-history lb))
+                                                        (u:sha256 (hx "b1")) (+ h0 10) :service-response-blocks 0)))
+                  (check-equal "before crediting, the producer accuses the receiver"
+                               (list (getf p :type) (getf p :accused)) (list :uncredited-onchain-payment (nd:node-pubkey-hex b))))
                 (nd::dormancy-credit b lb (op:field o :migration-manifest) txid 1)
+                (check "after crediting, the producer accuses no one"
+                       (null (fr:uncredited-migration-proof (reverse (nd:record-history la)) (reverse (nd:record-history lb))
+                                                            (u:sha256 (hx "b1")) (+ h0 10) :service-response-blocks 0)))
                 (check-equal "the receiver credits the deposit under its descriptor"
                              (lg:deposit-balance (lg:find-deposit (nd:record-ledger lb) d1)) 400000)
                 (setf (gethash (cons txid 1) chain)
@@ -1630,7 +1637,19 @@
                 (nd:rotate-vault b lb :timeout 20 :splice (list txid 1))
                 (let* ((ub (nd:begin-quorum b lb)) (ob (op:decode-operation (up:update-message ub))))
                   (check "the receiver's rotation splices the migration output in" (op:field ob :splice-in-outpoint))
-                  (check "and closes the accept" (null (lg:ledger-dormancy-accept (nd:record-ledger lb)))))))))))))
+                  (check "and closes the accept" (null (lg:ledger-dormancy-accept (nd:record-ledger lb))))
+                  ;; The same QuorumBegin without the splice, signed by the receiver: NonConformingUpdate.
+                  (let* ((m (op:decode-operation (up:update-message ub)))
+                         (bad-op (loop for (k v) on m by #'cddr unless (member k '(:splice-in-outpoint :splice-in-amount)) append (list k v)))
+                         (fault (up:make-signed-update :operator-id (up:update-operator-id ub) :ledger-id (up:update-ledger-id ub)
+                                                       :seq (up:update-seq ub) :prev-hash (up:update-prev-hash ub)
+                                                       :message (op:encode-operation bad-op) :block-height (up:update-block-height ub)
+                                                       :block-hash (up:update-block-hash ub))))
+                    (up:sign-operator fault (nd::node-priv b))
+                    (multiple-value-bind (ok why)
+                        (fr:verify-proof (fr:make-non-conforming-update-proof (nd:node-pubkey b) (up:update-ledger-id ub) fault)
+                                         :history (remove ub (reverse (nd:record-history lb))))
+                      (check (format nil "a receiver QuorumBegin omitting the splice is NonConformingUpdate (~a)" why) ok))))))))))))
 
 (with-gate ("arming waits for its pledge's height: a stale cached height never excludes the armer")
   ;; regtest smoke flake: each pledge mined, then armed at once with a cached height one

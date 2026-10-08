@@ -114,6 +114,7 @@
   (feerate-fn nil)                             ; (lambda (height)) -> block feerate (DEP-03 Reference feerate)
   (vault-scanned nil)                          ; the last block height scanned for vault spends
   (reported-vault-spend (make-hash-table :test (quote equal) :synchronized t))
+  (migrations-watched (make-hash-table :test (quote equal) :synchronized t)) ; "ledger:seq" -> (:height h :hash b) | :done
   ;; ledger id hex -> txids of confiscations we saw confirmed.  Kept apart from the forks: a fork
   ;; forgets its confiscation once the lottery output is spent (the winner's claim), and the vault
   ;; watch must still excuse it.  Persisted in confiscations.txt.
@@ -1345,20 +1346,9 @@
           msat)))))
 
 (defun dormancy-offer (node rec)
-  "DEP-20 §8.3: the bucket remainder (small or non-addressable dormant deposits) a notice now would
-   migrate, as (values manifest-entries hash total): what a DormancyOffer (Kind 9110) offers."
-  (let* ((l (record-ledger rec)) (bound (- (height node) (lg::ledger-dormancy-blocks l)))
-         (floor-msat (lg:dormancy-amount-msats l)) (out '()))
-    (maphash (lambda (id d)
-               (when (and (plusp (lg:deposit-balance d)) (zerop (lg:deposit-locked-balance d))
-                          (<= (lg:deposit-last-signed-activity d) bound)
-                          (or (null (lg:pk-key-path-spk (lg:deposit-descriptor d))) (< (lg:deposit-balance d) floor-msat)))
-                 (push (list :deposit-id id :amount (lg:deposit-balance d) :fees (lg:deposit-fees d)
-                             :descriptor (lg:deposit-descriptor d))
-                       out)))
-             (lg:ledger-deposits l))
-    (let ((m (sort out #'bytes< :key (lambda (e) (getf e :deposit-id)))))
-      (values m (sha256 (op:encode-manifest m)) (reduce #'+ m :key (lambda (e) (getf e :amount)))))))
+  "DEP-20 §8.3: what a DormancyOffer (Kind 9110) offers now: (values manifest-entries hash total)."
+  (let ((m (lg:dormancy-offer-entries (record-ledger rec) (height node))))
+    (values m (sha256 (op:encode-manifest m)) (reduce #'+ m :key (lambda (e) (getf e :amount))))))
 
 (defun accept-address (node manifest-hash)
   "DEP-20 §8.3: the funding address a cl receiver names, a DEP-10 offer-style address (our key
@@ -2072,6 +2062,7 @@
                                    (ignore-errors (drive-disputes node))
                                    (ignore-errors (drive-dereliction node))
                                    (ignore-errors (drive-vault-watch node))
+                                   (ignore-errors (drive-migration-watch node))
                                    (ignore-errors (drive-rotation-rebroadcast node))))
                   :name "cld-expiry"))
 
@@ -3444,6 +3435,51 @@
               (handler-case (report-vault-spend node rec spend)
                 (error (e) (log! node "vault watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e))))))
         (setf (node-vault-scanned node) to)))))
+
+(defparameter *migration-service-response-blocks* 72
+  "DEP-20 §8.3: blocks a receiver has to credit a confirmed migration before it is provable.")
+
+(defun drive-migration-watch (node)
+  "DEP-20 §8.3: for each ledger we hold whose latest rotation migrated deposits, note the block
+   the migration output confirmed in (while it is still unspent), and once the receiver has signed
+   an update *MIGRATION-SERVICE-RESPONSE-BLOCKS* later without crediting every migrated entry,
+   broadcast the UncreditedOnchainPayment proof against it."
+  (loop for rec being the hash-values of (node-ledgers node)
+        unless (record-fork-p rec)
+          do (let ((source (reverse (record-history rec))))
+               (multiple-value-bind (qu nu qb) (fr:latest-migration source)
+                 (let* ((key (and qu (format nil "~a:~a" (record-id-hex rec) (up:update-seq qu))))
+                        (seen (and key (gethash key (node-migrations-watched node)))))
+                   (when (and qu (not (eq seen :done)))
+                     (handler-case
+                         (let* ((txid (op:field qb :new-outpoint-txid)) (vout (op:field qb :migration-vout))
+                                (conf (or seen
+                                          (let ((info (and (node-chain-fn node) (funcall (node-chain-fn node) txid vout))))
+                                            (when (and info (plusp (or (getf info :confirmations) 0)) (node-block-hash-fn node))
+                                              (let* ((h (- (height node) (getf info :confirmations) -1))
+                                                     (b (funcall (node-block-hash-fn node) h)))
+                                                (when b (setf (gethash key (node-migrations-watched node)) (list :height h :hash b)))))))))
+                           (when (and conf (>= (height node) (+ (getf conf :height) *migration-service-response-blocks*)))
+                             (let* ((au (up:decode-update (op:field (op:decode-operation (up:update-message nu)) :dormancy-accept)))
+                                    (rid (bytes->hex (up:update-ledger-id au)))
+                                    (rrec (find-record node rid))
+                                    (rhist (if (and rrec (not (record-fork-p rrec))) (reverse (record-history rrec)) (ledger-updates-from-relays node rid)))
+                                    (proof (fr:uncredited-migration-proof source rhist (getf conf :hash) (getf conf :height)
+                                                                          :service-response-blocks *migration-service-response-blocks*)))
+                               (cond (proof
+                                      (multiple-value-bind (ok why)
+                                          (fr:verify-proof proof :history rhist
+                                                                 :height-of-block (or (node-height-of-block node) (lambda (b) (declare (ignore b)) (height node))))
+                                        (if ok
+                                            (progn (log! node "UNCREDITED MIGRATION: ~a has not credited ~a's migration; proof broadcast"
+                                                         (subseq rid 0 8) (subseq (record-id-hex rec) 0 8))
+                                                   (setf (gethash key (node-migrations-watched node)) :done)
+                                                   (broadcast-fraud node proof))
+                                            (log! node "uncredited-migration proof against ~a does not verify: ~a" (subseq rid 0 8) why))))
+                                     ;; nothing late enough yet, or all credited: done only when all are
+                                     ((null (fr:uncredited-migration-proof source rhist (getf conf :hash) 0 :service-response-blocks 0))
+                                      (when rhist (setf (gethash key (node-migrations-watched node)) :done)))))))
+                       (error (e) (log! node "migration watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e)))))))))
 
 (defun report-vault-spend (node rec spend)
   (let* ((id (record-id-hex rec))
