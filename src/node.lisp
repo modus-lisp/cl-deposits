@@ -1761,6 +1761,8 @@
    ledger D at 127572 of 138728, a rotation at 128928 never reached, and
    disputed it.  A replica behind the relay is left alone (the replica lane
    catches it up; catching up here raced that lane).  Returns the ids disputed."
+  ;; ADVERSARY :ignore-fraud — a derelict member also lets an expired quorum lie.
+  (when (getf (node-adversary node) :ignore-fraud) (return-from dispute-expired-quorums nil))
   (let ((h (height node)))
     (when (plusp h)
       (let* ((stale (loop for rec being the hash-values of (node-ledgers node)
