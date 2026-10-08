@@ -67,7 +67,13 @@ form_ledger() {   # form_ledger NAME OPERATOR "m1,m2,m3"
       txid=$(wcli sendtoaddress "$addr" 0.5); mine 3
       vout=$(bcli getrawtransaction "$txid" true | python3 -c "import json,sys; tx=json.load(sys.stdin); print([o['n'] for o in tx['vout'] if o['scriptPubKey'].get('address')=='$addr'][0])")
       sleep 20   # the reference wallets sync through the shim on a timer
-      expect "$(cld_ctl "$op" "(:begin-quorum :ledger \"$id\" :txid \"$txid\" :vout $vout :sats 25000000 :collateral-sats 25000000)")"
+      # Reference members refuse an update whose height is over 6 blocks ahead of theirs, and they sync
+      # heights on their periodic: after a burst of setup mining, retry until they catch up.
+      local r i; for i in 1 2 3 4 5 6; do
+        r=$(cld_ctl "$op" "(:begin-quorum :ledger \"$id\" :txid \"$txid\" :vout $vout :sats 25000000 :collateral-sats 25000000)")
+        case "$r" in *":STATUS :OK"*) break;; *"cosignatures"*) echo "   begin-quorum retry $i: $r" >&2; sleep 20;; *) break;; esac
+      done
+      expect "$r"
       expect "$(cld_ctl "$op" "(:advertise :ledger \"$id\")")"
       printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$id" "$op" "$txid" "$vout" >>"$SOAK/ledgers.tsv";;
     ref*)
