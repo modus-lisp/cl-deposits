@@ -20,7 +20,7 @@
            #:ledger-pending-withdrawals #:ledger-credited-payments #:ledger-fees-accumulated
            #:ledger-sequence #:ledger-chain-tip #:ledger-joined-quorums #:ledger-dispute-state
            #:ledger-active-ruleset #:ledger-pending-exits #:ledger-vault-current-p #:due-exits #:+exit-cutoff-margin+
-           #:exit-dust-msats #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
+           #:exit-dust-msats #:spk-type #:dust-floor-sats #:standard-output-p #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
            #:ledger-dormancy-notice #:dormancy-spin-outs #:dormancy-amount-msats #:deposit-last-signed-activity
            #:pk-key-path-spk #:dormancy-cost #:dormancy-migration #:ledger-dormancy-accept #:migration-marker #:dormancy-offer-entries
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
@@ -130,6 +130,27 @@
 (defun rotation-feerate (ledger)
   "DEP-03: the governing QuorumBegin's reference feerate, or 2 sat/vB when none is recorded."
   (or (ledger-reference-feerate ledger) 2))
+
+(defun spk-type (spk)
+  "DEP-20 §3 Exit addresses: the standard output types an exit, spin-out or migration may pay —
+   :p2pkh :p2sh :p2wpkh :p2wsh :p2tr — or NIL for anything else (bare scripts, other witness
+   versions, OP_RETURN, malformed lengths), which would not relay."
+  (let ((n (length spk)))
+    (cond ((and (= n 25) (= (aref spk 0) #x76) (= (aref spk 1) #xa9) (= (aref spk 2) 20) (= (aref spk 23) #x88) (= (aref spk 24) #xac)) :p2pkh)
+          ((and (= n 23) (= (aref spk 0) #xa9) (= (aref spk 1) 20) (= (aref spk 22) #x87)) :p2sh)
+          ((and (= n 22) (= (aref spk 0) 0) (= (aref spk 1) 20)) :p2wpkh)
+          ((and (= n 34) (= (aref spk 0) 0) (= (aref spk 1) 32)) :p2wsh)
+          ((and (= n 34) (= (aref spk 0) #x51) (= (aref spk 1) 32)) :p2tr))))
+
+(defun dust-floor-sats (spk)
+  "DEP-20 §3: the smallest output to SPK that relays — Bitcoin Core's dust threshold at the
+   3 sat/vB dust relay feerate: P2PKH 546, P2SH 540, P2WPKH 294, P2WSH 330, P2TR 330.  NIL if
+   SPK is not a standard exit type."
+  (case (spk-type spk) (:p2pkh 546) (:p2sh 540) (:p2wpkh 294) ((:p2wsh :p2tr) 330)))
+
+(defun standard-output-p (spk sats)
+  "SPK is a standard exit type and SATS clears its dust floor."
+  (let ((f (dust-floor-sats spk))) (and f (>= sats f))))
 
 (defun exit-cost (address feerate)
   "DEP-20 §3: an exit output's own marginal cost, feerate x (9 + len(spk)) sats."
@@ -245,17 +266,19 @@
             (push (list :deposit-id (deposit-id d) :amount (deposit-balance d) :fees (deposit-fees d)
                         :descriptor (deposit-descriptor d))
                   out)))
-        ;; Below the 330-sat dust floor the output would not relay: nothing migrates.
-        (when (and out (>= (floor (+ total premium) 1000) 330))
+        ;; Below its dust floor the output would not relay: nothing migrates.
+        (when (and out (standard-output-p (getf n :spk) (floor (+ total premium) 1000)))
           (values (nreverse out) (getf n :spk) (floor (+ total premium) 1000)))))))
 
 (defun due-exits (ledger height cutoff)
   "DEP-20 §3 due set: pending requests appended at block_height <= CUTOFF whose output clears the
-   330-sat floor after its own cost, unexpired, in append order, as a list of (id . plist)."
+   dust floor of its address type (dust-floor-sats) after its own cost, unexpired, in append
+   order, as a list of (id . plist)."
   (let ((due '()) (f (rotation-feerate ledger)))
     (maphash (lambda (id e)
                (when (and (<= (getf e :block-height) cutoff)
-                          (>= (- (floor (getf e :amount) 1000) (exit-cost (getf e :exit-address) f)) 330)
+                          (standard-output-p (getf e :exit-address)
+                                             (- (floor (getf e :amount) 1000) (exit-cost (getf e :exit-address) f)))
                           (or (null (getf e :expires-at)) (> (getf e :expires-at) cutoff)))
                  (push (cons id e) due)))
              (ledger-pending-exits ledger))
@@ -566,6 +589,7 @@
                                :premium (f :premium)))))))
       (:dormancy-accept
        (let ((a (ledger-dormancy-accept ledger)))
+         (unless (spk-type (f :exit-address)) (fail :dormancy-accept "migration address is not a standard output script"))
          (when (and a (or (getf a :outpoint) (> (getf a :expires) *block-height*)))
            (fail :dormancy-accept "another migration is outstanding"))
          (when (> (+ (total-obligations ledger) (f :accepted-total)) (ledger-reserves-amount ledger))
@@ -575,6 +599,7 @@
                (list :hash (f :manifest-hash) :spk (f :exit-address) :total (f :accepted-total)
                      :expires (f :expires-at-height) :premium-deposit (f :deposit-id) :credited 0 :outpoint nil))))
       (:exit-request
+       (unless (spk-type (f :exit-address)) (fail :exit-address "not a standard output script (DEP-20 §3)"))
        (let ((d (find-deposit ledger (f :deposit-id))))
          (unless (plusp (f :amount)) (fail :exit-amount "zero"))
          (%lock d (f :amount))

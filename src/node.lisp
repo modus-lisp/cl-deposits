@@ -1171,6 +1171,14 @@
       (cl-consensus.encoding:segwit-decode address (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)))
     (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
 
+(defun check-relayable (tx)
+  "DEP-20 §3: every output of a rotation must relay — a standard type at or above its dust
+   floor — or one bad exit makes the whole rotation unbroadcastable."
+  (loop for out in (btx:tx-outputs tx) for i from 0
+        unless (lg:standard-output-p (btx:txout-script out) (btx:txout-value out))
+          do (fail "rotation output ~a (~a sats, ~a) would not relay" i (btx:txout-value out)
+                   (or (lg:spk-type (btx:txout-script out)) "non-standard script"))))
+
 (defun check-rotation-tx (node rec o tx &optional (height (height node)))
   "DEP-03 Rotation ordering: TX (signed) is the rotation QuorumBegin O names, of REC's current
    vault: its txid and output 0, byte-identical unsigned to the rotation we build, and a
@@ -1208,6 +1216,7 @@
                                            :splice (and splice (subseq splice 0 3)))))
             (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx tx :witness nil)))
               (fail "rotation_tx differs from the DEP-03 rotation we build"))
+            (check-relayable tx)
             (let ((new (btx:txout-value (first (btx:tx-outputs tx)))))
               (unless (= new (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000))
                 (fail "QuorumBegin amounts do not sum to the rotation's new vault"))
@@ -2992,6 +3001,7 @@
                                          (parse-splice-param node (w:jget params "splice_in_outpoint")))))
           (unless (equalp expected (hex->bytes (or (w:jget params "sighash") (fail "no sighash"))))
             (fail "sighash is not the rotation's"))
+          (check-relayable proposed)
           (log! node "signing rotation of ~a at tier ~a" (subseq id 0 8) tier-index)
           ;; Its QuorumBegin follows only once the rotation confirms; until then the
           ;; vault watch must not take our own signature for a theft.
@@ -3633,6 +3643,21 @@
           (setf (node-vault-scanned node) (getf plist :scanned))
           (dolist (e (getf plist :spends)) (setf (gethash (car e) (node-reported-vault-spend node)) (cdr e))))))))
 
+(defun vault-watch-targets (node)
+  "((rec qb-seq txid vout) ...): for every base ledger we hold, the vaults of its latest two
+   QuorumBegins."
+  (let ((out '()))
+    (loop for rec being the hash-values of (node-ledgers node)
+          unless (record-fork-p rec)
+            do (ignore-errors
+                (let ((qbs (loop for u in (record-history rec)
+                                 when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
+                                   collect (up:update-seq u))))
+                  (dolist (seq (subseq qbs 0 (min 2 (length qbs))))
+                    (multiple-value-bind (reserves txid vout) (fr::spent-vault (record-history rec) seq)
+                      (when reserves (push (list rec seq txid vout) out)))))))
+    out))
+
 (defun drive-vault-watch (node)
   "Scan the blocks that are now GRACE deep for spends of any vault outpoint we replicate.
    A spend its ledger's history does not account for becomes an owed theft record (keyed by
@@ -3645,19 +3670,19 @@
            (from (or (and (node-vault-scanned node) (1+ (node-vault-scanned node))) (max 0 (- to *vault-scan-depth*))))
            (watched (make-hash-table :test #'equalp)) (outpoints '()) (hold nil) (dirty nil))
       (when (>= to from)
-        (loop for rec being the hash-values of (node-ledgers node)
-              unless (record-fork-p rec)
-                do (ignore-errors
-                    (multiple-value-bind (reserves txid vout) (disputed-reserves node rec)
-                      (declare (ignore reserves))
-                      (push rec (gethash (cons txid vout) watched))
-                      (pushnew (cons txid vout) outpoints :test #'equalp))))
+        ;; The current vault, and the one before it: a QuorumBegin is recorded before its
+        ;; rotation confirms (DEP-03), so the old vault stays watched until it is spent by
+        ;; that rotation (authorised) or by anything else (theft under the old quorum).
+        (loop for (rec seq txid vout) in (vault-watch-targets node)
+              do (push (cons rec seq) (gethash (cons txid vout) watched))
+                 (pushnew (cons txid vout) outpoints :test #'equalp))
         (dolist (spend (funcall (node-spender-fn node) from to outpoints))
-          (dolist (rec (gethash (cons (getf spend :txid) (getf spend :vout)) watched))
-            (handler-case (when (note-vault-spend node rec spend) (setf dirty t))
+          (dolist (w (gethash (cons (getf spend :txid) (getf spend :vout)) watched))
+            (destructuring-bind (rec . qb-seq) w
+            (handler-case (when (note-vault-spend node rec spend qb-seq) (setf dirty t))
               (error (e)
                 (log! node "vault watch on ~a: ~a (retrying)" (subseq (record-id-hex rec) 0 8) e)
-                (let ((h (getf spend :height))) (when h (setf hold (min (or hold h) h))))))))
+                (let ((h (getf spend :height))) (when h (setf hold (min (or hold h) h)))))))))
         (setf (node-vault-scanned node) (if hold (min to (1- hold)) to))
         (setf dirty t))
       (when (publish-owed-vault-spends node) (setf dirty t))
@@ -3709,16 +3734,17 @@
 
 (defun vault-spend-key (id-hex txid) (format nil "~a:~a" id-hex (txid-hex txid)))
 
-(defun note-vault-spend (node rec spend)
-  "If SPEND (of REC's vault) is a theft, record what we owe for it; T when newly recorded."
+(defun note-vault-spend (node rec spend &optional qb-seq)
+  "If SPEND (of REC's vault under the QuorumBegin at QB-SEQ, default the latest) is a theft,
+   record what we owe for it; T when newly recorded."
   (let* ((id (record-id-hex rec))
          (tx (btx:parse-tx (bw:make-reader (hex->bytes (getf spend :tx)))))
          (key (vault-spend-key id (btx:tx-txid tx))))
     (unless (gethash key (node-reported-vault-spend node))
-      (let* ((qb (governing-quorum-begin-seq rec (lg:ledger-sequence (record-ledger rec))))
+      (let* ((qb (or qb-seq (governing-quorum-begin-seq rec (lg:ledger-sequence (record-ledger rec)))))
              (probe (fr:make-unauthorized-vault-spend-proof (node-pubkey node) (hex->bytes id) (hex->bytes id) qb tx
                                                            (getf spend :prevouts) (getf spend :block-hash))))
-        (multiple-value-bind (reserves vtxid vvout) (disputed-reserves node rec)
+        (multiple-value-bind (reserves vtxid vvout) (fr::spent-vault (record-history rec) qb)
           (let ((signers (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves vtxid vvout)))
             (when (and signers (not (member (btx:tx-txid tx) (authorised-spend-txids node rec) :test #'equalp)))
               (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"

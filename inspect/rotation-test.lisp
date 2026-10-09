@@ -101,6 +101,31 @@
             (check "JSON round trip keeps the proof hash" (equalp (fr:proof-hash proof) (fr:proof-hash back)))
             (check "prevouts survive the round trip" (equal (getf (getf back :evidence) :prevouts) (getf (getf proof :evidence) :prevouts)))))))))
 
+(with-gate ("DEP-20 §3 exit addresses: standard types and per-type dust floors (shared vector)")
+  (with-open-file (in (vector-path "exit_address.txt"))
+    (let ((n 0))
+      (loop for line = (read-line in nil) while line
+            unless (and (plusp (length line)) (char= (char line 0) #\#))
+              do (let* ((parts (let ((p (position #\Space line :from-end t)))
+                                 (list (subseq line 0 (position #\Space line)) (subseq line (1+ (position #\Space line)) p) (subseq line (1+ p)))))
+                        (spk (u:hex->bytes (first parts))) (type (second parts)) (floor (parse-integer (third parts))))
+                   (incf n)
+                   (if (string= type "invalid")
+                       (check (format nil "~a is not a standard exit" (first parts)) (null (lg:spk-type spk)))
+                       (progn (check-equal (format nil "~a is ~a" (first parts) type) (string-downcase (lg:spk-type spk)) type)
+                              (check-equal (format nil "~a floor" type) (lg:dust-floor-sats spk) floor)
+                              (check (format nil "~a: ~a relays, ~a does not" type floor (1- floor))
+                                     (and (lg:standard-output-p spk floor) (not (lg:standard-output-p spk (1- floor)))))))))
+      (check-equal "the vector has 12 cases" n 12)))
+  (check "the fold refuses an ExitRequest to a non-standard script"
+         (let ((why (handler-case
+                        (progn (lg:apply-operation (lg:make-ledger)
+                                                   (list :type :exit-request :deposit-id (u:sha256 (hx "01")) :amount 1000000
+                                                         :exit-address (u:hex->bytes "6a0401020304") :nonce 1 :expiry 10 :witness '()))
+                               "")
+                      (error (e) (princ-to-string e)))))
+           (search "standard" why))))
+
 (with-gate ("DEP-20 exits: the shared vector (cl-generated, deposits-rust reproduces it)")
   (let ((cases '()) (cur nil))
     (with-open-file (in (vector-path "exit_settlement.txt"))
