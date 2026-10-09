@@ -3400,18 +3400,21 @@
 ;;; theft cost a colluder nothing (docs/TRUST-MODEL.md §2a: the difference between
 ;;; ~5% and ~30% collusion tolerated at Q = 7).
 
-(defun ledgers-operated-by (node pubkey33)
+(defun ledgers-operated-by (node pubkey33 &key strict)
   "Ledger ids PUBKEY33 operates: its advertisements (Kind 39100, tag o) and our
-   replicas of ledgers it operates."
-  (let ((ids '()))
-    (dolist (e (ignore-errors (bus:bus-fetch (node-bus node)
-                                             (flt:make-filter :kinds (list w:+kind-advertisement+)
-                                                              :tags (list (cons "o" (list (bytes->hex pubkey33))))))))
+   replicas of ledgers it operates.  Second value: NIL if the relay fetch failed (so the
+   list may be incomplete); STRICT callers retry later instead of treating it as final."
+  (declare (ignore strict))
+  (let ((ids '()) (ok t))
+    (dolist (e (handler-case (bus:bus-fetch (node-bus node)
+                                            (flt:make-filter :kinds (list w:+kind-advertisement+)
+                                                             :tags (list (cons "o" (list (bytes->hex pubkey33))))))
+                 (error () (setf ok nil) '())))
       (let ((d (ev:first-tag-value e "d"))) (when (and d (= (length d) 64)) (pushnew d ids :test #'string=))))
     (loop for rec being the hash-values of (node-ledgers node)
           when (and (not (record-fork-p rec)) (equalp (lg:ledger-operator-key (record-ledger rec)) pubkey33))
             do (pushnew (record-id-hex rec) ids :test #'string=))
-    ids))
+    (values ids ok)))
 
 (defun governing-quorum-begin-seq (rec seq)
   (let ((qb (find-if (lambda (u) (and (<= (up:update-seq u) seq)
@@ -3488,11 +3491,12 @@
                            (not (gethash key (node-reported-derelict node)))
                            (equalp (lg:ledger-operator-key (record-ledger mrec)) mk)   ; it operates target, we hold it
                            (>= (- (up:update-block-height newest) vh) required))        ; active past the window
-                  (setf (gethash key (node-reported-derelict node)) t)
                   (log! node "DERELICTION: ~a kept operating ~a ~a blocks past the fraud without disputing ~a"
                         (subseq (bytes->hex mk) 0 8) (subseq target 0 8) (- (up:update-block-height newest) vh) (subseq id 0 8))
                   (broadcast-fraud node (fr:make-dispute-dereliction-proof
-                                         mk (hex->bytes target) original-fraud-hash32 visible-block-hash32 required newest)))))))))))
+                                         mk (hex->bytes target) original-fraud-hash32 visible-block-hash32 required newest))
+                  ;; marked only once published: a failed publish is retried on the next pass
+                  (setf (gethash key (node-reported-derelict node)) t))))))))))
 
 (defun node-derelict-watch-keys (node) (loop for k being the hash-keys of (node-derelict-watch node) collect k))
 
@@ -3555,14 +3559,44 @@
    spend is judged only once it is this deep.")
 (defparameter *vault-scan-depth* 30 "Blocks before our first scan to look back over.")
 
+(defparameter *vault-spend-publish-blocks* 144
+  "Blocks after a theft's block during which we keep (re)publishing its proofs: to targets a
+   relay error hid, and to ledgers its signers start advertising later.")
+
+(defun vault-watch-file (node) (and (node-data-dir node) (merge-pathnames "vault-watch.sexp" (node-data-dir node))))
+
+(defun save-vault-watch (node)
+  "Persist the scan height and every theft we still owe proofs for (write beside, rename)."
+  (let ((f (vault-watch-file node)))
+    (when f
+      (ensure-directories-exist f)
+      (let ((tmp (make-pathname :type "tmp" :defaults f))
+            (plist (list :scanned (node-vault-scanned node)
+                         :spends (loop for k being the hash-keys of (node-reported-vault-spend node) using (hash-value v)
+                                       collect (cons k v)))))
+        (with-open-file (out tmp :direction :output :if-exists :supersede)
+          (with-standard-io-syntax (let ((*print-readably* nil)) (prin1 plist out))))
+        (uiop:rename-file-overwriting-target tmp f)))))
+
+(defun load-vault-watch (node)
+  (let ((f (vault-watch-file node)))
+    (when (and f (probe-file f))
+      (let ((plist (ignore-errors (with-open-file (in f) (with-standard-io-syntax (read in))))))
+        (when plist
+          (setf (node-vault-scanned node) (getf plist :scanned))
+          (dolist (e (getf plist :spends)) (setf (gethash (car e) (node-reported-vault-spend node)) (cdr e))))))))
+
 (defun drive-vault-watch (node)
   "Scan the blocks that are now GRACE deep for spends of any vault outpoint we replicate.
-   A spend its ledger's history does not account for gets an UnauthorizedVaultSpend proof
-   against each signer on each ledger that signer operates."
+   A spend its ledger's history does not account for becomes an owed theft record (keyed by
+   ledger and spending txid, persisted) BEFORE the scan height moves past it; each pass then
+   (re)publishes an UnauthorizedVaultSpend against each signer on each ledger that signer
+   operates, until every target found has its proof and the publish window has passed.  A spend
+   we could not judge holds the scan height below its block, so the next pass retries it."
   (when (node-spender-fn node)
     (let* ((to (- (height node) *vault-spend-grace-blocks*))
            (from (or (and (node-vault-scanned node) (1+ (node-vault-scanned node))) (max 0 (- to *vault-scan-depth*))))
-           (watched (make-hash-table :test #'equalp)) (outpoints '()))
+           (watched (make-hash-table :test #'equalp)) (outpoints '()) (hold nil) (dirty nil))
       (when (>= to from)
         (loop for rec being the hash-values of (node-ledgers node)
               unless (record-fork-p rec)
@@ -3573,10 +3607,14 @@
                       (pushnew (cons txid vout) outpoints :test #'equalp))))
         (dolist (spend (funcall (node-spender-fn node) from to outpoints))
           (dolist (rec (gethash (cons (getf spend :txid) (getf spend :vout)) watched))
-            (unless (gethash (record-id-hex rec) (node-reported-vault-spend node))
-              (handler-case (report-vault-spend node rec spend)
-                (error (e) (log! node "vault watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e))))))
-        (setf (node-vault-scanned node) to)))))
+            (handler-case (when (note-vault-spend node rec spend) (setf dirty t))
+              (error (e)
+                (log! node "vault watch on ~a: ~a (retrying)" (subseq (record-id-hex rec) 0 8) e)
+                (let ((h (getf spend :height))) (when h (setf hold (min (or hold h) h))))))))
+        (setf (node-vault-scanned node) (if hold (min to (1- hold)) to))
+        (setf dirty t))
+      (when (publish-owed-vault-spends node) (setf dirty t))
+      (when dirty (ignore-errors (save-vault-watch node))))))
 
 (defun drive-migration-watch (node)
   "DEP-20 §8.3: for each ledger we hold whose latest rotation migrated deposits, note the block
@@ -3622,26 +3660,57 @@
                                       (setf (gethash key (node-migrations-watched node)) :done))))))
                        (error (e) (log! node "migration watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e)))))))))
 
-(defun report-vault-spend (node rec spend)
+(defun vault-spend-key (id-hex txid) (format nil "~a:~a" id-hex (txid-hex txid)))
+
+(defun note-vault-spend (node rec spend)
+  "If SPEND (of REC's vault) is a theft, record what we owe for it; T when newly recorded."
   (let* ((id (record-id-hex rec))
          (tx (btx:parse-tx (bw:make-reader (hex->bytes (getf spend :tx)))))
-         (qb (governing-quorum-begin-seq rec (lg:ledger-sequence (record-ledger rec))))
-         (probe (fr:make-unauthorized-vault-spend-proof (node-pubkey node) (hex->bytes id) (hex->bytes id) qb tx
-                                                       (getf spend :prevouts) (getf spend :block-hash))))
-    (multiple-value-bind (reserves vtxid vvout) (disputed-reserves node rec)
-      (let ((signers (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves vtxid vvout)))
-        (when (and signers (not (member (btx:tx-txid tx) (authorised-spend-txids node rec) :test #'equalp)))
-          (setf (gethash id (node-reported-vault-spend node)) t)
-          (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"
-                (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16) (length signers))
-          (dolist (x signers)
-            ;; x-only key; the operated ledgers are advertised under the full key, either parity
-            (dolist (full (list (cat (octets 2) x) (cat (octets 3) x)))
-              (dolist (target (ledgers-operated-by node full))
-                (log! node "vault spend: ~a signed it; proof against its ledger ~a" (subseq (bytes->hex x) 0 8) (subseq target 0 8))
-                (broadcast-fraud node (fr:make-unauthorized-vault-spend-proof full (hex->bytes target) (hex->bytes id) qb tx
-                                                                              (getf spend :prevouts) (getf spend :block-hash))))))
-          t)))))
+         (key (vault-spend-key id (btx:tx-txid tx))))
+    (unless (gethash key (node-reported-vault-spend node))
+      (let* ((qb (governing-quorum-begin-seq rec (lg:ledger-sequence (record-ledger rec))))
+             (probe (fr:make-unauthorized-vault-spend-proof (node-pubkey node) (hex->bytes id) (hex->bytes id) qb tx
+                                                           (getf spend :prevouts) (getf spend :block-hash))))
+        (multiple-value-bind (reserves vtxid vvout) (disputed-reserves node rec)
+          (let ((signers (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves vtxid vvout)))
+            (when (and signers (not (member (btx:tx-txid tx) (authorised-spend-txids node rec) :test #'equalp)))
+              (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"
+                    (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16) (length signers))
+              (setf (gethash key (node-reported-vault-spend node))
+                    (list :id id :qb qb :tx (getf spend :tx) :height (getf spend :height)
+                          :block-hash (bytes->hex (getf spend :block-hash))
+                          :prevouts (getf (getf probe :evidence) :prevouts)
+                          :signers (mapcar #'bytes->hex signers) :published '()))
+              t)))))))
+
+(defun publish-owed-vault-spends (node)
+  "Publish every owed theft proof not yet published; T if anything changed."
+  (let ((changed nil) (h (height node)))
+    (loop for key being the hash-keys of (node-reported-vault-spend node) using (hash-value e)
+          when (and (listp e) (not (getf e :done)))
+            do (handler-case
+                   (let ((tx (btx:parse-tx (bw:make-reader (hex->bytes (getf e :tx)))))
+                         (prevouts (coerce (fr::parse-prevouts (getf e :prevouts)) 'list))
+                         (bh (hex->bytes (getf e :block-hash))) (complete t))
+                     (dolist (xh (getf e :signers))
+                       (let ((x (hex->bytes xh)))
+                         ;; x-only key; the operated ledgers are advertised under the full key, either parity
+                         (dolist (full (list (cat (octets 2) x) (cat (octets 3) x)))
+                           (multiple-value-bind (targets ok) (ledgers-operated-by node full :strict t)
+                             (unless ok (setf complete nil))
+                             (dolist (target targets)
+                               (let ((pk (format nil "~a:~a" (bytes->hex full) target)))
+                                 (unless (member pk (getf e :published) :test #'string=)
+                                   (log! node "vault spend: ~a signed it; proof against its ledger ~a" (subseq xh 0 8) (subseq target 0 8))
+                                   (broadcast-fraud node (fr:make-unauthorized-vault-spend-proof
+                                                          full (hex->bytes target) (hex->bytes (getf e :id)) (getf e :qb) tx prevouts bh))
+                                   (push pk (getf e :published))
+                                   (setf changed t))))))))
+                     (when (and complete (> h (+ (or (getf e :height) 0) *vault-spend-publish-blocks*)))
+                       (setf (getf e :done) t changed t))
+                     (setf (gethash key (node-reported-vault-spend node)) e))
+                 (error (err) (log! node "vault spend ~a: publishing failed (~a); retrying" (subseq key 0 8) err))))
+    changed))
 
 (defparameter *vault-spend-verdict-ttl* 600
   "Seconds a spend's verdict is reused: long enough to absorb one theft's proof storm, short
@@ -3838,6 +3907,7 @@
 
 (defun %load-data-dir (node &key (log-fn (lambda (fmt &rest args) (apply #'log! node fmt args))))
   (load-known-confiscations node)
+  (load-vault-watch node)
   (let* ((dir (node-data-dir node))
          (log-lock (bt:make-lock "load-log"))
          (files (directory (merge-pathnames "ledger_*.json" dir))))
