@@ -141,7 +141,8 @@
      (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))
     (102 :dormancy-notice (:rotation-height 306 :u32) (:migration-receiver 288 :pubkey :optional)
      (:manifest-hash 308 :bytes32 :optional) (:migration-manifest 316 :manifest :optional)
-     (:dormancy-accept 338 :bytes :optional) (:premium 340 :u64 :optional))
+     (:dormancy-accept 338 :bytes :optional) (:premium 340 :u64 :optional)
+     (:receiver-quorum-begin 342 :bytes :optional))
     (103 :dormancy-accept
      (:deposit-id 200 :deposit-id :optional) (:exit-address 300 :bytes) (:expires-at-height 302 :u32)
      (:manifest-hash 308 :bytes32) (:offer-event-id 310 :bytes32) (:accepted-total 312 :u64))

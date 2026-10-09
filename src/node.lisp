@@ -1085,7 +1085,9 @@
                    (declare (ignore required signers tier operator-alone))
                    (unless allowed (fail "not cosignable at this height")))
                  (when (eq (op:operation-type o) :quorum-begin) (check-quorum-begin-vault node rec o params block-height))
-                 (when (eq (op:operation-type o) :dormancy-accept) (check-dormancy-accept node rec o params)))
+                 (when (eq (op:operation-type o) :dormancy-accept) (check-dormancy-accept node rec o params))
+                 (when (and (eq (op:operation-type o) :dormancy-notice) (op:field o :migration-receiver))
+                   (check-migration-receiver node o)))
                (let* ((mlh (member-ledger-hash node))
                       (c (up:sign-cosignature candidate (node-priv node) (node-pubkey node) mlh)))
                  (log! node "cosigned ~a seq ~a" (subseq (record-id-hex rec) 0 8) seq)
@@ -1381,6 +1383,44 @@
           (when (or (and (lg::member-min-fee-bps mem) (< (op:fees-annualized-bps f) (lg::member-min-fee-bps mem)))
                     (and (lg::member-min-fee-fixed mem) (< (op:fees-annualized-msats f) (lg::member-min-fee-fixed mem))))
             (fail "deposit ~a's fees are below a member's floor" (bytes->hex (getf e :deposit-id)))))))))
+
+(defun receiver-history (node ledger-id-hex)
+  "A receiver ledger's history, ascending: our replica if we hold one, else the relays'."
+  (let ((r (find-record node ledger-id-hex)))
+    (if (and r (not (record-fork-p r))) (reverse (record-history r)) (ledger-updates-from-relays node ledger-id-hex))))
+
+(defun receiver-governing-quorum-begin (node accept-update)
+  "DEP-20 §8.3: the receiver's latest QuorumBegin before ACCEPT-UPDATE, from its history."
+  (let ((qb nil))
+    (dolist (u (receiver-history node (bytes->hex (up:update-ledger-id accept-update))))
+      (when (and (< (up:update-seq u) (up:update-seq accept-update))
+                 (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :quorum-begin))
+        (setf qb u)))
+    (or qb (fail "the receiver's ledger has no QuorumBegin before the accept"))))
+
+(defun check-migration-receiver (node o)
+  "DEP-20 §8.3 (L4), a source cosigner: the accept is in the receiver's canonical history, the
+   carried QuorumBegin is the receiver's latest (its quorum is current), and that vault is funded
+   and unspent on chain."
+  (let* ((au (up:decode-update (op:field o :dormancy-accept)))
+         (qu (up:decode-update (or (op:field o :receiver-quorum-begin) (fail "no receiver_quorum_begin"))))
+         (qb (op:decode-operation (up:update-message qu)))
+         (hist (receiver-history node (bytes->hex (up:update-ledger-id au))))
+         (ours (find (up:update-seq au) hist :key #'up:update-seq))
+         (latest-qb (let ((q nil))
+                      (dolist (u hist q)
+                        (when (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :quorum-begin)
+                          (setf q u))))))
+    (unless (and ours (equalp (up:chain-hash ours) (up:chain-hash au)))
+      (fail "the accept is not in the receiver's history"))
+    (unless (and latest-qb (equalp (up:chain-hash latest-qb) (up:chain-hash qu)))
+      (fail "the carried QuorumBegin is not the receiver's current one"))
+    (when (node-chain-fn node)
+      (let ((info (funcall (node-chain-fn node) (op:field qb :new-outpoint-txid) (op:field qb :new-outpoint-vout))))
+        (unless (and info (plusp (or (getf info :confirmations) 0))
+                     (= (getf info :value-sats) (floor (+ (op:field qb :amount) (op:field qb :collateral-amount)) 1000)))
+          (fail "the receiver's vault is not funded and unspent on chain"))))
+    t))
 
 (defun dormancy-credit (node rec manifest txid vout &key (premium 0))
   "DEP-20 §8.3 receiver: credit each manifest deposit (opening it with its descriptor and fees if

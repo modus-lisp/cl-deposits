@@ -135,6 +135,12 @@
                                                :manifest-hash (and m (sha256 (hex->bytes m)))
                                                :migration-manifest (and m (op:decode-manifest (hex->bytes m)))
                                                :dormancy-accept (and (arg form :accept) (hex->bytes (arg form :accept)))
+                                               ;; L4: the receiver's governing QuorumBegin (fetched when not given)
+                                               :receiver-quorum-begin
+                                               (cond ((arg form :receiver-qb) (hex->bytes (arg form :receiver-qb)))
+                                                     ((arg form :accept)
+                                                      (up:encode-update (nd::receiver-governing-quorum-begin
+                                                                         node (up:decode-update (hex->bytes (arg form :accept)))))))
                                                :premium (arg form :premium))))))
            (ok :seq (up:update-seq u))))
         (:dormancy-offer

@@ -1612,15 +1612,30 @@
           (let* ((acc (nd::dormancy-accept b lb manifest (u:sha256 (hx "0f")) total))
                  (accept-hex (up:encode-update acc)))
             (check "the receiver's members cosigned the accept" (>= (length (up:update-cosignatures acc)) 2))
-            (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
-                                            :migration-receiver (nd:node-pubkey b) :manifest-hash hash
-                                            :migration-manifest manifest :dormancy-accept accept-hex))
+            (let ((rqb (up:encode-update (nd::receiver-governing-quorum-begin a acc)))
+                  (bare (let ((u (copy-structure acc)))   ; L4: the receiver's key alone, no quorum
+                          (setf (up:update-cosignatures u) '())
+                          (up:sign-operator u (nd::node-priv b))
+                          (up:encode-update u))))
+              (check-signals "L4: an accept with no receiver-quorum cosignatures is refused" error
+                (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
+                                                :migration-receiver (nd:node-pubkey b) :manifest-hash hash
+                                                :migration-manifest manifest :dormancy-accept bare :receiver-quorum-begin rqb)))
+              (check-signals "L4: a notice without the receiver's QuorumBegin is refused" error
+                (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
+                                                :migration-receiver (nd:node-pubkey b) :manifest-hash hash
+                                                :migration-manifest manifest :dormancy-accept accept-hex)))
+              (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
+                                              :migration-receiver (nd:node-pubkey b) :manifest-hash hash
+                                              :migration-manifest manifest :dormancy-accept accept-hex
+                                              :receiver-quorum-begin rqb)))
             (check-signals "a notice with another receiver's key is refused" error
               (progn (setf (lg:ledger-dormancy-notice (nd:record-ledger la)) nil)
                      (unwind-protect
                           (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
                                                           :migration-receiver (nd:node-pubkey c) :manifest-hash hash
-                                                          :migration-manifest manifest :dormancy-accept accept-hex))
+                                                          :migration-manifest manifest :dormancy-accept accept-hex
+                                                          :receiver-quorum-begin (up:encode-update (nd::receiver-governing-quorum-begin a acc))))
                        nil)))
             ;; restore the good notice (the probe above cleared it locally)
             (setf (lg:ledger-dormancy-notice (nd:record-ledger la))

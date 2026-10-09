@@ -147,6 +147,37 @@
         (and k (= (length k) 33) (member (aref k 0) '(2 3))
              (values (tr::taproot-output-spk-from-root (subseq k 1 33) (make-array 0 :element-type '(unsigned-byte 8)))))))))
 
+(defun migration-exit-spks (receiver33 manifest-hash)
+  "DEP-20 §8.3: the receiver operator's own offer-type addresses for a manifest: the P2WPKH of its
+   key, and the P2TR with its x-only key internal and merkle root SHA256(manifest-hash)."
+  (list (cat (octets 0 20) (cl-consensus.wire:hash160 (coerce receiver33 '(simple-array (unsigned-byte 8) (*)))))
+        (values (tr::taproot-output-spk-from-root (subseq receiver33 1 33) (sha256 manifest-hash)))))
+
+(defun quorum-backed-accept-p (accept qb-update receiver)
+  "DEP-20 §8.3 (L4): QB-UPDATE is a QuorumBegin signed by RECEIVER on the accept's ledger at a lower
+   sequence, cosigned by a strict majority of its quorum_members, and ACCEPT carries valid
+   cosignatures from a strict majority of those members.  (values ok reason)."
+  (let* ((qb (ignore-errors (op:decode-operation (up:update-message qb-update))))
+         (members (and qb (op:field qb :quorum-members))))
+    (flet ((majority-of (u)
+             (let ((seen '()))
+               (dolist (c (up:update-cosignatures u))
+                 (when (and (member (up:cosig-pubkey c) members :test #'equalp)
+                            (not (member (up:cosig-pubkey c) seen :test #'equalp))
+                            (up:verify-cosignature u c))
+                   (push (up:cosig-pubkey c) seen)))
+               (>= (length seen) (majority-threshold (length members))))))
+      (cond ((not (and qb (eq (op:operation-type qb) :quorum-begin) members))
+             (values nil "receiver_quorum_begin is not a QuorumBegin"))
+            ((not (and (equalp (up:update-operator-id qb-update) receiver) (up:verify-operator-signature qb-update)))
+             (values nil "receiver_quorum_begin is not signed by the receiver"))
+            ((not (and (equalp (up:update-ledger-id qb-update) (up:update-ledger-id accept))
+                       (< (up:update-seq qb-update) (up:update-seq accept))))
+             (values nil "receiver_quorum_begin is not an earlier update of the accept's ledger"))
+            ((not (majority-of qb-update)) (values nil "receiver_quorum_begin lacks its quorum's majority"))
+            ((not (majority-of accept)) (values nil "the accept lacks a majority of the receiver's quorum"))
+            (t (values t nil))))))
+
 (defun dormancy-cost (ledger) "An addressable spin-out's output cost, sats." (* (rotation-feerate ledger) (+ 9 34)))
 
 (defun dormancy-spin-outs (ledger cutoff)
@@ -519,6 +550,16 @@
                            (fail :dormancy-notice "the accept expires before the rotation"))
                          (unless (zerop (mod (or (f :premium) 0) 1000))
                            (fail :dormancy-notice "premium_msats must be whole satoshis"))
+                         ;; L4: an update of an existing, quorum-backed receiver ledger, paying its own key.
+                         (multiple-value-bind (ok why)
+                             (if (f :receiver-quorum-begin)
+                                 (handler-case (quorum-backed-accept-p u (up:decode-update (f :receiver-quorum-begin)) (f :migration-receiver))
+                                   (error () (values nil "receiver_quorum_begin does not decode")))
+                                 (values nil "the notice carries no receiver_quorum_begin"))
+                           (unless ok (fail :dormancy-notice why)))
+                         (unless (member (op:field a :exit-address) (migration-exit-spks (f :migration-receiver) (f :manifest-hash))
+                                         :test #'equalp)
+                           (fail :dormancy-notice "exit_address is not the receiver operator's own address for this manifest"))
                          (list :receiver (f :migration-receiver) :manifest (f :migration-manifest)
                                :spk (op:field a :exit-address) :total (op:field a :accepted-total)
                                :premium (f :premium)))))))

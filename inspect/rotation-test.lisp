@@ -268,3 +268,15 @@
                           (check-equal (format nil "verdict at ~a" (second w))
                                        (if (fr:verify-proof proof :history history :height-of-block #'hob) "1" "0") (nth 3 w))))
                        (t (setf (gethash (first w) kv) (second w))))))))))
+
+(with-gate ("DEP-20 §8.3 (L4): the accept must come from a quorum-backed receiver ledger — the shared vector")
+  (with-open-file (in (vector-path "migration_accept.txt"))
+    (loop for line = (read-line in nil) while line
+          unless (or (zerop (length line)) (char= (char line 0) #\#))
+            do (destructuring-bind (tag name expect hex) (uiop:split-string line :separator " ")
+                 (declare (ignore tag))
+                 (check-equal (format nil "notice ~a" name)
+                              (handler-case (let ((lg:*block-height* 100))
+                                              (lg:apply-operation (lg:make-ledger) (op:decode-operation (u:hex->bytes hex))) "ok")
+                                (error () "refuse"))
+                              expect)))))
