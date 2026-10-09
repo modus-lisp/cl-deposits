@@ -2868,21 +2868,60 @@
     (cl-consensus.encoding:segwit-encode (rs:hrp-for (intern (string-upcase (node-network node)) :keyword))
                                          (if (>= witver #x50) (- witver #x50) witver) program)))
 
+(defun dispute-respectful-p (node id-hex)
+  "Whether our dispute of ID-HEX is for a lapsed quorum (a respectful confiscation, DEP-06),
+   from our own fork's DisputeEnter: never from a proposer."
+  (let ((fork (find-fork node id-hex (node-pubkey node))))
+    (and fork (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
+                (and enter (expiry-reason-p (op:field enter-op :reason)))))))
+
+(defun unsigned-bytes (tx) (btx:serialize-tx tx :witness nil))
+
+(defun confiscation-match (node id-hex tx)
+  "TX is a confiscation of ID-HEX as the pinned builder makes it (DEP-03): every byte of our
+   own rebuild at TX's tier, the shape our dispute's reason dictates, and the rule's fee.  The
+   lottery output may pay a lottery over another subset of the armers (a proposer that saw a
+   different set of late arms, DEP-03); nothing else may differ.  Returns :ours (our cut),
+   :subset, or NIL; second value the lottery it pays."
+  (let* ((reserves (ignore-errors (disputed-reserves node (find-record node id-hex))))
+         (ti (and reserves (position (btx:tx-locktime tx) (rs:reserves-tiers reserves) :key #'rs:tier-locktime))))
+    (when (and ti (not (rs:tier-tie-breaker-p (nth ti (rs:reserves-tiers reserves)))) (btx:tx-outputs tx))
+      (let ((ours (ignore-errors (multiple-value-list
+                                  (build-confiscation node id-hex :respectful (dispute-respectful-p node id-hex) :tier-index ti)))))
+        (when ours
+          (destructuring-bind (built lottery &rest _) ours
+            (declare (ignore _))
+            (cond ((equalp (unsigned-bytes built) (unsigned-bytes tx)) (values :ours lottery))
+                  (t (let ((l (ignore-errors (lottery-paid-by node id-hex (btx:txout-script (first (btx:tx-outputs tx)))))))
+                       (when l
+                         (let ((swapped (btx:make-tx :version (btx:tx-version built) :locktime (btx:tx-locktime built) :segwit-p t
+                                                     :inputs (btx:tx-inputs built)
+                                                     :outputs (cons (btx:make-txout :value (btx:txout-value (first (btx:tx-outputs built)))
+                                                                                    :script (lot:lottery-spk l))
+                                                                    (rest (btx:tx-outputs built)))
+                                                     :witnesses (list nil))))
+                           (when (equalp (unsigned-bytes swapped) (unsigned-bytes tx)) (values :subset l)))))))))))))
+
 (defun handle-confiscation-sign (node event params)
-  "A recovery-quorum member: rebuild the confiscation from public state, sign
-   only if the proposer's sighash is exactly ours."
+  "A recovery-quorum member: rebuild the confiscation from public state and sign
+   only a transaction byte-identical to that rebuild (FINDINGS D2: never a sighash
+   the proposer computed over a transaction of its choosing)."
   (let ((id (w:event-ledger-id event)))
     (unless (find-fork node id (node-pubkey node))
       (log! node "confiscation_sign for ~a from ~a: we hold no fork, not answering" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8))
       (return-from handle-confiscation-sign nil))   ; not a disputant: not ours to answer
     (handler-case
         (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (w:jget params "tx_hex") (fail "no unsigned_tx"))))))
-               (_seen (unless (find (btx:tx-txid proposed) (gethash id (node-seen-confiscations node)) :key #'btx:tx-txid :test #'equalp)
-                        (push proposed (gethash id (node-seen-confiscations node)))))
-               ;; DEP-03: the fee is the rule's, not the proposer's (build-confiscation's default);
-               ;; the shape is read off the proposed tx.
+               ;; DEP-03: the fee is the rule's and the shape our own dispute's reason, never the proposer's.
                (fee nil)
-               (respectful (let ((r (w:jget params "respectful"))) (if (eq r nil) (> (length (btx:tx-outputs proposed)) 1) r))))
+               (respectful (dispute-respectful-p node id))
+               (match (confiscation-match node id proposed)))
+          (let ((r (w:jget params "respectful")))
+            (when (and r (not (eq r :false)) (not respectful)) (fail "a respectful confiscation of a punitive dispute")))
+          ;; A proposal over another subset of the armers is a real confiscation (it may land, and
+          ;; we must recognise it), but not ours to sign until our views of late arms converge.
+          (when (and match (not (find (btx:tx-txid proposed) (gethash id (node-seen-confiscations node)) :key #'btx:tx-txid :test #'equalp)))
+            (push proposed (gethash id (node-seen-confiscations node))))
           (multiple-value-bind (tx lottery prevouts reserves tier-index)
               ;; The proposer names its tier (the reference's `tier_index`; else the
               ;; one whose CLTV is the proposed nLockTime).  It must be open at our height.
@@ -2896,12 +2935,14 @@
                 (when (> (rs:tier-locktime (nth ti tiers)) (height node))
                   (fail "tier ~a opens at ~a, we are at ~a" ti (rs:tier-locktime (nth ti tiers)) (height node)))
                 (build-confiscation node id :respectful respectful :fee fee :tier-index ti))
-            (let ((expected (confiscation-sighash proposed prevouts reserves tier-index)))
+            (unless (and (equalp (btx:tx-txid tx) (btx:tx-txid proposed)) (equalp (unsigned-bytes tx) (unsigned-bytes proposed)))
+              (fail "~a confiscation is not the one we rebuild (ours: sats ~a, base seq ~a, outputs ~a)"
+                    (if (eq match :subset) "a subset-lottery" "the proposed")
+                    (car (aref prevouts 0)) (lg:ledger-sequence (record-ledger (find-record node id)))
+                    (mapcar (lambda (o) (cons (btx:txout-value o) (subseq (bytes->hex (btx:txout-script o)) 0 12))) (btx:tx-outputs tx))))
+            (let ((expected (confiscation-sighash tx prevouts reserves tier-index)))
               (unless (equalp expected (hex->bytes (w:jget params "sighash")))
-                (fail "sighash is not for the confiscation we expect (ours: sats ~a, reserves spk ~a, base seq ~a, outputs ~a)"
-                      (car (aref prevouts 0)) (subseq (bytes->hex (cdr (aref prevouts 0))) 0 16)
-                      (lg:ledger-sequence (record-ledger (find-record node id)))
-                      (mapcar (lambda (o) (cons (btx:txout-value o) (subseq (bytes->hex (btx:txout-script o)) 0 12))) (btx:tx-outputs tx))))
+                (fail "the proposer's sighash is not our rebuild's"))
               ;; Its txid does not depend on the witness: keep it, the claim spends it.  Keep every
               ;; one we sign, too: a proposal from another proposer may be the one that lands.
               (dolist (fork (forks-of node id)) (setf (record-lottery fork) lottery (record-confiscation fork) proposed))
@@ -3405,9 +3446,10 @@
     ;; Rotations we signed or broadcast whose QuorumBegin has not landed yet.
     (dolist (txid (gethash (record-id-hex rec) (node-signed-rotations node))) (pushnew txid ids :test #'equalp))
     (let ((r (record-rotation rec))) (when r (pushnew (hex->bytes (getf r :txid)) ids :test #'equalp)))
-    ;; A proposal we saw but refused is still a confiscation if it pays a lottery over the armers.
+    ;; A proposal we saw but refused is still a confiscation if it is our rebuild with its
+    ;; lottery over another subset of the armers (never merely "pays a lottery": FINDINGS D2).
     (dolist (tx (gethash (record-id-hex rec) (node-seen-confiscations node)))
-      (when (ignore-errors (lottery-paid-by node (record-id-hex rec) (btx:txout-script (first (btx:tx-outputs tx)))))
+      (when (ignore-errors (confiscation-match node (record-id-hex rec) tx))
         (pushnew (btx:tx-txid tx) ids :test #'equalp)))
     (dolist (txid (gethash (record-id-hex rec) (node-known-confiscations node)))
       (pushnew txid ids :test #'equalp))

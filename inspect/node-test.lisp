@@ -248,6 +248,28 @@
         (check-equal "a re-arm is still three armers" (mapcar (lambda (m) (length (nd:armers-of m id))) (list b c d)) '(3 3 3))
         (check-equal "and the re-armed member's latest collateral counts"
                      (third (fourth (find (nd:node-pubkey b) (nd:armers-of c id) :key #'first :test #'equalp))) 12000000)
+        ;; --- FINDINGS D2: one armer proposes a "confiscation" paying its own key, with a sighash
+        ;; honestly computed over that transaction.  Co-signers must sign only their own rebuild.
+        (multiple-value-bind (honest lottery0 prevouts reserves tier) (nd:build-confiscation b id)
+          (declare (ignore lottery0))
+          (let* ((sats (car (aref prevouts 0)))
+                 (theft (btx:parse-tx (cl-consensus.wire:make-reader (btx:serialize-tx
+                          (btx:make-tx :version 2 :locktime (btx:tx-locktime honest) :segwit-p t
+                                       :inputs (btx:tx-inputs honest)
+                                       :outputs (list (btx:make-txout :value (- sats 5000)
+                                                                      :script (concatenate '(vector (unsigned-byte 8)) #(#x51 #x20) (up:x-only (nd:node-pubkey b)))))
+                                       :witnesses (list nil))))))
+                 (sighash (nd::confiscation-sighash theft prevouts reserves tier))
+                 (responses (nd::send-request b id "confiscation_sign"
+                                              (w:json-object "sighash" (u:bytes->hex sighash) "respectful" nil "tier_index" tier
+                                                             "unsigned_tx" (nd::unsigned-tx-hex theft)
+                                                             "last_valid_sequence" (lg:ledger-sequence (nd:record-ledger (nd:find-fork b id (nd:node-pubkey b)))))
+                                              :want 2 :timeout 3)))
+            (check "D2: no member signs a proposed confiscation that pays the proposer's key"
+                   (notany (lambda (r) (w:jget r "success")) responses))
+            (check "D2: and none records it as a confiscation its vault watch would excuse"
+                   (every (lambda (m) (not (member (btx:tx-txid theft) (nd::authorised-spend-txids m (nd:find-record m id)) :test #'equalp)))
+                          (list c d)))))
         ;; --- Confiscation, built by b, signed by the recovery quorum over the relay.
         (multiple-value-bind (ctx lottery)
             (handler-case (nd:confiscate b id)
