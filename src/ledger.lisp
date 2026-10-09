@@ -421,7 +421,8 @@
          (push (cons (f :nonce) (f :expiry)) (deposit-seen-nonces d))
          (setf (gethash (f :payment-id) (ledger-open-invoice-locks ledger))
                (list :deposit-id (f :deposit-id) :amount (f :amount) :fee fee
-                     :lock-sequence (f :sequence-number) :timeout-height (f :timeout-height)))))
+                     :lock-sequence (f :sequence-number) :timeout-height (f :timeout-height)
+                     :witness (f :witness)))))
       (:invoice-fail
        (let* ((lock (gethash (f :payment-id) (ledger-open-invoice-locks ledger)))
               (d (find-deposit ledger (f :deposit-id))))

@@ -69,6 +69,9 @@
         (check "invoice minted by the (mock) Lightning node" (string= "lnmock1" (subseq bolt11 0 7)))
         (check "attestation cosigned by a quorum member" (and (w:jget res "cosign_signature") t))
         (check-equal "nothing credited before payment" (nd:credit-paid-invoices a) '())
+        ;; L2: an invoice paid short is not credited at the invoiced amount.
+        (ln:mock-ln-settle mock-ln hash 1)
+        (check-equal "an underpaid invoice is not credited" (nd:credit-paid-invoices a) '())
         (ln:mock-ln-settle mock-ln hash)
         (check-equal "payment settled -> one InvoiceCredit" (nd:credit-paid-invoices a) (list hash))
         (check-equal "w2 balance includes the credit" (nd:wallet-balance w2 id d2) 65000)
@@ -469,11 +472,43 @@
                  (let ((o (op:decode-operation (up:update-message (first (nd:record-history la))))))
                    (and (eq (op:operation-type o) :invoice-fulfill) (equalp (op:field o :preimage) preimage) (equalp (op:field o :payment-id) hash))))))
       ;; A payment that fails: lock released, InvoiceFail on the chain.
-      (multiple-value-bind (ok pre err) (nd:wallet-pay-invoice w1 id d1 (format nil "lnmock19~a" (u:bytes->hex (u:sha256 (hx "dead")))) 5000 :height *height*)
+      (multiple-value-bind (ok pre err) (nd:wallet-pay-invoice w1 id d1 (format nil "lnmock15000~a" (u:bytes->hex (u:sha256 (hx "dead")))) 5000 :height *height*)
         (declare (ignore pre))
         (check "failed payment reported" (and (not ok) (search "failed" err)))
         (check-equal "funds released after InvoiceFail" (multiple-value-list (nd:wallet-balance w1 id d1)) '(69900 0))
         (check-equal "InvoiceFail recorded" (op:operation-type (op:decode-operation (up:update-message (first (nd:record-history la))))) :invoice-fail))
+      ;; L1: an invoice for more than the lock is refused before anything is locked.
+      (multiple-value-bind (bolt11 hash) (ln:mock-ln-external-invoice mock-ln 30000)
+        (declare (ignore hash))
+        (let ((seq (lg:ledger-sequence (nd:record-ledger la))))
+          (multiple-value-bind (ok pre err) (nd:wallet-pay-invoice w1 id d1 bolt11 1000 :height *height*)
+            (declare (ignore pre))
+            (check "an invoice for 30000 msat against a 1000 msat lock is refused" (and (not ok) (search "invoice is for" err)) err)
+            (check-equal "nothing was locked or appended" (lg:ledger-sequence (nd:record-ledger la)) seq)
+            (check-equal "the balance is untouched" (multiple-value-list (nd:wallet-balance w1 id d1)) '(69900 0)))))
+      ;; L3: a payment still in flight keeps its lock — however long it takes —
+      ;; and settles only when the Lightning node vouches for the outcome.
+      (let ((nd::*pay-poll-rounds* 2))
+        ;; (d1 pays 4000 net below, so later balances are 4000 lower.)
+      (multiple-value-bind (bolt11 hash) (ln:mock-ln-external-invoice mock-ln 4000)
+          (ln:mock-ln-hold hash)
+          (multiple-value-bind (ok pre err) (nd:wallet-pay-invoice w1 id d1 bolt11 4000 :height *height*)
+            (declare (ignore pre))
+            (check "a payment still pending is not reported as failed" (and (not ok) (search "pending" err)) err)
+            (check-equal "and its lock is held" (multiple-value-list (nd:wallet-balance w1 id d1)) '(69900 4000))
+            (check-equal "the poller does not settle what is still in flight" (nd:settle-pending-payments a) '())
+            (check-equal "the lock is still held" (multiple-value-list (nd:wallet-balance w1 id d1)) '(69900 4000))
+            (ln:mock-ln-resolve hash :succeeded)
+            (check-equal "once it succeeds, the poller settles it" (nd:settle-pending-payments a) (list hash))
+            (check-equal "debited, nothing locked" (multiple-value-list (nd:wallet-balance w1 id d1)) '(65900 0))
+            (check-equal "with an InvoiceFulfill" (op:operation-type (op:decode-operation (up:update-message (first (nd:record-history la))))) :invoice-fulfill)))
+        (multiple-value-bind (bolt11 hash) (ln:mock-ln-external-invoice mock-ln 3000)
+          (ln:mock-ln-hold hash)
+          (nd:wallet-pay-invoice w1 id d1 bolt11 3000 :height *height*)
+          (check-equal "a second held payment is locked" (multiple-value-list (nd:wallet-balance w1 id d1)) '(65900 3000))
+          (ln:mock-ln-resolve hash :failed)
+          (check-equal "a definitive failure releases it" (nd:settle-pending-payments a) (list hash))
+          (check-equal "unlocked" (multiple-value-list (nd:wallet-balance w1 id d1)) '(65900 0))))
       ;; Reference-shaped transfer_lock / transfer_complete (field by field, signature).
       (let* ((preimage (u:sha256 (hx "77"))) (hash (u:sha256 preimage)) (nonce (u:sha256 (hx "88")))
              (tid (u:sha256 (u:cat nonce d1 d2)))
@@ -492,7 +527,7 @@
             (nd:wallet-request w2 id "transfer_complete" (w:json-object "transfer_id" (u:bytes->hex tid) "preimage" (u:bytes->hex preimage)))
           (declare (ignore res))
           (check "reference-shaped transfer_complete accepted" ok err))
-        (check-equal "balances after the field-by-field transfer" (list (nd:wallet-balance w1 id d1) (nd:wallet-balance w2 id d2)) '(59900 10000))))))
+        (check-equal "balances after the field-by-field transfer" (list (nd:wallet-balance w1 id d1) (nd:wallet-balance w2 id d2)) '(55900 10000))))))
 
 
 

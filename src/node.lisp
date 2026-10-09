@@ -37,7 +37,7 @@
            #:node-chain-fn #:node-pledge-fn #:lottery-armers #:split-armers #:eligibility-floor-sats #:node-min-confs #:node-data-dir #:record-pinned #:height #:tip
            #:node-error #:request #:wallet #:make-wallet #:wallet-pubkey #:wallet-request
            #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer #:wallet-exit #:wallet-exit-cancel #:wallet-migrate #:wallet-make-offer #:wallet-complete-offer #:address->spk
-           #:wallet-make-invoice #:wallet-pay-invoice #:credit-paid-invoices #:start-invoice-poller #:node-ln #:node-invoices
+           #:wallet-make-invoice #:wallet-pay-invoice #:credit-paid-invoices #:settle-pending-payments #:start-invoice-poller #:node-ln #:node-invoices
            #:enter-dispute #:arm-dispute #:fork-key #:find-fork #:forks-of #:armers-of #:disputed-reserves
            #:rotate-vault #:pending-rotation #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
@@ -104,6 +104,9 @@
   (adversary '())                              ; red team (docs/REDTEAM.md): plist of misbehaviours this node performs on purpose
   (hooks '())                                  ; (lambda (rec update op)) called after every accepted/committed update
   (invoices (make-hash-table :test #'equalp))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
+  ;; Payment ids a pay_invoice handler is polling right now; SETTLE-PENDING-PAYMENTS
+  ;; leaves those to the handler so a lock is never settled twice.
+  (ln-polling (make-hash-table :test #'equalp :synchronized t))
   (chain-fn nil)                               ; (lambda (txid vout)) -> plist :value-sats :confirmations, or NIL
   (pledge-fn nil)                              ; (lambda (txid vout scan-from)) -> plist :created :value-sats :spend (DEP-03 cut), or NIL
   (utxos-fn nil)                               ; (lambda (address)) -> list of plists :txid :vout :sats :confirmations
@@ -1609,6 +1612,25 @@
 ;;; the node's Lightning backend, then InvoiceFulfill with the preimage or
 ;;; InvoiceFail.
 
+(defun settle-invoice-lock (node rec payment-id outcome preimage)
+  "Append the InvoiceFulfill or InvoiceFail that OUTCOME calls for, if the lock is
+   still open.  Only a definitive outcome settles: :succeeded with a preimage that
+   hashes to the payment id, or :failed.  Returns the operation appended, or NIL."
+  (let ((lock (gethash payment-id (lg:ledger-open-invoice-locks (record-ledger rec)))))
+    (when lock
+      (cond
+        ((and (eq outcome :succeeded) preimage (equalp (sha256 preimage) payment-id))
+         (let ((o (list :type :invoice-fulfill :deposit-id (getf lock :deposit-id) :amount (getf lock :amount)
+                        :payment-id payment-id :sequence-number (1+ (lg:ledger-sequence (record-ledger rec)))
+                        :witness (getf lock :witness) :preimage preimage)))
+           (append-operation node rec o) o))
+        ((eq outcome :failed)
+         (let ((o (list :type :invoice-fail :deposit-id (getf lock :deposit-id) :payment-id payment-id
+                        :sequence-number (1+ (lg:ledger-sequence (record-ledger rec))))))
+           (append-operation node rec o) o))))))
+
+(defvar *pay-poll-rounds* 60 "Half-second polls a pay_invoice handler waits before answering pending.")
+
 (defun handle-pay-invoice (node rec event params)
   (unless (node-ln node) (fail "no lightning node"))
   (let* ((deposit-id (deposit-id-param params))
@@ -1622,34 +1644,61 @@
                       :sequence-number (1+ (lg:ledger-sequence (record-ledger rec)))
                       :nonce (w:jget params "nonce") :expiry (w:jget params "expiry") :fee fee
                       :witness (witness-from-json (w:jget params "witness")))))
-         (d (lg:find-deposit (record-ledger rec) (op:field o :deposit-id))))
+         (d (lg:find-deposit (record-ledger rec) (op:field o :deposit-id)))
+         (asked (ln:invoice-amount-msat bolt11)))
     (unless (equalp (ln:invoice-payment-hash bolt11) (op:field o :payment-id)) (fail "payment_hash does not match the invoice"))
+    ;; The lock is what the depositor authorised.  An invoice for any other
+    ;; amount is refused here, before anything is locked or sent.
+    (when (and asked (/= asked (op:field o :amount)))
+      (fail (format nil "the invoice is for ~d msat but the lock is for ~d" asked (op:field o :amount))))
     (unless (authorized-p node rec o d (op:field o :witness)) (fail "witness does not authorize this lock"))
     (when (> (height node) (op:field o :expiry)) (fail "operation expired"))
     (append-operation node rec o)
-    ;; Pay, then settle the lock either way.
-    (let ((outcome :failed) (preimage nil))
-      (handler-case
-          (progn (ln:ln-pay (node-ln node) bolt11 :amount-msat (op:field o :amount) :height (height node))
-                 (loop repeat 60
-                       do (multiple-value-bind (st pre) (ln:ln-payment-status (node-ln node) (op:field o :payment-id))
-                            (case st (:succeeded (setf outcome :succeeded preimage pre) (return))
-                                     (:failed (return))
+    (let ((pid (op:field o :payment-id)) (outcome :pending) (preimage nil))
+      (setf (gethash pid (node-ln-polling node)) t)
+      (unwind-protect
+           (progn
+             (handler-case
+                 (progn (ln:ln-pay (node-ln node) bolt11 :amount-msat (op:field o :amount) :height (height node))
+                        (loop repeat *pay-poll-rounds*
+                              do (multiple-value-bind (st pre) (ln:ln-payment-status (node-ln node) pid)
+                                   (case st
+                                     (:succeeded (setf outcome :succeeded preimage pre) (return))
+                                     (:failed (setf outcome :failed) (return))
                                      (t (sleep 0.5))))))
-        (error (e) (log! node "pay failed: ~a" e)))
-      (if (and (eq outcome :succeeded) preimage (equalp (sha256 preimage) (op:field o :payment-id)))
-          (progn
-            (append-operation node rec (list :type :invoice-fulfill :deposit-id (op:field o :deposit-id) :amount (op:field o :amount)
-                                             :payment-id (op:field o :payment-id) :sequence-number (1+ (lg:ledger-sequence (record-ledger rec)))
-                                             :witness (op:field o :witness) :preimage preimage))
-            (respond node event t :result (w:json-object "payment_id" (bytes->hex (op:field o :payment-id))
-                                                         "deposit_id" (bytes->hex (op:field o :deposit-id))
-                                                         "amount_msat" (op:field o :amount) "preimage" (bytes->hex preimage)
-                                                         "status" "succeeded")))
-          (progn
-            (append-operation node rec (list :type :invoice-fail :deposit-id (op:field o :deposit-id) :payment-id (op:field o :payment-id)
-                                             :sequence-number (1+ (lg:ledger-sequence (record-ledger rec)))))
-            (respond node event nil :error "payment failed; lock released"))))))
+               ;; Declined before any HTLC went out: nothing was sent, so the lock
+               ;; can be released.
+               (ln:ln-refused (e) (log! node "pay refused: ~a" e) (setf outcome :failed))
+               ;; Anything else (a dropped socket, a status we could not read) says
+               ;; nothing about whether the payment is in flight: keep the lock.
+               (error (e) (log! node "pay ~a: ~a — the lock stays until it resolves" (subseq (bytes->hex pid) 0 8) e)))
+             (let ((settled (settle-invoice-lock node rec pid outcome preimage)))
+               (cond
+                 ((and settled (eq (op:operation-type settled) :invoice-fulfill))
+                  (respond node event t :result (w:json-object "payment_id" (bytes->hex pid)
+                                                               "deposit_id" (bytes->hex (op:field o :deposit-id))
+                                                               "amount_msat" (op:field o :amount) "preimage" (bytes->hex preimage)
+                                                               "status" "succeeded")))
+                 (settled (respond node event nil :error "payment failed; lock released"))
+                 (t (respond node event nil :error "payment pending; the lock stays until it settles or fails")))))
+        (remhash pid (node-ln-polling node))))))
+
+(defun settle-pending-payments (node)
+  "Every open InvoiceLock on a ledger we operate whose payment is not being polled
+   by its handler: ask the Lightning node, and settle the ones it can vouch for.
+   The ledger's open locks are the persisted list, so this resumes after a restart.
+   Returns the payment ids settled."
+  (let ((settled '()))
+    (when (node-ln node)
+      (loop for rec being the hash-values of (node-ledgers node)
+            when (and (record-owned-p rec) (not (record-fork-p rec)))
+              do (loop for pid in (loop for k being the hash-keys of (lg:ledger-open-invoice-locks (record-ledger rec)) collect k)
+                       unless (gethash pid (node-ln-polling node))
+                         do (handler-case
+                                (multiple-value-bind (st pre) (ln:ln-payment-status (node-ln node) pid)
+                                  (when (settle-invoice-lock node rec pid st pre) (push pid settled)))
+                              (error (e) (log! node "settle ~a: ~a" (subseq (bytes->hex pid) 0 8) e))))))
+    settled))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Lightning: make_invoice (operator), cosign_invoice (member), crediting
@@ -1733,7 +1782,10 @@
   (let ((credited '()))
     (when (node-ln node)
       (loop for hash being the hash-keys of (node-invoices node) using (hash-value inv)
-            when (eq :paid (ln:ln-invoice-status (node-ln node) hash))
+            when (multiple-value-bind (st received) (ln:ln-invoice-status (node-ln node) hash)
+                   ;; Paid means at least the invoiced amount ARRIVED.  A status
+                   ;; without a received amount is not enough to credit on.
+                   (and (eq st :paid) received (>= received (getf inv :amount))))
               do (handler-case
                      (let ((rec (getf inv :rec)))
                        (append-operation node rec
@@ -2109,7 +2161,10 @@
                   :name "cld-expiry"))
 
 (defun start-invoice-poller (node &key (interval 3))
-  (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (credit-paid-invoices node)))) :name "cld-invoices"))
+  (bt:make-thread (lambda () (loop (sleep interval)
+                                   (ignore-errors (credit-paid-invoices node))
+                                   (ignore-errors (settle-pending-payments node))))
+                 :name "cld-invoices"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Wallet: a key, a bus, and the requests it can make
