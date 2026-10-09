@@ -235,7 +235,7 @@
                 (ok :commitment (bytes->hex (cl-deposits.lottery:commitment-of (nd:arm-dispute node fork :replacement replacement)))
                     :replacement (and replacement t))))
         (:address (ok :address (nd::our-target-address node)))   ; the node key's P2TR key-path address: collateral, lottery target
-        (:confiscate (multiple-value-bind (tx lottery) (nd:confiscate node (arg form :ledger) :respectful (arg form :respectful) :fee (arg form :fee 1000))
+        (:confiscate (multiple-value-bind (tx lottery) (nd:confiscate node (arg form :ledger) :respectful (arg form :respectful))
                        (ok :txid (txid-hex (cl-consensus.tx:tx-txid tx)) :lottery (cl-deposits.lottery:lottery-address lottery))))
         (:reveal (nd:publish-reveal node (arg form :ledger)) (ok))
         (:check-expired (ok :disputed (nd:check-expired-quorums node :anchor-block-hash (txid-bytes (run-cli (or (uiop:getenv "CLD_BITCOIN_CLI") "bitcoin-cli") "getbestblockhash")))))
