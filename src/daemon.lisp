@@ -44,7 +44,10 @@
       (ecase (car form)
         (:info (ok :pubkey (nd:node-pubkey-hex node) :height (nd:height node)
                    :inbox (getf (nd:inbox-depths node) :inbox) :cosign-inbox (getf (nd:inbox-depths node) :cosign-inbox)
-                   :ledgers (loop for rec being the hash-values of (nd:node-ledgers node) collect (ledger-summary node rec))))
+                   :ledgers (loop for rec being the hash-values of (nd:node-ledgers node) collect (ledger-summary node rec))
+                   :forks (mapcar (lambda (f) (list :ledger (subseq (getf f :ledger) 0 16) :by (subseq (getf f :by) 0 16)
+                                                    :state (getf f :state) :live (getf f :live)))
+                                  (nd:fork-summaries node))))
         (:log (let* ((all (nd:node-log node)) (len (length all))
                      ;; (:log [:tail N] [:since K]) — the last N entries, or every entry after the
                      ;; first K (K from an earlier :count), so a flood cannot push a line out of reach

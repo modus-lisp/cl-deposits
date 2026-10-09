@@ -41,7 +41,7 @@
            #:enter-dispute #:arm-dispute #:fork-key #:find-fork #:forks-of #:armers-of #:disputed-reserves
            #:rotate-vault #:pending-rotation #:build-confiscation #:confiscate #:publish-reveal #:reveals-of #:claim-or-yield #:node-broadcast-fn
            #:node-broadcasts #:broadcast-fraud #:record-fork-p #:record-preimage #:record-lottery #:record-confiscation
-           #:node-height-of-block #:equivocate #:node-spender-fn #:drive-vault-watch #:node-reported-vault-spend
+           #:node-height-of-block #:fork-live-p #:live-fork #:fork-summaries #:equivocate #:node-spender-fn #:drive-vault-watch #:node-reported-vault-spend
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
            #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
@@ -838,8 +838,12 @@
               (accept-update node rec update)))))
         ;; A quorum member's dispute fork (or its continuation).
         ((not (equalp signer (node-pubkey node)))
-         (let ((fork (find-fork node id signer))
-               (o (op:decode-operation (up:update-message update))))
+         (let* ((o (op:decode-operation (up:update-message update)))
+                (fork (let ((f (find-fork node id signer)))
+                        (if (and f (eq (op:operation-type o) :dispute-enter) (not (fork-live-p node f))
+                                 (not (record-owned-p f)))
+                            (progn (retire-fork node f) nil)
+                            f))))
            (cond (fork (accept-update node fork update))
                  ((and (eq (op:operation-type o) :dispute-enter)
                        (member signer (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp))
@@ -2416,6 +2420,47 @@
   (loop for rec being the hash-values of (node-ledgers node)
         when (and (record-fork-p rec) (string= (record-fork-of rec) id-hex)) collect rec))
 
+(defun latest-quorum-begin-seq (rec)
+  (or (loop for u in (record-history rec)
+            when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
+              return (up:update-seq u))
+      0))
+
+(defun fork-live-p (node fork)
+  "FORK still speaks for its ledger's current dispute: it has custody (DisputeAcquire: the
+   base chain is dead), or it is unconcluded and its DisputeEnter is at or after the base's
+   latest QuorumBegin.  A yielded fork, or one from before a later QuorumBegin, is history:
+   it must not stop us detecting, disputing or acting on what happens on the ledger now."
+  (let ((base (find-record node (record-fork-of fork))))
+    (multiple-value-bind (enter eo) (fork-op fork :dispute-enter)
+      (cond ((fork-op fork :dispute-acquire) t)
+            ((fork-op fork :dispute-yield) nil)
+            ((null enter) t)
+            ((null base) t)
+            (t (>= (or (op:field eo :last-valid-sequence) -1) (latest-quorum-begin-seq base)))))))
+
+(defun live-fork (node id-hex operator33)
+  "OPERATOR33's fork of ID-HEX when it is live (fork-live-p), else NIL."
+  (let ((f (find-fork node id-hex operator33))) (and f (fork-live-p node f) f)))
+
+(defun retire-fork (node fork)
+  "Drop a fork that is no longer live so a new dispute can open in its place; what it knew of
+   a confiscation is kept (note-confiscation persists it)."
+  (when (record-confiscation fork) (note-confiscation node (record-fork-of fork) (btx:tx-txid (record-confiscation fork))))
+  (remhash (fork-key (record-fork-of fork) (record-fork-operator fork)) (node-ledgers node))
+  (log! node "fork of ~a by ~a retired (concluded or superseded by a later QuorumBegin)"
+        (subseq (record-fork-of fork) 0 8) (subseq (bytes->hex (record-fork-operator fork)) 0 8)))
+
+(defun fork-summaries (node)
+  "Every dispute fork we hold: ledger, its operator (the disputant), state, and whether it is
+   live (fork-live-p) — a non-live fork no longer suppresses detection on its ledger."
+  (loop for f being the hash-values of (node-ledgers node)
+        when (record-fork-p f)
+          collect (list :ledger (record-fork-of f) :by (bytes->hex (record-fork-operator f))
+                        :state (cond ((fork-op f :dispute-acquire) :acquired) ((fork-op f :dispute-yield) :yielded)
+                                     ((fork-op f :dispute-armed) :armed) (t :entered))
+                        :live (and (fork-live-p node f) t))))
+
 (defun disputing-members (node rec)
   "Pubkeys of REC's current quorum members that have disputed it since the quorum
    began: a fork whose DisputeEnter (other than for a lapsed quorum) is at or after
@@ -2495,6 +2540,8 @@
 
 (defun enter-dispute (node rec last-valid-seq &key (reason "fraud") anchor-block-hash anchor-block-height)
   "We are a quorum member of REC's ledger and have grounds: fork it and publish DisputeEnter."
+  (let ((stale (find-fork node (record-id-hex rec) (node-pubkey node))))
+    (when (and stale (not (fork-live-p node stale))) (retire-fork node stale)))
   (let ((fork (or (find-fork node (record-id-hex rec) (node-pubkey node))
                   (make-fork node rec last-valid-seq (node-pubkey node)))))
     (commit-update node fork (new-update node fork (%strip-nil-fields
@@ -3219,7 +3266,7 @@
     (and (not (record-owned-p rec)) (not (record-fork-p rec))
          (lg:ledger-quorum-expiry ledger) (> h (+ (lg:ledger-quorum-expiry ledger) grace))
          (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
-         (not (find-fork node (record-id-hex rec) (node-pubkey node))))))
+         (not (live-fork node (record-id-hex rec) (node-pubkey node))))))
 
 (defun check-expired-quorums (node &key anchor-block-hash (grace 0) skip)
   "For every ledger we cosign whose quorum_expiry is more than GRACE blocks behind
@@ -3233,7 +3280,7 @@
                                                           (or anchor-block-hash (make-array 32 :element-type '(unsigned-byte 8)))
                                                           (lg:ledger-quorum-expiry ledger))))
                  (broadcast-fraud node proof)
-                 (unless (find-fork node (record-id-hex rec) (node-pubkey node))
+                 (unless (live-fork node (record-id-hex rec) (node-pubkey node))
                    (enter-dispute node rec (lg:ledger-sequence ledger) :reason "quorum_expired"
                                   :anchor-block-hash anchor-block-hash :anchor-block-height h))
                  (push (record-id-hex rec) disputed)))
@@ -3383,13 +3430,13 @@
     (when (and (not (record-owned-p rec)) (not (record-fork-p rec))
                (equalp (up:update-prev-hash update) (lg:ledger-chain-tip ledger))
                (> (up:update-seq update) (lg:ledger-sequence ledger))
-               (not (find-fork node id (node-pubkey node))))
+               (not (live-fork node id (node-pubkey node))))
       (log! node "NON-CONFORMING cosigned update on ~a at seq ~a: ~a" (subseq id 0 8) (up:update-seq update) condition)
       (let ((proof (fr:make-non-conforming-update-proof (up:update-operator-id update) (up:update-ledger-id update) update)))
         (broadcast-fraud node proof)
         (broadcast-cosigner-contagion node rec update)
         (when (and (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
-                   (not (find-fork node id (node-pubkey node))))   ; the proof may have looped back and forked us already
+                   (not (live-fork node id (node-pubkey node))))   ; the proof may have looped back and forked us already
           ;; DEP-19 §6: watch co-members who ignore this (same as the received-proof path).
           (let ((vh (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) (height node))))))
             (when vh (setf (gethash id (node-derelict-watch node)) (cons (fr:proof-hash proof) vh))))
@@ -3456,7 +3503,7 @@
                                   (not (string= (record-id-hex rec) (getf (getf proof :evidence) :fault-ledger-id)))
                                   (equalp (lg:ledger-operator-key (record-ledger rec)) accused)
                                   (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
-                                  (not (find-fork node (record-id-hex rec) (node-pubkey node))))
+                                  (not (live-fork node (record-id-hex rec) (node-pubkey node))))
                           collect rec)))
     (when targets
       (let* ((fault (up:decode-update (hex->bytes (getf (getf proof :evidence) :fault-update-hex))))
@@ -3481,7 +3528,7 @@
       (dolist (m (lg:ledger-quorum-members ledger))
         (let* ((mk (lg:member-pubkey m)) (required (or (lg:member-dispute-response-blocks m) 144)))
           (when (and (not (equalp mk (node-pubkey node)))     ; not us
-                     (not (find-fork node id mk)))            ; the member never disputed REC
+                     (not (live-fork node id mk)))            ; the member never disputed REC (this dispute)
             (dolist (target (ledgers-operated-by node mk))
               (let* ((mrec (find-record node target))
                      (key (format nil "~a:~a" target (bytes->hex mk)))
@@ -3727,7 +3774,7 @@
                                   (not (string= (record-id-hex rec) spent-id))
                                   (equalp (lg:ledger-operator-key (record-ledger rec)) accused)
                                   (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
-                                  (not (find-fork node (record-id-hex rec) (node-pubkey node))))
+                                  (not (live-fork node (record-id-hex rec) (node-pubkey node))))
                           collect rec)))
     (when targets
       (multiple-value-bind (ok why)
@@ -3770,7 +3817,7 @@
          (rec (find-record node id)))
     (when (and rec (not (record-owned-p rec))
                (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
-               (not (find-fork node id (node-pubkey node))))
+               (not (live-fork node id (node-pubkey node))))
       (multiple-value-bind (ok why)
           (fr:verify-proof proof :history (reverse (record-history rec))
                            :height-of-block (or (node-height-of-block node)

@@ -790,7 +790,20 @@
           (nd:drive-disputes b)
           (check-equal "the DisputeEnter reason is the reference's" 
                        (op:field (nth-value 1 (nd::fork-op (nd:find-fork b id (nd:node-pubkey b)) :dispute-enter)) :reason) "quorum_expired")
-          (check "b yielded its now-baseless dispute" (nd::fork-op (nd:find-fork b id (nd:node-pubkey b)) :dispute-yield)))))))
+          (check "b yielded its now-baseless dispute" (nd::fork-op (nd:find-fork b id (nd:node-pubkey b)) :dispute-yield))
+          ;; FINDINGS D4: the yielded fork is history.  It must not blind b to the next lapse.
+          (check "the yielded fork is not live" (null (nd:live-fork b id (nd:node-pubkey b))))
+          (check "(:info)'s fork summary shows it, not live"
+                 (find-if (lambda (f) (and (string= (getf f :ledger) id) (eq (getf f :state) :yielded) (not (getf f :live))))
+                          (nd:fork-summaries b)))
+          (let* ((expiry2 (lg:ledger-quorum-expiry (nd:record-ledger (nd:find-record b id))))
+                 (*height* (+ expiry2 4)))
+            (check-equal "when the new quorum lapses too, b disputes it again" (nd:dispute-expired-quorums b :grace 3) (list id))
+            (let ((f (nd:find-fork b id (nd:node-pubkey b))))
+              (check "with a fresh, live fork from the new QuorumBegin's epoch"
+                     (and f (nd:fork-live-p b f) (null (nd::fork-op f :dispute-yield)))))
+            (check "c sees b's new DisputeEnter on a fresh fork (its stale copy retired)"
+                   (let ((f (nd:find-fork c id (nd:node-pubkey b)))) (and f (null (nd::fork-op f :dispute-yield)))))))))))
 
 (with-gate ("confiscation signs the tier open at the height: a minority past expiry + 720")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
