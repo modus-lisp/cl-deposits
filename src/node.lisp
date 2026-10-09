@@ -2345,15 +2345,7 @@
 ;;; Completion scripts (DEP-09/13): sha256(H) opened by a preimage, pointlock(P)
 ;;; opened by the scalar s with s*G = P.
 
-(defun completion-satisfied-p (script witness)
-  (let ((arg (and (position #\( script) (position #\) script) (subseq script (1+ (position #\( script)) (position #\) script)))))
-    (and witness (= 1 (length witness)) arg
-         (cond ((search "sha256(" script) (equalp (sha256 (first witness)) (hex->bytes arg)))
-               ((search "pointlock(" script)
-                (let ((s (be->int (first witness))))
-                  (and (= 32 (length (first witness))) (< 0 s secp256k1-fast:*secp256k1-n*)
-                       (equalp (up:compressed-pubkey s) (hex->bytes arg)))))
-               (t nil)))))
+(defun completion-satisfied-p (script witness) (lg:completion-satisfied-p script witness))
 
 ;;; Wallet: DEP-12 escalation through a quorum member
 

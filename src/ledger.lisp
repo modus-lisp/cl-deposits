@@ -20,11 +20,11 @@
            #:ledger-pending-withdrawals #:ledger-credited-payments #:ledger-fees-accumulated
            #:ledger-sequence #:ledger-chain-tip #:ledger-joined-quorums #:ledger-dispute-state
            #:ledger-active-ruleset #:ledger-pending-exits #:ledger-vault-current-p #:due-exits #:+exit-cutoff-margin+
-           #:exit-dust-msats #:spk-type #:dust-floor-sats #:standard-output-p #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
+           #:exit-dust-msats #:completion-satisfied-p #:fees-due #:spk-type #:dust-floor-sats #:standard-output-p #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
            #:ledger-dormancy-notice #:dormancy-spin-outs #:dormancy-amount-msats #:deposit-last-signed-activity
            #:pk-key-path-spk #:dormancy-cost #:dormancy-migration #:ledger-dormancy-accept #:migration-marker #:dormancy-offer-entries
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
-           #:deposit-fees #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
+           #:deposit-fees #:deposit-last-fee-assessment #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:collateral-floor-bps #:collateral-meets-floor-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
@@ -331,6 +331,30 @@
       (let ((d (gethash spender (ledger-deposits ledger))))
         (when d (setf (deposit-last-signed-activity d) *block-height*))))))
 
+(defun completion-satisfied-p (script witness)
+  "DEP-09: WITNESS (one element) satisfies a transfer's completion SCRIPT: sha256(H) by a
+   preimage of H, pointlock(P) by a scalar s with s·G = P."
+  (let ((arg (and (position #\( script) (position #\) script) (subseq script (1+ (position #\( script)) (position #\) script)))))
+    (and witness (= 1 (length witness)) arg
+         (cond ((search "sha256(" script) (equalp (sha256 (first witness)) (hex->bytes arg)))
+               ((search "pointlock(" script)
+                (let ((s (be->int (first witness))))
+                  (and (= 32 (length (first witness))) (< 0 s secp256k1-fast:*secp256k1-n*)
+                       (equalp (up:compressed-pubkey s) (hex->bytes arg)))))
+               (t nil)))))
+
+(defun fees-due (d height)
+  "DEP-07: the custody fee deposit D owes at HEIGHT — one frequency_blocks period at most, none
+   before the window has elapsed: annualized_msats·b/52560 + balance·annualized_bps·b/525600000,
+   each floored, b = min(height − last_fee_assessment, frequency_blocks)."
+  (let* ((fees (deposit-fees d)) (freq (op:fees-frequency-blocks fees))
+         (elapsed (- height (deposit-last-fee-assessment d))))
+    (if (or (<= elapsed 0) (< elapsed freq))
+        0
+        (let ((b (min elapsed freq)))
+          (+ (floor (* (op:fees-annualized-msats fees) b) 52560)
+             (floor (* (deposit-balance d) (op:fees-annualized-bps fees) b) (* 52560 10000)))))))
+
 (defun apply-operation (ledger o)
   "Fold one operation into LEDGER, or signal LEDGER-ERROR leaving it untouched
    in the ways that matter (callers replaying a chain treat any error as fatal)."
@@ -412,6 +436,7 @@
        (let ((id (f :deposit-id)))
          (when (gethash id (ledger-deposits ledger)) (fail :deposit-exists))
          (let ((d (make-deposit :id id :descriptor (f :descriptor) :opened-at-block *block-height*
+                                :last-fee-assessment (if (zerop *block-height*) (ledger-genesis-block ledger) *block-height*)
                                 :last-activity-block *block-height* :last-signed-activity *block-height*)))
            (when (f :fees) (setf (deposit-fees d) (f :fees)))
            (when (f :transfer-fees) (setf (deposit-transfer-fees d) (f :transfer-fees)))
@@ -449,6 +474,9 @@
       (:invoice-fail
        (let* ((lock (gethash (f :payment-id) (ledger-open-invoice-locks ledger)))
               (d (find-deposit ledger (f :deposit-id))))
+         ;; FINDINGS L6: an operator-only op, so checked here by every member and replica.
+         (unless (and lock (equalp (getf lock :deposit-id) (f :deposit-id)))
+           (fail :invoice-fail "names no open invoice lock of this deposit"))
          (%unlock d (+ (or (getf lock :amount) 0) (or (getf lock :fee) 0)))
          (%charge-fixed ledger d)
          (remhash (f :payment-id) (ledger-open-invoice-locks ledger))))
@@ -456,6 +484,12 @@
        (let* ((lock (gethash (f :payment-id) (ledger-open-invoice-locks ledger)))
               (fee (or (getf lock :fee) 0))
               (d (find-deposit ledger (f :deposit-id))))
+         (unless (and lock (equalp (getf lock :deposit-id) (f :deposit-id)))
+           (fail :invoice-fulfill "names no open invoice lock of this deposit"))
+         (unless (eql (f :amount) (getf lock :amount))
+           (fail :invoice-fulfill (format nil "amount ~a is not the lock's ~a" (f :amount) (getf lock :amount))))
+         (unless (and (f :preimage) (equalp (sha256 (f :preimage)) (f :payment-id)))
+           (fail :invoice-fulfill "preimage does not open the payment hash"))
          (%fulfill d (+ (f :amount) fee))
          (remhash (f :payment-id) (ledger-open-invoice-locks ledger))
          (incf (ledger-fees-accumulated ledger) fee)))
@@ -629,6 +663,9 @@
                      :timeout-height (f :timeout-height) :transfer-nonce (f :transfer-nonce)))))
       (:transfer-complete
        (let ((p (gethash (f :transfer-id) (ledger-pending-transfers ledger))))
+         (unless p (fail :transfer-complete "no such pending transfer"))
+         (unless (completion-satisfied-p (getf p :completion-script) (f :script-witness))
+           (fail :transfer-complete "script_witness does not satisfy the lock's completion script"))
          (remhash (f :transfer-id) (ledger-pending-transfers ledger))
          (when p
            (let ((src (gethash (getf p :source) (ledger-deposits ledger)))
@@ -641,6 +678,9 @@
              (incf (ledger-fees-accumulated ledger) (getf p :fee))))))
       (:transfer-fail
        (let ((p (gethash (f :transfer-id) (ledger-pending-transfers ledger))))
+         (unless p (fail :transfer-fail "no such pending transfer"))
+         (when (and (integerp (getf p :timeout-height)) (< *block-height* (getf p :timeout-height)))
+           (fail :transfer-fail (format nil "block ~a is before the lock's timeout ~a" *block-height* (getf p :timeout-height))))
          (remhash (f :transfer-id) (ledger-pending-transfers ledger))
          (when p
            (let ((src (gethash (getf p :source) (ledger-deposits ledger))))

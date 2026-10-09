@@ -43,10 +43,28 @@
                  (handler-case (d16:evaluate descriptor op (snapshot d height) (d16:witness-from-stack witness descriptor op))
                    (d16:eval-error () nil))))))))
 
+(defun operator-violation (ledger o)
+  "DEP-07 FeeCollect, which no depositor signs: the cadence the depositor accepted
+   (FeeWindowNotElapsed) and the one-period assessment cap (FeeExceedsAssessment), both read
+   from the pre-state deposit.  The cap is a rule of every ruleset (DEP-07, FINDINGS L6)."
+  (when (eq (op:operation-type o) :fee-collect)
+    (let ((d (gethash (field o :deposit-id) (lg:ledger-deposits ledger))))
+      (when d
+        (let ((next (+ (lg:deposit-last-fee-assessment d) (op:fees-frequency-blocks (lg:deposit-fees d))))
+              (due (lg:fees-due d (field o :block-height))))
+          (cond ((< (field o :block-height) next)
+                 (format nil "FeeWindowNotElapsed: block ~a is before ~a" (field o :block-height) next))
+                ((> (field o :amount) due)
+                 (format nil "FeeExceedsAssessment: collected ~a, at most ~a due" (field o :amount) due))))))))
+
 (defun violation (ledger o height)
   "NIL when operation O conforms at HEIGHT on LEDGER (its state before O), else
-   a string naming the broken rule.  Operations no depositor signs conform here;
-   the fold judges everything else, including an unknown deposit."
+   a string naming the broken rule.  Depositor-signed operations: expiry, nonce and witness;
+   FeeCollect: DEP-07's window and cap.  The fold judges everything else, including an unknown
+   deposit and the operator-only transfer and invoice settlements."
+  (or (operator-violation ledger o) (depositor-violation ledger o height)))
+
+(defun depositor-violation (ledger o height)
   (when (d17:operation->dep16 o)
     (let* ((d (ignore-errors (lg:find-deposit ledger (or (field o :source-deposit-id) (field o :deposit-id)))))
            (nonce (field o :nonce)) (expiry (field o :expiry)))

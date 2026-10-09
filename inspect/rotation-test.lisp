@@ -101,6 +101,60 @@
             (check "JSON round trip keeps the proof hash" (equalp (fr:proof-hash proof) (fr:proof-hash back)))
             (check "prevouts survive the round trip" (equal (getf (getf back :evidence) :prevouts) (getf (getf proof :evidence) :prevouts)))))))))
 
+(with-gate ("FINDINGS L6: operations no depositor signs are checked by every member and replica")
+  ;; DEP-07 fee cap, shared vector
+  (with-open-file (in (vector-path "fees_due.txt"))
+    (let ((n 0))
+      (loop for line = (read-line in nil) while line
+            unless (or (zerop (length line)) (char= (char line 0) #\#))
+              do (destructuring-bind (bal am bps freq last h due)
+                     (with-input-from-string (s line) (loop repeat 7 collect (read s)))
+                   (incf n)
+                   (let ((d (lg::make-deposit :id (u:sha256 (hx "01")) :balance bal :last-fee-assessment last
+                                              :fees (op:make-fees :annualized-msats am :annualized-bps bps :frequency-blocks freq))))
+                     (check-equal (format nil "fees due ~a" line) (lg:fees-due d h) due))))
+      (check-equal "the fee vector has 8 cases" n 8)))
+  (let* ((dep (u:sha256 (hx "d1"))) (pay (u:sha256 (u:sha256 (hx "77")))) (pre (u:sha256 (hx "77")))
+         (l (lg:make-ledger))
+         (d (lg::make-deposit :id dep :balance 1000000 :locked-balance 0 :last-fee-assessment 1000
+                              :fees (op:make-fees :annualized-msats 52560000 :annualized-bps 0 :frequency-blocks 144))))
+    (setf (gethash dep (lg:ledger-deposits l)) d)
+    (flet ((refused (o &optional (h 1100))
+             (handler-case (let ((lg:*block-height* h)) (lg:apply-operation (lg:copy-ledger l) o) nil)
+               (error () t))))
+      ;; FeeCollect: the window and the cap (conformance; every cosigner and replica)
+      (check "FeeCollect before the window is non-conforming"
+             (search "FeeWindowNotElapsed" (or (cl-deposits.conformance:violation l (list :type :fee-collect :deposit-id dep :amount 1 :block-height 1100) 1100) "")))
+      (check "FeeCollect above one period's assessment is non-conforming"
+             (search "FeeExceedsAssessment" (or (cl-deposits.conformance:violation l (list :type :fee-collect :deposit-id dep :amount 144001 :block-height 1144) 1144) "")))
+      (check "FeeCollect of exactly the period's assessment conforms"
+             (null (cl-deposits.conformance:violation l (list :type :fee-collect :deposit-id dep :amount 144000 :block-height 1144) 1144)))
+      ;; Transfers
+      (setf (gethash (u:sha256 (hx "aa")) (lg:ledger-pending-transfers l))
+            (list :source dep :destination dep :amount 1000 :fee 0 :completion-script (format nil "sha256(~a)" (u:bytes->hex pay))
+                  :timeout-height 1200))
+      (incf (lg::deposit-locked-balance d) 1000)
+      (check "TransferComplete without the preimage is refused"
+             (refused (list :type :transfer-complete :transfer-id (u:sha256 (hx "aa")) :script-witness (list (u:sha256 (hx "78"))))))
+      (check "TransferComplete with the preimage applies"
+             (not (refused (list :type :transfer-complete :transfer-id (u:sha256 (hx "aa")) :script-witness (list pre)))))
+      (check "TransferComplete of no pending transfer is refused"
+             (refused (list :type :transfer-complete :transfer-id (u:sha256 (hx "ab")) :script-witness (list pre))))
+      (check "TransferFail before the lock's timeout is refused"
+             (refused (list :type :transfer-fail :transfer-id (u:sha256 (hx "aa")) :block-hash (u:sha256 (hx "00")) :reason 1) 1199))
+      (check "TransferFail at the timeout applies"
+             (not (refused (list :type :transfer-fail :transfer-id (u:sha256 (hx "aa")) :block-hash (u:sha256 (hx "00")) :reason 1) 1200)))
+      ;; Invoices
+      (setf (gethash pay (lg:ledger-open-invoice-locks l)) (list :deposit-id dep :amount 5000 :fee 10))
+      (check "InvoiceFulfill without the preimage is refused"
+             (refused (list :type :invoice-fulfill :deposit-id dep :amount 5000 :payment-id pay :sequence-number 9 :witness '() :preimage (u:sha256 (hx "78")))))
+      (check "InvoiceFulfill for a different amount is refused"
+             (refused (list :type :invoice-fulfill :deposit-id dep :amount 4000 :payment-id pay :sequence-number 9 :witness '() :preimage pre)))
+      (check "InvoiceFulfill with no matching lock is refused"
+             (refused (list :type :invoice-fulfill :deposit-id dep :amount 5000 :payment-id (u:sha256 (hx "99")) :sequence-number 9 :witness '() :preimage pre)))
+      (check "InvoiceFail with no matching lock is refused"
+             (refused (list :type :invoice-fail :deposit-id dep :payment-id (u:sha256 (hx "99")) :sequence-number 9))))))
+
 (with-gate ("DEP-20 §3 exit addresses: standard types and per-type dust floors (shared vector)")
   (with-open-file (in (vector-path "exit_address.txt"))
     (let ((n 0))
