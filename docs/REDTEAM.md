@@ -1008,3 +1008,17 @@ Two more interop faults surfaced in this run and were fixed. cl members refused 
 `rotation_sign`, whose JSON carries `splice_in_outpoint: null`: `jget` returned the symbol NULL, not
 NIL (0f9a5a6). Reference members refused updates more than 6 blocks from a stale cached height; they
 now refresh the height before refusing (deposits-rust 300edc2).
+
+The rerun after the fix (reset network, 1013-223054, then 1013-230913) raised no accusation on
+any reference node. **rotation, exit, migrate, dormancy, dereliction, splice and withhold-reveal all
+PASS.** Two failures on the way were harness faults:
+- *withhold-reveal*: the claim landed about 3 minutes after the confiscation, but `gettxout` counts
+  mempool spends. The loop saw the output spent before any block held the claim, and the mempool
+  fallback read the blank line after `[`. It now waits for a confirmed spend.
+- *splice B* (intermittent): before the rotation the reference operator re-stages its members. The
+  re-adds timed out (1 of 2 cosignatures in 10 s), and `radd` took "listed" for staged, though an
+  active member is always listed. The rotation then declared an unstaged member
+  (`quorum_member_unstaged`). The script now retries each re-add until it succeeds; the reference
+  CLI exits 0 on error, so it reads the output. Why the cl members missed the 10 s window is not
+  known: their logs were in memory and lost on the next scenario's restart. cl nodes now also
+  append their log to `node.log` in the data dir.

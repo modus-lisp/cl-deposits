@@ -56,7 +56,12 @@ RPK=$(pubkey_of $R1)
 RADDR=$(bcli deriveaddresses "$(bcli getdescriptorinfo "wpkh($RPK)" | python3 -c 'import json,sys; print(json.load(sys.stdin)["descriptor"])')" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])')
 STXB=$(wcli sendtoaddress "$RADDR" $SPLICE_BTC); mine 3 >/dev/null; SVB=$(outpoint_vout "$STXB" "$RADDR"); sleep 30
 C0B=$(coll $C1 "$RL")
-for m in $C1 $C2; do radd "$(pubkey_of $m)" "$(own_ledger $m)" >/dev/null; done; radd "$(pubkey_of $R2)" "$(own_ledger $R2)" >/dev/null
+# Re-stage the members for the rotation.  An active member is always listed, so success is the
+# add itself (it needs the members' cosignatures now): a timed-out re-add left the rotation
+# declaring an unstaged member (quorum_member_unstaged, run 1013-223054).
+restage() { local i; for i in 1 2 3 4 5 6; do ref_cli $R1 quorum add "$RL" "$1" "$2" 2>&1 | grep -q "Error: " || return 0; sleep 10; done; return 1; }   # the CLI exits 0 on error
+for m in $C1 $C2; do restage "$(pubkey_of $m)" "$(own_ledger $m)" || fail "B: re-stage $m"; done
+restage "$(pubkey_of $R2)" "$(own_ledger $R2)" || fail "B: re-stage $R2"
 out=$(timeout 300 "$REF_NODE_BIN" quorum begin "$RL" --splice "$STXB:$SVB" --network "$CLD_CHAIN" --esplora "$ESPLORA_URL" --relay "$RELAY_URL" --data-dir "$(ref_dir $R1)" 2>&1 | grep -vE '^\S*\[[0-9]m|^\[2m')
 echo "$out" | tail -3 | sed 's/^/   /'
 RTB=$(echo "$out" | grep -oE 'TXID: [0-9a-f]{64}' | grep -oE '[0-9a-f]{64}' | head -1); [ -n "$RTB" ] || fail "B: no rotation txid from quorum begin"
