@@ -57,8 +57,11 @@
 (defun json (object) (js:stringify object))
 (defun parse-json (string) (js:parse string))
 (defun jget (object &rest keys)
+  "The value at KEYS, NIL when absent.  JSON null (CL:NULL from the parser) also reads
+   as NIL: the reference sends optional fields as null (splice_in_outpoint), and a
+   handler that tested only for absence took the symbol for a value."
   (let ((o object))
-    (dolist (key keys o)
+    (dolist (key keys (if (eq o 'null) nil o))
       (setf o (and (hash-table-p o) (gethash key o))))))
 
 ;;; ---------------------------------------------------------------------------
