@@ -979,3 +979,32 @@ Failures, and what they were:
 - *withhold-reveal `DEPS[0]: unbound variable`*: a wallet open refused on a ledger whose quorum was
   born expired (a member's commitment had lapsed); prepare-quorum now refuses that, and the harness
   reports the wallet's error.
+
+### 2026-10-13 — the full suite on current main; a false accusation from the judge's tip
+
+Run 1013-175058 on a reset regtest network, both implementations at main: 19 PASS, 5 fail
+(rotation, splice, migrate, dormancy, withhold-reveal), dereliction SKIP. Four of the failures share
+one cause, found in the `exit` scenario that ran before them.
+
+**Finding: a replica judged an honest update at its own tip.** ref6 cosigned the exit QuorumBegin at
+seq 18 (cl operator cld24), then flagged the committed update NON-CONFORMING and armed a dispute.
+That raised contagion against the operator and a cl member, whose later ledgers failed. The cosign
+check and Rust's proof verifier both apply an operation at the update's signed `block_height`. The
+fold-time accuser in `inbound.rs` applied it at the wallet's cached tip. Exit settlement depends on
+height: the cutoff must lie in [h−144, h], and requests can expire by h. On a replica whose tip lags
+the update, `exit_cutoff_height` (the update's own height) is "outside the window", so the replica
+accuses a quorum that every other replica accepts. A rerun with violation logging passed, with no
+accusation, on an idle network where the tips had caught up.
+
+Fixed per the standing rule. DEP-02 now says every rule that reads a height reads the update's
+signed `block_height`, never the judge's tip. The judge's tip only bounds cosigning (±6 blocks). Rust
+8b9a8c8 judges at `block_height` in both the accuser and the cosigner, and logs the violations. cl
+already judged there; its cosign tier read the node's tip and now reads `block_height`
+(DEP-05). The shared vector is `exit_settlement.txt` case `judge_height`. The due_set QuorumBegin
+settles at its signed height and is refused (`exit_cutoff`) at a lagging (4985) and a leading (5200)
+tip. Both implementations check it.
+
+Two more interop faults surfaced in this run and were fixed. cl members refused the reference's
+`rotation_sign`, whose JSON carries `splice_in_outpoint: null`: `jget` returned the symbol NULL, not
+NIL (0f9a5a6). Reference members refused updates more than 6 blocks from a stale cached height; they
+now refresh the height before refusing (deposits-rust 300edc2).
