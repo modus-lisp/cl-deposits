@@ -139,9 +139,19 @@
   (min-confs 1)
   (member-ledger-hex nil))                     ; our own ledger used for QuorumJoin / member_ledger_hash
 
+(defvar *log-file-lock* (bt:make-lock "node.log"))
 (defun log! (node fmt &rest args)
-  ;; One line per entry: the control socket is line-oriented.
-  (push (substitute #\Space #\Newline (apply #'format nil fmt args)) (node-log node)))
+  ;; One line per entry: the control socket is line-oriented.  With a data dir it is also
+  ;; appended to node.log there, timestamped, so it outlives a restart.
+  (let ((line (substitute #\Space #\Newline (apply #'format nil fmt args))))
+    (push line (node-log node))
+    (when (node-data-dir node)
+      (ignore-errors
+       (bt:with-lock-held (*log-file-lock*)
+         (with-open-file (s (merge-pathnames "node.log" (node-data-dir node))
+                            :direction :output :if-exists :append :if-does-not-exist :create)
+           (multiple-value-bind (sec min hr d mo y) (decode-universal-time (get-universal-time) 0)
+             (format s "~d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0dZ ~a~%" y mo d hr min sec line))))))))
 
 (defun add-hook (node fn) (push fn (node-hooks node)))
 (defun extra-actions (node)

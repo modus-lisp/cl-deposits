@@ -47,7 +47,9 @@ echo "== mining past the reveal deadline (72 blocks), then watching ${WAIT}s for
 for i in $(seq 1 8); do mine 10 >/dev/null; sleep 5; done
 claim=""
 for i in $(seq 1 $WAIT); do
-  if [ -z "$(bcli gettxout "$conf_txid" 0 2>/dev/null | head -1)" ]; then
+  # Spent in a block (include_mempool=false): a claim still in the mempool is not yet found by
+  # the block scan, and reading the mempool for it once took the blank line after '['.
+  if [ -z "$(bcli gettxout "$conf_txid" 0 false 2>/dev/null | head -1)" ]; then
     tip=$(bcli getblockcount)
     for h in $(seq "$tip" -1 $((tip - 30))); do
       claim=$(bcli getblock "$(bcli getblockhash "$h")" 2 2>/dev/null | python3 -c '
@@ -60,7 +62,6 @@ for tx in b["tx"]:
 ' "$conf_txid")
       [ -n "$claim" ] && break
     done
-    [ -z "$claim" ] && claim=$(bcli getrawmempool | tr -d '[]", ' | head -1)
     break
   fi
   [ $((i % 10)) -eq 0 ] && mine 1 >/dev/null
