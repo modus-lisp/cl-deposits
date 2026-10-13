@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# redteam/check-obligations.sh — DEP-06 §Confiscation obligations, live, mixed quorums.
+#
+# A receiver ledger Y (cl operator, cl and reference members) owes two things it never credits:
+#   - a DEP-20 §8.3 migration from a source ledger X (a small dormant pk() deposit), whose output
+#     sits at Y's vault script; Y accepts but never sends MigrationCredit;
+#   - an ordinary DEP-10 funding offer a wallet paid (50000 sats) that Y never credits.
+# A member proves the uncredited payment (UncreditedOnchainPayment, deposit-bound offer evidence)
+# and the members dispute Y. Before arming they record both obligations (ObligationRecord).
+# PASS = the confiscation on chain spends Y's vault and the migration output (swept through the
+#        tier) and pays the migrated deposit's owner and the payment's owner their key-path P2TR
+#        outputs net of their own cost, a reference member having signed it.
+source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env" 2>/dev/null; source "$(dirname "$0")/_lib.sh"
+WAIT=${WAIT:-900}
+pick OP C1 C2 C3 OP2
+R1=${R1:-ref6}; R2=${R2:-ref7}
+for n in $OP $C1 $C2 $C3 $OP2; do cld_running $n || continue; stop_cld $n >/dev/null; start_cld $n >/dev/null & done; wait
+export DORM=5 DORM_NOTICE=3
+NAME=${REDTEAM_OBL:-OBL$RANDOM}
+w() { "$CLD_SRC/devnet/cld-wallet.sh" "$@"; }
+X=$(form_ledger "$NAME" $OP "" $C1 $C2 $C3 $R1 $R2) || exit 1
+Y=$(RESP=${RESP:-5} form_ledger "${NAME}Y" $OP2 "" $C1 $C2 $C3 $R1 $R2) || exit 1
+await_active "$X" $OP $C1 $C2 $C3; await_active "$Y" $OP2 $C1 $C2 $C3
+read -r ftx fvout <"$S/redteam-$NAME.outpoint"
+D3=$(sx "$(w w3 "$X" open)" ":DEPOSIT"); [ -n "$D3" ] || fail "w3 open"
+expect "$(cld_ctl $OP "(:credit :ledger \"$X\" :deposit \"$D3\" :msat 600000 :txid \"$ftx\" :vout $fvout)")" "credit the small deposit"
+echo "== source $X (small dormant $D3), receiver $Y ($OP2)"
+mine 7 >/dev/null; sleep 5; H=$(bcli getblockcount)
+r=$(cld_ctl $OP "(:dormancy-offer :ledger \"$X\")"); expect "$r" "dormancy-offer"; M=$(sx "$r" ":MANIFEST")
+r=$(cld_ctl $OP2 "(:dormancy-accept :ledger \"$Y\" :manifest \"$M\" :total 600000 :source \"$X\")"); expect "$r" "dormancy-accept"
+ACC=$(sx "$r" ":ACCEPT"); VAULT=$(sx "$r" ":ADDRESS")
+expect "$(cld_ctl $OP "(:dormancy-notice :ledger \"$X\" :rotation-height $((H + 4)) :receiver \"$(pubkey_of $OP2)\" :manifest \"$M\" :accept \"$ACC\")")" "notice"
+mine 5 >/dev/null; sleep 5
+consent "$X" $OP $C1 $C2 $C3 $R1 $R2
+r=$(cld_ctl $OP "(:rotate-vault :ledger \"$X\" :expiry-blocks 4320)"); expect "$r" "source rotation"; RT=$(sx "$r" ":TXID")
+for i in 1 2 3; do r=$(cld_ctl $OP "(:begin-quorum :ledger \"$X\")"); case "$r" in *":STATUS :OK"*) break;; esac; sleep 15; done
+expect "$r" "source begin-quorum"; mine 3 >/dev/null; sleep 10
+MV=$(outpoint_vout "$RT" "$VAULT") || fail "the migration does not pay Y's vault $VAULT"
+echo "   migration output $RT:$MV pays Y's vault; Y never credits it"
+# the ordinary payment Y never credits
+D4=$(sx "$(w w4 "$Y" open)" ":DEPOSIT"); [ -n "$D4" ] || fail "w4 open"
+r=$(w w4 "$Y" offer 100000); expect "$r" "w4 offer"
+OADDR=$(sx "$r" ":FUNDING-ADDRESS"); ODESC=$(sx "$r" ":DESCRIPTOR")
+OFFER=$(printf '%s' "$r" | python3 -c 'import sys,re; s=sys.stdin.read(); m=re.search(r":OFFER \"((?:[^\"\\\\]|\\\\.)*)\"", s); print(m.group(1).replace("\\\\\"", "\"").replace("\\\\\\\\", "\\\\"))')
+PT=$(wcli sendtoaddress "$OADDR" 0.0005); mine 8 >/dev/null; sleep 10
+PV=$(outpoint_vout "$PT" "$OADDR")
+echo "   w4 paid Y's offer $PT:$PV (50000 sats); Y never credits it"
+r=$(cld_ctl $C1 "(:uncredited-offer-proof :ledger \"$Y\" :offer $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$OFFER") :descriptor \"$ODESC\" :txid \"$PT\" :vout $PV)")
+expect "$r" "uncredited-offer-proof (verifies, broadcast)"
+echo "== the members dispute Y; waiting for the confiscation (up to ${WAIT}s)"
+P3=$(sx "$(w w3 "$X" pubkey)" ":PUBKEY"); P4=$(sx "$(w w4 "$Y" pubkey)" ":PUBKEY")
+tr_of() { bcli deriveaddresses "$(bcli getdescriptorinfo "tr(${1:2})" | python3 -c 'import json,sys; print(json.load(sys.stdin)["descriptor"])')" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])'; }
+A3=$(tr_of "$P3"); A4=$(tr_of "$P4")
+conf=""
+for i in $(seq 1 $((WAIT / 10))); do
+  conf=$(for n in $C1 $C2 $C3; do cld_ctl $n '(:log :tail 400)' 2>/dev/null; done | tr '"' '\n' | grep -F "dispute ${Y:0:8}:" | grep -oE "confiscation [0-9a-f]{64} on chain" | grep -oE '[0-9a-f]{64}' | head -1)
+  [ -n "$conf" ] && break; mine 1 >/dev/null; sleep 10
+done
+[ -n "$conf" ] || fail "no confiscation of Y within ${WAIT}s"
+tx=$(bcli getrawtransaction "$conf" true)
+python3 - "$tx" "$RT" "$MV" "$A3" "$A4" <<'PY' || fail "the confiscation does not settle the obligations"
+import json, sys
+t = json.loads(sys.argv[1]); rt, mv, a3, a4 = sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
+ins = [(i["txid"], i["vout"]) for i in t["vin"]]
+paid = {o["scriptPubKey"].get("address"): round(o["value"] * 1e8) for o in t["vout"]}
+ok = (rt, mv) in ins and paid.get(a3) == 600 - 86 and paid.get(a4) == 50000 - 86
+print(f"   inputs {len(ins)}: migration swept {(rt, mv) in ins}; pays {a3[:12]}… {paid.get(a3)}, {a4[:12]}… {paid.get(a4)}")
+sys.exit(0 if ok else 1)
+PY
+signed=0; for m in $R1 $R2; do sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" 2>/dev/null | grep -qi "Signed confiscation sighash for ledger ${Y:0:16}" && signed=$((signed+1)); done
+echo "   reference members that signed the confiscation: $signed"
+echo "PASS: the confiscation swept the migration output and paid both owed deposits to their owners."

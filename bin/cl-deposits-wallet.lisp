@@ -59,6 +59,12 @@
              (format t "~s~%" (list :exit-request id :offer-id (cl-deposits.wire:jget offer "offer_id")
                                     :funding-address (cl-deposits.wire:jget offer "funding_address")
                                     :deadline (cl-deposits.wire:jget offer "deadline_block")))))
+          ((string= action "offer")   ; offer MAX-SATS [BLOCKS-VALID] — a cosigned DEP-10 funding offer for our deposit
+           (let ((offer (cl-deposits.node:wallet-make-offer wal ledger (parse-integer (first rest))
+                                                            :blocks-valid (parse-integer (or (second rest) "144")))))
+             (format t "~s~%" (list :status :ok :funding-address (cl-deposits.wire:jget offer "funding_address")
+                                    :descriptor (cl-deposits.node::wallet-descriptor wal)
+                                    :offer (cl-deposits.wire:json offer)))))
           ((string= action "complete-offer")   ; complete-offer OFFER-ID TXID VOUT  (LEDGER = the offer's ledger)
            (format t "~s~%" (list :status :ok :result (format nil "~a" (cl-deposits.node:wallet-complete-offer
                                                                     wal ledger (first rest) (second rest) (parse-integer (third rest)))))))
