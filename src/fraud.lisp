@@ -610,7 +610,9 @@
   "DEP-06 offer evidence (mirrors the reference's verify_uncredited_onchain): the descriptor hashes
    to the offer's deposit_id; the offer cosignature verifies over the DEP-10 digest (which binds
    that deposit); the payment's block is on our chain; the accused signed PROOF-SEQUENCE at least
-   REQUIRED-CONFIRMATIONS later; and no OnchainCredit of the payment at or before it."
+   the ledger's governing service_response_blocks later (its own terms; the carried
+   required_confirmations is ignored, or a forger lowers it to frame an honest operator); and no
+   OnchainCredit of the payment at or before it."
   (handler-case
       (let* ((deposit (offer-deposit-id proof))
              (txid (hex->bytes (e proof :txid))) (vout (e proof :vout))
@@ -627,7 +629,9 @@
               ((null confirmed) (values nil "confirmed_at_block_hash not in the verifier's chain"))
               ((null pu) (values nil "proof_sequence not in the accused's history"))
               ((null ph) (values nil "the proof_sequence update's block is not on the verifier's chain"))
-              ((< (- ph confirmed) (e proof :required-confirmations)) (values nil "too soon after the payment confirmed"))
+              ((< (- ph confirmed) (governing-service-response-blocks history (e proof :proof-sequence)))
+               (values nil (format nil "the proof update is fewer than ~a blocks (the ledger's terms) after the payment confirmed"
+                                   (governing-service-response-blocks history (e proof :proof-sequence)))))
               ((onchain-credited-p history (up:update-seq pu) txid vout) (values nil "the payment was credited: not fraud"))
               (t (values t nil))))
     (error (c) (values nil (princ-to-string c)))))
