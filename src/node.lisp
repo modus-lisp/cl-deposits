@@ -118,6 +118,7 @@
   (vault-scanned nil)                          ; the last block height scanned for vault spends
   (reported-vault-spend (make-hash-table :test (quote equal) :synchronized t))
   (migrations-watched (make-hash-table :test (quote equal) :synchronized t)) ; "ledger:seq" -> (:height h :hash b) | :done
+  (obligation-proofs (make-hash-table :test (quote equal) :synchronized t))  ; ledger id hex -> verified offer-evidence proof JSON texts
   ;; ledger id hex -> txids of confiscations we saw confirmed.  Kept apart from the forks: a fork
   ;; forgets its confiscation once the lottery output is spent (the winner's claim), and the vault
   ;; watch must still excuse it.  Persisted in confiscations.txt.
@@ -1307,11 +1308,8 @@
 ;;; ---------------------------------------------------------------------------
 ;;; DEP-10 funding offers (we are the operator, or a member cosigning one)
 
-(defun offer-cosign-digest (ledger-id-hex offer-id operator33 address deadline member-ledger-hash)
-  "DEP-10 offer cosign digest: ledger_id is the hex text, len(address) one byte, deadline LE32."
-  (let ((tag (sha256 (ascii->bytes "deposits/offer_cosign"))))
-    (sha256 (cat tag tag (ascii->bytes ledger-id-hex) offer-id (up:x-only operator33)
-                 (octets (length address)) (ascii->bytes address) (int->le deadline 4) member-ledger-hash))))
+(defun offer-cosign-digest (ledger-id-hex offer-id deposit-id operator33 address deadline member-ledger-hash)
+  (lg:offer-cosign-digest ledger-id-hex offer-id deposit-id operator33 address deadline member-ledger-hash))
 
 (defun offer-address (node offer-id)
   "A key-path P2TR of our key committing OFFER-ID (tweaked by it), so each offer's payments are its own."
@@ -1332,6 +1330,7 @@
         (when (eq (lg:ledger-quorum-state (record-ledger rec)) :active)
           (let ((r (first (send-request node (record-id-hex rec) "cosign_offer"
                                         (w:json-object "offer_id" (bytes->hex offer-id) "operator_id" (node-pubkey-hex node)
+                                                       "deposit_id" (bytes->hex (op:deposit-id descriptor))
                                                        "funding_address" address "deadline_block" deadline)
                                         :want 1 :successes-only t))))
             (let ((res (and r (w:jget r "result"))))
@@ -1340,11 +1339,12 @@
               (let ((pk (hex->bytes (w:jget res "cosigner_pubkey"))) (sig (hex->bytes (w:jget res "signature_hex")))
                     (mlh (hex->bytes (w:jget res "member_ledger_hash_hex"))))
                 (unless (schnorr:schnorr-verify (up:x-only pk)
-                                                (offer-cosign-digest (record-id-hex rec) offer-id (node-pubkey node) address deadline mlh) sig)
+                                                (offer-cosign-digest (record-id-hex rec) offer-id (op:deposit-id descriptor) (node-pubkey node) address deadline mlh) sig)
                   (fail "offer cosignature does not verify"))
                 (setf cosign res)))))
         (setf (gethash offer-id (record-offers rec)) offer)
         (apply #'w:json-object "offer_id" (bytes->hex offer-id) "operator_id" (node-pubkey-hex node)
+               "deposit_id" (bytes->hex (op:deposit-id descriptor))
                "funding_address" address "deadline_block" deadline "max_sats" max-sats "min_sats" min-sats
                "cosign_required" (and cosign t)
                (when cosign (list "cosigner_pubkey" (w:jget cosign "cosigner_pubkey")
@@ -1487,12 +1487,13 @@
           (let* ((offer-id (hex->bytes (w:jget params "offer_id")))
                  (operator (hex->bytes (w:jget params "operator_id")))
                  (address (w:jget params "funding_address")) (deadline (w:jget params "deadline_block"))
+                 (deposit-id (hex->bytes (or (w:jget params "deposit_id") (fail "an offer names its deposit_id (DEP-10)"))))
                  (mlh (member-ledger-hash node)))
             (unless (equalp operator (lg:ledger-operator-key (record-ledger rec))) (fail "not this ledger's operator"))
             (unless (and (= (length offer-id) 32) (stringp address) (integerp deadline)) (fail "malformed offer"))
             (respond node event t
                      :result (w:json-object "signature_hex" (bytes->hex (schnorr:schnorr-sign (node-priv node)
-                                                                                            (offer-cosign-digest id offer-id operator address deadline mlh)
+                                                                                            (offer-cosign-digest id offer-id deposit-id operator address deadline mlh)
                                                                                             (random-aux)))
                                             "cosigner_pubkey" (node-pubkey-hex node)
                                             "member_ledger_hash_hex" (bytes->hex mlh)))))
@@ -2632,7 +2633,13 @@
           (commit-update node fork (new-update node fork (list :type :obligation-record
                                                                :source-notice-update (up:encode-update nu)
                                                                :source-qb-update (up:encode-update qu))))
-          (log! node "recorded the dangling migration of ~a on our fork" (subseq id 0 8)))))))
+          (log! node "recorded the dangling migration of ~a on our fork" (subseq id 0 8)))))
+    ;; DEP-06: every proven-uncredited payment we verified against this ledger
+    (dolist (json (gethash id (node-obligation-proofs node)))
+      (handler-case
+          (progn (commit-update node fork (new-update node fork (list :type :obligation-record :uncredited-proof (ascii->bytes json))))
+                 (log! node "recorded an uncredited payment of ~a on our fork" (subseq id 0 8)))
+        (error (e) (log! node "uncredited payment not recorded on ~a: ~a" (subseq id 0 8) e))))))
 
 (defun arm-dispute (node fork &key seed replacement)
   "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL."
@@ -2850,6 +2857,29 @@
                                 (if spk
                                     (push (list (getf e :deposit-id) spk v) outs)
                                     (incf residue (floor (getf e :amount) 1000)))))))))))))))))
+    ;; DEP-06: proven-uncredited offer payments recorded on the participants' forks are owed too
+    ;; (paid from the vault: the payment itself sits at the operator's offer address).
+    (let ((hist (reverse (record-history base))) (paid '())
+          (hob (or (node-height-of-block node) (lambda (b) (declare (ignore b)) nil))))
+      (dolist (p participants)
+        (let ((fork (find-fork node id-hex (first p))))
+          (dolist (u (and fork (reverse (record-history fork))))
+            (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+              (when (and o (eq (op:operation-type o) :obligation-record) (op:field o :uncredited-proof)
+                         (< (up:update-seq u) (sixth p)))
+                (let* ((proof (ignore-errors (fr:json->proof (w:parse-json (bytes->ascii (op:field o :uncredited-proof))))))
+                       (txid (and proof (ignore-errors (hex->bytes (fr::e proof :txid)))))
+                       (vout (and proof (fr::e proof :vout))))
+                  (when (and txid (not (member (cons txid vout) paid :test #'equalp))
+                             (string-equal (getf proof :ledger-id) id-hex)
+                             (fr:verify-proof proof :history hist :height-of-block hob)
+                             (not (fr::onchain-credited-p hist (or lvs most-positive-fixnum) txid vout)))
+                    (push (cons txid vout) paid)
+                    (let ((e (fr::payment-entry proof)))
+                      (multiple-value-bind (spk v) (lg:owed-spk-sats e)
+                        (if spk
+                            (push (list (getf e :deposit-id) spk v) outs)
+                            (incf residue (floor (getf e :amount) 1000)))))))))))))
     (values (sort swept (lambda (x y) (or (bytes< (first x) (first y))
                                           (and (equalp (first x) (first y)) (< (second x) (second y))))))
             (mapcar #'cdr (sort outs #'bytes< :key #'first))
@@ -3843,35 +3873,48 @@
 
 (defun drive-obligation-watch (node)
   "DEP-06 §Confiscation obligations: for each ledger we hold whose custody changed after a
-   confiscation while a migration to it dangled, once the new operator signs an update its
+   confiscation, for each obligation it owed — a migration dangling at the acquire, or a payment
+   recorded on its history's forks (ObligationRecord) — once the new operator signs an update its
    service_response_blocks past the acquire without crediting the residue, broadcast
-   UnhonouredObligation against it (once)."
+   UnhonouredObligation against it (once each)."
   (loop for rec being the hash-values of (node-ledgers node)
         for l = (record-ledger rec)
-        for a = (lg:ledger-dormancy-accept l)
-        when (and (not (record-fork-p rec)) (lg:ledger-confiscation-txid l) a (not (getf a :resolved)) (getf a :source))
-          do (let ((key (format nil "obligation:~a" (record-id-hex rec))))
-               (unless (gethash key (node-migrations-watched node))
-                 (handler-case
-                     (let* ((history (reverse (record-history rec)))
-                            (au (find :dispute-acquire history :from-end t
-                                      :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u))))))
-                            (conf (find (lg:ledger-confiscation-txid l)
-                                        (loop for f in (forks-of node (record-id-hex rec)) when (record-confiscation f) collect (record-confiscation f))
-                                        :key #'btx:tx-txid :test #'equalp)))
+        when (and (not (record-fork-p rec)) (lg:ledger-confiscation-txid l))
+          do (handler-case
+                 (let* ((history (reverse (record-history rec)))
+                        (au (find :dispute-acquire history :from-end t
+                                  :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u))))))
+                        (conf (find (lg:ledger-confiscation-txid l)
+                                    (loop for f in (forks-of node (record-id-hex rec)) when (record-confiscation f) collect (record-confiscation f))
+                                    :key #'btx:tx-txid :test #'equalp))
+                        (a (lg:ledger-dormancy-accept l))
+                        (candidates '()))
+                   (when (and au conf)
+                     (when (and a (not (getf a :resolved)) (getf a :source))
                        (multiple-value-bind (nu qu) (migration-source-updates node a (bytes->hex (getf a :source)))
-                         (let ((proof (and au conf qu (fr:unhonoured-obligation-proof history au conf nu qu))))
-                           (when proof
-                             (multiple-value-bind (ok why)
-                                 (fr:verify-proof proof :history history
-                                                        :height-of-block (or (node-height-of-block node) (lambda (b) (declare (ignore b)) (height node))))
-                               (if ok
-                                   (progn (setf (gethash key (node-migrations-watched node)) :done)
-                                          (log! node "UNHONOURED OBLIGATION: ~a's new operator left a migration's residue uncredited; proof broadcast"
-                                                (subseq (record-id-hex rec) 0 8))
-                                          (broadcast-fraud node proof))
-                                   (log! node "unhonoured-obligation proof on ~a does not verify: ~a" (subseq (record-id-hex rec) 0 8) why)))))))
-                   (error (e) (log! node "obligation watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e)))))))
+                         (when qu (push (list (format nil "obligation:~a:migration" (record-id-hex rec)) :notice-update nu :qb-update qu) candidates))))
+                     (dolist (u history)
+                       (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                         (when (and o (eq (op:operation-type o) :obligation-record) (op:field o :uncredited-proof)
+                                    (< (up:update-seq u) (up:update-seq au)))
+                           (push (list (format nil "obligation:~a:~a" (record-id-hex rec) (bytes->hex (sha256 (op:field o :uncredited-proof))))
+                                       :uncredited-proof (bytes->ascii (op:field o :uncredited-proof)))
+                                 candidates))))
+                     (dolist (c candidates)
+                       (destructuring-bind (key &rest args) c
+                         (unless (gethash key (node-migrations-watched node))
+                           (let ((proof (apply #'fr:unhonoured-obligation-proof history au conf args)))
+                             (when proof
+                               (multiple-value-bind (ok why)
+                                   (fr:verify-proof proof :history history
+                                                          :height-of-block (or (node-height-of-block node) (lambda (b) (declare (ignore b)) (height node))))
+                                 (if ok
+                                     (progn (setf (gethash key (node-migrations-watched node)) :done)
+                                            (log! node "UNHONOURED OBLIGATION: ~a's new operator left an obligation's residue uncredited; proof broadcast"
+                                                  (subseq (record-id-hex rec) 0 8))
+                                            (broadcast-fraud node proof))
+                                     (log! node "unhonoured-obligation proof on ~a does not verify: ~a" (subseq (record-id-hex rec) 0 8) why))))))))))
+               (error (e) (log! node "obligation watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e)))))
 
 (defun drive-migration-watch (node)
   "DEP-20 §8.3: for each ledger we hold whose latest rotation migrated deposits, note the block
@@ -4040,6 +4083,9 @@
                                                      :defrauded-updates (updates-of-ledger node (getf original :ledger-id)))
                       (values nil "no original proof")))
                 (fr:verify-proof proof :history (reverse (record-history rec)) :height-of-block hob)))
+        (when (and ok (eq (getf proof :type) :uncredited-onchain-payment) (not (fr::e proof :source-qb-update)))
+          ;; DEP-06: a proven-uncredited payment is owed at confiscation: keep it to record before arming
+          (pushnew (w:json (fr:proof->json proof)) (gethash id (node-obligation-proofs node)) :test #'string=))
         (if ok
             (let ((last-valid (min (lg:ledger-sequence (record-ledger rec))
                                    (case (getf proof :type)

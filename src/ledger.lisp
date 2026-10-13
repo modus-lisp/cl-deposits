@@ -23,7 +23,7 @@
            #:exit-dust-msats #:completion-satisfied-p #:fees-due #:spk-type #:dust-floor-sats #:standard-output-p #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
            #:ledger-dormancy-notice #:dormancy-spin-outs #:dormancy-amount-msats #:deposit-last-signed-activity
            #:pk-key-path-spk #:dormancy-cost #:dormancy-migration #:ledger-dormancy-accept #:dormancy-offer-entries #:segwit-address-spk
-           #:migration-evidence #:ledger-confiscation-txid #:unpaid-entries #:owed-spk-sats
+           #:migration-evidence #:ledger-confiscation-txid #:offer-cosign-digest #:*uncredited-proof-checker* #:unpaid-entries #:owed-spk-sats
            #:consumed-notice-id #:accept-outstanding-p
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-last-fee-assessment #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
@@ -234,6 +234,18 @@
                  (push (list :deposit-id id :amount (deposit-balance d) :fees (deposit-fees d) :descriptor (deposit-descriptor d)) out)))
              (ledger-deposits ledger))
     (sort out #'bytes< :key (lambda (e) (getf e :deposit-id)))))
+
+(defvar *uncredited-proof-checker* nil
+  "Set by the fraud package: (lambda (ledger proof-json-bytes)) signalling unless the bytes are an
+   UncreditedOnchainPayment with offer evidence against LEDGER whose descriptor hashes to its
+   deposit_id and whose offer cosignature is by a member of LEDGER's quorum (DEP-06).")
+
+(defun offer-cosign-digest (ledger-id-hex offer-id deposit-id operator33 address deadline member-ledger-hash)
+  "DEP-10 offer cosign digest: ledger_id the hex text, the offer's deposit_id (16 bytes),
+   len(address) one byte, deadline LE32."
+  (let ((tag (sha256 (ascii->bytes "deposits/offer_cosign"))))
+    (sha256 (cat tag tag (ascii->bytes ledger-id-hex) offer-id deposit-id (up:x-only operator33)
+                 (octets (length address)) (ascii->bytes address) (int->le deadline 4) member-ledger-hash))))
 
 (defun segwit-address-spk (address)
   "The scriptPubKey of a segwit ADDRESS (any network: the hrp is read off the address)."
@@ -733,7 +745,15 @@
        ;; DEP-06 §Confiscation obligations: on a fork, before arming; evidence only, no state.
        (unless (eq (ledger-dispute-state ledger) :disputed)
          (fail :obligation-record "an obligation is recorded on a disputing fork before arming"))
-       (migration-evidence ledger (f :source-notice-update) (f :source-qb-update)))
+       (cond ((f :uncredited-proof)
+              (when (or (f :source-notice-update) (f :source-qb-update))
+                (fail :obligation-record "one form: a migration or a payment"))
+              (handler-case (funcall *uncredited-proof-checker* ledger (f :uncredited-proof))
+                (ledger-error (c) (error c))
+                (error (c) (fail :obligation-record (princ-to-string c)))))
+             ((and (f :source-notice-update) (f :source-qb-update))
+              (migration-evidence ledger (f :source-notice-update) (f :source-qb-update)))
+             (t (fail :obligation-record "an ObligationRecord carries a migration or a payment"))))
       (:exit-request
        (unless (spk-type (f :exit-address)) (fail :exit-address "not a standard output script (DEP-20 §3)"))
        (let ((d (find-deposit ledger (f :deposit-id))))

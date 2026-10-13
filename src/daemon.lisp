@@ -17,7 +17,7 @@
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:nd #:cl-deposits.node) (#:lg #:cl-deposits.ledger) (#:up #:cl-deposits.update)
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
-                    (#:bus #:cl-deposits.bus) (#:js #:json-simple))
+                    (#:bus #:cl-deposits.bus) (#:js #:json-simple) (#:fr #:cl-deposits.fraud))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
            #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn #:bitcoin-cli-feerate-fn))
 (in-package #:cl-deposits.daemon)
@@ -146,6 +146,23 @@
                                                                          node (up:decode-update (hex->bytes (arg form :accept)))))))
                                                :premium (arg form :premium))))))
            (ok :seq (up:update-seq u))))
+        (:uncredited-offer-proof
+         ;; DEP-06 (a wallet's evidence, for the red team): :ledger :offer "the operator's offer JSON"
+         ;; :descriptor :txid "display" :vout N [:confirmations 6] — proved against the operator's
+         ;; latest update in our replica, verified, then broadcast.
+         (let* ((rec (rec! node form)) (txid (txid-bytes (arg form :txid))) (vout (arg form :vout))
+                (info (or (funcall (nd:node-chain-fn node) txid vout) (fail "payment output unknown or spent")))
+                (h (- (nd:height node) (getf info :confirmations) -1))
+                (history (reverse (nd:record-history rec)))
+                (proof (fr:make-uncredited-offer-proof (nd:record-id-hex rec) (w:parse-json (arg form :offer)) (arg form :descriptor)
+                                                       txid vout (getf info :value-sats)
+                                                       (funcall (nd::node-block-hash-fn node) h) (arg form :confirmations 6)
+                                                       (car (last history)))))
+           (multiple-value-bind (ok why)
+               (fr:verify-proof proof :history history :height-of-block (nd:node-height-of-block node))
+             (unless ok (fail "the proof does not verify: ~a" why))
+             (nd::broadcast-fraud node proof)
+             (ok :hash (bytes->hex (fr:proof-hash proof))))))
         (:dormancy-offer
          ;; DEP-20 §8.3: the manifest a notice now would migrate (to hand to a receiver).
          (multiple-value-bind (m hash total) (nd::dormancy-offer node (rec! node form))

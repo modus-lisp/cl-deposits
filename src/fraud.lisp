@@ -20,7 +20,7 @@
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
            #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers
-           #:unhonoured-obligation-proof #:verify-unhonoured-obligation))
+           #:unhonoured-obligation-proof #:verify-unhonoured-obligation #:make-uncredited-offer-proof))
 (in-package #:cl-deposits.fraud)
 
 (defparameter +types+
@@ -59,7 +59,10 @@
          (if (getf ev :source-qb-update)
              ;; DEP-20 §8.3 migration evidence (the reference's UncreditedMigration).
              (cat (s :source-notice-update) (s :source-qb-update) (s :proof-update) (b :confirmed-at-block-hash))
-         (cat (s :offer-id) (int->le (getf ev :deadline-block) 4) (s :txid) (int->le (getf ev :vout) 4)
+         (cat (s :offer-id)
+              ;; DEP-10: the deposit the offer names, as hex text (JSON may have decoded it to bytes)
+              (let ((d (getf ev :deposit-id))) (ascii->bytes (cond ((stringp d) d) (d (bytes->hex d)) (t ""))))
+              (int->le (getf ev :deadline-block) 4) (s :txid) (int->le (getf ev :vout) 4)
               (int->le (getf ev :amount-sats) 8) (b :confirmed-at-block-hash))))
         (:dispute-dereliction
          (cat (s :original-fraud-hash) (s :disclosure-update) (s :quorum-begin-update) (s :visibility-update)
@@ -68,7 +71,8 @@
          (cat (s :spent-ledger-id) (int->le (getf ev :governing-quorumbegin-seq) 8) (s :spend-tx-hex) (b :spend-block-hash)))
         (:winner-collateral-deviation (cat (s :winner-armed-update-hex) (s :claim-txid) (b :claim-block-hash)))
         (:unhonoured-obligation
-         (cat (s :source-notice-update) (s :source-qb-update) (s :acquire-update) (s :confiscation-tx) (s :proof-update)))))))
+         (cat (s :source-notice-update) (s :source-qb-update) (ascii->bytes (or (getf ev :uncredited-proof) ""))
+              (s :acquire-update) (s :confiscation-tx) (s :proof-update)))))))
 
 (defun proof-hash (proof)
   (tagged-hash "deposits/fraud_proof" (octets (proof-discriminant (getf proof :type)))
@@ -598,6 +602,89 @@
                 (t (values t nil)))))))
     (error (c) (values nil (princ-to-string c)))))
 
+(defun offer-deposit-id (proof)
+  "The offer evidence's deposit id as bytes (JSON may give hex text or bytes)."
+  (let ((d (e proof :deposit-id))) (if (stringp d) (hex->bytes d) d)))
+
+(defun verify-uncredited-onchain (proof history height-of-block)
+  "DEP-06 offer evidence (mirrors the reference's verify_uncredited_onchain): the descriptor hashes
+   to the offer's deposit_id; the offer cosignature verifies over the DEP-10 digest (which binds
+   that deposit); the payment's block is on our chain; the accused signed PROOF-SEQUENCE at least
+   REQUIRED-CONFIRMATIONS later; and no OnchainCredit of the payment at or before it."
+  (handler-case
+      (let* ((deposit (offer-deposit-id proof))
+             (txid (hex->bytes (e proof :txid))) (vout (e proof :vout))
+             (digest (lg:offer-cosign-digest (getf proof :ledger-id) (hex->bytes (e proof :offer-id)) deposit
+                                             (hex->bytes (e proof :accused-operator-pubkey)) (e proof :funding-address)
+                                             (e proof :deadline-block) (hex->bytes (e proof :cosigner-ledger-hash))))
+             (confirmed (funcall height-of-block (let ((b (e proof :confirmed-at-block-hash))) (if (stringp b) (hex->bytes b) b))))
+             (pu (find (e proof :proof-sequence) history :key #'up:update-seq))
+             (ph (and pu (funcall height-of-block (up:update-block-hash pu)))))
+        (cond ((not (and (stringp (e proof :descriptor)) (equalp (op:deposit-id (e proof :descriptor)) deposit)))
+               (values nil "descriptor does not hash to the offer's deposit_id"))
+              ((not (schnorr:schnorr-verify (up:x-only (hex->bytes (e proof :cosigner-pubkey))) digest (hex->bytes (e proof :cosign-signature))))
+               (values nil "offer cosignature does not verify"))
+              ((null confirmed) (values nil "confirmed_at_block_hash not in the verifier's chain"))
+              ((null pu) (values nil "proof_sequence not in the accused's history"))
+              ((null ph) (values nil "the proof_sequence update's block is not on the verifier's chain"))
+              ((< (- ph confirmed) (e proof :required-confirmations)) (values nil "too soon after the payment confirmed"))
+              ((onchain-credited-p history (up:update-seq pu) txid vout) (values nil "the payment was credited: not fraud"))
+              (t (values t nil))))
+    (error (c) (values nil (princ-to-string c)))))
+
+(defun onchain-credited-p (history upto-seq txid vout &optional (after-seq -1))
+  "An OnchainCredit of TXID:VOUT in HISTORY after AFTER-SEQ, at or before UPTO-SEQ."
+  (some (lambda (u)
+          (and (< after-seq (up:update-seq u) (1+ upto-seq))
+               (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                 (labels ((hit (o) (case (op:operation-type o)
+                                     (:onchain-credit (and (equalp (op:field o :txid) txid) (eql (op:field o :vout) vout)))
+                                     (:batch (some #'hit (op:field o :operations))))))
+                   (and o (hit o))))))
+        history))
+
+(defun make-uncredited-offer-proof (ledger-id-hex offer descriptor txid vout amount-sats confirmed-block-hash
+                                    required-confirmations proof-update)
+  "DEP-06 offer evidence (a wallet's): OFFER is the cosigned offer as the operator returned it
+   (JSON object: offer_id, deposit_id, operator_id, funding_address, deadline_block,
+   cosigner_pubkey, cosigner_ledger_hash, cosign_signature); PROOF-UPDATE the operator's update
+   past the payment's confirmations that does not credit it."
+  (list :type :uncredited-onchain-payment :accused (w:jget offer "operator_id") :ledger-id ledger-id-hex
+        :evidence (list :offer-id (w:jget offer "offer_id") :deposit-id (w:jget offer "deposit_id") :descriptor descriptor
+                        :funding-address (w:jget offer "funding_address") :accused-operator-pubkey (w:jget offer "operator_id")
+                        :deadline-block (w:jget offer "deadline_block") :cosigner-pubkey (w:jget offer "cosigner_pubkey")
+                        :cosigner-ledger-hash (w:jget offer "cosigner_ledger_hash") :cosign-signature (w:jget offer "cosign_signature")
+                        :txid (bytes->hex txid) :vout vout :amount-sats amount-sats
+                        :confirmed-at-block-hash confirmed-block-hash :required-confirmations required-confirmations
+                        :proof-sequence (up:update-seq proof-update))))
+
+(defun payment-entry (proof)
+  "The owed entry of an offer-evidence proof: (:deposit-id :amount msat :descriptor)."
+  (list :deposit-id (offer-deposit-id proof) :amount (* 1000 (e proof :amount-sats)) :descriptor (e proof :descriptor)
+        :fees (op:make-fees)))
+
+(defun check-uncredited-record (ledger bytes)
+  "DEP-06 ObligationRecord (payment form), self-contained: offer evidence against LEDGER, its
+   descriptor hashing to its deposit_id, its cosignature by a member of LEDGER's quorum."
+  (let ((proof (json->proof (w:parse-json (bytes->ascii bytes)))))
+    (unless (and (eq (getf proof :type) :uncredited-onchain-payment) (not (e proof :source-qb-update)) (e proof :offer-id))
+      (error "not an UncreditedOnchainPayment with offer evidence"))
+    (unless (string-equal (getf proof :ledger-id) (bytes->hex (lg:ledger-id ledger))) (error "the proof is against another ledger"))
+    (let ((deposit (offer-deposit-id proof)) (cosigner (hex->bytes (e proof :cosigner-pubkey))))
+      (unless (and (stringp (e proof :descriptor)) (equalp (op:deposit-id (e proof :descriptor)) deposit))
+        (error "descriptor does not hash to the offer's deposit_id"))
+      (unless (member cosigner (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
+        (error "the offer's cosigner is not a member of the ledger's quorum"))
+      (unless (schnorr:schnorr-verify (up:x-only cosigner)
+                                      (lg:offer-cosign-digest (getf proof :ledger-id) (hex->bytes (e proof :offer-id)) deposit
+                                                              (hex->bytes (e proof :accused-operator-pubkey)) (e proof :funding-address)
+                                                              (e proof :deadline-block) (hex->bytes (e proof :cosigner-ledger-hash)))
+                                      (hex->bytes (e proof :cosign-signature)))
+        (error "offer cosignature does not verify")))
+    proof))
+
+(setf lg:*uncredited-proof-checker* #'check-uncredited-record)
+
 (defun unpaid-in-tx (entries tx)
   "DEP-06: the ENTRIES no output of TX pays (the splice-out rule's script and value)."
   (let ((outs (mapcar (lambda (o) (cons (btx:txout-script o) (btx:txout-value o))) (btx:tx-outputs tx))))
@@ -616,8 +703,8 @@
         history))
 
 (defun obligation-context (history acquire-update notice-hex qb-hex)
-  "Shared by the producer and verifier of UnhonouredObligation: the ledger before the acquire and
-   the source evidence checked against it.  (values notice qb qu prefix-ledger prefix) or an error."
+  "A migration's UnhonouredObligation context: the ledger before the acquire and the source
+   evidence checked against it.  (values notice qb qu prefix-ledger prefix) or an error."
   (let* ((prefix (remove-if-not (lambda (u) (< (up:update-seq u) (up:update-seq acquire-update))) history))
          (l (lg:replay prefix))
          (a (or (lg:ledger-dormancy-accept l) (error "no accept before the custody change"))))
@@ -627,32 +714,61 @@
         (error "the migration was not dangling at the custody change"))
       (values notice qb qu l prefix))))
 
-(defun unhonoured-obligation-proof (history acquire-update confiscation-tx notice-update qb-update)
+(defun obligation-owed (history acquire-update evidence height-of-block)
+  "The owed obligation EVIDENCE (a plist: :source-notice-update/:source-qb-update hex, or
+   :uncredited-proof JSON text) names: (values entries credited-p prefix), CREDITED-P a function
+   (pu-seq) true when the new operator credited it after the acquire, at or before PU-SEQ.  With
+   HEIGHT-OF-BLOCK a payment proof is verified against the history before the acquire."
+  (let ((prefix (remove-if-not (lambda (u) (< (up:update-seq u) (up:update-seq acquire-update))) history))
+        (aseq (up:update-seq acquire-update)))
+    (if (getf evidence :uncredited-proof)
+        (let* ((proof (json->proof (w:parse-json (getf evidence :uncredited-proof))))
+               (txid (hex->bytes (e proof :txid))) (vout (e proof :vout)))
+          (unless (and (eq (getf proof :type) :uncredited-onchain-payment) (e proof :offer-id)
+                       (string-equal (getf proof :ledger-id) (bytes->hex (up:update-ledger-id acquire-update))))
+            (error "not offer evidence against this ledger"))
+          (when height-of-block
+            (multiple-value-bind (ok why) (verify-uncredited-onchain proof prefix height-of-block)
+              (unless ok (error "the payment proof does not verify before the custody change: ~a" why))))
+          (values (list (payment-entry proof))
+                  (lambda (pu-seq) (onchain-credited-p history pu-seq txid vout aseq))
+                  prefix))
+        (multiple-value-bind (notice qb) (obligation-context history acquire-update (getf evidence :source-notice-update)
+                                                             (getf evidence :source-qb-update))
+          (declare (ignore notice))
+          (values (op:field qb :migration-manifest)
+                  (lambda (pu-seq) (residue-credited-p history aseq pu-seq (op:field qb :new-outpoint-txid) (op:field qb :migration-vout)))
+                  prefix)))))
+
+(defun unhonoured-obligation-proof (history acquire-update confiscation-tx &key notice-update qb-update uncredited-proof)
   "DEP-06 producer: an UnhonouredObligation against the new operator (ACQUIRE-UPDATE's custodian)
    whose HISTORY (ascending) has an update its governing service_response_blocks past the acquire
-   without crediting the residue of the dangling migration (NOTICE-UPDATE, QB-UPDATE) that
-   CONFISCATION-TX did not pay.  NIL otherwise."
+   without crediting the residue — of a dangling migration (NOTICE-UPDATE, QB-UPDATE) or of a
+   proven-uncredited payment (UNCREDITED-PROOF, its JSON text) — that CONFISCATION-TX did not pay.
+   NIL otherwise."
   (ignore-errors
-   (multiple-value-bind (notice qb) (obligation-context history acquire-update (bytes->hex (up:encode-update notice-update))
-                                                       (bytes->hex (up:encode-update qb-update)))
-     (declare (ignore notice))
-     (when (unpaid-in-tx (op:field qb :migration-manifest) confiscation-tx)
-       (let* ((srb (governing-service-response-blocks history (up:update-seq acquire-update)))
-              (pu (car (last (remove-if (lambda (u) (< (up:update-block-height u) (+ (up:update-block-height acquire-update) srb))) history)))))
-         (when (and pu (not (residue-credited-p history (up:update-seq acquire-update) (up:update-seq pu)
-                                                (op:field qb :new-outpoint-txid) (op:field qb :migration-vout))))
-           (list :type :unhonoured-obligation
-                 :accused (bytes->hex (op:field (op:decode-operation (up:update-message acquire-update)) :new-custodian))
-                 :ledger-id (bytes->hex (up:update-ledger-id acquire-update))
-                 :evidence (list :source-notice-update (bytes->hex (up:encode-update notice-update))
-                                 :source-qb-update (bytes->hex (up:encode-update qb-update))
-                                 :acquire-update (bytes->hex (up:encode-update acquire-update))
-                                 :confiscation-tx (bytes->hex (btx:serialize-tx confiscation-tx :witness nil))
-                                 :proof-update (bytes->hex (up:encode-update pu))))))))))
+   (let ((ev (if uncredited-proof
+                 (list :uncredited-proof uncredited-proof)
+                 (list :source-notice-update (bytes->hex (up:encode-update notice-update))
+                       :source-qb-update (bytes->hex (up:encode-update qb-update))))))
+     (multiple-value-bind (entries credited-p) (obligation-owed history acquire-update ev nil)
+       (when (unpaid-in-tx entries confiscation-tx)
+         (let* ((srb (governing-service-response-blocks history (up:update-seq acquire-update)))
+                (pu (car (last (remove-if (lambda (u) (< (up:update-block-height u) (+ (up:update-block-height acquire-update) srb))) history)))))
+           (when (and pu (not (funcall credited-p (up:update-seq pu))))
+             (list :type :unhonoured-obligation
+                   :accused (bytes->hex (op:field (op:decode-operation (up:update-message acquire-update)) :new-custodian))
+                   :ledger-id (bytes->hex (up:update-ledger-id acquire-update))
+                   :evidence (list :source-notice-update (or (getf ev :source-notice-update) "")
+                                   :source-qb-update (or (getf ev :source-qb-update) "")
+                                   :uncredited-proof (or uncredited-proof "")
+                                   :acquire-update (bytes->hex (up:encode-update acquire-update))
+                                   :confiscation-tx (bytes->hex (btx:serialize-tx confiscation-tx :witness nil))
+                                   :proof-update (bytes->hex (up:encode-update pu)))))))))))
 
 (defun verify-unhonoured-obligation (proof history height-of-block)
   "DEP-06 §Confiscation obligations: the accused took custody (DisputeAcquire naming the
-   confiscation), a dangling migration's residue was not paid by that confiscation, and the
+   confiscation), a dangling obligation's residue was not paid by that confiscation, and the
    accused signed PROOF-UPDATE its governing service_response_blocks after the acquire without
    crediting it.  HISTORY is the accused ledger's; (values ok reason)."
   (handler-case
@@ -661,13 +777,15 @@
              (tx (btx:parse-tx (bw:make-reader (hex->bytes (e proof :confiscation-tx)))))
              (pu (up:decode-update (hex->bytes (e proof :proof-update))))
              (in (lambda (u) (let ((o (find (up:update-seq u) history :key #'up:update-seq)))
-                               (and o (equalp (up:chain-hash o) (up:chain-hash u)))))))
+                               (and o (equalp (up:chain-hash o) (up:chain-hash u))))))
+             (ev (if (plusp (length (or (e proof :uncredited-proof) "")))
+                     (list :uncredited-proof (e proof :uncredited-proof))
+                     (list :source-notice-update (e proof :source-notice-update) :source-qb-update (e proof :source-qb-update)))))
         (if (not (and (eq (op:operation-type ao) :dispute-acquire) (funcall in au)
                       (string-equal (bytes->hex (op:field ao :new-custodian)) (getf proof :accused))
                       (equalp (op:field ao :confiscation-txid) (btx:tx-txid tx))))
             (values nil "acquire_update is not the accused's custody change naming this confiscation")
-            (multiple-value-bind (notice qb qu l prefix) (obligation-context history au (e proof :source-notice-update) (e proof :source-qb-update))
-              (declare (ignore notice qu l))
+            (multiple-value-bind (entries credited-p prefix) (obligation-owed history au ev height-of-block)
               (let* ((vault-qb (find :quorum-begin (reverse prefix) :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u))))))
                      (vo (and vault-qb (op:decode-operation (up:update-message vault-qb))))
                      (in0 (first (btx:tx-inputs tx)))
@@ -678,14 +796,13 @@
                   ((not (and vo (equalp (btx:txin-prev-hash in0) (op:field vo :new-outpoint-txid))
                              (eql (btx:txin-prev-index in0) (op:field vo :new-outpoint-vout))))
                    (values nil "confiscation_tx does not spend the ledger's vault"))
-                  ((null (unpaid-in-tx (op:field qb :migration-manifest) tx)) (values nil "the confiscation paid every entry: no residue"))
+                  ((null (unpaid-in-tx entries tx)) (values nil "the confiscation paid every entry: no residue"))
                   ((not (and (up:verify-operator-signature pu) (string-equal (bytes->hex (up:update-operator-id pu)) (getf proof :accused))
                              (equalp (up:update-ledger-id pu) (up:update-ledger-id au)) (funcall in pu)))
                    (values nil "proof_update is not the accused's update in its history"))
                   ((not (and ah ph (= ph (up:update-block-height pu)))) (values nil "the updates' blocks are not on the verifier's chain"))
                   ((< (- ph ah) srb) (values nil (format nil "the proof update is fewer than ~a blocks after the custody change" srb)))
-                  ((residue-credited-p history (up:update-seq au) (up:update-seq pu) (op:field qb :new-outpoint-txid) (op:field qb :migration-vout))
-                   (values nil "the residue was credited: not fraud"))
+                  ((funcall credited-p (up:update-seq pu)) (values nil "the residue was credited: not fraud"))
                   (t (values t nil)))))))
     (error (c) (values nil (princ-to-string c)))))
 
@@ -699,7 +816,7 @@
     (:uncredited-onchain-payment
      (if (e proof :source-qb-update)
          (verify-uncredited-migration proof history height-of-block)
-         (values nil "cannot verify offer evidence here")))
+         (verify-uncredited-onchain proof history height-of-block)))
     (t (values nil (format nil "cannot verify ~a here" (getf proof :type))))))
 
 ;;; ---------------------------------------------------------------------------

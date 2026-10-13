@@ -151,7 +151,8 @@
     (105 :migration-credit
      (:source-notice-update 346 :bytes) (:source-qb-update 348 :bytes) (:confiscation-tx 350 :bytes :optional))
     (106 :obligation-record
-     (:source-notice-update 346 :bytes) (:source-qb-update 348 :bytes))
+     (:source-notice-update 346 :bytes :optional) (:source-qb-update 348 :bytes :optional)
+     (:uncredited-proof 356 :bytes :optional))
     (101 :exit-cancel
      (:deposit-id 200 :deposit-id) (:exit-request-id 304 :bytes32) (:nonce 288 :u64) (:expiry 290 :u32)
      (:witness 204 :witness) (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))))

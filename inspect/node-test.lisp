@@ -1578,7 +1578,7 @@
         (check "the destination's offer is cosigned by a member" (w:jget offer "cosign_signature"))
         (check "and verifies against the DEP-10 digest"
                (secp:schnorr-verify (up:x-only (u:hex->bytes (w:jget offer "cosigner_pubkey")))
-                                    (nd::offer-cosign-digest dst (u:hex->bytes (w:jget offer "offer_id")) (nd:node-pubkey b)
+                                    (nd::offer-cosign-digest dst (u:hex->bytes (w:jget offer "offer_id")) (u:hex->bytes (w:jget offer "deposit_id")) (nd:node-pubkey b)
                                                              (w:jget offer "funding_address") (w:jget offer "deadline_block")
                                                              (u:hex->bytes (w:jget offer "cosigner_ledger_hash")))
                                     (u:hex->bytes (w:jget offer "cosign_signature"))))
@@ -1614,7 +1614,7 @@
     (dolist (c cases)
       (flet ((f (k) (cdr (assoc k c :test #'string=))))
         (check-equal (format nil "~a digest" (f "case"))
-                     (u:bytes->hex (nd::offer-cosign-digest (f "ledger") (u:hex->bytes (f "offer")) (u:hex->bytes (f "operator"))
+                     (u:bytes->hex (nd::offer-cosign-digest (f "ledger") (u:hex->bytes (f "offer")) (u:hex->bytes (f "deposit")) (u:hex->bytes (f "operator"))
                                                             (f "address") (parse-integer (f "deadline")) (u:hex->bytes (f "member_ledger_hash"))))
                      (f "digest"))))))
 
