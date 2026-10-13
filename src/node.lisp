@@ -1098,7 +1098,7 @@
                    (let ((lg:*block-height* block-height) (lg:*update-seq* seq))
                      (lg:apply-operation (lg:copy-ledger (record-ledger rec)) o)))
                  (multiple-value-bind (required signers tier operator-alone allowed)
-                     (lg:cosign-requirement ledger o (height node))
+                     (lg:cosign-requirement ledger o block-height)
                    (declare (ignore required signers tier operator-alone))
                    (unless allowed (fail "not cosignable at this height")))
                  (when (eq (op:operation-type o) :quorum-begin) (check-quorum-begin-vault node rec o params block-height))
