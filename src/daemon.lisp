@@ -156,7 +156,8 @@
                 (u (nd::dormancy-accept node rec (op:decode-manifest (hex->bytes (arg form :manifest)))
                                         (if (arg form :offer) (hex->bytes (arg form :offer)) (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
                                         (arg form :total) :expiry-blocks (arg form :expiry-blocks 288)
-                                        :premium-deposit (and (arg form :premium-deposit) (hex->bytes (arg form :premium-deposit))))))
+                                        :premium-deposit (and (arg form :premium-deposit) (hex->bytes (arg form :premium-deposit)))
+                                        :source-ledger (and (arg form :source) (hex->bytes (arg form :source))))))
            (ok :seq (up:update-seq u) :accept (bytes->hex (up:encode-update u))
                :address (nd::accept-address node rec))))
         (:dormancy-credit

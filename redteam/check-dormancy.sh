@@ -36,7 +36,7 @@ mine 7 >/dev/null; sleep 5
 H=$(bcli getblockcount)
 r=$(cld_ctl $OP "(:dormancy-offer :ledger \"$X\")"); expect "$r" "dormancy-offer"
 M=$(sx "$r" ":MANIFEST"); [ "$(sx "$r" ":COUNT")" = 1 ] || fail "the offer should list only the small deposit: $r"
-r=$(cld_ctl $OP2 "(:dormancy-accept :ledger \"$Y\" :manifest \"$M\" :total 335000)"); expect "$r" "dormancy-accept (receiver's members cosign)"
+r=$(cld_ctl $OP2 "(:dormancy-accept :ledger \"$Y\" :manifest \"$M\" :total 335000 :source \"$X\")"); expect "$r" "dormancy-accept (receiver's members cosign)"
 ACC=$(sx "$r" ":ACCEPT"); MA=$(sx "$r" ":ADDRESS")
 expect "$(cld_ctl $OP "(:dormancy-notice :ledger \"$X\" :rotation-height $((H + 4)) :receiver \"$(pubkey_of $OP2)\" :manifest \"$M\" :accept \"$ACC\")")" "dormancy-notice with migration"
 A=$(wcli getnewaddress "" bech32m)

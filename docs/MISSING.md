@@ -84,10 +84,14 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   no embedding) — gated and vectored, not yet run live. Since 2026-10-13 (§8.3 phase 1): the accept names
   the receiver's vault script and freezes its rotation until resolved; a receiver credits only by
   `MigrationCredit` (the source's signed notice and consuming QuorumBegin, which records
-  `consumed_notice`); the migration output is spliced as a second tier-signed vault input. Still
-  open (phase 2): the confiscation does not yet sweep unspliced migration outputs or splice out
-  dangling obligations, and proof 11 (`UnhonouredObligation`) is unimplemented; no live run of
-  the vault-script splice across implementations yet.
+  `consumed_notice`); the migration output is spliced as a second tier-signed vault input. Phase 2
+  (2026-10-13): disputing members record a dangling migration on their forks (`ObligationRecord`);
+  the confiscation sweeps the migration outputs at the vault script and splices the owed entries
+  out to their depositors' key-path addresses (pinned builder, shared vector); the winner records
+  `confiscation_txid` and credits the residue with `MigrationCredit`, else `UnhonouredObligation`
+  (proof 11, self-evident). Not yet run live: the cross-implementation vault-script splice and a
+  confiscation with obligations. Ordinary (DEP-10 offer) uncredited payments are not yet owed at
+  confiscation: their evidence does not bind a deposit (the offer cosign digest omits it).
 - ~~**Operator stand-down after confiscation.**~~ **Done (2026-10-01):** a cl operator stands down
   once custody moves or a majority of its quorum disputes it (cl 9b1a6d4), and cl members refuse
   to extend a deposed operator's chain (3e1ad0f), as the reference's members already did.

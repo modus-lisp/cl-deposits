@@ -113,7 +113,8 @@
      (:last-valid-sequence 102 :u64) (:reason 100 :string) (:anchor-block-hash 292 :bytes32 :optional)
      (:anchor-block-height 294 :u32 :optional) (:fraud-proof-hash 344 :bytes32 :optional))
     (55 :dispute-acquire
-     (:new-custodian 108 :pubkey) (:claim-txid 110 :bytes32) (:new-reserves-address 120 :string))
+     (:new-custodian 108 :pubkey) (:claim-txid 110 :bytes32) (:new-reserves-address 120 :string)
+     (:confiscation-txid 352 :bytes32 :optional))
     (56 :dispute-yield)
     (57 :dispute-armed
      (:armed-block 118 :u32) (:commitment-hash 112 :bytes20) (:target-reserves 122 :string)
@@ -145,8 +146,11 @@
      (:receiver-quorum-begin 342 :bytes :optional))
     (103 :dormancy-accept
      (:deposit-id 200 :deposit-id :optional) (:exit-address 300 :bytes) (:expires-at-height 302 :u32)
-     (:manifest-hash 308 :bytes32) (:offer-event-id 310 :bytes32) (:accepted-total 312 :u64))
+     (:manifest-hash 308 :bytes32) (:offer-event-id 310 :bytes32) (:accepted-total 312 :u64)
+     (:source-ledger-id 354 :bytes32 :optional))
     (105 :migration-credit
+     (:source-notice-update 346 :bytes) (:source-qb-update 348 :bytes) (:confiscation-tx 350 :bytes :optional))
+    (106 :obligation-record
      (:source-notice-update 346 :bytes) (:source-qb-update 348 :bytes))
     (101 :exit-cancel
      (:deposit-id 200 :deposit-id) (:exit-request-id 304 :bytes32) (:nonce 288 :u64) (:expiry 290 :u32)

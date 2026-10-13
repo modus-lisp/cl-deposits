@@ -23,6 +23,7 @@
            #:exit-dust-msats #:completion-satisfied-p #:fees-due #:spk-type #:dust-floor-sats #:standard-output-p #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
            #:ledger-dormancy-notice #:dormancy-spin-outs #:dormancy-amount-msats #:deposit-last-signed-activity
            #:pk-key-path-spk #:dormancy-cost #:dormancy-migration #:ledger-dormancy-accept #:dormancy-offer-entries #:segwit-address-spk
+           #:migration-evidence #:ledger-confiscation-txid #:unpaid-entries #:owed-spk-sats
            #:consumed-notice-id #:accept-outstanding-p
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-last-fee-assessment #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
@@ -87,7 +88,8 @@
   (reference-feerate nil)           ; the governing QuorumBegin's reference_feerate_sat_vb (DEP-03)
   (dormancy-blocks 26280) (dormancy-notice-blocks 2016)   ; DEP-20 §8, from the promoted members
   (dormancy-notice nil)             ; outstanding DormancyNotice: (:height h :rotation-height r [:manifest :receiver :spk :total :premium])
-  (dormancy-accept nil))            ; receiver: our DormancyAccept (:hash :spk :total :expires :premium-deposit :resolved :outpoint)
+  (dormancy-accept nil)             ; receiver: our DormancyAccept (:hash :spk :total :expires :premium-deposit :resolved :outpoint)
+  (confiscation-txid nil))          ; DEP-06: the confiscation a custody change followed (DisputeAcquire)
 
 (defun make-ledger () (%make-ledger))
 
@@ -251,6 +253,48 @@
   "DEP-20 §8.3 receiver: an accept not yet resolved, below expires_at_height + 6 at HEIGHT."
   (let ((a (ledger-dormancy-accept ledger)))
     (and a (not (getf a :resolved)) (< height (+ (getf a :expires) +accept-grace-blocks+)))))
+
+(defun migration-evidence (ledger notice-bytes qb-bytes)
+  "DEP-20 §8.3 / DEP-06: a source's signed DormancyNotice carrying an accept of LEDGER and the
+   source QuorumBegin that consumed it (same operator and ledger, later, naming the notice).
+   (values notice qb qb-update to-us), TO-US when QB migrates to the accept's signer; or a
+   ledger error."
+  (multiple-value-bind (nu notice qu qb)
+      (handler-case (let* ((nu (up:decode-update notice-bytes)) (qu (up:decode-update qb-bytes)))
+                      (values nu (op:decode-operation (up:update-message nu)) qu (op:decode-operation (up:update-message qu))))
+        (error () (fail :migration-evidence "the source updates do not decode")))
+    (let ((acc (and (eq (op:operation-type notice) :dormancy-notice) (op:field notice :dormancy-accept)
+                    (ignore-errors (up:decode-update (op:field notice :dormancy-accept))))))
+      (unless (and acc (up:verify-operator-signature nu) (equalp (up:update-ledger-id acc) (ledger-id ledger)))
+        (fail :migration-evidence "the notice does not carry this ledger's accept"))
+      (unless (and (eq (op:operation-type qb) :quorum-begin) (up:verify-operator-signature qu)
+                   (equalp (up:update-operator-id qu) (up:update-operator-id nu))
+                   (equalp (up:update-ledger-id qu) (up:update-ledger-id nu))
+                   (> (up:update-seq qu) (up:update-seq nu))
+                   (equalp (op:field qb :consumed-notice) (sha256 (up:update-message nu))))
+        (fail :migration-evidence "the QuorumBegin did not consume that notice"))
+      (values notice qb qu (and (op:field qb :migration-manifest)
+                                (equalp (op:field qb :migration-receiver) (up:update-operator-id acc)))))))
+
+(defconstant +confiscation-feerate+ 2
+  "The confiscation's feerate (both implementations build it at the DEP-03 default).")
+
+(defun owed-spk-sats (e &optional (feerate +confiscation-feerate+))
+  "DEP-06: the splice-out a confiscation pays an owed entry E — (values spk sats) when its
+   descriptor is pk(K) and floor(amount/1000) - feerate x 43 is at least 330; else NIL (residue)."
+  (let ((spk (pk-key-path-spk (getf e :descriptor))) (sats (- (floor (getf e :amount) 1000) (* feerate 43))))
+    (when (and spk (>= sats 330)) (values spk sats))))
+
+(defun unpaid-entries (ledger entries tx-bytes)
+  "The ENTRIES no output of the confiscation TX-BYTES (whose txid the ledger recorded) paid."
+  (let ((tx (handler-case (cl-consensus.tx:parse-tx (cl-consensus.wire:make-reader tx-bytes))
+              (error () (fail :migration-credit "confiscation_tx does not decode")))))
+    (unless (equalp (cl-consensus.tx:tx-txid tx) (ledger-confiscation-txid ledger))
+      (fail :migration-credit "confiscation_tx is not the recorded confiscation"))
+    (let ((outs (mapcar (lambda (o) (cons (cl-consensus.tx:txout-script o) (cl-consensus.tx:txout-value o))) (cl-consensus.tx:tx-outputs tx))))
+      (remove-if (lambda (e) (multiple-value-bind (spk sats) (owed-spk-sats e)
+                               (and spk (find-if (lambda (o) (and (equalp (car o) spk) (= (cdr o) sats))) outs))))
+                 entries))))
 
 (defun %open-migrated-deposit (ledger e)
   "DEP-20 §8.3: a migrated deposit opened on the receiver with its descriptor and fee schedule."
@@ -600,7 +644,8 @@
       (:ledger-close nil)
       (:dispute-enter (setf (ledger-dispute-state ledger) :disputed))
       (:dispute-armed (setf (ledger-dispute-state ledger) :armed))
-      (:dispute-acquire (setf (ledger-operator-key ledger) (f :new-custodian)
+      (:dispute-acquire (setf (ledger-confiscation-txid ledger) (f :confiscation-txid)
+                              (ledger-operator-key ledger) (f :new-custodian)
                               (ledger-vault-current-p ledger) nil (ledger-dormancy-notice ledger) nil
                               (ledger-dispute-state ledger) :normal))
       (:dormancy-notice
@@ -654,43 +699,41 @@
                                           (f :accepted-total) (ledger-reserves-amount ledger))))
          (setf (ledger-dormancy-accept ledger)
                (list :hash (f :manifest-hash) :spk (f :exit-address) :total (f :accepted-total)
-                     :expires (f :expires-at-height) :premium-deposit (f :deposit-id) :resolved nil :outpoint nil))))
+                     :expires (f :expires-at-height) :premium-deposit (f :deposit-id) :resolved nil :outpoint nil
+                     :source (f :source-ledger-id)))))
       (:migration-credit
        ;; DEP-20 §8.3: positive evidence — the source's signed notice and the QuorumBegin that consumed it.
        (let ((a (or (ledger-dormancy-accept ledger) (fail :migration-credit "no DormancyAccept to resolve"))))
          (when (getf a :resolved) (fail :migration-credit "the accept is already resolved"))
-         (multiple-value-bind (nu notice qu qb)
-             (handler-case (let* ((nu (up:decode-update (f :source-notice-update))) (qu (up:decode-update (f :source-qb-update))))
-                             (values nu (op:decode-operation (up:update-message nu)) qu (op:decode-operation (up:update-message qu))))
-               (error () (fail :migration-credit "the source updates do not decode")))
-           (let ((acc (and (eq (op:operation-type notice) :dormancy-notice) (op:field notice :dormancy-accept)
-                           (ignore-errors (up:decode-update (op:field notice :dormancy-accept))))))
-             (unless (and acc (up:verify-operator-signature nu)
-                          (equalp (up:update-ledger-id acc) (ledger-id ledger))
-                          (equalp (op:field notice :manifest-hash) (getf a :hash)))
-               (fail :migration-credit "the notice does not carry this ledger's accept"))
-             (unless (and (eq (op:operation-type qb) :quorum-begin) (up:verify-operator-signature qu)
-                          (equalp (up:update-operator-id qu) (up:update-operator-id nu))
-                          (equalp (up:update-ledger-id qu) (up:update-ledger-id nu))
-                          (> (up:update-seq qu) (up:update-seq nu))
-                          (equalp (op:field qb :consumed-notice) (sha256 (up:update-message nu))))
-               (fail :migration-credit "the QuorumBegin did not consume that notice"))
-             (if (and (op:field qb :migration-manifest)
-                      (equalp (op:field qb :migration-receiver) (ledger-operator-key ledger))
-                      (< (up:update-block-height qu) (getf a :expires)))
-                 (let ((sum (reduce #'+ (op:field qb :migration-manifest) :key (lambda (e) (getf e :amount))))
-                       (premium (or (op:field notice :premium) 0)))
-                   (when (> (+ sum premium) (getf a :total)) (fail :migration-credit "the migration exceeds the accepted total"))
-                   (dolist (e (op:field qb :migration-manifest))
-                     (unless (gethash (getf e :deposit-id) (ledger-deposits ledger))
-                       (%open-migrated-deposit ledger e))
-                     (%credit (find-deposit ledger (getf e :deposit-id)) (getf e :amount)))
-                   (let ((pd (and (getf a :premium-deposit) (gethash (getf a :premium-deposit) (ledger-deposits ledger)))))
-                     (when (and pd (plusp premium)) (%credit pd premium)))
-                   (setf (getf (ledger-dormancy-accept ledger) :outpoint) (cons (op:field qb :new-outpoint-txid) (op:field qb :migration-vout))
-                         (getf (ledger-dormancy-accept ledger) :resolved) t))
-                 ;; consumed without migrating to us: the accept is resolved, nothing credited
-                 (setf (ledger-dormancy-accept ledger) nil))))))
+         (multiple-value-bind (notice qb qu to-us) (migration-evidence ledger (f :source-notice-update) (f :source-qb-update))
+           (unless (equalp (op:field notice :manifest-hash) (getf a :hash))
+             (fail :migration-credit "the notice does not carry this ledger's accept"))
+           (if (and to-us (< (up:update-block-height qu) (getf a :expires)))
+               (let* ((sum (reduce #'+ (op:field qb :migration-manifest) :key (lambda (e) (getf e :amount))))
+                      (premium (or (op:field notice :premium) 0))
+                      ;; DEP-06: after a custody change only what the confiscation did not pay
+                      (entries (if (ledger-confiscation-txid ledger)
+                                   (let ((tx (or (f :confiscation-tx) (fail :migration-credit "after a custody change a MigrationCredit carries the confiscation"))))
+                                     (unpaid-entries ledger (op:field qb :migration-manifest) tx))
+                                   (op:field qb :migration-manifest))))
+                 (when (> (+ sum premium) (getf a :total)) (fail :migration-credit "the migration exceeds the accepted total"))
+                 (dolist (e entries)
+                   (unless (gethash (getf e :deposit-id) (ledger-deposits ledger))
+                     (%open-migrated-deposit ledger e))
+                   (%credit (find-deposit ledger (getf e :deposit-id)) (getf e :amount)))
+                 (let ((pd (and (getf a :premium-deposit) (gethash (getf a :premium-deposit) (ledger-deposits ledger)))))
+                   (when (and pd (plusp premium) (not (ledger-confiscation-txid ledger))) (%credit pd premium)))
+                 (setf (getf (ledger-dormancy-accept ledger) :outpoint)
+                       (and (not (ledger-confiscation-txid ledger))   ; a confiscation swept it
+                            (cons (op:field qb :new-outpoint-txid) (op:field qb :migration-vout)))
+                       (getf (ledger-dormancy-accept ledger) :resolved) t))
+               ;; consumed without migrating to us: the accept is resolved, nothing credited
+               (setf (ledger-dormancy-accept ledger) nil)))))
+      (:obligation-record
+       ;; DEP-06 §Confiscation obligations: on a fork, before arming; evidence only, no state.
+       (unless (eq (ledger-dispute-state ledger) :disputed)
+         (fail :obligation-record "an obligation is recorded on a disputing fork before arming"))
+       (migration-evidence ledger (f :source-notice-update) (f :source-qb-update)))
       (:exit-request
        (unless (spk-type (f :exit-address)) (fail :exit-address "not a standard output script (DEP-20 §3)"))
        (let ((d (find-deposit ledger (f :deposit-id))))

@@ -1384,7 +1384,7 @@
   (let ((reserves (disputed-reserves node rec)))
     (values (rs:reserves-address reserves) (rs:reserves-spk reserves))))
 
-(defun dormancy-accept (node rec manifest offer-event-id total &key (expiry-blocks 288) premium-deposit)
+(defun dormancy-accept (node rec manifest offer-event-id total &key (expiry-blocks 288) premium-deposit source-ledger)
   "DEP-20 §8.3 receiver: accept a manifest.  Cosigners check its hash, our capacity and fee floors.
    Returns the signed update (its bytes go into the source's DormancyNotice)."
   (let ((hash (sha256 (op:encode-manifest manifest))))
@@ -1394,7 +1394,8 @@
         (append-operation node rec (%strip-nil-fields
                                     (list :type :dormancy-accept :deposit-id premium-deposit :exit-address spk
                                           :expires-at-height (+ (height node) expiry-blocks) :manifest-hash hash
-                                          :offer-event-id offer-event-id :accepted-total total)))))))
+                                          :offer-event-id offer-event-id :accepted-total total
+                                          :source-ledger-id source-ledger)))))))
 
 (defun check-dormancy-accept (node rec o params)
   "A receiver's cosigner: the accept names our current vault script, the manifest the request
@@ -2190,6 +2191,7 @@
                                    (ignore-errors (drive-dereliction node))
                                    (ignore-errors (drive-vault-watch node))
                                    (ignore-errors (drive-migration-watch node))
+                                   (ignore-errors (drive-obligation-watch node))
                                    (ignore-errors (drive-rotation-rebroadcast node))))
                   :name "cld-expiry"))
 
@@ -2618,10 +2620,27 @@
                      (fail "pledge confirmed at ~a, our chain height is still ~a" created (height node)))
                    (sleep 0.5)))))))
 
+(defun record-obligations (node fork)
+  "DEP-06: if the disputed ledger had an unresolved DormancyAccept at the fork point and its source
+   consumed the notice, append an ObligationRecord (the source's notice and QuorumBegin) to FORK."
+  (let* ((id (record-id-hex fork)) (base (find-record node id)) (lvs (dispute-last-valid-seq node id))
+         (l (and base lvs (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base))))))
+         (a (and l (lg:ledger-dormancy-accept l))))
+    (when (and a (not (getf a :resolved)) (getf a :source))
+      (multiple-value-bind (nu qu) (migration-source-updates node a (bytes->hex (getf a :source)))
+        (when qu
+          (commit-update node fork (new-update node fork (list :type :obligation-record
+                                                               :source-notice-update (up:encode-update nu)
+                                                               :source-qb-update (up:encode-update qu))))
+          (log! node "recorded the dangling migration of ~a on our fork" (subseq id 0 8)))))))
+
 (defun arm-dispute (node fork &key seed replacement)
   "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL."
   (let ((preimage (lot:derive-preimage (or seed (lottery-seed node (record-id-hex fork))))))
     (when replacement (await-pledge-height node replacement))
+    ;; DEP-06 §Confiscation obligations: record a dangling migration before arming.
+    (handler-case (record-obligations node fork)
+      (error (e) (log! node "obligation record on ~a: ~a" (subseq (record-id-hex fork) 0 8) e)))
     (setf (record-preimage fork) preimage)
     (commit-update node fork (new-update node fork (%strip-nil-fields
                                                     (list :type :dispute-armed :armed-block (height node)
@@ -2785,6 +2804,57 @@
             do (setf best i))
     best))
 
+(defun outpoint-at-snapshot (node txid vout snapshot)
+  "An output confirmed by SNAPSHOT and unspent through it: its sats, else NIL (pledge-fn facts)."
+  (let ((facts (and (node-pledge-fn node) (funcall (node-pledge-fn node) txid vout (1+ snapshot)))))
+    (and facts (getf facts :value-sats) (getf facts :created) (<= (getf facts :created) snapshot)
+         (let ((spend (getf facts :spend))) (or (eq spend :unspent) (and (consp spend) (> (second spend) snapshot))))
+         (getf facts :value-sats))))
+
+(defun confiscation-obligations (node id-hex participants snapshot)
+  "DEP-06 §Confiscation obligations: (values swept splice-outs residue-sats) for the confiscation of
+   ID-HEX.  SWEPT ((txid vout sats) ...) ascending; SPLICE-OUTS ((spk . sats) ...) ascending by
+   deposit id; RESIDUE-SATS the owed entries no splice-out pays.  From the ledger at the fork
+   point and the ObligationRecords on PARTICIPANTS' forks below their DisputeArmed."
+  (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
+         (lvs (dispute-last-valid-seq node id-hex))
+         (l (if lvs (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base)))) (record-ledger base)))
+         (a (lg:ledger-dormancy-accept l))
+         (swept '()) (outs '()) (residue 0))
+    (when a
+      ;; a credited migration output not yet spliced backs the ledger's own deposits
+      (when (getf a :outpoint)
+        (let ((sats (outpoint-at-snapshot node (car (getf a :outpoint)) (cdr (getf a :outpoint)) snapshot)))
+          (when sats (push (list (car (getf a :outpoint)) (cdr (getf a :outpoint)) sats) swept))))
+      ;; dangling: recorded on a participant's fork, unresolved at the fork point
+      (unless (getf a :resolved)
+        (let ((seen '()))
+          (dolist (p participants)
+            (let ((fork (find-fork node id-hex (first p))))
+              (dolist (u (and fork (reverse (record-history fork))))
+                (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                  (when (and o (eq (op:operation-type o) :obligation-record) (< (up:update-seq u) (sixth p)))
+                    (multiple-value-bind (notice qb qu to-us)
+                        (ignore-errors (lg:migration-evidence l (op:field o :source-notice-update) (op:field o :source-qb-update)))
+                      (when (and qb to-us
+                                 (equalp (op:field notice :manifest-hash) (getf a :hash))
+                                 (< (up:update-block-height qu) (getf a :expires)))
+                        (let* ((txid (op:field qb :new-outpoint-txid)) (vout (op:field qb :migration-vout))
+                               (sats (and (not (member (cons txid vout) seen :test #'equalp))
+                                          (outpoint-at-snapshot node txid vout snapshot))))
+                          (when sats
+                            (push (cons txid vout) seen)
+                            (push (list txid vout sats) swept)
+                            (dolist (e (op:field qb :migration-manifest))
+                              (multiple-value-bind (spk v) (lg:owed-spk-sats e)
+                                (if spk
+                                    (push (list (getf e :deposit-id) spk v) outs)
+                                    (incf residue (floor (getf e :amount) 1000)))))))))))))))))
+    (values (sort swept (lambda (x y) (or (bytes< (first x) (first y))
+                                          (and (equalp (first x) (first y)) (< (second x) (second y))))))
+            (mapcar #'cdr (sort outs #'bytes< :key #'first))
+            residue)))
+
 (defun build-confiscation (node id-hex &key respectful fee tier-index armers)
   "The confiscation transaction for a disputed ledger, from public state only,
    so every cosigner rebuilds the same one.  It spends the reserves through
@@ -2799,19 +2869,18 @@
          (lottery (progn (when (null participants) (fail "no armer is a lottery participant"))
                          (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword)))))
     (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node base)
-      (let* ((fee (or fee (lot:confiscation-fee (1+ (length voters)))))   ; DEP-03: members + operator
-             (tier-index (or tier-index (confiscation-tier reserves (height node))))
-             (locktime (rs:tier-locktime (nth tier-index (rs:reserves-tiers reserves))))
-             (outs (lot:confiscation-outputs (lot:lottery-spk lottery) sats fee :respectful respectful
-                                             :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
-                                             :operator-pubkey33 operator))
-             (tx (btx:parse-tx (bw:make-reader
-                                (btx:serialize-tx
-                                 (btx:make-tx :version 2 :locktime locktime :segwit-p t
-                                              :inputs (list (btx:make-txin :prev-hash txid :prev-index vout :script (octets) :sequence rot:+sequence-rbf+))
-                                              :outputs (loop for (spk . v) in outs collect (btx:make-txout :value v :script spk))
-                                              :witnesses (list nil)))))))
-        (values tx lottery (vector (cons sats (rs:reserves-spk reserves))) reserves tier-index)))))
+      (multiple-value-bind (swept splice-outs residue)
+          (confiscation-obligations node id-hex armers (nth-value 2 (lottery-armers node id-hex)))
+        (let* ((tier-index (or tier-index (confiscation-tier reserves (height node))))
+               (tx (lot:confiscation-tx :vault (list txid vout sats) :swept swept :lottery-spk (lot:lottery-spk lottery)
+                                        :voters (1+ (length voters)) :locktime (rs:tier-locktime (nth tier-index (rs:reserves-tiers reserves)))
+                                        :respectful respectful :fee fee
+                                        :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
+                                        :residue-sats residue :splice-outs splice-outs :operator-pubkey33 operator)))
+          (values tx lottery (coerce (cons (cons sats (rs:reserves-spk reserves))
+                                           (loop for (nil nil ss) in swept collect (cons ss (rs:reserves-spk reserves))))
+                                     'vector)
+                  reserves tier-index))))))
 
 (defun unsigned-tx-hex (tx)
   "An unsigned transaction as we send it to other signers: the legacy form.
@@ -2828,8 +2897,13 @@
   "Build the confiscation, gather the recovery quorum's tier-0 signatures over
    the relay (confiscation_sign), assemble, and broadcast.  Returns (values tx lottery)."
   (multiple-value-bind (tx lottery prevouts reserves tier-index) (build-confiscation node id-hex :respectful respectful :fee fee)
-    (setf fee (- (car (aref prevouts 0)) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))
+    (setf fee (- (reduce #'+ prevouts :key #'car) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))
     (let* ((sighash (confiscation-sighash tx prevouts reserves tier-index))
+           ;; DEP-06: swept migration outputs are spent through the same tier, one signature each
+           (sweep-hashes (loop for i from 1 below (length prevouts)
+                               collect (rot:tier-sighash tx i prevouts (nth tier-index (rs:reserves-leaves reserves)))))
+           (sweep-sigs (list (cons (up:x-only (node-pubkey node))
+                                   (mapcar (lambda (h) (schnorr:schnorr-sign (node-priv node) h (random-aux))) sweep-hashes))))
            (tier (nth tier-index (rs:reserves-tiers reserves)))
            (keys (rs:tier-keys tier))
            (ours (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))
@@ -2838,6 +2912,7 @@
                                     ;; The reference's field names: sighash, unsigned_tx, last_valid_sequence.
                                     (w:json-object "sighash" (bytes->hex sighash) "respectful" (and respectful t) "fee_sats" fee
                                                    "tier_index" tier-index
+                                                   "sweep_sighashes" (and sweep-hashes (coerce (mapcar #'bytes->hex sweep-hashes) 'vector))
                                                    "unsigned_tx" (unsigned-tx-hex tx)
                                                    "last_valid_sequence" (lg:ledger-sequence (record-ledger (or (find-fork node id-hex (node-pubkey node)) (find-record node id-hex)))))
                                     :want (1- (rs:tier-threshold tier)) :timeout 20 :successes-only t)))
@@ -2845,14 +2920,22 @@
         (let ((res (w:jget r "result")))
           (unless (w:jget r "success") (log! node "confiscation_sign refused: ~a" (w:jget r "error")))
           (when (and (w:jget r "success") res)
-            (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
+            (let* ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature")))
+                   (ss (mapcar #'hex->bytes (coerce (or (w:jget res "sweep_signatures") #()) 'list))))
               (when (and (member pk keys :test #'equalp) (schnorr:schnorr-verify pk sighash sig)
-                         (not (assoc pk sigs :test #'equalp)))
+                         (not (assoc pk sigs :test #'equalp))
+                         (= (length ss) (length sweep-hashes))
+                         (every (lambda (h s) (schnorr:schnorr-verify pk h s)) sweep-hashes ss))
+                (push (cons pk ss) sweep-sigs)
                 (push (cons pk sig) sigs))))))
       (when (< (length sigs) (rs:tier-threshold tier)) (fail "only ~a of ~a confiscation signatures" (length sigs) (rs:tier-threshold tier)))
       (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
              (signed (rot:attach-tier-witness tx 0 reserves tier-index ordered)))
-        (unless (rot:verify-spend signed 0 prevouts) (fail "assembled confiscation does not verify"))
+        (loop for i from 1 below (length prevouts)
+              do (setf signed (rot:attach-tier-witness signed i reserves tier-index
+                                                       (mapcar (lambda (k) (nth (1- i) (cdr (assoc k sweep-sigs :test #'equalp)))) keys))))
+        (dotimes (i (length prevouts))
+          (unless (rot:verify-spend signed i prevouts) (fail "assembled confiscation input ~a does not verify" i)))
         (broadcast node signed)
         (dolist (fork (forks-of node id-hex)) (setf (record-lottery fork) lottery (record-confiscation fork) signed))
         (values signed lottery)))))
@@ -3125,9 +3208,17 @@
                             :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
                 (push (cons proposed lottery) (gethash id (node-signed-confiscations node))))
               (log! node "signed confiscation of ~a proposed by ~a (fee ~a sats)" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8)
-                    (- (car (aref prevouts 0)) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))
+                    (- (reduce #'+ prevouts :key #'car) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
-                                                           "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))))
+                                                           "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux)))
+                                                           ;; DEP-06: one signature per swept migration output
+                                                           "sweep_signatures"
+                                                           (coerce (loop for i from 1 below (length prevouts)
+                                                                         collect (bytes->hex (schnorr:schnorr-sign
+                                                                                              (node-priv node)
+                                                                                              (rot:tier-sighash tx i prevouts (nth tier-index (rs:reserves-leaves reserves)))
+                                                                                              (random-aux))))
+                                                                   'vector))))))
       (error (e) (log! node "refused confiscation_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
 
 (defun publish-reveal (node id-hex)
@@ -3249,7 +3340,9 @@
               (unless (rot:verify-spend signed i prevouts) (fail "claim input ~a does not verify" i)))
             (broadcast node signed)
             (commit-update node fork (new-update node fork (list :type :dispute-acquire :new-custodian (node-pubkey node)
-                                                                 :claim-txid (btx:tx-txid signed) :new-reserves-address target)))
+                                                                 :claim-txid (btx:tx-txid signed) :new-reserves-address target
+                                                                 ;; DEP-06: the confiscation whose residue we now owe
+                                                                 :confiscation-txid txid)))
             (values :won signed)))))))
 
 (defun subset-attestations (node id-hex lottery idx tx prevouts sighash)
@@ -3747,6 +3840,38 @@
         (setf dirty t))
       (when (publish-owed-vault-spends node) (setf dirty t))
       (when dirty (ignore-errors (save-vault-watch node))))))
+
+(defun drive-obligation-watch (node)
+  "DEP-06 §Confiscation obligations: for each ledger we hold whose custody changed after a
+   confiscation while a migration to it dangled, once the new operator signs an update its
+   service_response_blocks past the acquire without crediting the residue, broadcast
+   UnhonouredObligation against it (once)."
+  (loop for rec being the hash-values of (node-ledgers node)
+        for l = (record-ledger rec)
+        for a = (lg:ledger-dormancy-accept l)
+        when (and (not (record-fork-p rec)) (lg:ledger-confiscation-txid l) a (not (getf a :resolved)) (getf a :source))
+          do (let ((key (format nil "obligation:~a" (record-id-hex rec))))
+               (unless (gethash key (node-migrations-watched node))
+                 (handler-case
+                     (let* ((history (reverse (record-history rec)))
+                            (au (find :dispute-acquire history :from-end t
+                                      :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u))))))
+                            (conf (find (lg:ledger-confiscation-txid l)
+                                        (loop for f in (forks-of node (record-id-hex rec)) when (record-confiscation f) collect (record-confiscation f))
+                                        :key #'btx:tx-txid :test #'equalp)))
+                       (multiple-value-bind (nu qu) (migration-source-updates node a (bytes->hex (getf a :source)))
+                         (let ((proof (and au conf qu (fr:unhonoured-obligation-proof history au conf nu qu))))
+                           (when proof
+                             (multiple-value-bind (ok why)
+                                 (fr:verify-proof proof :history history
+                                                        :height-of-block (or (node-height-of-block node) (lambda (b) (declare (ignore b)) (height node))))
+                               (if ok
+                                   (progn (setf (gethash key (node-migrations-watched node)) :done)
+                                          (log! node "UNHONOURED OBLIGATION: ~a's new operator left a migration's residue uncredited; proof broadcast"
+                                                (subseq (record-id-hex rec) 0 8))
+                                          (broadcast-fraud node proof))
+                                   (log! node "unhonoured-obligation proof on ~a does not verify: ~a" (subseq (record-id-hex rec) 0 8) why)))))))
+                   (error (e) (log! node "obligation watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e)))))))
 
 (defun drive-migration-watch (node)
   "DEP-20 §8.3: for each ledger we hold whose latest rotation migrated deposits, note the block

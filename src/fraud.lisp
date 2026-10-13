@@ -19,14 +19,15 @@
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:uncredited-migration-proof #:latest-migration #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
-           #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers))
+           #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers
+           #:unhonoured-obligation-proof #:verify-unhonoured-obligation))
 (in-package #:cl-deposits.fraud)
 
 (defparameter +types+
   '((:uncredited-onchain-payment . 1) (:uncredited-lightning-payment . 2) (:stale-cosignature . 3)
     (:dispute-dereliction . 4) (:non-conforming-update . 5) (:quorum-expired . 6)
     (:winner-collateral-deviation . 7) (:equivocation . 8) (:non-conforming-cosignature . 9)
-    (:unauthorized-vault-spend . 10)))
+    (:unauthorized-vault-spend . 10) (:unhonoured-obligation . 11)))
 
 (defparameter +type-names+
   '((:uncredited-onchain-payment . "UncreditedOnchainPayment") (:uncredited-lightning-payment . "UncreditedLightningPayment")
@@ -34,7 +35,7 @@
     (:non-conforming-update . "NonConformingUpdate") (:quorum-expired . "QuorumExpired")
     (:winner-collateral-deviation . "WinnerCollateralDeviation") (:equivocation . "Equivocation")
     (:non-conforming-cosignature . "NonConformingCosignature")
-    (:unauthorized-vault-spend . "UnauthorizedVaultSpend")))
+    (:unauthorized-vault-spend . "UnauthorizedVaultSpend") (:unhonoured-obligation . "UnhonouredObligation")))
 
 (defun proof-discriminant (type) (or (cdr (assoc type +types+)) (error "unknown proof type ~s" type)))
 (defun respectful-p (proof) (eq (getf proof :type) :quorum-expired))
@@ -65,7 +66,9 @@
               (s :member-ledger-id) (s :member-pubkey) (int->le (getf ev :member-active-sequence) 8)))
         (:unauthorized-vault-spend
          (cat (s :spent-ledger-id) (int->le (getf ev :governing-quorumbegin-seq) 8) (s :spend-tx-hex) (b :spend-block-hash)))
-        (:winner-collateral-deviation (cat (s :winner-armed-update-hex) (s :claim-txid) (b :claim-block-hash)))))))
+        (:winner-collateral-deviation (cat (s :winner-armed-update-hex) (s :claim-txid) (b :claim-block-hash)))
+        (:unhonoured-obligation
+         (cat (s :source-notice-update) (s :source-qb-update) (s :acquire-update) (s :confiscation-tx) (s :proof-update)))))))
 
 (defun proof-hash (proof)
   (tagged-hash "deposits/fraud_proof" (octets (proof-discriminant (getf proof :type)))
@@ -595,12 +598,104 @@
                 (t (values t nil)))))))
     (error (c) (values nil (princ-to-string c)))))
 
+(defun unpaid-in-tx (entries tx)
+  "DEP-06: the ENTRIES no output of TX pays (the splice-out rule's script and value)."
+  (let ((outs (mapcar (lambda (o) (cons (btx:txout-script o) (btx:txout-value o))) (btx:tx-outputs tx))))
+    (remove-if (lambda (e) (multiple-value-bind (spk sats) (lg:owed-spk-sats e)
+                             (and spk (find-if (lambda (o) (and (equalp (car o) spk) (= (cdr o) sats))) outs))))
+               entries)))
+
+(defun residue-credited-p (history after-seq upto-seq txid vout)
+  "A MigrationCredit after AFTER-SEQ, at or before UPTO-SEQ, resolving the migration TXID:VOUT."
+  (some (lambda (u)
+          (and (< after-seq (up:update-seq u) (1+ upto-seq))
+               (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                 (and o (eq (op:operation-type o) :migration-credit)
+                      (let ((sq (ignore-errors (op:decode-operation (up:update-message (up:decode-update (op:field o :source-qb-update)))))))
+                        (and sq (equalp (op:field sq :new-outpoint-txid) txid) (eql (op:field sq :migration-vout) vout)))))))
+        history))
+
+(defun obligation-context (history acquire-update notice-hex qb-hex)
+  "Shared by the producer and verifier of UnhonouredObligation: the ledger before the acquire and
+   the source evidence checked against it.  (values notice qb qu prefix-ledger prefix) or an error."
+  (let* ((prefix (remove-if-not (lambda (u) (< (up:update-seq u) (up:update-seq acquire-update))) history))
+         (l (lg:replay prefix))
+         (a (or (lg:ledger-dormancy-accept l) (error "no accept before the custody change"))))
+    (multiple-value-bind (notice qb qu to-us) (lg:migration-evidence l (hex->bytes notice-hex) (hex->bytes qb-hex))
+      (unless (and to-us (equalp (op:field notice :manifest-hash) (getf a :hash)) (not (getf a :resolved))
+                   (< (up:update-block-height qu) (getf a :expires)))
+        (error "the migration was not dangling at the custody change"))
+      (values notice qb qu l prefix))))
+
+(defun unhonoured-obligation-proof (history acquire-update confiscation-tx notice-update qb-update)
+  "DEP-06 producer: an UnhonouredObligation against the new operator (ACQUIRE-UPDATE's custodian)
+   whose HISTORY (ascending) has an update its governing service_response_blocks past the acquire
+   without crediting the residue of the dangling migration (NOTICE-UPDATE, QB-UPDATE) that
+   CONFISCATION-TX did not pay.  NIL otherwise."
+  (ignore-errors
+   (multiple-value-bind (notice qb) (obligation-context history acquire-update (bytes->hex (up:encode-update notice-update))
+                                                       (bytes->hex (up:encode-update qb-update)))
+     (declare (ignore notice))
+     (when (unpaid-in-tx (op:field qb :migration-manifest) confiscation-tx)
+       (let* ((srb (governing-service-response-blocks history (up:update-seq acquire-update)))
+              (pu (car (last (remove-if (lambda (u) (< (up:update-block-height u) (+ (up:update-block-height acquire-update) srb))) history)))))
+         (when (and pu (not (residue-credited-p history (up:update-seq acquire-update) (up:update-seq pu)
+                                                (op:field qb :new-outpoint-txid) (op:field qb :migration-vout))))
+           (list :type :unhonoured-obligation
+                 :accused (bytes->hex (op:field (op:decode-operation (up:update-message acquire-update)) :new-custodian))
+                 :ledger-id (bytes->hex (up:update-ledger-id acquire-update))
+                 :evidence (list :source-notice-update (bytes->hex (up:encode-update notice-update))
+                                 :source-qb-update (bytes->hex (up:encode-update qb-update))
+                                 :acquire-update (bytes->hex (up:encode-update acquire-update))
+                                 :confiscation-tx (bytes->hex (btx:serialize-tx confiscation-tx :witness nil))
+                                 :proof-update (bytes->hex (up:encode-update pu))))))))))
+
+(defun verify-unhonoured-obligation (proof history height-of-block)
+  "DEP-06 §Confiscation obligations: the accused took custody (DisputeAcquire naming the
+   confiscation), a dangling migration's residue was not paid by that confiscation, and the
+   accused signed PROOF-UPDATE its governing service_response_blocks after the acquire without
+   crediting it.  HISTORY is the accused ledger's; (values ok reason)."
+  (handler-case
+      (let* ((au (up:decode-update (hex->bytes (e proof :acquire-update))))
+             (ao (op:decode-operation (up:update-message au)))
+             (tx (btx:parse-tx (bw:make-reader (hex->bytes (e proof :confiscation-tx)))))
+             (pu (up:decode-update (hex->bytes (e proof :proof-update))))
+             (in (lambda (u) (let ((o (find (up:update-seq u) history :key #'up:update-seq)))
+                               (and o (equalp (up:chain-hash o) (up:chain-hash u)))))))
+        (if (not (and (eq (op:operation-type ao) :dispute-acquire) (funcall in au)
+                      (string-equal (bytes->hex (op:field ao :new-custodian)) (getf proof :accused))
+                      (equalp (op:field ao :confiscation-txid) (btx:tx-txid tx))))
+            (values nil "acquire_update is not the accused's custody change naming this confiscation")
+            (multiple-value-bind (notice qb qu l prefix) (obligation-context history au (e proof :source-notice-update) (e proof :source-qb-update))
+              (declare (ignore notice qu l))
+              (let* ((vault-qb (find :quorum-begin (reverse prefix) :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u))))))
+                     (vo (and vault-qb (op:decode-operation (up:update-message vault-qb))))
+                     (in0 (first (btx:tx-inputs tx)))
+                     (ah (funcall height-of-block (up:update-block-hash au)))
+                     (ph (funcall height-of-block (up:update-block-hash pu)))
+                     (srb (governing-service-response-blocks history (up:update-seq au))))
+                (cond
+                  ((not (and vo (equalp (btx:txin-prev-hash in0) (op:field vo :new-outpoint-txid))
+                             (eql (btx:txin-prev-index in0) (op:field vo :new-outpoint-vout))))
+                   (values nil "confiscation_tx does not spend the ledger's vault"))
+                  ((null (unpaid-in-tx (op:field qb :migration-manifest) tx)) (values nil "the confiscation paid every entry: no residue"))
+                  ((not (and (up:verify-operator-signature pu) (string-equal (bytes->hex (up:update-operator-id pu)) (getf proof :accused))
+                             (equalp (up:update-ledger-id pu) (up:update-ledger-id au)) (funcall in pu)))
+                   (values nil "proof_update is not the accused's update in its history"))
+                  ((not (and ah ph (= ph (up:update-block-height pu)))) (values nil "the updates' blocks are not on the verifier's chain"))
+                  ((< (- ph ah) srb) (values nil (format nil "the proof update is fewer than ~a blocks after the custody change" srb)))
+                  ((residue-credited-p history (up:update-seq au) (up:update-seq pu) (op:field qb :new-outpoint-txid) (op:field qb :migration-vout))
+                   (values nil "the residue was credited: not fraud"))
+                  (t (values t nil)))))))
+    (error (c) (values nil (princ-to-string c)))))
+
 (defun verify-proof (proof &key history height-of-block)
   (case (getf proof :type)
     (:equivocation (verify-equivocation proof history))
     (:quorum-expired (verify-quorum-expired proof history height-of-block))
     (:non-conforming-update (verify-non-conforming-update proof history))
     (:dispute-dereliction (values nil "dereliction needs the defrauded ledger: verify-dispute-dereliction"))
+    (:unhonoured-obligation (verify-unhonoured-obligation proof history height-of-block))
     (:uncredited-onchain-payment
      (if (e proof :source-qb-update)
          (verify-uncredited-migration proof history height-of-block)

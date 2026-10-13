@@ -24,7 +24,7 @@
            #:calculate-winner #:derive-preimage #:commitment-of #:claim-witness
            #:recovery-witness #:build-armer-share #:armer-share #:armer-share-spk #:armer-share-address
            #:armer-share-leaves #:armer-share-control-block #:forfeit-sweep-outputs
-           #:confiscation-outputs #:revealers-from-witness #:tapbuilder-tree #:p2tr-spk #:key-path-spk
+           #:confiscation-outputs #:confiscation-tx #:revealers-from-witness #:tapbuilder-tree #:p2tr-spk #:key-path-spk
            #:+reveal-csv+ #:+armer-sweep-csv+ #:+max-disputants+ #:+timeout-recovery-csv+
            #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+ #:claim-tx #:+claim-fee-floor+))
 (in-package #:cl-deposits.lottery)
@@ -296,6 +296,29 @@
                                                                     :script (octets) :sequence #xfffffffd))))
                :outputs (list (btx:make-txout :value (- (+ lottery-sats (if collateral (third collateral) 0)) fee) :script destination-spk))
                :witnesses (make-list (if collateral 2 1) :initial-element nil)))
+
+(defun confiscation-tx (&key vault swept lottery-spk voters locktime respectful fee obligations-sats (residue-sats 0)
+                             splice-outs operator-pubkey33 (feerate +confiscation-default-feerate+))
+  "DEP-03 \"Confiscation fee\" / DEP-06 §Confiscation obligations, unsigned: version 2, nLockTime
+   LOCKTIME; input 0 VAULT (txid vout sats), then SWEPT ((txid vout sats) ...), all #xfffffffd;
+   output 0 the lottery (punitive: inputs - fee - splice-outs; respectful: max(obligations +
+   residue, 330), the rest to the operator's P2WPKH unless dust), then SPLICE-OUTS ((spk . sats)
+   ...).  FEE defaults to feerate x (120 + 30 x VOTERS + |SWEPT| x (41 + 30 x VOTERS))."
+  (let* ((fee (or fee (* feerate (+ 120 (* 30 voters) (* (length swept) (+ 41 (* 30 voters)))))))
+         (inputs (+ (third vault) (reduce #'+ swept :key #'third)))
+         (paid (reduce #'+ splice-outs :key #'cdr))
+         (outs (append (confiscation-outputs lottery-spk (- inputs paid) fee :respectful respectful
+                                             :obligations-sats (+ (or obligations-sats 0) residue-sats)
+                                             :operator-pubkey33 operator-pubkey33)
+                       splice-outs)))
+    (btx:parse-tx
+     (cl-consensus.wire:make-reader
+      (btx:serialize-tx
+       (btx:make-tx :version 2 :locktime locktime :segwit-p t
+                    :inputs (loop for (tx vo) in (cons vault swept)
+                                  collect (btx:make-txin :prev-hash tx :prev-index vo :script (octets) :sequence #xfffffffd))
+                    :outputs (loop for (spk . val) in outs collect (btx:make-txout :value val :script spk))
+                    :witnesses (make-list (1+ (length swept)))))))))
 
 (defun confiscation-outputs (lottery-spk reserves-sats fee-sats &key respectful obligations-sats operator-pubkey33)
   "A list of (spk . sats).  Punitive: everything to the lottery output.
