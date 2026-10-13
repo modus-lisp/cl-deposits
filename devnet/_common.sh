@@ -90,7 +90,7 @@ ref_port()  { for e in "${REF_NODES[@]}"; do [ "${e%%:*}" = "$1" ] && echo "${e#
 ref_dir()   { echo "$CLD_ROOT/$1"; }
 ref_pid()   { pgrep -nf "deposits-node run .*--data-dir $(ref_dir "$1") " 2>/dev/null || cat "$(ref_dir "$1")/ref.pid" 2>/dev/null; }   # the daemon itself, not a wrapper
 ref_running(){ local p; p=$(ref_pid "$1") && [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
-ref_env()   { echo "LIGHTNING_BACKEND=none CHAIN_BACKEND=bitcoind BITCOIND_RPC_URL=http://127.0.0.1:${BITCOIN_RPC_PORT:-38332} BITCOIND_COOKIE_FILE=$BITCOIN_DATADIR/$CLD_CHAIN/.cookie"; }
+ref_env()   { echo "LIGHTNING_BACKEND=none CHAIN_BACKEND=bitcoind BITCOIND_RPC_URL=http://127.0.0.1:${BITCOIN_RPC_PORT:-38332} BITCOIND_COOKIE_FILE=$BITCOIN_DATADIR/$CLD_CHAIN/.cookie DEPOSITS_STACK_DUMP=1"; }   # SIGUSR2 dumps a stack (a stalled node)
 # ref_cli NAME CMD ARGS...  — the reference CLI against NAME's data dir (the daemon may be running; the CLI reaches it over the relay)
 ref_cli()   { local n=$1; shift; env $(ref_env) RUST_LOG=error "$REF_NODE_BIN" "$@" --network "$CLD_CHAIN" --esplora "$ESPLORA_URL" --relay "$RELAY_URL" --data-dir "$(ref_dir "$n")" 2>&1 | grep -vE '^\S*\[[0-9]m|^\[2m' ; }
 # The protocol identity (operator/cosigner key) is NOT the Nostr key: it is what `quorum show-identity` prints.
