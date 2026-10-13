@@ -48,18 +48,21 @@
 
 (defconstant +default-feerate+ 2 "sat/vB while no reference_feerate_sat_vb is recorded (DEP-03).")
 
-(defun rotation-vsize (voters spk-lengths splice-p)
-  "DEP-03 \"Rotation transaction\": 46 + 30 x VOTERS + sum (9 + len spk) + 68 x [splice-in]."
-  (+ 46 (* 30 voters) (reduce #'+ spk-lengths :key (lambda (l) (+ 9 l))) (if splice-p 68 0)))
+(defun rotation-vsize (voters spk-lengths splice-p &optional splice-vault-p)
+  "DEP-03 \"Rotation transaction\": 46 + 30 x VOTERS + sum (9 + len spk) + splice_vsize, the
+   splice term 68 for a key-path or P2WPKH splice-in, 41 + 30 x VOTERS for one at the vault's own
+   script (spent through the same tier)."
+  (+ 46 (* 30 voters) (reduce #'+ spk-lengths :key (lambda (l) (+ 9 l)))
+     (cond ((not splice-p) 0) (splice-vault-p (+ 41 (* 30 voters))) (t 68))))
 
 (defun build-rotation (&key vault-txid vault-vout vault-sats voters (feerate +default-feerate+) (locktime 0)
-                            new-vault-spk splice extras)
+                            new-vault-spk splice extras splice-vault-p)
   "DEP-03 \"Rotation transaction\", unsigned: version 2, nLockTime the tier's CLTV;
    input 0 the vault and input 1 SPLICE (txid vout sats), both #xfffffffd; output 0
    the new vault, then EXTRAS ((spk . sats) ...: the exits in recorded order, then the
    migration).  Fee feerate x rotation-vsize.  NIL if the new vault falls below 330."
   (let* ((fee (* feerate (rotation-vsize voters (cons (length new-vault-spk) (mapcar (lambda (e) (length (car e))) extras))
-                                         (and splice t))))
+                                         (and splice t) splice-vault-p)))
          (new (- (+ vault-sats (if splice (third splice) 0)) (reduce #'+ extras :key #'cdr) fee)))
     (when (>= new 330)
       (btx:make-tx :version 2 :locktime locktime :segwit-p t

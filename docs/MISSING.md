@@ -81,9 +81,13 @@ recorded in docs/REDTEAM.md and docs/TRUST-MODEL.md; this lists only what does n
   (`redteam/check-{exit,splice,migrate,dormancy}.sh`). Since 2026-10-08 a Rust operator issues them too
   (`deposits-node dormancy offer|accept|notice|credit`), and both implementations produce the §8.3
   uncredited-migration proof (a migration watch on any node holding the source ledger; self-evident,
-  no embedding) — gated and vectored, not yet run live. Still open: cosigners do not check a
-  migration credit against the source's QuorumBegin; the proof takes `service_response_blocks` from
-  the evidence (the producers use 72) rather than the receiver's quorum.
+  no embedding) — gated and vectored, not yet run live. Since 2026-10-13 (§8.3 phase 1): the accept names
+  the receiver's vault script and freezes its rotation until resolved; a receiver credits only by
+  `MigrationCredit` (the source's signed notice and consuming QuorumBegin, which records
+  `consumed_notice`); the migration output is spliced as a second tier-signed vault input. Still
+  open (phase 2): the confiscation does not yet sweep unspliced migration outputs or splice out
+  dangling obligations, and proof 11 (`UnhonouredObligation`) is unimplemented; no live run of
+  the vault-script splice across implementations yet.
 - ~~**Operator stand-down after confiscation.**~~ **Done (2026-10-01):** a cl operator stands down
   once custody moves or a majority of its quorum disputes it (cl 9b1a6d4), and cl members refuse
   to extend a deposed operator's chain (3e1ad0f), as the reference's members already did.

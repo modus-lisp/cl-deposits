@@ -158,12 +158,11 @@
                                         (arg form :total) :expiry-blocks (arg form :expiry-blocks 288)
                                         :premium-deposit (and (arg form :premium-deposit) (hex->bytes (arg form :premium-deposit))))))
            (ok :seq (up:update-seq u) :accept (bytes->hex (up:encode-update u))
-               :address (nd::accept-address node (sha256 (hex->bytes (arg form :manifest)))))))
+               :address (nd::accept-address node rec))))
         (:dormancy-credit
-         ;; DEP-20 §8.3 receiver: :manifest "hex" :txid "display hex" :vout N [:premium msat]
+         ;; DEP-20 §8.3 receiver: :source "source ledger hex" — resolve the accept (MigrationCredit)
          (let ((rec (rec! node form)))
-           (nd::dormancy-credit node rec (op:decode-manifest (hex->bytes (arg form :manifest))) (txid-bytes (arg form :txid))
-                                (arg form :vout) :premium (arg form :premium 0))
+           (nd::dormancy-credit node rec (arg form :source))
            (ok :credited t)))
         (:rotate-vault
          (let ((rec (rec! node form)))

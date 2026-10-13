@@ -334,12 +334,13 @@
                                 ((string= key "new_vault_spk") (setf (getf (car cases) :spk) (u:hex->bytes (second words))))
                                 ((string= key "tx") (setf (getf (car cases) :tx) (second words)))
                                 (t (setf (getf (car cases) (intern (string-upcase key) :keyword)) (parse-integer (second words))))))))))
-    (check-equal "four shapes" (length cases) 4)
+    (check-equal "five shapes" (length cases) 5)
     (dolist (c (reverse cases))
       (destructuring-bind (txid vout sats) (getf c :vault)
         (let ((tx (cl-deposits.rotation:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
                                                        :voters (getf c :voters) :feerate (getf c :feerate) :locktime (getf c :locktime)
-                                                       :new-vault-spk (getf c :spk) :splice (getf c :splice) :extras (getf c :extras))))
+                                                       :new-vault-spk (getf c :spk) :splice (getf c :splice) :extras (getf c :extras)
+                                                       :splice-vault-p (eql (getf c :splice_vault) 1))))
           (check-equal (format nil "~a rotation tx" (getf c :name))
                        (and tx (u:bytes->hex (btx:serialize-tx tx :witness nil))) (getf c :tx)))))
     (check "a rotation leaving the vault below dust is refused"

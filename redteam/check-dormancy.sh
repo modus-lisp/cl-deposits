@@ -68,7 +68,7 @@ cos=0; for m in $R1 $R2; do sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" 2>
 [ $cos -ge 1 ] || fail "no reference member cosigned the QuorumBegin recording the spin-out"
 echo "   reference members: $signed signed the rotation, $cos cosigned its QuorumBegin"
 # §8.3 receiver: credit the migrated deposit, then splice the migration output at the next rotation.
-expect "$(cld_ctl $OP2 "(:dormancy-credit :ledger \"$Y\" :manifest \"$M\" :txid \"$RT\" :vout $MV)")" "dormancy-credit"
+expect "$(cld_ctl $OP2 "(:dormancy-credit :ledger \"$Y\" :source \"$X\")")" "dormancy-credit"
 [ "$(sx "$(bal_on w3 "$Y" "$D3")" ":BALANCE")" = 335000 ] || fail "the receiver did not credit the migrated deposit: $(bal_on w3 "$Y" "$D3")"
 echo "   receiver credited the migrated deposit (335000 msat) under its own ledger"
 mine 2 >/dev/null; sleep 5

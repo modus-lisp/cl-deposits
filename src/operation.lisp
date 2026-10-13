@@ -49,7 +49,7 @@
      (:splice-in-outpoint 282 :bytes :optional) (:splice-in-amount 284 :u64 :optional)
      (:reference-feerate 292 :u32 :optional) (:dormancy-outputs 336 :exit-outputs :optional)
      (:migration-manifest 316 :manifest :optional) (:migration-receiver 288 :pubkey :optional)
-     (:migration-vout 290 :u32 :optional))
+     (:migration-vout 290 :u32 :optional) (:consumed-notice 344 :bytes32 :optional))
     (20 :deposit-open
      (:deposit-id 200 :deposit-id) (:descriptor 202 :string) (:fees 12 :fees :optional)
      (:transfer-fees 226 :transfer-fees :optional) (:payment-hash 14 :bytes32 :optional)
@@ -146,6 +146,8 @@
     (103 :dormancy-accept
      (:deposit-id 200 :deposit-id :optional) (:exit-address 300 :bytes) (:expires-at-height 302 :u32)
      (:manifest-hash 308 :bytes32) (:offer-event-id 310 :bytes32) (:accepted-total 312 :u64))
+    (105 :migration-credit
+     (:source-notice-update 346 :bytes) (:source-qb-update 348 :bytes))
     (101 :exit-cancel
      (:deposit-id 200 :deposit-id) (:exit-request-id 304 :bytes32) (:nonce 288 :u64) (:expiry 290 :u32)
      (:witness 204 :witness) (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))))

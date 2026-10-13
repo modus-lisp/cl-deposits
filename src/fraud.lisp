@@ -523,20 +523,17 @@
                                 :confirmed-at-block-hash confirmed-block-hash)))))))
 
 (defun migration-credited-p (qb history upto-seq txid vout)
-  "Every entry QB migrated has an OnchainCredit (deposit, exact amount, TXID:VOUT) in HISTORY at or
-   before UPTO-SEQ."
-  (let ((credited '()))
-    (labels ((walk (o)
-               (case (op:operation-type o)
-                 (:onchain-credit
-                  (when (and (equalp (op:field o :txid) txid) (eql (op:field o :vout) vout))
-                    (push (cons (op:field o :deposit-id) (op:field o :amount)) credited)))
-                 (:batch (mapc #'walk (op:field o :operations))))))
-      (dolist (u history)
-        (when (<= (up:update-seq u) upto-seq)
-          (ignore-errors (walk (op:decode-operation (up:update-message u)))))))
-    (every (lambda (m) (member (cons (getf m :deposit-id) (getf m :amount)) credited :test #'equalp))
-           (op:field qb :migration-manifest))))
+  "HISTORY resolves the migration QB records with a MigrationCredit (DEP-20 §8.3) naming a source
+   QuorumBegin of the same rotation (TXID) and migration_vout (VOUT) at or before UPTO-SEQ; the
+   fold credits exactly QB's migrated entries."
+  (declare (ignore qb))
+  (some (lambda (u)
+          (and (<= (up:update-seq u) upto-seq)
+               (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                 (and o (eq (op:operation-type o) :migration-credit)
+                      (let ((sq (ignore-errors (op:decode-operation (up:update-message (up:decode-update (op:field o :source-qb-update)))))))
+                        (and sq (equalp (op:field sq :new-outpoint-txid) txid) (eql (op:field sq :migration-vout) vout)))))))
+        history))
 
 (defun verify-uncredited-migration (proof history height-of-block)
   "DEP-20 §8.3: the accused (receiver) signed a DormancyAccept the source's notice carries, over

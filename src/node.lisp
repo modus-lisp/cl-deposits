@@ -543,7 +543,7 @@
    carries beyond the deposits (not a fee); collateral pays the dormancy cost and the premium."
   (multiple-value-bind (ex ee ec) (exit-settlement ledger height cutoff)
     (multiple-value-bind (dx de dc) (dormancy-settlement ledger cutoff (length ee))
-      (multiple-value-bind (mentries mspk msats) (lg:dormancy-migration ledger cutoff (length de))
+      (multiple-value-bind (mentries mspk msats) (lg:dormancy-migration ledger cutoff (length de) height)
         (if mentries
             (let ((premium-msat (or (getf (lg:ledger-dormancy-notice ledger) :premium) 0)))
               (values (append ex dx (list (cons mspk msats))) ee de ec
@@ -603,24 +603,31 @@
              (splice-in (when splice
                           (multiple-value-bind (ssats sspk) (splice-prevout node (first splice) (second splice))
                             (list (first splice) (second splice) ssats sspk))))
+             ;; DEP-20 §8.3: a migration output at our own vault script is spent through the same tier.
+             (vault-splice (and splice-in (equalp (fourth splice-in) (rs:reserves-spk cur))))
              (tx (or (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
                                          :voters (length (rs:reserves-voters cur))
                                          :feerate (lg:rotation-feerate (record-ledger rec))
                                          :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk new)
-                                         :extras extras :splice (and splice-in (subseq splice-in 0 3)))
+                                         :extras extras :splice (and splice-in (subseq splice-in 0 3))
+                                         :splice-vault-p vault-splice)
                      (fail "the rotation leaves the new vault below dust")))
              (prevouts (if splice-in
                            (vector (cons sats (rs:reserves-spk cur)) (cons (third splice-in) (fourth splice-in)))
                            (vector (cons sats (rs:reserves-spk cur)))))
              (sighash (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves cur))))
+             (sighash1 (and vault-splice (rot:tier-sighash tx 1 prevouts (nth tier-index (rs:reserves-leaves cur)))))
              (keys (rs:tier-keys tier))
              (sigs (list (cons (up:x-only (node-pubkey node)) (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))
+             (sigs1 (and vault-splice
+                         (list (cons (up:x-only (node-pubkey node)) (schnorr:schnorr-sign (node-priv node) sighash1 (random-aux))))))
              (responses (send-request node (record-id-hex rec) "rotation_sign"
                                       (w:json-object "sighash" (bytes->hex sighash) "unsigned_tx" (unsigned-tx-hex tx)
                                                      "tier_index" tier-index
                                                      "ledger_hash" (bytes->hex (rs:reserves-ledger-hash new))
                                                      "new_quorum_expiry" expiry "exit_cutoff_height" cutoff
-                                                     "splice_in_outpoint" (and splice-in (format nil "~a:~a" (bytes->hex (first splice-in)) (second splice-in))))
+                                                     "splice_in_outpoint" (and splice-in (format nil "~a:~a" (bytes->hex (first splice-in)) (second splice-in)))
+                                                     "splice_sighash" (and sighash1 (bytes->hex sighash1)))
                                       :want (max 0 (1- (rs:tier-threshold tier))) :timeout timeout :successes-only t)))
         (dolist (r responses)
           (let ((res (w:jget r "result")))
@@ -628,21 +635,21 @@
               (let ((res (if (stringp res) (w:parse-json res) res)))
                 (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
                   (when (and (member pk keys :test #'equalp) (schnorr:schnorr-verify pk sighash sig)
-                             (not (assoc pk sigs :test #'equalp)))
+                             (not (assoc pk sigs :test #'equalp))
+                             ;; a vault-script splice needs the member's signature on input 1 too
+                             (or (not vault-splice)
+                                 (let ((s1 (and (w:jget res "splice_signature") (hex->bytes (w:jget res "splice_signature")))))
+                                   (and s1 (schnorr:schnorr-verify pk sighash1 s1) (push (cons pk s1) sigs1)))))
                     (push (cons pk sig) sigs)))))))
         (when (< (length sigs) (rs:tier-threshold tier))
           (fail "rotation: only ~a of ~a signatures" (length sigs) (rs:tier-threshold tier)))
         (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
                (signed (let ((s (rot:attach-tier-witness tx 0 cur tier-index ordered)))
-                         (if splice-in
-                             (attach-key-path-witness
-                              s 1 (key-path-signature node s 1 prevouts
-                                                      ;; DEP-20 §8.3: a migration output sits at our accept address.
-                                                      (let ((a (lg:ledger-dormancy-accept (record-ledger rec))))
-                                                        (if (and a (equalp (fourth splice-in) (getf a :spk)))
-                                                            (sha256 (getf a :hash))
-                                                            (octets)))))
-                             s)))
+                         (cond (vault-splice
+                                (rot:attach-tier-witness s 1 cur tier-index
+                                                         (mapcar (lambda (k) (cdr (assoc k sigs1 :test #'equalp))) keys)))
+                               (splice-in (attach-key-path-witness s 1 (key-path-signature node s 1 prevouts)))
+                               (t s))))
                (new-sats (btx:txout-value (first (btx:tx-outputs tx)))))
           (dotimes (i (length (btx:tx-inputs signed)))
             (unless (rot:verify-spend signed i prevouts) (fail "assembled rotation input ~a does not verify" i)))
@@ -716,6 +723,8 @@
                              (let ((m (median-feerate node (height node)))) (when m (list :reference-feerate (max 2 m))))
                              (when entries (list :exit-outputs entries))
                              (when dentries (list :dormancy-outputs dentries))
+                             (let ((cid (lg:consumed-notice-id ledger (getf rotation :cutoff))))
+                               (when cid (list :consumed-notice cid)))
                              (when mig (list :migration-manifest (getf mig :entries)
                                              :migration-receiver (getf (lg:ledger-dormancy-notice ledger) :receiver)
                                              :migration-vout (getf mig :vout)))
@@ -1213,7 +1222,8 @@
                                            :feerate (lg:rotation-feerate ledger)
                                            :voters (length (rs:reserves-voters cur)) :locktime (rs:tier-locktime tier)
                                            :new-vault-spk (address-spk node (op:field o :reserves-id)) :extras extras
-                                           :splice (and splice (subseq splice 0 3)))))
+                                           :splice (and splice (subseq splice 0 3))
+                                           :splice-vault-p (and splice (equalp (fourth splice) (rs:reserves-spk cur))))))
             (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx tx :witness nil)))
               (fail "rotation_tx differs from the DEP-03 rotation we build"))
             (check-relayable tx)
@@ -1368,17 +1378,17 @@
   (let ((m (lg:dormancy-offer-entries (record-ledger rec) (height node))))
     (values m (sha256 (op:encode-manifest m)) (reduce #'+ m :key (lambda (e) (getf e :amount))))))
 
-(defun accept-address (node manifest-hash)
-  "DEP-20 §8.3: the funding address a cl receiver names, a DEP-10 offer-style address (our key
-   tweaked by the manifest hash).  (values address spk root)."
-  (multiple-value-bind (address spk) (offer-address node manifest-hash)
-    (values address spk (sha256 manifest-hash))))
+(defun accept-address (node rec)
+  "DEP-20 §8.3: the address a receiver's accept names — its current vault, so the migration sits
+   under the quorum's tiers until spliced.  (values address spk)."
+  (let ((reserves (disputed-reserves node rec)))
+    (values (rs:reserves-address reserves) (rs:reserves-spk reserves))))
 
 (defun dormancy-accept (node rec manifest offer-event-id total &key (expiry-blocks 288) premium-deposit)
   "DEP-20 §8.3 receiver: accept a manifest.  Cosigners check its hash, our capacity and fee floors.
    Returns the signed update (its bytes go into the source's DormancyNotice)."
   (let ((hash (sha256 (op:encode-manifest manifest))))
-    (multiple-value-bind (address spk) (accept-address node hash)
+    (multiple-value-bind (address spk) (accept-address node rec)
       (declare (ignore address))
       (let ((*extra-cosign-params* (list "migration_manifest" (bytes->hex (op:encode-manifest manifest)))))
         (append-operation node rec (%strip-nil-fields
@@ -1387,9 +1397,11 @@
                                           :offer-event-id offer-event-id :accepted-total total)))))))
 
 (defun check-dormancy-accept (node rec o params)
-  "A receiver's cosigner: the manifest the request carries hashes to the accept's, and our
-   quorum's fee floors are at or below every deposit's schedule (DEP-20 §8.3)."
-  (declare (ignore node))
+  "A receiver's cosigner: the accept names our current vault script, the manifest the request
+   carries hashes to the accept's, and our quorum's fee floors are at or below every deposit's
+   schedule (DEP-20 §8.3)."
+  (unless (equalp (op:field o :exit-address) (ignore-errors (rs:reserves-spk (disputed-reserves node rec))))
+    (fail "the accept does not name our current vault script"))
   (let* ((hex (or (w:jget params "migration_manifest") (fail "a DormancyAccept cosign must carry the manifest")))
          (m (op:decode-manifest (hex->bytes hex))))
     (unless (equalp (sha256 (hex->bytes hex)) (op:field o :manifest-hash)) (fail "manifest does not hash to the accept's"))
@@ -1438,21 +1450,29 @@
           (fail "the receiver's vault is not funded and unspent on chain"))))
     t))
 
-(defun dormancy-credit (node rec manifest txid vout &key (premium 0))
-  "DEP-20 §8.3 receiver: credit each manifest deposit (opening it with its descriptor and fees if
-   new) and the premium, naming the migration outpoint."
-  (let* ((l (record-ledger rec)) (a (or (lg:ledger-dormancy-accept l) (fail "no outstanding accept")))
-         (marker (lg:migration-marker (getf a :hash))))
-    (dolist (e manifest)
-      (unless (gethash (getf e :deposit-id) (lg:ledger-deposits (record-ledger rec)))
-        (append-operation node rec (list :type :deposit-open :deposit-id (getf e :deposit-id) :descriptor (getf e :descriptor)
-                                         :fees (getf e :fees) :receive-requires-sig nil)))
-      (append-operation node rec (list :type :onchain-credit :txid txid :vout vout :deposit-id (getf e :deposit-id)
-                                       :amount (getf e :amount) :funding-address marker)))
-    (when (and (plusp premium) (getf a :premium-deposit))
-      (append-operation node rec (list :type :onchain-credit :txid txid :vout vout :deposit-id (getf a :premium-deposit)
-                                       :amount premium :funding-address marker)))
-    t))
+(defun migration-source-updates (node accept source-ledger-hex)
+  "DEP-20 §8.3 receiver: from SOURCE-LEDGER-HEX's history, the notice carrying ACCEPT (our accept
+   record) and the QuorumBegin that consumed it: (values notice-update qb-update) or NIL."
+  (let* ((hist (receiver-history node source-ledger-hex))
+         (nu (find-if (lambda (u) (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                                    (and o (eq (op:operation-type o) :dormancy-notice)
+                                         (equalp (op:field o :manifest-hash) (getf accept :hash)))))
+                      hist :from-end t))
+         (id (and nu (sha256 (up:update-message nu))))
+         (qu (and id (find-if (lambda (u) (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                                            (and o (eq (op:operation-type o) :quorum-begin)
+                                                 (equalp (op:field o :consumed-notice) id))))
+                              hist))))
+    (when qu (values nu qu))))
+
+(defun dormancy-credit (node rec source-ledger-hex)
+  "DEP-20 §8.3 receiver: resolve our accept with positive evidence — the source's notice and the
+   QuorumBegin that consumed it (MigrationCredit); the fold credits exactly what migrated."
+  (let ((a (or (lg:ledger-dormancy-accept (record-ledger rec)) (fail "no accept to resolve"))))
+    (multiple-value-bind (nu qu) (migration-source-updates node a source-ledger-hex)
+      (unless qu (fail "the source has not yet consumed the notice"))
+      (append-operation node rec (list :type :migration-credit :source-notice-update (up:encode-update nu)
+                                       :source-qb-update (up:encode-update qu))))))
 
 (defun handle-cosign-offer (node event params)
   "A member: cosign an operator's funding offer (DEP-10) unless its operator is deposed."
@@ -2967,13 +2987,18 @@
                                                 :voters (length (rs:reserves-voters reserves))
                                                 :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk expected)
                                                 :extras (settlement ledger h cutoff)
-                                                :splice (and splice (list (first splice) (second splice) (third splice)))))))
+                                                :splice (and splice (list (first splice) (second splice) (third splice)))
+                                                :splice-vault-p (and splice (equalp (fourth splice) (rs:reserves-spk reserves)))))))
           (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx proposed :witness nil)))
             (fail "rotation tx differs from the DEP-03 rotation we build"))))
-      (rot:tier-sighash proposed 0 (if splice
-                                       (vector (cons sats (rs:reserves-spk reserves)) (cons (third splice) (fourth splice)))
-                                       (vector (cons sats (rs:reserves-spk reserves))))
-                        (nth tier-index (rs:reserves-leaves reserves))))))
+      (let ((prevouts (if splice
+                          (vector (cons sats (rs:reserves-spk reserves)) (cons (third splice) (fourth splice)))
+                          (vector (cons sats (rs:reserves-spk reserves)))))
+            (leaf (nth tier-index (rs:reserves-leaves reserves))))
+        ;; second value: input 1's sighash when the splice-in sits at the vault's own script
+        (values (rot:tier-sighash proposed 0 prevouts leaf)
+                (and splice (equalp (fourth splice) (rs:reserves-spk reserves))
+                     (rot:tier-sighash proposed 1 prevouts leaf)))))))
 
 (defun parse-splice-param (node param)
   "\"txidhex:vout\" (rotation_sign) -> (txid vout sats spk), looked up on our chain (DEP-20 §4)."
@@ -2989,9 +3014,12 @@
                (tier-index (or (w:jget params "tier_index") 0))
                (claimed-hash (hex->bytes (or (w:jget params "ledger_hash") (fail "no ledger_hash"))))
                (claimed-expiry (or (w:jget params "new_quorum_expiry") (fail "no new_quorum_expiry")))
-               (expected (check-rotation node rec proposed tier-index claimed-hash claimed-expiry
-                                         (w:jget params "exit_cutoff_height")
-                                         (parse-splice-param node (w:jget params "splice_in_outpoint")))))
+               (expected1 nil)
+               (expected (multiple-value-bind (s0 s1)
+                             (check-rotation node rec proposed tier-index claimed-hash claimed-expiry
+                                             (w:jget params "exit_cutoff_height")
+                                             (parse-splice-param node (w:jget params "splice_in_outpoint")))
+                           (setf expected1 s1) s0)))
           (unless (equalp expected (hex->bytes (or (w:jget params "sighash") (fail "no sighash"))))
             (fail "sighash is not the rotation's"))
           (check-relayable proposed)
@@ -3000,7 +3028,9 @@
           ;; vault watch must not take our own signature for a theft.
           (pushnew (btx:tx-txid proposed) (gethash id (node-signed-rotations node)) :test #'equalp)
           (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
-                                                       "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux))))))
+                                                       "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux)))
+                                                       ;; DEP-03: a vault-script splice-in is signed through the same tier
+                                                       "splice_signature" (and expected1 (bytes->hex (schnorr:schnorr-sign (node-priv node) expected1 (random-aux)))))))
       (error (e) (log! node "refused rotation_sign for ~a: ~a" (subseq id 0 8) e)
         (respond node event nil :error (princ-to-string e))))))
 

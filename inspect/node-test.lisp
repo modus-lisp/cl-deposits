@@ -1711,22 +1711,22 @@
                 (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
                                                 :migration-receiver (nd:node-pubkey b) :manifest-hash hash
                                                 :migration-manifest manifest :dormancy-accept accept-hex)))
+              (check-signals "a notice with another receiver's key is refused" error
+                (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
+                                                :migration-receiver (nd:node-pubkey c) :manifest-hash hash
+                                                :migration-manifest manifest :dormancy-accept accept-hex
+                                                :receiver-quorum-begin rqb)))
               (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
                                               :migration-receiver (nd:node-pubkey b) :manifest-hash hash
                                               :migration-manifest manifest :dormancy-accept accept-hex
                                               :receiver-quorum-begin rqb)))
-            (check-signals "a notice with another receiver's key is refused" error
-              (progn (setf (lg:ledger-dormancy-notice (nd:record-ledger la)) nil)
-                     (unwind-protect
-                          (nd:append-operation a la (list :type :dormancy-notice :rotation-height (+ h0 13)
-                                                          :migration-receiver (nd:node-pubkey c) :manifest-hash hash
-                                                          :migration-manifest manifest :dormancy-accept accept-hex
-                                                          :receiver-quorum-begin (up:encode-update (nd::receiver-governing-quorum-begin a acc))))
-                       nil)))
-            ;; restore the good notice (the probe above cleared it locally)
-            (setf (lg:ledger-dormancy-notice (nd:record-ledger la))
-                  (list :height (+ h0 10) :rotation-height (+ h0 13) :receiver (nd:node-pubkey b) :manifest manifest
-                        :spk (op:field (op:decode-operation (up:update-message acc)) :exit-address) :total total :premium nil))
+            (check-equal "the accept names the receiver's own vault script"
+                         (op:field (op:decode-operation (up:update-message acc)) :exit-address)
+                         (rs:reserves-spk (nd::disputed-reserves b lb)))
+            (stage-b)
+            (check-signals "the receiver may not rotate while its accept is outstanding" error
+              (progn (nd:rotate-vault b lb :timeout 20) (nd:begin-quorum b lb)))
+            (nd::clear-rotation b lb)
             (setf *height* (+ h0 14))
             (stage-a)
             (multiple-value-bind (txid sats) (nd:rotate-vault a la :timeout 20)
@@ -1744,7 +1744,11 @@
                                                         (u:sha256 (hx "b1")) (- h0 200))))
                   (check-equal "before crediting, the producer accuses the receiver"
                                (list (getf p :type) (getf p :accused)) (list :uncredited-onchain-payment (nd:node-pubkey-hex b))))
-                (nd::dormancy-credit b lb (op:field o :migration-manifest) txid 1)
+                (check-equal "the QuorumBegin names the notice it consumed"
+                             (op:field o :consumed-notice)
+                             (u:sha256 (up:update-message (find :dormancy-notice (reverse (nd:record-history la))
+                                                               :key (lambda (x) (op:operation-type (op:decode-operation (up:update-message x))))))))
+                (nd::dormancy-credit b lb (nd:record-id-hex la))
                 (check "after crediting, the producer accuses no one"
                        (null (fr:uncredited-migration-proof (reverse (nd:record-history la)) (reverse (nd:record-history lb))
                                                             (u:sha256 (hx "b1")) (- h0 200))))

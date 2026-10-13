@@ -22,7 +22,8 @@
            #:ledger-active-ruleset #:ledger-pending-exits #:ledger-vault-current-p #:due-exits #:+exit-cutoff-margin+
            #:exit-dust-msats #:completion-satisfied-p #:fees-due #:spk-type #:dust-floor-sats #:standard-output-p #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
            #:ledger-dormancy-notice #:dormancy-spin-outs #:dormancy-amount-msats #:deposit-last-signed-activity
-           #:pk-key-path-spk #:dormancy-cost #:dormancy-migration #:ledger-dormancy-accept #:migration-marker #:dormancy-offer-entries
+           #:pk-key-path-spk #:dormancy-cost #:dormancy-migration #:ledger-dormancy-accept #:dormancy-offer-entries #:segwit-address-spk
+           #:consumed-notice-id #:accept-outstanding-p
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-last-fee-assessment #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
@@ -86,7 +87,7 @@
   (reference-feerate nil)           ; the governing QuorumBegin's reference_feerate_sat_vb (DEP-03)
   (dormancy-blocks 26280) (dormancy-notice-blocks 2016)   ; DEP-20 §8, from the promoted members
   (dormancy-notice nil)             ; outstanding DormancyNotice: (:height h :rotation-height r [:manifest :receiver :spk :total :premium])
-  (dormancy-accept nil))            ; receiver: our outstanding DormancyAccept (:hash :spk :total :expires :premium-deposit :credited :outpoint)
+  (dormancy-accept nil))            ; receiver: our DormancyAccept (:hash :spk :total :expires :premium-deposit :resolved :outpoint)
 
 (defun make-ledger () (%make-ledger))
 
@@ -168,12 +169,6 @@
         (and k (= (length k) 33) (member (aref k 0) '(2 3))
              (values (tr::taproot-output-spk-from-root (subseq k 1 33) (make-array 0 :element-type '(unsigned-byte 8)))))))))
 
-(defun migration-exit-spks (receiver33 manifest-hash)
-  "DEP-20 §8.3: the receiver operator's own offer-type addresses for a manifest: the P2WPKH of its
-   key, and the P2TR with its x-only key internal and merkle root SHA256(manifest-hash)."
-  (list (cat (octets 0 20) (cl-consensus.wire:hash160 (coerce receiver33 '(simple-array (unsigned-byte 8) (*)))))
-        (values (tr::taproot-output-spk-from-root (subseq receiver33 1 33) (sha256 manifest-hash)))))
-
 (defun quorum-backed-accept-p (accept qb-update receiver)
   "DEP-20 §8.3 (L4): QB-UPDATE is a QuorumBegin signed by RECEIVER on the accept's ledger at a lower
    sequence, cosigned by a strict majority of its quorum_members, and ACCEPT carries valid
@@ -238,14 +233,41 @@
              (ledger-deposits ledger))
     (sort out #'bytes< :key (lambda (e) (getf e :deposit-id)))))
 
-(defun migration-marker (manifest-hash) (format nil "migration:~a" (bytes->hex manifest-hash)))
+(defun segwit-address-spk (address)
+  "The scriptPubKey of a segwit ADDRESS (any network: the hrp is read off the address)."
+  (let ((hrp (subseq address 0 (position #\1 address :from-end t))))
+    (multiple-value-bind (witver program) (cl-consensus.encoding:segwit-decode address hrp)
+      (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program))))
 
-(defun dormancy-migration (ledger cutoff nspins)
+(defun consumed-notice-id (ledger cutoff)
+  "DEP-20 §8.3: the id (SHA256 of its operation encoding) of the notice a rotating QuorumBegin
+   with CUTOFF consumes, or NIL."
+  (let ((n (ledger-dormancy-notice ledger)))
+    (and n (ledger-vault-current-p ledger) (>= cutoff (getf n :rotation-height)) (getf n :id))))
+
+(defconstant +accept-grace-blocks+ 6 "DEP-20 §8.3: an accept stays outstanding to expires_at_height + 6.")
+
+(defun accept-outstanding-p (ledger height)
+  "DEP-20 §8.3 receiver: an accept not yet resolved, below expires_at_height + 6 at HEIGHT."
+  (let ((a (ledger-dormancy-accept ledger)))
+    (and a (not (getf a :resolved)) (< height (+ (getf a :expires) +accept-grace-blocks+)))))
+
+(defun %open-migrated-deposit (ledger e)
+  "DEP-20 §8.3: a migrated deposit opened on the receiver with its descriptor and fee schedule."
+  (let ((d (make-deposit :id (getf e :deposit-id) :descriptor (getf e :descriptor) :opened-at-block *block-height*
+                         :last-fee-assessment *block-height* :last-activity-block *block-height*
+                         :last-signed-activity *block-height*)))
+    (when (getf e :fees) (setf (deposit-fees d) (getf e :fees)))
+    (setf (gethash (getf e :deposit-id) (ledger-deposits ledger)) d)))
+
+(defun dormancy-migration (ledger cutoff nspins &optional (height *block-height*))
   "DEP-20 §8.3: at a rotating QuorumBegin with exit_cutoff_height CUTOFF that consumes a notice
    naming a receiver, the migrated deposits (manifest-shaped plists, ascending id, capped by the
    accept's total) and the output: (values entries spk sats).  NIL if no migration."
   (let ((n (ledger-dormancy-notice ledger)))
-    (when (and n (getf n :receiver) (ledger-vault-current-p ledger) (>= cutoff (getf n :rotation-height)))
+    (when (and n (getf n :receiver) (ledger-vault-current-p ledger) (>= cutoff (getf n :rotation-height))
+               ;; nothing migrates at or past the accept's expiry
+               (< height (getf n :expires)))
       (let* ((bound (- (getf n :height) (ledger-dormancy-blocks ledger)))
              (spun (mapcar #'first (dormancy-spin-outs ledger cutoff)))
              (offered (mapcar (lambda (e) (getf e :deposit-id)) (getf n :manifest)))
@@ -406,6 +428,14 @@
                                        (eql (op:field o :migration-vout) (+ 1 nexits (length spins))))))
                    (fail :migration-manifest (format nil "~a deposits migrate, ~a recorded or mismatched" (length mentries) (length rec))))
                  (dolist (m mentries) (setf (deposit-balance (find-deposit ledger (getf m :deposit-id))) 0))))
+             ;; DEP-20 §8.3 source: a QuorumBegin consuming a notice names it.
+             (let ((cid (consumed-notice-id ledger cutoff)))
+               (unless (equalp cid (op:field o :consumed-notice))
+                 (fail :consumed-notice (if cid "a QuorumBegin consuming a notice must record consumed_notice"
+                                            "consumed_notice names no notice this QuorumBegin consumes"))))
+             ;; DEP-20 §8.3 receiver: no rotation while an accept is outstanding.
+             (when (and (ledger-vault-current-p ledger) (accept-outstanding-p ledger *block-height*))
+               (fail :migration-freeze "a receiver may not rotate while its DormancyAccept is outstanding"))
              ;; DEP-20 §8.3 receiver: a credited migration must be spliced in at this rotation.
              (let ((a (ledger-dormancy-accept ledger)))
                (when (and a (getf a :outpoint) (ledger-vault-current-p ledger))
@@ -498,20 +528,9 @@
        ;; not exceed the reserves amount.  Unchecked until the red team read this
        ;; arm (docs/REDTEAM.md #1): a cl cosigner would sign an operator crediting
        ;; itself any amount.  (The reference additionally caps by collateral.)
-       (let ((a (ledger-dormancy-accept ledger)))
-         (if (and a (equal (f :funding-address) (migration-marker (getf a :hash))))
-             ;; DEP-20 §8.3: a migration credit draws on the accept's reservation, one outpoint.
-             (progn
-               (when (> (+ (getf a :credited) (f :amount)) (getf a :total))
-                 (fail :over-obligation "migration credits exceed the accepted total"))
-               (when (and (getf a :outpoint) (not (equalp (getf a :outpoint) (cons (f :txid) (f :vout)))))
-                 (fail :over-obligation "migration credits name another outpoint"))
-               (setf (getf (ledger-dormancy-accept ledger) :credited) (+ (getf a :credited) (f :amount))
-                     (getf (ledger-dormancy-accept ledger) :outpoint) (cons (f :txid) (f :vout))))
-             (%check-obligation-room ledger (+ (f :amount)
-                                               (if (and a (or (getf a :outpoint) (> (getf a :expires) *block-height*)))
-                                                   (- (getf a :total) (getf a :credited))
-                                                   0)))))
+       ;; An outstanding DormancyAccept reserves its total (DEP-20 §8.3).
+       (%check-obligation-room ledger (+ (f :amount) (if (accept-outstanding-p ledger *block-height*)
+                                                         (getf (ledger-dormancy-accept ledger) :total) 0)))
        (%credit (find-deposit ledger (f :deposit-id)) (f :amount)))
       (:onchain-lock
        (let ((d (find-deposit ledger (f :deposit-id))))
@@ -615,23 +634,63 @@
                                    (error () (values nil "receiver_quorum_begin does not decode")))
                                  (values nil "the notice carries no receiver_quorum_begin"))
                            (unless ok (fail :dormancy-notice why)))
-                         (unless (member (op:field a :exit-address) (migration-exit-spks (f :migration-receiver) (f :manifest-hash))
-                                         :test #'equalp)
-                           (fail :dormancy-notice "exit_address is not the receiver operator's own address for this manifest"))
+                         (unless (equalp (op:field a :exit-address)
+                                         (ignore-errors
+                                          (segwit-address-spk (op:field (op:decode-operation (up:update-message (up:decode-update (f :receiver-quorum-begin))))
+                                                                        :reserves-id))))
+                           (fail :dormancy-notice "exit_address is not the receiver's current vault script"))
                          (list :receiver (f :migration-receiver) :manifest (f :migration-manifest)
                                :spk (op:field a :exit-address) :total (op:field a :accepted-total)
-                               :premium (f :premium)))))))
+                               :premium (f :premium) :expires (op:field a :expires-at-height))))
+                     ;; DEP-20 §8.3: the id a consuming QuorumBegin records.
+                     (list :id (sha256 (op:encode-operation o))))))
       (:dormancy-accept
        (let ((a (ledger-dormancy-accept ledger)))
          (unless (spk-type (f :exit-address)) (fail :dormancy-accept "migration address is not a standard output script"))
-         (when (and a (or (getf a :outpoint) (> (getf a :expires) *block-height*)))
+         (when (and a (or (getf a :outpoint) (accept-outstanding-p ledger *block-height*)))
            (fail :dormancy-accept "another migration is outstanding"))
          (when (> (+ (total-obligations ledger) (f :accepted-total)) (ledger-reserves-amount ledger))
            (fail :dormancy-accept (format nil "obligations ~a + ~a exceed reserves ~a" (total-obligations ledger)
                                           (f :accepted-total) (ledger-reserves-amount ledger))))
          (setf (ledger-dormancy-accept ledger)
                (list :hash (f :manifest-hash) :spk (f :exit-address) :total (f :accepted-total)
-                     :expires (f :expires-at-height) :premium-deposit (f :deposit-id) :credited 0 :outpoint nil))))
+                     :expires (f :expires-at-height) :premium-deposit (f :deposit-id) :resolved nil :outpoint nil))))
+      (:migration-credit
+       ;; DEP-20 §8.3: positive evidence — the source's signed notice and the QuorumBegin that consumed it.
+       (let ((a (or (ledger-dormancy-accept ledger) (fail :migration-credit "no DormancyAccept to resolve"))))
+         (when (getf a :resolved) (fail :migration-credit "the accept is already resolved"))
+         (multiple-value-bind (nu notice qu qb)
+             (handler-case (let* ((nu (up:decode-update (f :source-notice-update))) (qu (up:decode-update (f :source-qb-update))))
+                             (values nu (op:decode-operation (up:update-message nu)) qu (op:decode-operation (up:update-message qu))))
+               (error () (fail :migration-credit "the source updates do not decode")))
+           (let ((acc (and (eq (op:operation-type notice) :dormancy-notice) (op:field notice :dormancy-accept)
+                           (ignore-errors (up:decode-update (op:field notice :dormancy-accept))))))
+             (unless (and acc (up:verify-operator-signature nu)
+                          (equalp (up:update-ledger-id acc) (ledger-id ledger))
+                          (equalp (op:field notice :manifest-hash) (getf a :hash)))
+               (fail :migration-credit "the notice does not carry this ledger's accept"))
+             (unless (and (eq (op:operation-type qb) :quorum-begin) (up:verify-operator-signature qu)
+                          (equalp (up:update-operator-id qu) (up:update-operator-id nu))
+                          (equalp (up:update-ledger-id qu) (up:update-ledger-id nu))
+                          (> (up:update-seq qu) (up:update-seq nu))
+                          (equalp (op:field qb :consumed-notice) (sha256 (up:update-message nu))))
+               (fail :migration-credit "the QuorumBegin did not consume that notice"))
+             (if (and (op:field qb :migration-manifest)
+                      (equalp (op:field qb :migration-receiver) (ledger-operator-key ledger))
+                      (< (up:update-block-height qu) (getf a :expires)))
+                 (let ((sum (reduce #'+ (op:field qb :migration-manifest) :key (lambda (e) (getf e :amount))))
+                       (premium (or (op:field notice :premium) 0)))
+                   (when (> (+ sum premium) (getf a :total)) (fail :migration-credit "the migration exceeds the accepted total"))
+                   (dolist (e (op:field qb :migration-manifest))
+                     (unless (gethash (getf e :deposit-id) (ledger-deposits ledger))
+                       (%open-migrated-deposit ledger e))
+                     (%credit (find-deposit ledger (getf e :deposit-id)) (getf e :amount)))
+                   (let ((pd (and (getf a :premium-deposit) (gethash (getf a :premium-deposit) (ledger-deposits ledger)))))
+                     (when (and pd (plusp premium)) (%credit pd premium)))
+                   (setf (getf (ledger-dormancy-accept ledger) :outpoint) (cons (op:field qb :new-outpoint-txid) (op:field qb :migration-vout))
+                         (getf (ledger-dormancy-accept ledger) :resolved) t))
+                 ;; consumed without migrating to us: the accept is resolved, nothing credited
+                 (setf (ledger-dormancy-accept ledger) nil))))))
       (:exit-request
        (unless (spk-type (f :exit-address)) (fail :exit-address "not a standard output script (DEP-20 §3)"))
        (let ((d (find-deposit ledger (f :deposit-id))))
