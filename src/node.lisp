@@ -2539,7 +2539,7 @@
     (setf (gethash (fork-key (record-id-hex rec) operator33) (node-ledgers node)) fork)
     fork))
 
-(defun enter-dispute (node rec last-valid-seq &key (reason "fraud") anchor-block-hash anchor-block-height)
+(defun enter-dispute (node rec last-valid-seq &key (reason "fraud") anchor-block-hash anchor-block-height fraud-proof-hash)
   "We are a quorum member of REC's ledger and have grounds: fork it and publish DisputeEnter."
   (let ((stale (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and stale (not (fork-live-p node stale))) (retire-fork node stale)))
@@ -2547,7 +2547,8 @@
                   (make-fork node rec last-valid-seq (node-pubkey node)))))
     (commit-update node fork (new-update node fork (%strip-nil-fields
                                                     (list :type :dispute-enter :last-valid-sequence last-valid-seq :reason reason
-                                                          :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height))))
+                                                          :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height
+                                                          :fraud-proof-hash fraud-proof-hash))))
     fork))
 
 (defun dispute-lottery-n (rec &optional fork-point)
@@ -3439,10 +3440,10 @@
         (broadcast-cosigner-contagion node rec update)
         (when (and (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
                    (not (live-fork node id (node-pubkey node))))   ; the proof may have looped back and forked us already
-          ;; DEP-19 §6: watch co-members who ignore this (same as the received-proof path).
-          (let ((vh (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) (height node))))))
-            (when vh (setf (gethash id (node-derelict-watch node)) (cons (fr:proof-hash proof) vh))))
-          (enter-dispute node rec (lg:ledger-sequence ledger) :reason "non_conforming_update"))))))
+          ;; DEP-19 §6: our DisputeEnter cites the proof; watch co-members who ignore it.
+          (watch-derelicts node id proof
+                           (enter-dispute node rec (lg:ledger-sequence ledger) :reason "non_conforming_update"
+                                                                                :fraud-proof-hash (fr:proof-hash proof))))))))
 
 ;;; Contagion (DEP-19 §5-6).  A cosigner of a non-conforming update is slashable on
 ;;; every ledger it operates, by that ledger's own quorum.  Without it, signing a
@@ -3516,36 +3517,73 @@
               (dolist (rec targets)
                 (log! node "contagion: ~a cosigned a non-conforming update on ~a; disputing its ledger ~a"
                       (subseq (getf proof :accused) 0 8) (subseq (getf (getf proof :evidence) :fault-ledger-id) 0 8) (subseq (record-id-hex rec) 0 8))
-                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "non_conforming_cosignature"))))))))
+                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "non_conforming_cosignature" :fraud-proof-hash (fr:proof-hash proof)))))))))
 
-(defun report-derelict-members (node rec original-fraud-hash32 visible-block-hash32)
-  "DEP-19 §6 / DEP-11.  REC was disputed on a fraud proof (hash ORIGINAL-FRAUD-HASH32) that
-   became visible at VISIBLE-BLOCK-HASH32.  Any co-member that kept operating a ledger it runs,
-   dispute_response_blocks past that, without disputing REC, is derelict.  A member is slashed on
-   the ledgers it OPERATES (which have a quorum), found as contagion finds them (advertisements +
-   our replicas), not on the quorumless member-ledger it cited when joining."
-  (let* ((ledger (record-ledger rec)) (id (record-id-hex rec))
-         (vh (and (node-height-of-block node) (ignore-errors (funcall (node-height-of-block node) visible-block-hash32)))))
-    (when vh
-      (dolist (m (lg:ledger-quorum-members ledger))
-        (let* ((mk (lg:member-pubkey m)) (required (or (lg:member-dispute-response-blocks m) 144)))
-          (when (and (not (equalp mk (node-pubkey node)))     ; not us
-                     (not (live-fork node id mk)))            ; the member never disputed REC (this dispute)
+(defun updates-of-ledger (node id-hex)
+  "Every update we hold of ID-HEX — its own chain and each fork of it — or, holding none,
+   what the relays have."
+  (let ((rec (find-record node id-hex)))
+    (if (and rec (not (record-fork-p rec)))
+        (append (record-history rec) (loop for f in (forks-of node id-hex) append (record-history f)))
+        (ledger-updates-from-relays node id-hex))))
+
+(defun watch-derelicts (node id-hex proof fork)
+  "DEP-19 §6: we disputed ID-HEX on PROOF with FORK's DisputeEnter, which cites the proof and
+   anchors it.  Watch the co-members who do not."
+  (let ((enter (and fork (find-if (lambda (u) (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :dispute-enter))
+                                  (record-history fork)))))
+    (when enter
+      (setf (gethash id-hex (node-derelict-watch node)) (list :proof proof :disclosure enter)))))
+
+(defun governing-quorum-begin (rec seq)
+  "REC's latest QuorumBegin at or before SEQ."
+  (find-if (lambda (u) (and (<= (up:update-seq u) seq)
+                            (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :quorum-begin)))
+           (record-history rec)))
+
+(defun report-derelict-members (node rec watch)
+  "DEP-19 §6 / DEP-11.  We disputed REC on (getf WATCH :proof) with the DisputeEnter (getf WATCH
+   :disclosure).  A co-member that cosigned REC at or after that disclosure and then kept operating
+   a ledger it runs past its own dispute_response_blocks, without disputing REC, is derelict.  It is
+   slashed on the ledgers it OPERATES (which have a quorum), found as contagion finds them
+   (advertisements + our replicas), not on the quorumless member-ledger it cited when joining."
+  (let* ((id (record-id-hex rec)) (proof (getf watch :proof)) (disc (getf watch :disclosure))
+         (anchor (up:update-block-height disc))
+         (lvs (op:field (op:decode-operation (up:update-message disc)) :last-valid-sequence))
+         (qb (governing-quorum-begin rec lvs))
+         (all (updates-of-ledger node id)))
+    (when qb
+      (dolist (mk (op:field (op:decode-operation (up:update-message qb)) :quorum-members))
+        (let* ((vis (and (not (equalp mk (node-pubkey node)))
+                         (find-if (lambda (u) (and (>= (up:update-block-height u) anchor)
+                                                   (find mk (up:update-cosignatures u) :key #'up:cosig-pubkey :test #'equalp)))
+                                  (reverse (record-history rec)))))
+               (required (and vis (fr::member-response-blocks (reverse (record-history rec)) mk (up:update-seq qb)))))
+          (when (and vis (notany (lambda (u) (fr::acted-on-p u mk (hex->bytes id))) all))
             (dolist (target (ledgers-operated-by node mk))
               (let* ((mrec (find-record node target))
-                     (key (format nil "~a:~a" target (bytes->hex mk)))
+                     (key (format nil "~a:~a:~a" target (bytes->hex mk) id))
                      (newest (and mrec (not (record-fork-p mrec))
                                   (find-if (lambda (u) (equalp (up:update-operator-id u) mk)) (record-history mrec)))))
                 (when (and newest
                            (not (gethash key (node-reported-derelict node)))
                            (equalp (lg:ledger-operator-key (record-ledger mrec)) mk)   ; it operates target, we hold it
-                           (>= (- (up:update-block-height newest) vh) required))        ; active past the window
-                  (log! node "DERELICTION: ~a kept operating ~a ~a blocks past the fraud without disputing ~a"
-                        (subseq (bytes->hex mk) 0 8) (subseq target 0 8) (- (up:update-block-height newest) vh) (subseq id 0 8))
-                  (broadcast-fraud node (fr:make-dispute-dereliction-proof
-                                         mk (hex->bytes target) original-fraud-hash32 visible-block-hash32 required newest))
-                  ;; marked only once published: a failed publish is retried on the next pass
-                  (setf (gethash key (node-reported-derelict node)) t))))))))))
+                           (>= (up:update-block-height newest) (+ (up:update-block-height vis) required)))
+                  (let ((d (fr:make-dispute-dereliction-proof mk (hex->bytes target) proof disc qb vis newest)))
+                    (multiple-value-bind (ok why)
+                        (fr:verify-dispute-dereliction d (reverse (record-history mrec))
+                                                       (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
+                                                       :defrauded-updates all)
+                      (if (not ok)
+                          (log! node "not reporting ~a on ~a: our own dereliction proof does not verify: ~a"
+                                (subseq (bytes->hex mk) 0 8) (subseq target 0 8) why)
+                          (progn
+                            (log! node "DERELICTION: ~a kept operating ~a ~a blocks past seeing ~a's fraud without disputing it"
+                                  (subseq (bytes->hex mk) 0 8) (subseq target 0 8)
+                                  (- (up:update-block-height newest) (up:update-block-height vis)) (subseq id 0 8))
+                            (broadcast-fraud node d)
+                            ;; marked only once published: a failed publish is retried on the next pass
+                            (setf (gethash key (node-reported-derelict node)) t))))))))))))))
 
 (defun node-derelict-watch-keys (node) (loop for k being the hash-keys of (node-derelict-watch node) collect k))
 
@@ -3554,7 +3592,7 @@
    active past dispute_response_blocks without disputing it."
   (loop for id being the hash-keys of (node-derelict-watch node) using (hash-value w)
         for rec = (find-record node id)
-        when rec do (ignore-errors (report-derelict-members node rec (car w) (cdr w)))))
+        when (and rec (listp w) (getf w :disclosure)) do (ignore-errors (report-derelict-members node rec w))))
 
 ;;; Unauthorised vault spend (DEP-06).  A reserves outpoint is spent by its
 ;;; QuorumBegin's rotation, a recorded exit, or a confiscation.  Anything else that
@@ -3813,7 +3851,7 @@
               (dolist (rec targets)
                 (log! node "contagion: ~a signed an unauthorised spend of ~a's vault; disputing its ledger ~a"
                       (subseq (getf proof :accused) 0 8) (subseq spent-id 0 8) (subseq (record-id-hex rec) 0 8))
-                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "unauthorized_vault_spend")))))))
+                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "unauthorized_vault_spend" :fraud-proof-hash (fr:proof-hash proof))))))))
 
 (defun broadcast-fraud (node proof)
   (bus:bus-publish (node-bus node) (w:fraud-event (node-keypair node) (getf proof :ledger-id) (getf proof :accused) (fr:broadcast->json proof))))
@@ -3837,24 +3875,30 @@
                (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
                (not (live-fork node id (node-pubkey node))))
       (multiple-value-bind (ok why)
-          (fr:verify-proof proof :history (reverse (record-history rec))
-                           :height-of-block (or (node-height-of-block node)
-                                                ;; no chain view: trust our own tip for the anchor
-                                                (lambda (hash) (declare (ignore hash)) (height node))))
+          (let ((hob (or (node-height-of-block node)
+                         ;; no chain view: trust our own tip for the anchor
+                         (lambda (hash) (declare (ignore hash)) (height node)))))
+            (if (eq (getf proof :type) :dispute-dereliction)
+                (let ((original (getf (getf proof :evidence) :original-proof)))
+                  (if original
+                      (fr:verify-dispute-dereliction proof (reverse (record-history rec)) hob
+                                                     :defrauded-updates (updates-of-ledger node (getf original :ledger-id)))
+                      (values nil "no original proof")))
+                (fr:verify-proof proof :history (reverse (record-history rec)) :height-of-block hob)))
         (if ok
             (let ((last-valid (min (lg:ledger-sequence (record-ledger rec))
                                    (case (getf proof :type)
                                      ((:equivocation :non-conforming-update) (1- (getf (getf proof :evidence) (if (eq (getf proof :type) :equivocation) :sequence :fault-sequence))))
                                      (t (lg:ledger-sequence (record-ledger rec)))))))
               (log! node "fraud proof ~a on ~a verified: disputing from seq ~a" (getf proof :type) (subseq id 0 8) last-valid)
-              (unless (eq (getf proof :type) :dispute-dereliction)
-                (let ((vh (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) (height node))))))
-                  (when vh (setf (gethash id (node-derelict-watch node)) (cons (fr:proof-hash proof) vh)))))
-              (enter-dispute node rec last-valid
-                             ;; snake_case, as the reference writes and matches it
-                             ;; ("quorum_expired", dispute.rs); "quorum-expired" made our
-                             ;; expiry disputes unrecognisable, to it and to our own driver.
-                             :reason (substitute #\_ #\- (string-downcase (symbol-name (getf proof :type))))))
+              (let ((fork (enter-dispute node rec last-valid
+                                         ;; snake_case, as the reference writes and matches it
+                                         ;; ("quorum_expired", dispute.rs); "quorum-expired" made our
+                                         ;; expiry disputes unrecognisable, to it and to our own driver.
+                                         :reason (substitute #\_ #\- (string-downcase (symbol-name (getf proof :type))))
+                                         :fraud-proof-hash (fr:proof-hash proof))))
+                (unless (member (getf proof :type) '(:dispute-dereliction :quorum-expired))
+                  (watch-derelicts node id proof fork))))
             (log! node "fraud proof rejected: ~a" why))))))
 
 ;;; ---------------------------------------------------------------------------

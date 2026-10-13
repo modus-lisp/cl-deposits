@@ -1236,106 +1236,144 @@
 
 
 
-(with-gate ("dereliction: a member that ignores a fraud proof is provably derelict (DEP-19 §6)")
-  ;; A operates L1 (B, C, D cosign).  A fraud proof on L1 becomes visible at block V.
-  ;; D keeps operating its own ledger well past V + dispute_response_blocks without
-  ;; disputing L1 -> derelict.  C disputes L1 promptly -> not derelict.
-  (let* ((bus (bus:make-mock-bus))
-         (heights (make-hash-table :test #'equalp))        ; block-hash -> height, for height-of-block
-         (hob (lambda (h) (gethash h heights)))
-         (a (nd:make-node :priv 11111111111111111201 :bus bus :height-fn (lambda () *height*) :height-of-block hob))
-         (b (nd:make-node :priv 22222222222222222202 :bus bus :height-fn (lambda () *height*) :height-of-block hob))
-         (c (nd:make-node :priv 33333333333333333303 :bus bus :height-fn (lambda () *height*) :height-of-block hob))
-         (d (nd:make-node :priv 44444444444444444404 :bus bus :height-fn (lambda () *height*) :height-of-block hob))
-         (la (nd:open-ledger a :reserves-id "genesis:dl1" :reserves 15600000 :collateral 15600000))
-         (id (nd:record-id-hex la)))
-    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
-    (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
-    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "d100")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
-    ;; the fraud became visible at block V
-    (let* ((v-hash (u:sha256 (hx "deadbeef"))) (v-height 1000) (required 144)
-           (fraud-hash (u:sha256 (hx "f00f"))))
-      (setf (gethash v-hash heights) v-height)
-      ;; D operates its own ledger up to block V + 200 (past the window) without disputing L1
-      (let* ((dl (nd:own-ledger d)))
-        (let ((*height* (+ v-height 200)))
-          (nd:credit-onchain d dl (nd:wallet-open-deposit (nd:make-wallet :priv 55555555555555555505 :bus bus) (nd:record-id-hex dl)) 1000 :txid (u:sha256 (hx "dd"))))
-        (nd::follow-ledger b (nd:record-id-hex dl))              ; b picks up d's own ledger from the bus
-        (let* ((dmrec (nd:find-record b (nd:record-id-hex dl)))
-               (newest (first (nd::record-history dmrec))))
-          (check "b replicates d's own ledger, advanced past the window"
-                 (and dmrec (>= (- (up:update-block-height newest) v-height) required)))
-          (let ((proof (fr:make-dispute-dereliction-proof (nd:node-pubkey d) (u:hex->bytes (nd:record-id-hex dl))
-                                                          fraud-hash v-hash required newest)))
-            (check "a dereliction proof against d verifies"
-                   (fr:verify-dispute-dereliction proof (reverse (nd::record-history dmrec)) hob))
-            (check "its proof hash round-trips through JSON"
-                   (equalp (fr:proof-hash (fr:json->proof (fr:proof->json proof))) (fr:proof-hash proof)))
-            ;; a member still inside the window is not derelict
-            (let ((early (fr:make-dispute-dereliction-proof (nd:node-pubkey d) (u:hex->bytes (nd:record-id-hex dl))
-                                                            fraud-hash (progn (setf (gethash (u:sha256 (hx "bb")) heights) (+ v-height 100)) (u:sha256 (hx "bb")))
-                                                            required newest)))
-              (check "not derelict while inside the response window"
-                     (not (fr:verify-dispute-dereliction early (reverse (nd::record-history dmrec)) hob))))
-            ;; wrong signer: a proof naming c against d's update does not verify
-            (check "the member-active update must be signed by the accused"
-                   (not (fr:verify-dispute-dereliction
-                         (fr:make-dispute-dereliction-proof (nd:node-pubkey c) (u:hex->bytes (nd:record-id-hex dl)) fraud-hash v-hash required newest)
-                         (reverse (nd::record-history dmrec)) hob))))
-          ;; producer: b scans and reports d (who never disputed L1)
-          (let ((before (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+))))))
-            (nd::report-derelict-members b (nd:find-record b id) fraud-hash v-hash)
-            (check "b broadcast a dereliction proof naming d"
-                   (> (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+)))) before))))))))
+;;; FINDINGS D1: a dereliction proof must bind to a real fraud, disclosed by a seated co-member,
+;;; seen by the accused, and judged on the accused's own window.  The cases are written to
+;;; inspect/vectors/dereliction.json (CL_DEPOSITS_WRITE_VECTORS=1) and re-verified from it here and
+;;; by the reference (deposits-protocol/tests/dereliction_vector.rs).
 
+(defun dereliction-vector-case (name proof expect)
+  (w:json-object "name" name "expect" (if expect "ok" "reject") "proof" (fr:proof->json proof)
+                 "proof_hash" (u:bytes->hex (fr:proof-hash proof))))
 
-
-(with-gate ("dereliction: self-detect arms the watch, drive-dereliction produces the proof")
+(with-gate ("dereliction: binds to a real, disclosed, seen fraud; forgeries fail (FINDINGS D1, DEP-19 §6)")
   (let* ((bus (bus:make-mock-bus))
          (heights (make-hash-table :test #'equalp))
          (bhf (lambda (h) (let ((hash (u:sha256 (u:int->be h 4)))) (setf (gethash hash heights) h) hash)))
          (hob (lambda (hash) (gethash hash heights)))
-         (a (nd:make-node :priv 11111111111111111211 :bus bus :height-fn (lambda () *height*) :height-of-block hob :block-hash-fn bhf))
-         (b (nd:make-node :priv 22222222222222222212 :bus bus :height-fn (lambda () *height*) :height-of-block hob :block-hash-fn bhf))
-         (c (nd:make-node :priv 33333333333333333313 :bus bus :height-fn (lambda () *height*) :height-of-block hob :block-hash-fn bhf))
-         (d (nd:make-node :priv 44444444444444444414 :bus bus :height-fn (lambda () *height*) :height-of-block hob :block-hash-fn bhf))
+         (mk (lambda (priv) (nd:make-node :priv priv :bus bus :height-fn (lambda () *height*) :height-of-block hob :block-hash-fn bhf)))
+         (a (funcall mk 11111111111111111211)) (b (funcall mk 22222222222222222212))
+         (c (funcall mk 33333333333333333313)) (d (funcall mk 44444444444444444414))
+         (o (funcall mk 77777777777777777717))                        ; an outsider: no seat anywhere
          (la (nd:open-ledger a :reserves-id "genesis:dw1" :reserves 15600000 :collateral 15600000))
-         (id (nd:record-id-hex la)))
-    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+         (id (nd:record-id-hex la)) (*height* 1000))
+    (funcall bhf *height*)
+    (dolist (m (list b c d o)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
     (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :dispute-response-blocks 5))
     (nd:begin-quorum a la :funding-txid (u:sha256 (hx "d001")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
+    (dolist (m (list c d o)) (nd::follow-ledger b (nd::node-member-ledger-hex m)))
     (let* ((w (nd:make-wallet :priv 55555555555555555515 :bus bus)) (dep (nd:wallet-open-deposit w id)))
       (nd:credit-onchain a la dep 100000 :txid (u:sha256 (hx "d002")))
-      ;; d keeps operating its own ledger well past the window; b replicates it
-      (let ((dl (nd:own-ledger d)))
-        (let ((*height* (+ *height* 200)))
-          (nd:credit-onchain d dl (nd:wallet-open-deposit (nd:make-wallet :priv 66666666666666666616 :bus bus) (nd:record-id-hex dl)) 1000 :txid (u:sha256 (hx "d003"))))
-        (nd::follow-ledger b (nd:record-id-hex dl))
-        (setf (getf (nd::node-adversary d) :ignore-fraud) t)   ; d ignores the fraud -> derelict
-        ;; b self-detects a forged witness-less lock from a (chains onto b's tip at next seq)
-        (let* ((rec (nd:find-record b id)) (ledger (nd:record-ledger rec))
-               (forged (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id)
-                                                       :seq (1+ (lg:ledger-sequence ledger)) :prev-hash (lg:ledger-chain-tip ledger) :block-height *height*
-                                                       :message (op:encode-operation (list :type :transfer-lock :transfer-nonce (u:sha256 (hx "d004"))
-                                                                                           :source-deposit-id dep :destination-deposit-id dep :amount 10000 :fee 0
-                                                                                           :completion-script "sha256(00)" :timeout-height (+ *height* 100)
-                                                                                           :transfer-id (u:sha256 (hx "d005")) :nonce 7777 :expiry (+ *height* 144) :witness '())))))
-                         (up:sign-operator u (nd::node-priv a)) u)))
-          (check "b has no derelict-watch before the fault" (null (nd::node-derelict-watch-keys b)))
-          (nd::report-non-conforming b rec forged "test: witness-less lock")
-          (check "b disputed la and armed a derelict-watch" (and (nd:find-fork b id (nd:node-pubkey b)) (nd::node-derelict-watch-keys b)))
-          ;; d never disputed la (it ignored the fraud); drive-dereliction reports it
-          (let ((before (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+))))))
-            (nd::drive-dereliction b)
+      (setf (getf (nd::node-adversary c) :ignore-fraud) t (getf (nd::node-adversary d) :ignore-fraud) t)
+      ;; b self-detects a forged witness-less lock from a and discloses it in its DisputeEnter
+      (let* ((rec (nd:find-record b id)) (ledger (nd:record-ledger rec))
+             (forged (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id)
+                                                     :seq (1+ (lg:ledger-sequence ledger)) :prev-hash (lg:ledger-chain-tip ledger) :block-height *height*
+                                                     :block-hash (funcall bhf *height*)
+                                                     :message (op:encode-operation (list :type :transfer-lock :transfer-nonce (u:sha256 (hx "d004"))
+                                                                                         :source-deposit-id dep :destination-deposit-id dep :amount 10000 :fee 0
+                                                                                         :completion-script "sha256(00)" :timeout-height (+ *height* 100)
+                                                                                         :transfer-id (u:sha256 (hx "d005")) :nonce 7777 :expiry (+ *height* 144) :witness '())))))
+                       (up:sign-operator u (nd::node-priv a)) u)))
+        (check "b has no derelict-watch before the fault" (null (nd::node-derelict-watch-keys b)))
+        (nd::report-non-conforming b rec forged "test: witness-less lock")
+        (let* ((watch (gethash id (nd::node-derelict-watch b)))
+               (disc (getf watch :disclosure)) (original (getf watch :proof)))
+          (check "b's DisputeEnter cites the proof it disputes on"
+                 (and disc (equalp (op:field (op:decode-operation (up:update-message disc)) :fraud-proof-hash) (fr:proof-hash original))))
+          ;; the operator carries on, still cosigned by c and d, which ignore the fraud: they saw it
+          (let ((*height* (+ *height* 1))) (funcall bhf *height*)
+            (nd:credit-onchain a la dep 1000 :txid (u:sha256 (hx "d006"))))
+          ;; ...and keep operating their own ledgers well past their 5-block window
+          (let ((*height* (+ *height* 20))) (funcall bhf *height*)
+            (dolist (m (list c d o))
+              (nd:credit-onchain m (nd:own-ledger m) (nd:wallet-open-deposit (nd:make-wallet :priv (+ 66666666666666666600 (random 99)) :bus bus) (nd::node-member-ledger-hex m))
+                                 1000 :txid (u:sha256 (u:int->be (random 100000) 4)))))
+          ;; c disputes after all, within its window measured from when it saw the fraud: a rebuttal
+          (let ((*height* (+ *height* 3))) (funcall bhf *height*)
+            (nd:enter-dispute c (nd:find-record c id) (op:field (op:decode-operation (up:update-message disc)) :last-valid-sequence)
+                              :reason "non_conforming_update" :fraud-proof-hash (fr:proof-hash original)))
+          (let* ((before (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+))))))
+            (let ((*height* (+ *height* 21))) (nd::drive-dereliction b))
             (let* ((after (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+))))
-                   (new (subseq after before))
-                   (der (remove-if-not (lambda (e) (eq :dispute-dereliction (getf (fr:json->broadcast (w:parse-json (cl-nostr.event:event-content e))) :type))) new)))
-              (check "drive-dereliction broadcast a DisputeDereliction naming d"
-                     (some (lambda (e) (string= (getf (fr:json->broadcast (w:parse-json (cl-nostr.event:event-content e))) :accused) (nd:node-pubkey-hex d))) der))
+                   (der (remove-if-not (lambda (p) (eq :dispute-dereliction (getf p :type)))
+                                       (mapcar (lambda (e) (fr:json->broadcast (w:parse-json (cl-nostr.event:event-content e)))) (subseq after before))))
+                   (pd (find (nd:node-pubkey-hex d) der :key (lambda (p) (getf p :accused)) :test #'string=))
+                   (dhist (lambda (n) (reverse (nd::record-history (nd:find-record b (nd::node-member-ledger-hex n))))))
+                   (all (nd::updates-of-ledger b id))
+                   (verify (lambda (p n) (fr:verify-dispute-dereliction p (funcall dhist n) hob :defrauded-updates all)))
+                   (mut (lambda (p &rest kvs) (let ((q (copy-tree p))) (loop for (k v) on kvs by #'cddr do (setf (getf (getf q :evidence) k) v)) q))))
+              (check "drive-dereliction reports d, which saw the fraud and stayed active past its window" pd)
+              (check "and not c, which disputed within its window" (notany (lambda (p) (string= (getf p :accused) (nd:node-pubkey-hex c))) der))
+              (check "the report verifies" (and pd (funcall verify pd d)))
+              (check "its proof hash round-trips through JSON" (and pd (equalp (fr:proof-hash (fr:json->proof (fr:proof->json pd))) (fr:proof-hash pd))))
               (check "a second pass does not re-report (dedup)"
-                     (progn (nd::drive-dereliction b)
-                            (= (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+)))) (length after)))))))))))
-
+                     (progn (let ((*height* (+ *height* 22))) (nd::drive-dereliction b))
+                            (= (length (bus:bus-fetch bus (cl-nostr.filter:make-filter :kinds (list w:+kind-fraud-proof+)))) (length after))))
+              (when pd
+                (let* ((ev (getf pd :evidence))
+                       (vis (up:decode-update (u:hex->bytes (getf ev :visibility-update))))
+                       (newest-of (lambda (n) (first (nd::record-history (nd:find-record b (nd::node-member-ledger-hex n))))))
+                       (invented (list :type :non-conforming-update :accused (nd:node-pubkey-hex a) :ledger-id id
+                                       :evidence (list :fault-sequence 99 :fault-update-hex (u:bytes->hex (up:encode-update forged)))))
+                       ;; the D1 probe: an outsider's own "disclosure", an old block, a zero window
+                       (outsider-disc (let ((u (up:make-signed-update :operator-id (nd:node-pubkey o) :ledger-id (u:hex->bytes id) :seq 3
+                                                                       :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                                                       :block-height 1000 :block-hash (funcall bhf 1000)
+                                                                       :message (op:encode-operation (list :type :dispute-enter :last-valid-sequence (op:field (op:decode-operation (up:update-message disc)) :last-valid-sequence) :reason "fraud"
+                                                                                                           :fraud-proof-hash (fr:proof-hash original))))))
+                                        (up:sign-operator u (nd::node-priv o)) u))
+                       (cases
+                         (list (list "valid" pd t d)
+                               (list "invented original hash" (funcall mut pd :original-fraud-hash (u:bytes->hex (u:sha256 (hx "f00f")))) nil d)
+                               (list "invented original proof" (funcall mut pd :original-proof invented :original-fraud-hash (u:bytes->hex (fr:proof-hash invented))) nil d)
+                               (list "outsider forgery: own disclosure, old block, window 0"
+                                     (let ((q (funcall mut pd :disclosure-update (u:bytes->hex (up:encode-update outsider-disc)))))
+                                       (setf (getf (getf q :evidence) :required-response-blocks) 0) q)
+                                     nil d)
+                               (list "srb=0 carried, active inside the accused's window"
+                                     (let ((q (fr:make-dispute-dereliction-proof (nd:node-pubkey d) (u:hex->bytes (nd::node-member-ledger-hex d)) original disc
+                                                                                 (up:decode-update (u:hex->bytes (getf ev :quorum-begin-update)))
+                                                                                 vis (or (find-if (lambda (u) (< (up:update-block-height u) (+ (up:update-block-height vis) 5)))
+                                                                                                  (nd::record-history (nd:find-record b (nd::node-member-ledger-hex d))))
+                                                                                         (funcall newest-of d)))))
+                                       (setf (getf (getf q :evidence) :required-response-blocks) 0) q)
+                                     nil d)
+                               (list "accused not seated"
+                                     (fr:make-dispute-dereliction-proof (nd:node-pubkey o) (u:hex->bytes (nd::node-member-ledger-hex o)) original disc
+                                                                        (up:decode-update (u:hex->bytes (getf ev :quorum-begin-update))) vis (funcall newest-of o))
+                                     nil o)
+                               (list "rebutted: the accused disputed within its window"
+                                     (fr:make-dispute-dereliction-proof (nd:node-pubkey c) (u:hex->bytes (nd::node-member-ledger-hex c)) original disc
+                                                                        (up:decode-update (u:hex->bytes (getf ev :quorum-begin-update))) vis (funcall newest-of c))
+                                     nil c))))
+                  (dolist (k cases)
+                    (destructuring-bind (name p expect n) k
+                      (multiple-value-bind (ok why) (funcall verify p n)
+                        (check (format nil "~a: ~:[rejected~;verifies~]~@[ (~a)~]" name expect (and (not expect) why)) (eq (and ok t) expect)))))
+                  ;; the shared vector: every case, the histories, and the block heights
+                  (let ((path (vector-path "dereliction.json"))
+                        (doc (w:json-object
+                              "cases" (coerce (loop for (name p expect n) in cases
+                                                    collect (let ((j (dereliction-vector-case name p expect)))
+                                                              (setf (gethash "member_ledger" j) (coerce (mapcar (lambda (u) (u:bytes->hex (up:encode-update u))) (funcall dhist n)) 'vector))
+                                                              j))
+                                              'vector)
+                              "defrauded_updates" (coerce (mapcar (lambda (u) (u:bytes->hex (up:encode-update u))) all) 'vector)
+                              "blocks" (let ((h (w:json-object))) (maphash (lambda (k v) (setf (gethash (u:bytes->hex k) h) v)) heights) h))))
+                    (when (uiop:getenv "CL_DEPOSITS_WRITE_VECTORS")
+                      (with-open-file (out path :direction :output :if-exists :supersede) (write-string (w:json doc) out)))
+                    (let* ((v (json-simple:parse (uiop:read-file-string path)))
+                           (vh (gethash "blocks" v))
+                           (vhob (lambda (hash) (gethash (u:bytes->hex hash) vh)))
+                           (vall (map 'list (lambda (x) (up:decode-update (u:hex->bytes x))) (gethash "defrauded_updates" v))))
+                      (check "the shared dereliction vector re-verifies with its recorded verdicts"
+                             (every (lambda (k)
+                                      (let ((ok (fr:verify-dispute-dereliction (fr:json->proof (gethash "proof" k))
+                                                                               (map 'list (lambda (x) (up:decode-update (u:hex->bytes x))) (gethash "member_ledger" k))
+                                                                               vhob :defrauded-updates vall)))
+                                        (and (eq (and ok t) (string= (gethash "expect" k) "ok"))
+                                             (string= (u:bytes->hex (fr:proof-hash (fr:json->proof (gethash "proof" k)))) (gethash "proof_hash" k)))))
+                                    (gethash "cases" v))))))))))))))
 
 ;; Shape of a reference operator's auto_rotation: a 1-in/1-out spend of the current
 ;; vault at a tier into the next quorum's reserves.  A cl member rebuilds both ends.

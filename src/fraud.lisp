@@ -60,7 +60,9 @@
              (cat (s :source-notice-update) (s :source-qb-update) (s :proof-update) (b :confirmed-at-block-hash))
          (cat (s :offer-id) (int->le (getf ev :deadline-block) 4) (s :txid) (int->le (getf ev :vout) 4)
               (int->le (getf ev :amount-sats) 8) (b :confirmed-at-block-hash))))
-        (:dispute-dereliction (cat (s :original-fraud-hash) (b :original-fraud-block-hash) (s :member-ledger-id) (s :member-pubkey)))
+        (:dispute-dereliction
+         (cat (s :original-fraud-hash) (s :disclosure-update) (s :quorum-begin-update) (s :visibility-update)
+              (s :member-ledger-id) (s :member-pubkey) (int->le (getf ev :member-active-sequence) 8)))
         (:unauthorized-vault-spend
          (cat (s :spent-ledger-id) (int->le (getf ev :governing-quorumbegin-seq) 8) (s :spend-tx-hex) (b :spend-block-hash)))
         (:winner-collateral-deviation (cat (s :winner-armed-update-hex) (s :claim-txid) (b :claim-block-hash)))))))
@@ -82,15 +84,20 @@
   (list :type :quorum-expired :accused (bytes->hex accused33) :ledger-id (bytes->hex ledger-id32)
         :evidence (list :anchor-block-hash anchor-block-hash32 :quorum-expiry quorum-expiry)))
 
-(defun make-dispute-dereliction-proof (member33 member-ledger-id32 original-fraud-hash32 original-fraud-block-hash32
-                                       required-response-blocks member-active-update)
-  "DEP-19 §6: MEMBER kept operating (MEMBER-ACTIVE-UPDATE, past the window) without acting on
-   the fraud proof ORIGINAL-FRAUD-HASH, embedded at ORIGINAL-FRAUD-BLOCK-HASH.  Presented on
-   the member's own ledger to slash it."
+(defun make-dispute-dereliction-proof (member33 member-ledger-id32 original-proof disclosure-update
+                                       quorum-begin-update visibility-update member-active-update)
+  "DEP-19 §6: MEMBER sat on the defrauded ledger's quorum (QUORUM-BEGIN-UPDATE), the fraud
+   ORIGINAL-PROOF was disclosed on that ledger by DISCLOSURE-UPDATE (a co-member's DisputeEnter
+   citing its hash, whose signed block is the anchor), MEMBER then cosigned VISIBILITY-UPDATE of
+   that ledger at or after the anchor, and kept operating its own ledger (MEMBER-ACTIVE-UPDATE)
+   past its own dispute_response_blocks from there without disputing.  Presented on the
+   member's own ledger to slash it.  Every element is signed or on chain: no embedding."
   (list :type :dispute-dereliction :accused (bytes->hex member33) :ledger-id (bytes->hex member-ledger-id32)
-        :evidence (list :original-fraud-hash (bytes->hex original-fraud-hash32)
-                        :original-fraud-block-hash original-fraud-block-hash32
-                        :required-response-blocks required-response-blocks
+        :evidence (list :original-proof original-proof
+                        :original-fraud-hash (bytes->hex (proof-hash original-proof))
+                        :disclosure-update (bytes->hex (up:encode-update disclosure-update))
+                        :quorum-begin-update (bytes->hex (up:encode-update quorum-begin-update))
+                        :visibility-update (bytes->hex (up:encode-update visibility-update))
                         :member-ledger-id (bytes->hex member-ledger-id32)
                         :member-active-sequence (up:update-seq member-active-update)
                         :member-pubkey (bytes->hex member33))))
@@ -286,26 +293,110 @@
                   fault-history))))
     (error (c) (values nil (princ-to-string c)))))
 
-(defun verify-dispute-dereliction (proof member-history height-of-block)
-  "DEP-19 §6 / DEP-11 §Dispute Participation.  MEMBER-HISTORY is the accused member's own
-   ledger (the one being slashed).  The member kept operating past the response window
-   without acting on a fraud proof: the original proof was embedded at a block the verifier
-   confirms, and the member signed an update of its own whose (v2-signed) block_height is at
-   least REQUIRED-RESPONSE-BLOCKS later.  Matches the reference's verify_inactive_quorum_member
-   (its fields; the extra two are not in the proof hash, see EVIDENCE-BYTES)."
+;;; DEP-19 §6 dereliction.  The proof binds to a real fraud (the original proof is carried and
+;;; verified against the defrauded ledger), to a real disclosure (a co-member's signed DisputeEnter
+;;; citing that proof's hash: its block is the anchor, not a free choice), to the accused's seat
+;;; (the defrauded ledger's QuorumBegin), and to the accused having seen the ledger after the
+;;; anchor (its own cosignature there).  The window is the accused's own recorded
+;;; dispute_response_blocks; any carried value is ignored.  A DisputeEnter or DisputeArmed the
+;;; accused signed on that ledger within the window rebuts it.
+
+(defparameter +default-dispute-response-blocks+ 144 "DEP-11's default when a member declared none.")
+
+(defun derelict-original-verifies-p (original chain height-of-block)
+  (if (member (getf original :type) '(:quorum-expired :dispute-dereliction))
+      (values nil "the original proof is not a punitive fraud proof")
+      (verify-proof original :history chain :height-of-block height-of-block)))
+
+(defun operator-chain (updates operator33)
+  "The defrauded ledger's own chain: updates its operator signed, one per sequence, in order."
+  (let ((by-seq (make-hash-table)))
+    (dolist (u updates) (when (and (equalp (up:update-operator-id u) operator33) (up:verify-operator-signature u))
+                          (unless (gethash (up:update-seq u) by-seq) (setf (gethash (up:update-seq u) by-seq) u))))
+    (sort (loop for u being the hash-values of by-seq collect u) #'< :key #'up:update-seq)))
+
+(defun member-response-blocks (chain member33 qb-seq)
+  "MEMBER's own dispute_response_blocks: from its latest QuorumAddMember at or before QB-SEQ."
+  (let ((found nil))
+    (dolist (u chain)
+      (when (<= (up:update-seq u) qb-seq)
+        (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+          (when (and o (eq (op:operation-type o) :quorum-add-member) (equalp (op:field o :quorum-member) member33))
+            (setf found (op:field o :dispute-response-blocks))))))
+    (or found +default-dispute-response-blocks+)))
+
+(defun acted-on-p (u member33 ledger-id)
+  "U is MEMBER's own signed DisputeEnter (not an expiry) or DisputeArmed on LEDGER-ID."
+  (and (equalp (up:update-operator-id u) member33) (equalp (up:update-ledger-id u) ledger-id)
+       (up:verify-operator-signature u)
+       (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+         (and o (or (eq (op:operation-type o) :dispute-armed)
+                    (and (eq (op:operation-type o) :dispute-enter)
+                         (not (equal (substitute #\_ #\- (or (op:field o :reason) "")) "quorum_expired"))))))))
+
+(defun verify-dispute-dereliction (proof member-history height-of-block &key defrauded-updates)
+  "MEMBER-HISTORY is the accused member's own ledger (the one being slashed); DEFRAUDED-UPDATES
+   every update the verifier holds of the defrauded ledger (its own chain and any forks).  Fails
+   closed without them.  (values ok reason)."
   (handler-case
-      (let* ((orig-h (funcall height-of-block (e proof :original-fraud-block-hash)))
-             (seq (e proof :member-active-sequence))
-             (member-update (find seq member-history :key #'up:update-seq))
-             (required (e proof :required-response-blocks)))
-        (cond ((null orig-h) (values nil "original-fraud block not in our chain"))
-              ((null member-update) (values nil "member-active update not in the member's history"))
-              ((not (string= (bytes->hex (up:update-operator-id member-update)) (e proof :member-pubkey)))
-               (values nil "member-active update not signed by the accused member"))
-              ((< (- (up:update-block-height member-update) orig-h) required)
-               (values nil (format nil "member-active block only ~a past the original fraud; need ~a"
-                                   (- (up:update-block-height member-update) orig-h) required)))
-              (t (values t nil))))
+      (let* ((original (or (e proof :original-proof) (error "no original proof")))
+             (h (proof-hash original))
+             (mk (hex->bytes (getf proof :accused)))
+             (d-id (hex->bytes (getf original :ledger-id)))
+             (accused-op (hex->bytes (getf original :accused)))
+             (chain (operator-chain (remove-if-not (lambda (u) (equalp (up:update-ledger-id u) d-id)) defrauded-updates) accused-op))
+             (disc (up:decode-update (hex->bytes (e proof :disclosure-update))))
+             (disc-op (op:decode-operation (up:update-message disc)))
+             (qb (up:decode-update (hex->bytes (e proof :quorum-begin-update))))
+             (qb-op (op:decode-operation (up:update-message qb)))
+             (vis (up:decode-update (hex->bytes (e proof :visibility-update))))
+             (active (find (e proof :member-active-sequence) member-history :key #'up:update-seq))
+             (anchor (up:update-block-height disc)))
+        (flet ((confirmed-at-p (u)
+                 ;; A signed header dates the update when it names a block (the reference's do); one
+                 ;; with no block hash (cl's, so far) is dated by its signed block_height alone.
+                 (let ((bh (up:update-block-hash u)))
+                   (or (null bh) (every #'zerop bh)
+                       (eql (funcall height-of-block bh) (up:update-block-height u))))))
+          (cond
+            ((not (string-equal (e proof :original-fraud-hash) (bytes->hex h)))
+             (values nil "original_fraud_hash is not the carried proof's hash"))
+            ((null chain) (values nil "we hold none of the defrauded ledger's updates"))
+            ((multiple-value-bind (ok why) (derelict-original-verifies-p original chain height-of-block)
+               (unless ok (return-from verify-dispute-dereliction (values nil (format nil "the original proof does not verify: ~a" why))))
+               nil))
+            ((not (and (equalp (up:update-ledger-id disc) d-id) (up:verify-operator-signature disc)
+                       (eq (op:operation-type disc-op) :dispute-enter) (equalp (op:field disc-op :fraud-proof-hash) h)))
+             (values nil "the disclosure is not a signed DisputeEnter on the defrauded ledger citing the proof"))
+            ((not (confirmed-at-p disc)) (values nil "the disclosure's block is not on our chain at its height"))
+            ((not (and (equalp (up:update-ledger-id qb) d-id) (equalp (up:update-operator-id qb) accused-op)
+                       (eq (op:operation-type qb-op) :quorum-begin)
+                       (find-if (lambda (u) (equalp (up:encode-update u) (up:encode-update qb))) chain)
+                       (<= (up:update-seq qb) (op:field disc-op :last-valid-sequence))
+                       (notany (lambda (u) (and (< (up:update-seq qb) (up:update-seq u) (1+ (op:field disc-op :last-valid-sequence)))
+                                                (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :quorum-begin)))
+                               chain)))
+             (values nil "the QuorumBegin is not the one governing the defrauded ledger at the fault"))
+            ((not (member mk (op:field qb-op :quorum-members) :test #'equalp))
+             (values nil "the accused held no seat on the defrauded ledger's quorum"))
+            ((not (member (up:update-operator-id disc) (op:field qb-op :quorum-members) :test #'equalp))
+             (values nil "the disclosure is not by a member of that quorum"))
+            ((equalp (up:update-operator-id disc) mk) (values nil "the accused disclosed it: it acted"))
+            ((not (and (equalp (up:update-ledger-id vis) d-id) (>= (up:update-block-height vis) anchor) (confirmed-at-p vis)
+                       (find-if (lambda (c) (and (equalp (up:cosig-pubkey c) mk) (up:verify-cosignature vis c))) (up:update-cosignatures vis))))
+             (values nil "no cosignature by the accused on the defrauded ledger at or after the anchor"))
+            ((null active) (values nil "member-active update not in the member's history"))
+            ((not (and (equalp (up:update-operator-id active) mk) (up:verify-operator-signature active) (confirmed-at-p active)))
+             (values nil "member-active update not signed by the accused at a block on our chain"))
+            (t (let* ((start (up:update-block-height vis))
+                      (required (member-response-blocks chain mk (up:update-seq qb)))
+                      (deadline (+ start required)))
+                 (cond ((< (up:update-block-height active) deadline)
+                        (values nil (format nil "member-active block only ~a past visibility; its window is ~a"
+                                            (- (up:update-block-height active) start) required)))
+                       ((find-if (lambda (u) (and (acted-on-p u mk d-id) (<= (up:update-block-height u) deadline))) defrauded-updates)
+                        (values nil "the accused disputed within its window"))
+                       (t (values t nil))))))))
     (error (c) (values nil (princ-to-string c)))))
 
 ;;; Unauthorised vault spend.  Everything is checked from chain data and the spent
@@ -512,7 +603,7 @@
     (:equivocation (verify-equivocation proof history))
     (:quorum-expired (verify-quorum-expired proof history height-of-block))
     (:non-conforming-update (verify-non-conforming-update proof history))
-    (:dispute-dereliction (verify-dispute-dereliction proof history height-of-block))
+    (:dispute-dereliction (values nil "dereliction needs the defrauded ledger: verify-dispute-dereliction"))
     (:uncredited-onchain-payment
      (if (e proof :source-qb-update)
          (verify-uncredited-migration proof history height-of-block)
@@ -528,7 +619,10 @@
 (defun proof->json (proof)
   (let ((ev (w:json-object)))
     (loop for (k v) on (getf proof :evidence) by #'cddr
-          do (setf (gethash (kebab->snake k) ev) (if (typep v '(vector (unsigned-byte 8))) (bytes->hex v) v)))
+          do (setf (gethash (kebab->snake k) ev)
+                   (cond ((eq k :original-proof) (proof->json v))
+                         ((typep v '(vector (unsigned-byte 8))) (bytes->hex v))
+                         (t v))))
     (w:json-object "proof_type" (cdr (assoc (getf proof :type) +type-names+))
                    "accused" (getf proof :accused) "ledger_id" (getf proof :ledger-id)
                    "evidence" (w:json-object (if (e proof :source-qb-update) "UncreditedMigration" (evidence-variant (getf proof :type))) ev))))
@@ -538,7 +632,7 @@
         (:stale-cosignature "StaleCosign") (:non-conforming-update "NonConformingUpdate")
         (t (cdr (assoc type +type-names+)))))
 
-(defparameter +hex-fields+ '(:spend-block-hash :anchor-block-hash :confirmed-at-block-hash :original-fraud-block-hash :claim-block-hash :deposit-id))
+(defparameter +hex-fields+ '(:spend-block-hash :anchor-block-hash :confirmed-at-block-hash :claim-block-hash :deposit-id))
 
 (defun json->proof (j)
   (let* ((type (car (rassoc (w:jget j "proof_type") +type-names+ :test #'string=)))
@@ -549,7 +643,9 @@
     (when (hash-table-p fields)
       (loop for k being the hash-keys of fields using (hash-value v)
             do (let ((kk (snake->kebab k)))
-                 (setf ev (append ev (list kk (if (and (member kk +hex-fields+) (stringp v)) (hex->bytes v) v)))))))
+                 (setf ev (append ev (list kk (cond ((eq kk :original-proof) (json->proof v))
+                                                     ((and (member kk +hex-fields+) (stringp v)) (hex->bytes v))
+                                                     (t v))))))))
     (list :type type :accused (w:jget j "accused") :ledger-id (w:jget j "ledger_id") :evidence ev)))
 
 (defun requires-embedding-p (type)
@@ -559,7 +655,7 @@
    an equivocation, a stale or non-conforming co-signature, a winner collateral
    deviation, an expired quorum) needs neither, and verifiers must not require one.
    The reference classifies the same way (FraudProofType::requires_embedding)."
-  (member type '(:uncredited-onchain-payment :uncredited-lightning-payment :dispute-dereliction)))
+  (member type '(:uncredited-onchain-payment :uncredited-lightning-payment)))
 
 (defun broadcast->json (proof &key embedding (causal-chain '()))
   "A self-evident proof goes out with no embedding key at all.  It used to carry a
