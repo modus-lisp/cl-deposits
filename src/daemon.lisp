@@ -23,7 +23,11 @@
 (in-package #:cl-deposits.daemon)
 
 (defun arg (form key &optional default) (getf (cdr form) key default))
-(defun rec! (node form) (or (nd:find-record node (arg form :ledger)) (error "no such ledger")))
+(defun rec! (node form)
+  "The ledger :ledger names, as we hold it: the chain we acquired (DisputeAcquire on our fork:
+   we operate it now), else the record."
+  (let* ((id (arg form :ledger)) (acq (and id (nd::acquired-fork node id))))
+    (or (and acq (nd:record-owned-p acq) acq) (nd:find-record node id) (error "no such ledger"))))
 (defun ok (&rest plist) (let ((*print-pretty* nil)) (format nil "~s" (list* :status :ok plist))))
 
 (defun ledger-summary (node rec)

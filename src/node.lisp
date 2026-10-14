@@ -2074,8 +2074,12 @@
   "Blocks the lowest-keyed armer has to propose before the others do too.")
 
 (defun fork-op (fork type)
-  "FORK's most recent update of operation TYPE, and its decoded operation."
-  (let ((u (find type (record-history fork) :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u)))))))
+  "FORK's most recent update of operation TYPE its own operator signed, and its decoded operation.
+   (A dispute of a ledger after a custody change forks the winner's chain, whose DisputeEnter and
+   DisputeAcquire are the winner's, not this fork's.)"
+  (let ((u (find-if (lambda (u) (and (equalp (up:update-operator-id u) (record-fork-operator fork))
+                                     (eq (op:operation-type (op:decode-operation (up:update-message u))) type)))
+                    (record-history fork))))
     (and u (values u (op:decode-operation (up:update-message u))))))
 
 (defun dispute-arm-closes (node base)
@@ -4144,7 +4148,8 @@
                                      (progn (setf (gethash key (node-migrations-watched node)) :done)
                                             (log! node "UNHONOURED OBLIGATION: ~a's new operator left an obligation's residue uncredited; proof broadcast"
                                                   (subseq (record-id-hex rec) 0 8))
-                                            (broadcast-fraud node proof))
+                                            (broadcast-fraud node proof)
+                                            (ignore-errors (dispute-new-operator node rec proof)))
                                      (log! node "unhonoured-obligation proof on ~a does not verify: ~a" (subseq (record-id-hex rec) 0 8) why))))))))))
                (error (e) (log! node "obligation watch on ~a: ~a" (subseq (record-id-hex rec) 0 8) e)))))
 
@@ -4318,6 +4323,35 @@
     (pushnew (w:json (fr:proof->json proof)) (gethash (record-id-hex rec) (node-obligation-proofs node)) :test #'string=)
     t))
 
+(defun dispute-new-operator (node chain proof)
+  "A verified UnhonouredObligation (DEP-06) against the operator CHAIN's ledger has had since a
+   custody change: as a member of that chain's quorum, dispute it from its tip, as the reference
+   disputes any proven fraud of a ledger's current operator.  CHAIN is the replica, or (cl keeps
+   the winner's chain as its fork) the acquired fork.  Returns our new fork, or NIL."
+  (let* ((id (record-id-hex chain)) (l (record-ledger chain))
+         (accused (hex->bytes (getf proof :accused))) (us (node-pubkey node))
+         (members (or (lg:ledger-quorum-members l) (lg:ledger-quorum-at-fork l))))
+    (cond ((equalp accused us) nil)
+          ((not (equalp accused (lg:ledger-operator-key l)))
+           (log! node "unhonoured-obligation proof on ~a names ~a, not its operator" (subseq id 0 8) (subseq (bytes->hex accused) 0 8)) nil)
+          ((not (member us members :key #'lg:member-pubkey :test #'equalp)) nil)
+          ;; already disputing it: our fork holds the custody change
+          ((let ((own (find-fork node id us)))
+             (and own (not (eq own chain))
+                  (some (lambda (u) (eq (op:operation-type (op:decode-operation (up:update-message u))) :dispute-acquire))
+                        (record-history own))))
+           nil)
+          (t
+           (log! node "UNHONOURED OBLIGATION on ~a verified: disputing its new operator ~a from seq ~a"
+                 (subseq id 0 8) (subseq (bytes->hex accused) 0 8) (lg:ledger-sequence l))
+           ;; Our fork from the dispute that moved custody is history now.
+           (let ((own (find-fork node id us)))
+             (when (and own (not (eq own chain)))
+               (release-pledges node id)
+               (retire-fork node own)))
+           (enter-dispute node chain (lg:ledger-sequence l) :reason "unhonoured_obligation"
+                                                            :fraud-proof-hash (fr:proof-hash proof))))))
+
 (defun handle-operator-fraud (node proof)
   (let* ((proof proof)
          (id (getf proof :ledger-id))
@@ -4330,8 +4364,7 @@
             (fr:verify-proof proof :history (reverse (record-history chain))
                                    :height-of-block (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node))))
           (if ok
-              (log! node "UNHONOURED OBLIGATION on ~a verified: its new operator ~a left residue uncredited"
-                    (subseq id 0 8) (subseq (getf proof :accused) 0 8))
+              (dispute-new-operator node chain proof)
               (log! node "unhonoured-obligation proof on ~a rejected: ~a" (subseq id 0 8) why))))
       (return-from handle-operator-fraud nil))
     ;; Already disputing (another proof came first): an offer proof is still owed at confiscation.

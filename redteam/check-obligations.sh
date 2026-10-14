@@ -60,6 +60,11 @@ r=$(cld_ctl $C1 "(:uncredited-offer-proof :ledger \"$Y\" :offer $(python3 -c 'im
 expect "$r" "uncredited-offer-proof (verifies, broadcast)"
 r=$(cld_ctl $C1 "(:uncredited-offer-proof :ledger \"$Y\" :offer $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$ROFFER") :descriptor \"$RDESC\" :txid \"$RT5\" :vout $RV5)")
 expect "$r" "uncredited-offer-proof of the residue payment"
+# Proof 11, live: a cl winner withholds the residue (ADVERSARY :withhold-residue); a reference
+# winner credits it. OBL_WITHHOLD=0 runs every winner honest.
+if [ "${OBL_WITHHOLD:-1}" = 1 ]; then
+  for n in $C1 $C2 $C3; do expect "$(cld_ctl $n '(:adversary :set :withhold-residue t)')" "withhold switch on $n"; done
+fi
 echo "== the members dispute Y; waiting for the confiscation (up to ${WAIT}s)"
 P3=$(sx "$(w w3 "$X" pubkey)" ":PUBKEY"); P4=$(sx "$(w w4 "$Y" pubkey)" ":PUBKEY")
 tr_of() { bcli deriveaddresses "$(bcli getdescriptorinfo "tr(${1:2})" | python3 -c 'import json,sys; print(json.load(sys.stdin)["descriptor"])')" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])'; }
@@ -114,7 +119,25 @@ for i in $(seq 1 $((WAIT / 10))); do
   mine 1 >/dev/null; sleep 10
 done
 [ -n "$acq" ] || fail "no DisputeAcquire of Y within ${WAIT}s"
-echo "   custody: DisputeAcquire at seq ${acq% *} by ${acq#* }; credits after it (count op): $credits"
+W=""; for n in $C1 $C2 $C3; do [ "$(pubkey_of $n | cut -c3-14)" = "${acq#* }" ] && W=$n; done
+echo "   custody: DisputeAcquire at seq ${acq% *} by ${acq#* } (${W:-a reference member}); credits after it (count op): $credits"
+if [ -n "$W" ] && [ "${OBL_WITHHOLD:-1}" = 1 ]; then
+  [ -z "$credits" ] || fail "the withholding winner $W credited anyway: $credits"
+  # The winner signs on, past its service_response_blocks (72), still not crediting: proof 11.
+  mine 75 >/dev/null; sleep 10
+  expect "$(cld_ctl $W "(:deposit-open :ledger \"$Y\" :descriptor \"pk($(pubkey_of $OP))\")")" "the winner's late update"
+  disputed=""
+  for i in $(seq 1 $((WAIT / 10))); do
+    disputed=$(for n in $C1 $C2 $C3; do [ "$n" = "$W" ] && continue
+                 cld_ctl $n '(:log :tail 600)' 2>/dev/null | tr '"' '\n' | grep -q "UNHONOURED OBLIGATION on ${Y:0:8} verified: disputing" && echo $n; done | tr '\n' ' ')
+    [ -n "$disputed" ] && break; mine 1 >/dev/null; sleep 10
+  done
+  [ -n "$disputed" ] || fail "no member disputed the withholding winner $W (proof 11)"
+  rp=0; for m in $R1 $R2; do sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" 2>/dev/null | grep "${Y:0:16}" | grep -q "UnhonouredObligation" && rp=$((rp+1)); done
+  echo "   proof 11: members that disputed the withholding winner: $disputed; reference members that received it: $rp"
+  echo "PASS: the confiscation paid both owed deposits; the withholding winner was proven (proof 11) and disputed."
+  exit 0
+fi
 case "$credits" in *" 35"*) ;; *) fail "the winner did not credit the residue payment (OnchainCredit)";; esac
 case "$credits" in *" 105"*) ;; *) fail "the winner did not resolve the dangling migration (MigrationCredit)";; esac
 echo "PASS: the confiscation swept the migration output and paid both owed deposits; the winner credited the residue."
