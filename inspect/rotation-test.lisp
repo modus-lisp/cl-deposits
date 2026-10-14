@@ -340,6 +340,21 @@
                      (check-equal (format nil "feerate ~a" fs) (list m lo hi)
                                   (list (parse-integer (nth 8 w)) (parse-integer (nth 10 w)) (parse-integer (nth 12 w)))))))))))))
 
+(with-gate ("DEP-05/DEP-06 governing service_response_blocks: the shared vector")
+  (let ((history '()) (n 0))
+    (with-open-file (in (vector-path "service_terms.txt"))
+      (loop for line = (read-line in nil) while line
+            unless (or (zerop (length line)) (char= (char line 0) #\#))
+              do (let ((w (uiop:split-string line :separator " ")))
+                   (cond
+                     ((string= (first w) "update") (setf history (append history (list (up:decode-update (u:hex->bytes (second w)))))))
+                     ((string= (first w) "terms")
+                      (incf n)
+                      (check-equal (format nil "terms at ~a" (second w))
+                                   (fr::governing-service-response-blocks history (parse-integer (second w)))
+                                   (parse-integer (third w))))))))
+    (check-equal "terms cases" 6 n)))
+
 (with-gate ("DEP-20 §8.3 UncreditedOnchainPayment migration evidence: the shared vector")
   (let ((kv (make-hash-table :test #'equal)) (history '()) (blocks '()))
     (with-open-file (in (vector-path "migration_proof.txt"))

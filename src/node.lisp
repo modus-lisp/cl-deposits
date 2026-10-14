@@ -292,7 +292,11 @@
     (up:make-signed-update :operator-id (node-pubkey node) :ledger-id (hex->bytes (record-id-hex rec))
                            :seq (if t0 (1+ (up:update-seq t0)) 0)
                            :prev-hash (if t0 (up:chain-hash t0) (make-array 32 :element-type '(unsigned-byte 8)))
-                           :message (op:encode-operation op) :block-height height)))
+                           :message (op:encode-operation op) :block-height height
+                           ;; DEP-02: the block at HEIGHT, so the update is datable on chain (an
+                           ;; uncredited proof needs its proof update's block on the verifier's chain).
+                           :block-hash (or (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) height)))
+                                           (make-array 32 :element-type '(unsigned-byte 8))))))
 
 (defun commit-update (node rec update)
   "Operator-sign, apply, record, publish, persist.  The update's cosignatures
@@ -864,7 +868,12 @@
                                  (not (record-owned-p f)))
                             (progn (retire-fork node f) nil)
                             f))))
-           (cond (fork (accept-update node fork update))
+           (cond (fork
+                  ;; a burst published out of order (the reference appends its QuorumAddMembers
+                  ;; and DisputeArmed at once): fill the gap first, or the fork never arms here
+                  (when (> (up:update-seq update) (1+ (lg:ledger-sequence (record-ledger fork))))
+                    (catch-up-fork node fork (1- (up:update-seq update))))
+                  (accept-update node fork update))
                  ((and (eq (op:operation-type o) :dispute-enter)
                        (member signer (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp))
                   (let ((fork (make-fork node rec (op:field o :last-valid-sequence) signer)))
@@ -979,12 +988,30 @@
     (when (plusp n) (log! node "caught up ~a from seq ~a to ~a" (subseq (record-id-hex rec) 0 8) from (lg:ledger-sequence ledger)))
     n))
 
+(defun catch-up-fork (node fork &optional upto)
+  "Another member's dispute fork past whose tip an update arrived (or, at startup, any it
+   published while we were down): apply that operator's updates from the relays, in order,
+   to UPTO (default 200 past our tip).  Returns how many applied."
+  (let* ((ledger (record-ledger fork)) (lo (1+ (lg:ledger-sequence ledger))) (n 0))
+    (dolist (u (handler-case (ledger-updates-from-relays node (record-id-hex fork) :from lo :to (or upto (+ lo 199)))
+                 (error (e) (log! node "fork catch-up on ~a: fetch failed: ~a" (subseq (record-id-hex fork) 0 8) e) '()))
+               n)
+      (when (and (= (up:update-seq u) (1+ (lg:ledger-sequence ledger)))
+                 (equalp (up:update-operator-id u) (record-fork-operator fork))
+                 (chains-on-p fork u))
+        (handler-case (when (eq (accept-update node fork u) :applied) (incf n))
+          (error (e)
+            (log! node "fork catch-up on ~a by ~a stopped at seq ~a: ~a" (subseq (record-id-hex fork) 0 8)
+                  (subseq (bytes->hex (record-fork-operator fork)) 0 8) (up:update-seq u) e)
+            (return n)))))))
+
 (defun catch-up-all (node)
   "At startup: every replica we cosign, before the first cosign request arrives."
   (loop for id being the hash-keys of (node-ledgers node) using (hash-value rec)
         do (cond ((not (record-p rec)) (log! node "catch-up: ~a holds ~s, not a record; dropped" id rec)
                                        (remhash id (node-ledgers node)))
-                 ((or (record-owned-p rec) (record-fork-p rec)))
+                 ((record-owned-p rec))
+                 ((record-fork-p rec) (ignore-errors (catch-up-fork node rec)))
                  (t (ignore-errors (catch-up node rec))))))
 
 (defun quorum-names-us-p (node id-hex)
@@ -2568,7 +2595,8 @@
          (fork (make-record :id-hex (record-id-hex rec) :ledger ledger :history (reverse history)
                             :owned-p (equalp operator33 (node-pubkey node))
                             :fork-p t :fork-of (record-id-hex rec) :fork-operator operator33)))
-    (setf (lg:ledger-quorum-members ledger) '() (lg:ledger-next-quorum-members ledger) '())
+    (setf (lg:ledger-quorum-at-fork ledger) (lg:ledger-quorum-members ledger)
+          (lg:ledger-quorum-members ledger) '() (lg:ledger-next-quorum-members ledger) '())
     (setf (gethash (fork-key (record-id-hex rec) operator33) (node-ledgers node)) fork)
     fork))
 
@@ -2644,7 +2672,12 @@
                                                                :source-notice-update (up:encode-update nu)
                                                                :source-qb-update (up:encode-update qu))))
           (log! node "recorded the dangling migration of ~a on our fork" (subseq id 0 8)))))
-    ;; DEP-06: every proven-uncredited payment we verified against this ledger
+    ;; DEP-06: every proven-uncredited payment we verified against this ledger, and any the
+    ;; relays hold (one broadcast after we entered the dispute, or while we were down)
+    (when base
+      (dolist (e (ignore-errors (bus:bus-fetch (node-bus node) (flt:make-filter :kinds (list w:+kind-fraud-proof+)
+                                                                                :tags (list (cons "d" (list (subseq id 0 16))))))))
+        (ignore-errors (note-obligation-proof node base (fr:json->broadcast (w:parse-json (ev:event-content e)))))))
     (dolist (json (gethash id (node-obligation-proofs node)))
       (handler-case
           (progn (commit-update node fork (new-update node fork (list :type :obligation-record :uncredited-proof (ascii->bytes json))))
@@ -2865,7 +2898,7 @@
                             (dolist (e (op:field qb :migration-manifest))
                               (multiple-value-bind (spk v) (lg:owed-spk-sats e)
                                 (if spk
-                                    (push (list (getf e :deposit-id) spk v) outs)
+                                    (push (list* (getf e :deposit-id) spk v) outs)
                                     (incf residue (floor (getf e :amount) 1000)))))))))))))))))
     ;; DEP-06: proven-uncredited offer payments recorded on the participants' forks are owed too
     ;; (paid from the vault: the payment itself sits at the operator's offer address).
@@ -2888,7 +2921,7 @@
                     (let ((e (fr::payment-entry proof)))
                       (multiple-value-bind (spk v) (lg:owed-spk-sats e)
                         (if spk
-                            (push (list (getf e :deposit-id) spk v) outs)
+                            (push (list* (getf e :deposit-id) spk v) outs)
                             (incf residue (floor (getf e :amount) 1000)))))))))))))
     (values (sort swept (lambda (x y) (or (bytes< (first x) (first y))
                                           (and (equalp (first x) (first y)) (< (second x) (second y))))))
@@ -4075,10 +4108,25 @@
       (:unauthorized-vault-spend (handle-vault-spend-fraud node proof))
       (t (handle-operator-fraud node proof)))))
 
+(defun offer-proof-p (proof)
+  (and (eq (getf proof :type) :uncredited-onchain-payment) (not (fr::e proof :source-qb-update))))
+
+(defun note-obligation-proof (node rec proof)
+  "DEP-06: an offer-evidence proof against REC that verifies is owed at confiscation; keep it
+   to record on our fork before arming.  True when kept."
+  (when (and (offer-proof-p proof) (string-equal (getf proof :ledger-id) (record-id-hex rec))
+             (fr:verify-proof proof :history (reverse (record-history rec))
+                                    :height-of-block (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))))
+    (pushnew (w:json (fr:proof->json proof)) (gethash (record-id-hex rec) (node-obligation-proofs node)) :test #'string=)
+    t))
+
 (defun handle-operator-fraud (node proof)
   (let* ((proof proof)
          (id (getf proof :ledger-id))
          (rec (find-record node id)))
+    ;; Already disputing (another proof came first): an offer proof is still owed at confiscation.
+    (when (and rec (not (record-owned-p rec)) (offer-proof-p proof) (live-fork node id (node-pubkey node)))
+      (ignore-errors (note-obligation-proof node rec proof)))
     (when (and rec (not (record-owned-p rec))
                (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
                (not (live-fork node id (node-pubkey node))))

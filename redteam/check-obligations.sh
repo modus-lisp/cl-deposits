@@ -5,7 +5,7 @@
 #   - a DEP-20 §8.3 migration from a source ledger X (a small dormant pk() deposit), whose output
 #     sits at Y's vault script; Y accepts but never sends MigrationCredit;
 #   - an ordinary DEP-10 funding offer a wallet paid (50000 sats) that Y never credits.
-# A member proves the uncredited payment (UncreditedOnchainPayment, deposit-bound offer evidence)
+# Y's terms are the default 72 blocks. A member proves the uncredited payment (UncreditedOnchainPayment, deposit-bound offer evidence)
 # and the members dispute Y. Before arming they record both obligations (ObligationRecord).
 # PASS = the confiscation on chain spends Y's vault and the migration output (swept through the
 #        tier) and pays the migrated deposit's owner and the payment's owner their key-path P2TR
@@ -41,10 +41,14 @@ echo "   migration output $RT:$MV pays Y's vault; Y never credits it"
 D4=$(sx "$(w w4 "$Y" open)" ":DEPOSIT"); [ -n "$D4" ] || fail "w4 open"
 r=$(w w4 "$Y" offer 100000); expect "$r" "w4 offer"
 OADDR=$(sx "$r" ":FUNDING-ADDRESS"); ODESC=$(sx "$r" ":DESCRIPTOR")
-OFFER=$(printf '%s' "$r" | python3 -c 'import sys,re; s=sys.stdin.read(); m=re.search(r":OFFER \"((?:[^\"\\\\]|\\\\.)*)\"", s); print(m.group(1).replace("\\\\\"", "\"").replace("\\\\\\\\", "\\\\"))')
+OFFER=$(printf '%s' "$r" | python3 -c 'import sys,json; s=sys.stdin.read(); print(json.JSONDecoder().raw_decode(s.split(":OFFER ",1)[1])[0])')
 PT=$(wcli sendtoaddress "$OADDR" 0.0005); mine 8 >/dev/null; sleep 10
 PV=$(outpoint_vout "$PT" "$OADDR")
 echo "   w4 paid Y's offer $PT:$PV (50000 sats); Y never credits it"
+# Y's terms: no member declares service_response_blocks, so 72 (DEP-05). The proofs need an update
+# Y signed that long after the payment (and the migration) confirmed: a fresh deposit opens one.
+mine 72 >/dev/null; sleep 15
+[ -n "$(sx "$(w w2 "$Y" open)" ":DEPOSIT")" ] || fail "w2 open on Y (Y's late update)"
 r=$(cld_ctl $C1 "(:uncredited-offer-proof :ledger \"$Y\" :offer $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$OFFER") :descriptor \"$ODESC\" :txid \"$PT\" :vout $PV)")
 expect "$r" "uncredited-offer-proof (verifies, broadcast)"
 echo "== the members dispute Y; waiting for the confiscation (up to ${WAIT}s)"

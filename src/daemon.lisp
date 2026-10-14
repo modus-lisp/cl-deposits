@@ -151,7 +151,7 @@
          ;; :descriptor :txid "display" :vout N [:confirmations 6] — proved against the operator's
          ;; latest update in our replica, verified, then broadcast.
          (let* ((rec (rec! node form)) (txid (txid-bytes (arg form :txid))) (vout (arg form :vout))
-                (info (or (funcall (nd:node-chain-fn node) txid vout) (fail "payment output unknown or spent")))
+                (info (or (funcall (nd:node-chain-fn node) txid vout) (error "payment output unknown or spent")))
                 (h (- (nd:height node) (getf info :confirmations) -1))
                 (history (reverse (nd:record-history rec)))
                 (proof (fr:make-uncredited-offer-proof (nd:record-id-hex rec) (w:parse-json (arg form :offer)) (arg form :descriptor)
@@ -160,7 +160,7 @@
                                                        (car (last history)))))
            (multiple-value-bind (ok why)
                (fr:verify-proof proof :history history :height-of-block (nd:node-height-of-block node))
-             (unless ok (fail "the proof does not verify: ~a" why))
+             (unless ok (error "the proof does not verify: ~a" why))
              (nd::broadcast-fraud node proof)
              (ok :hash (bytes->hex (fr:proof-hash proof))))))
         (:dormancy-offer

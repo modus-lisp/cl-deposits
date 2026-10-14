@@ -78,6 +78,9 @@ for i in 1 2 3; do r=$(cld_ctl $OP2 "(:begin-quorum :ledger \"$Y\")"); case "$r"
 expect "$r" "receiver begin-quorum"; mine 3 >/dev/null; sleep 10
 bcli getrawtransaction "$RT2" true | grep -q "\"txid\": \"$RT\"" || fail "the receiver's rotation $RT2 does not spend the migration output"
 echo "   receiver's rotation $RT2 splices the migration output in"
+sp=0; for m in $R1 $R2; do sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" 2>/dev/null | grep "action=rotation_sign, ledger=${Y:0:16}" | tail -1 | grep -q "success=true" && sp=$((sp+1)); done
+[ $sp -ge 1 ] || fail "no reference member signed the receiver's vault-script splice"
+echo "   reference members: $sp signed the vault-script splice"
 cos=0; for m in $R1 $R2; do sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" 2>/dev/null | grep "action=cosign_update, ledger=${Y:0:16}" | tail -1 | grep -q "success=true" && cos=$((cos+1)); done
 [ $cos -ge 1 ] || fail "no reference member cosigned the receiver's splicing QuorumBegin"
 echo "PASS: dormant deposit spun out, small deposit migrated, credited and spliced in, across implementations."

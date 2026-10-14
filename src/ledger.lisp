@@ -23,7 +23,7 @@
            #:exit-dust-msats #:completion-satisfied-p #:fees-due #:spk-type #:dust-floor-sats #:standard-output-p #:*update-seq* #:ledger-reference-feerate #:rotation-feerate #:exit-cost
            #:ledger-dormancy-notice #:dormancy-spin-outs #:dormancy-amount-msats #:deposit-last-signed-activity
            #:pk-key-path-spk #:dormancy-cost #:dormancy-migration #:ledger-dormancy-accept #:dormancy-offer-entries #:segwit-address-spk
-           #:migration-evidence #:ledger-confiscation-txid #:offer-cosign-digest #:*uncredited-proof-checker* #:unpaid-entries #:owed-spk-sats
+           #:migration-evidence #:ledger-confiscation-txid #:ledger-quorum-at-fork #:offer-cosign-digest #:*uncredited-proof-checker* #:unpaid-entries #:owed-spk-sats
            #:consumed-notice-id #:accept-outstanding-p
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-last-fee-assessment #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
@@ -89,7 +89,8 @@
   (dormancy-blocks 26280) (dormancy-notice-blocks 2016)   ; DEP-20 §8, from the promoted members
   (dormancy-notice nil)             ; outstanding DormancyNotice: (:height h :rotation-height r [:manifest :receiver :spk :total :premium])
   (dormancy-accept nil)             ; receiver: our DormancyAccept (:hash :spk :total :expires :premium-deposit :resolved :outpoint)
-  (confiscation-txid nil))          ; DEP-06: the confiscation a custody change followed (DisputeAcquire)
+  (confiscation-txid nil)           ; DEP-06: the confiscation a custody change followed (DisputeAcquire)
+  (quorum-at-fork '()))             ; the quorum at the fork point (DisputeEnter), which a fork's records are judged by
 
 (defun make-ledger () (%make-ledger))
 
@@ -654,12 +655,15 @@
                          :joined-at-sequence (1+ (ledger-sequence ledger)))
                    (ledger-joined-quorums ledger)))))
       (:ledger-close nil)
-      (:dispute-enter (setf (ledger-dispute-state ledger) :disputed))
+      (:dispute-enter (setf (ledger-dispute-state ledger) :disputed)
+                      ;; a live fork cleared its quorum and set this already (MAKE-FORK); a replay sets it here
+                      (when (ledger-quorum-members ledger)
+                        (setf (ledger-quorum-at-fork ledger) (ledger-quorum-members ledger))))
       (:dispute-armed (setf (ledger-dispute-state ledger) :armed))
       (:dispute-acquire (setf (ledger-confiscation-txid ledger) (f :confiscation-txid)
                               (ledger-operator-key ledger) (f :new-custodian)
                               (ledger-vault-current-p ledger) nil (ledger-dormancy-notice ledger) nil
-                              (ledger-dispute-state ledger) :normal))
+                              (ledger-dispute-state ledger) :normal (ledger-quorum-at-fork ledger) '()))
       (:dormancy-notice
        (when (ledger-dormancy-notice ledger) (fail :dormancy-notice "a notice is already outstanding"))
        (unless (>= (f :rotation-height) (+ *block-height* (ledger-dormancy-notice-blocks ledger)))

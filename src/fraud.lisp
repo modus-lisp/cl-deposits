@@ -506,7 +506,9 @@
              (when (op:field o :service-response-blocks)
                (setf (gethash (op:field o :quorum-member) declared) (op:field o :service-response-blocks))))
             (:quorum-begin (setf members (op:field o :quorum-members)))))))
-    (or (loop for m in members for v = (gethash m declared) when v maximize v) +default-service-response-blocks+)))
+    ;; (LOOP's MAXIMIZE over nothing is 0, not NIL: collect first, so none declared is the default.)
+    (let ((vs (loop for m in members for v = (gethash m declared) when v collect v)))
+      (if vs (reduce #'max vs) +default-service-response-blocks+))))
 
 (defun uncredited-migration-proof (source-history receiver-history confirmed-block-hash confirmed-height)
   "DEP-20 §8.3 producer: an UncreditedOnchainPayment (migration evidence) against the receiver of
@@ -677,7 +679,9 @@
     (let ((deposit (offer-deposit-id proof)) (cosigner (hex->bytes (e proof :cosigner-pubkey))))
       (unless (and (stringp (e proof :descriptor)) (equalp (op:deposit-id (e proof :descriptor)) deposit))
         (error "descriptor does not hash to the offer's deposit_id"))
-      (unless (member cosigner (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
+      ;; on a fork (the only place it is recorded) the quorum is the one at the fork point
+      (unless (member cosigner (or (lg:ledger-quorum-at-fork ledger) (lg:ledger-quorum-members ledger))
+                      :key #'lg:member-pubkey :test #'equalp)
         (error "the offer's cosigner is not a member of the ledger's quorum"))
       (unless (schnorr:schnorr-verify (up:x-only cosigner)
                                       (lg:offer-cosign-digest (getf proof :ledger-id) (hex->bytes (e proof :offer-id)) deposit
