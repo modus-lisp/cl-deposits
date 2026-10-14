@@ -2166,12 +2166,13 @@
         (if built
             (values (first built) (second built) :pending)
             ;; Spent vault, no pending lottery it rebuilds to (claimed, or not a confiscation):
-            ;; the full shape x tier x subset search is not repeated for 30 blocks.
+            ;; final, since nothing can spend that vault again, so the shape x tier x subset
+            ;; search is not repeated (until a restart).
             (when (multiple-value-bind (r txid vout) (disputed-reserves node (find-record node id-hex))
                     (declare (ignore r))
                     (not (funcall (node-chain-fn node) txid vout)))
               (bt:with-lock-held (*rebuild-misses-lock*)
-                (setf (gethash (cons (node-pubkey node) id-hex) *rebuild-misses*) (+ (height node) 30)))
+                (setf (gethash (cons (node-pubkey node) id-hex) *rebuild-misses*) most-positive-fixnum))
               nil))))))
 
 (defun lottery-paid-by (node id-hex spk)
@@ -2369,12 +2370,20 @@
                           (error (e) (note-dispute node id "confiscation not yet: ~a" e))))
                        (t (note-dispute node id "armed; another armer proposes first"))))))))))))
 
-(defvar *drive-dispute-lock* (bt:make-lock "drive-dispute"))
+(defvar *drive-locks* (make-hash-table :test #'equalp))
+(defvar *drive-locks-lock* (bt:make-lock "drive-locks"))
+
+(defun drive-lock (node fork)
+  "One lock per (node, disputed ledger): a fork is never driven twice at once, and a long
+   pass over old forks never blocks arming a new one."
+  (let ((key (cons (node-pubkey node) (record-id-hex fork))))
+    (bt:with-lock-held (*drive-locks-lock*)
+      (or (gethash key *drive-locks*) (setf (gethash key *drive-locks*) (bt:make-lock "drive-fork"))))))
 
 (defun drive-disputes (node)
   (loop for rec in (loop for r being the hash-values of (node-ledgers node)
                          when (and (record-fork-p r) (record-owned-p r)) collect r)
-        do (bt:with-lock-held (*drive-dispute-lock*)
+        do (bt:with-lock-held ((drive-lock node rec))
              (handler-case (drive-dispute node rec)
                (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e))))))
 
@@ -2384,11 +2393,13 @@
 (defun drive-dispute-now (node fork)
   "Arm a dispute as soon as we enter it, as the reference does, rather than at the next
    once-a-minute pass: the arm window can close first, leaving us out of the lottery.  Only
-   when no pass is driving (never two arms at once, never blocking the relay handler)."
-  (when (and *drive-dispute-on-enter* (bt:acquire-lock *drive-dispute-lock* nil))
-    (unwind-protect (handler-case (drive-dispute node fork)
-                      (error (e) (note-dispute node (record-id-hex fork) "error: ~a" e)))
-      (bt:release-lock *drive-dispute-lock*))))
+   when no pass is driving this ledger (never two arms at once, never blocking the relay
+   handler)."
+  (let ((lock (drive-lock node fork)))
+    (when (and *drive-dispute-on-enter* (bt:acquire-lock lock nil))
+      (unwind-protect (handler-case (drive-dispute node fork)
+                        (error (e) (note-dispute node (record-id-hex fork) "error: ~a" e)))
+        (bt:release-lock lock)))))
 
 (defun start-expiry-watch (node &key (interval 60))
   (bt:make-thread (lambda () (loop (sleep interval)
