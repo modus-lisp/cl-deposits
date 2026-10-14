@@ -14,6 +14,7 @@ source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/en
 WAIT=${WAIT:-900}
 pick OP C1 C2 C3 OP2
 R1=${R1:-ref6}; R2=${R2:-ref7}
+for m in $R1 $R2; do eval "REFLOG0_$m=$(( $(stat -c %s "$CLD_ROOT/$m/node.log" 2>/dev/null || echo 0) + 1 ))"; done   # this run's part only
 for n in $OP $C1 $C2 $C3 $OP2; do cld_running $n || continue; stop_cld $n >/dev/null; start_cld $n >/dev/null & done; wait
 export DORM=5 DORM_NOTICE=3
 NAME=${REDTEAM_OBL:-OBL$RANDOM}
@@ -144,16 +145,21 @@ if [ -n "$W" ] && [ "${OBL_WITHHOLD:-1}" = 1 ]; then
   # The winner signs on, past its service_response_blocks (72), still not crediting: proof 11.
   mine 75 >/dev/null; sleep 10
   expect "$(cld_ctl $W "(:deposit-open :ledger \"$Y\" :descriptor \"pk($(pubkey_of $OP))\")")" "the winner's late update"
-  disputed=""
+  # Both implementations must act on proof 11: a cl member (not the winner) and a reference member
+  # each verify it and dispute the winner's ledger.
+  ref_disputed() { for m in $R1 $R2; do tail -c +"$(eval echo \$REFLOG0_$m)" "$CLD_ROOT/$m/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+                     | grep -q "INITIATING DISPUTE based on fraud proof: ledger=${Y}.*UnhonouredObligation" && echo $m; done | tr '\n' ' '; }
+  disputed=""; rdisputed=""
   for i in $(seq 1 $((WAIT / 10))); do
     disputed=$(for n in $C1 $C2 $C3; do [ "$n" = "$W" ] && continue
                  cld_ctl $n '(:log :tail 600)' 2>/dev/null | tr '"' '\n' | grep -q "UNHONOURED OBLIGATION on ${Y:0:8} verified: disputing" && echo $n; done | tr '\n' ' ')
-    [ -n "$disputed" ] && break; mine 1 >/dev/null; sleep 10
+    rdisputed=$(ref_disputed)
+    [ -n "$disputed" ] && [ -n "$rdisputed" ] && break; mine 1 >/dev/null; sleep 10
   done
-  [ -n "$disputed" ] || fail "no member disputed the withholding winner $W (proof 11)"
-  rp=0; for m in $R1 $R2; do sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" 2>/dev/null | grep "${Y:0:16}" | grep -q "UnhonouredObligation" && rp=$((rp+1)); done
-  echo "   proof 11: members that disputed the withholding winner: $disputed; reference members that received it: $rp"
-  echo "PASS: the confiscation paid both owed deposits; the withholding winner was proven (proof 11) and disputed."
+  echo "   proof 11: cl members that disputed the withholding winner: ${disputed:-none}; reference members: ${rdisputed:-none}"
+  [ -n "$disputed" ] || fail "no cl member disputed the withholding winner $W (proof 11)"
+  [ -n "$rdisputed" ] || fail "no reference member disputed the withholding winner $W (proof 11)"
+  echo "PASS: the confiscation paid both owed deposits; the withholding winner was proven (proof 11) and disputed by cl and reference members."
   exit 0
 fi
 case "$credits" in *" 35"*) ;; *) fail "the winner did not credit the residue payment (OnchainCredit)";; esac
