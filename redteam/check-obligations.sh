@@ -154,7 +154,7 @@ if [ -n "$W" ] && [ "${OBL_WITHHOLD:-1}" = 1 ]; then
   # Both implementations must act on proof 11: a cl member (not the winner) and a reference member
   # each verify it and dispute the winner's ledger.
   ref_disputed() { for m in $R1 $R2; do tail -c +"$(eval echo \$REFLOG0_$m)" "$CLD_ROOT/$m/node.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
-                     | grep -q "INITIATING DISPUTE based on fraud proof: ledger=${Y}.*UnhonouredObligation" && echo $m; done | tr '\n' ' '; }
+                     | grep -q "INITIATING DISPUTE based on fraud proof: ledger=${Y:0:16}.*UnhonouredObligation" && echo $m; done | tr '\n' ' '; }
   disputed=""; rdisputed=""
   for i in $(seq 1 $((WAIT / 10))); do
     disputed=$(for n in $C1 $C2 $C3; do [ "$n" = "$W" ] && continue
