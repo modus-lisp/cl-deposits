@@ -2139,6 +2139,9 @@
 
 (defconstant +max-arms+ 4 "Arms that count per armer: the first and up to three re-arms (DEP-03).")
 
+(defvar *rebuild-misses* (make-hash-table :test #'equalp))
+(defvar *rebuild-misses-lock* (bt:make-lock "rebuild-misses"))
+
 (defun confiscated-lottery (node id-hex)
   "The confiscation of ID-HEX that is on chain: one we signed, or rebuilt from
    public state.  (values tx lottery :pending) while its lottery output is unspent."
@@ -2156,9 +2159,20 @@
     ;; pending, and rebuilding every shape x tier x subset would only rediscover that, at a
     ;; chain walk per obligation, on every pass.
     (unless (or (gethash id-hex (node-signed-confiscations node))
-                (gethash id-hex (node-seen-confiscations node)))
+                (gethash id-hex (node-seen-confiscations node))
+                (let ((until (bt:with-lock-held (*rebuild-misses-lock*) (gethash (cons (node-pubkey node) id-hex) *rebuild-misses*))))
+                  (and until (< (height node) until))))
       (let ((built (rebuild-confiscation-on-chain node id-hex)))
-        (when built (values (first built) (second built) :pending))))))
+        (if built
+            (values (first built) (second built) :pending)
+            ;; Spent vault, no pending lottery it rebuilds to (claimed, or not a confiscation):
+            ;; the full shape x tier x subset search is not repeated for 30 blocks.
+            (when (multiple-value-bind (r txid vout) (disputed-reserves node (find-record node id-hex))
+                    (declare (ignore r))
+                    (not (funcall (node-chain-fn node) txid vout)))
+              (bt:with-lock-held (*rebuild-misses-lock*)
+                (setf (gethash (cons (node-pubkey node) id-hex) *rebuild-misses*) (+ (height node) 30)))
+              nil))))))
 
 (defun lottery-paid-by (node id-hex spk)
   "The lottery over a subset of ID-HEX's armers whose output script is SPK (our cut
