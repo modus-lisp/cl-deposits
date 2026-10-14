@@ -425,29 +425,47 @@
    a mempool-only spend is unspent), (:at h) for a spend confirmed in blocks SCAN-FROM..tip
    (getblock verbosity 3 gives the input's prevout height and value), or :before when the
    output is neither: spent earlier, unconfirmed, or unknown.  All three exclude the pledge."
-  (lambda (txid vout scan-from)
-    (let* ((hex (txid-hex txid))
-           (json (lambda (out) (and (plusp (length out)) (char= (char out 0) #\{) (js:parse out))))
-           (tip (parse-integer (string-trim '(#\Newline #\Space) (run-cli cli "getblockcount")) :junk-allowed t))
-           (utxo (funcall json (run-cli cli "gettxout" hex (princ-to-string vout) "false"))))
-      (cond
-        (utxo (list :created (let ((best (funcall json (run-cli cli "getblockheader" (gethash "bestblock" utxo)))))
-                               ;; heights from gettxout's own bestblock: a block between two calls cannot skew it
-                               (and best (- (gethash "height" best) (1- (gethash "confirmations" utxo)))))
-                    :value-sats (round (* (gethash "value" utxo) 100000000)) :spend :unspent))
-        ((null tip) nil)
-        (t (or (loop for h from scan-from to tip
-                     for bhash = (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string h)))
-                     for blk = (funcall json (run-cli cli "getblock" bhash "3"))
-                     thereis (and blk
-                                  (loop for tx across (gethash "tx" blk)
-                                        thereis (loop for i across (gethash "vin" tx)
-                                                      for pv = (gethash "prevout" i)
-                                                      thereis (and pv (equal (gethash "txid" i) hex) (eql (gethash "vout" i) vout)
-                                                                   (list :created (gethash "height" pv)
-                                                                         :value-sats (round (* (gethash "value" pv) 100000000))
-                                                                         :spend (list :at h)))))))
-               (list :created 0 :value-sats most-positive-fixnum :spend :before)))))))
+  ;; A confirmed spend never changes, so once found (a walk to the tip, a process pair per
+  ;; block) it is remembered.  Without this every dispute pass re-walked the chain for every
+  ;; obligation and pledge of every fork, and drive-disputes stopped reaching new disputes.
+  ;; Only spends 6+ deep are kept (reorgs); :before is not, since an unconfirmed output also
+  ;; reads as :before and may yet confirm.  An unspent output is one gettxout.
+  (let ((known (make-hash-table :test #'equal)) (lock (bt:make-lock "pledge-fn")))
+    (lambda (txid vout scan-from)
+      (block pledge
+        (let* ((hex (txid-hex txid))
+               (hit (bt:with-lock-held (lock) (gethash (cons hex vout) known))))
+          (when hit
+            (return-from pledge
+              (if (>= (second (getf hit :spend)) scan-from)
+                  hit
+                  (list :created 0 :value-sats most-positive-fixnum :spend :before))))
+          (let* ((json (lambda (out) (and (plusp (length out)) (char= (char out 0) #\{) (js:parse out))))
+                 (tip (parse-integer (string-trim '(#\Newline #\Space) (run-cli cli "getblockcount")) :junk-allowed t))
+                 (utxo (funcall json (run-cli cli "gettxout" hex (princ-to-string vout) "false")))
+                 (result
+                   (cond
+                     (utxo (list :created (let ((best (funcall json (run-cli cli "getblockheader" (gethash "bestblock" utxo)))))
+                                            ;; heights from gettxout's own bestblock: a block between two calls cannot skew it
+                                            (and best (- (gethash "height" best) (1- (gethash "confirmations" utxo)))))
+                                 :value-sats (round (* (gethash "value" utxo) 100000000)) :spend :unspent))
+                     ((null tip) nil)
+                     (t (or (loop for h from scan-from to tip
+                                  for bhash = (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string h)))
+                                  for blk = (funcall json (run-cli cli "getblock" bhash "3"))
+                                  thereis (and blk
+                                               (loop for tx across (gethash "tx" blk)
+                                                     thereis (loop for i across (gethash "vin" tx)
+                                                                   for pv = (gethash "prevout" i)
+                                                                   thereis (and pv (equal (gethash "txid" i) hex) (eql (gethash "vout" i) vout)
+                                                                                (list :created (gethash "height" pv)
+                                                                                      :value-sats (round (* (gethash "value" pv) 100000000))
+                                                                                      :spend (list :at h)))))))
+                            (list :created 0 :value-sats most-positive-fixnum :spend :before))))))
+            (let ((spend (getf result :spend)))
+              (when (and (consp spend) tip (>= tip (+ (second spend) 6)))
+                (bt:with-lock-held (lock) (setf (gethash (cons hex vout) known) result))))
+            result))))))
 
 (defun bitcoin-cli-feerate-fn (cli)
   "Height -> the block's feerate, floor(4 x total fee / total weight) over its non-coinbase
