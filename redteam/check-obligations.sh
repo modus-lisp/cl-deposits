@@ -69,8 +69,26 @@ echo "== the members dispute Y; waiting for the confiscation (up to ${WAIT}s)"
 P3=$(sx "$(w w3 "$X" pubkey)" ":PUBKEY"); P4=$(sx "$(w w4 "$Y" pubkey)" ":PUBKEY")
 tr_of() { bcli deriveaddresses "$(bcli getdescriptorinfo "tr(${1:2})" | python3 -c 'import json,sys; print(json.load(sys.stdin)["descriptor"])')" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])'; }
 A3=$(tr_of "$P3"); A4=$(tr_of "$P4")
+# The confiscation is the transaction that spends Y's vault, whoever proposed it: the
+# reference members arm at once and can run the whole lottery before a cl member's
+# once-a-minute dispute pass arms, so the cl members' logs need not mention it.
+read -r ytx yvout <"$S/redteam-${NAME}Y.outpoint"
+H0=$(( $(bcli getblockcount) - 30 ))
+vault_spender() {
+  local tip h; tip=$(bcli getblockcount)
+  for h in $(seq "$H0" "$tip"); do
+    bcli getblock "$(bcli getblockhash "$h")" 2 | python3 -c '
+import json, sys
+b = json.load(sys.stdin)
+for t in b["tx"]:
+    if any(i.get("txid") == sys.argv[1] and i.get("vout") == int(sys.argv[2]) for i in t["vin"]):
+        print(t["txid"]); break' "$ytx" "$yvout"
+  done | head -1
+}
 conf=""
 for i in $(seq 1 $((WAIT / 10))); do
+  conf=$(vault_spender)
+  [ -n "$conf" ] && break
   conf=$(for n in $C1 $C2 $C3; do cld_ctl $n '(:log :tail 400)' 2>/dev/null; done | tr '"' '\n' | grep -F "dispute ${Y:0:8}:" | grep -oE "confiscation [0-9a-f]{64} on chain" | grep -oE '[0-9a-f]{64}' | head -1)
   [ -n "$conf" ] && break; mine 1 >/dev/null; sleep 10
 done
