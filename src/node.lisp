@@ -2100,7 +2100,13 @@
    txid depends on the tier (nLockTime) and on whether it was respectful (the
    operator's change output), so both are tried; a rebuild with the defaults
    (non-respectful) never matched a respectful confiscation after a restart."
-  (when (node-chain-fn node)
+  (when (and (node-chain-fn node)
+             ;; No confiscation can exist while the vault is unspent: one gettxout instead of
+             ;; rebuilding every shape x tier x armer subset, each with its obligations (a
+             ;; chain walk apiece), on every drive-disputes pass of a fresh dispute.
+             (multiple-value-bind (r txid vout) (disputed-reserves node (find-record node id-hex))
+               (declare (ignore r))
+               (not (funcall (node-chain-fn node) txid vout))))
     (flet ((try (armers)
              (loop for respectful in '(t nil)
                    thereis (loop for ti below (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))
