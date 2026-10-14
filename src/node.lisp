@@ -2390,26 +2390,47 @@
     (bt:with-lock-held (*drive-locks-lock*)
       (or (gethash key *drive-locks*) (setf (gethash key *drive-locks*) (bt:make-lock "drive-fork"))))))
 
+(defparameter *max-drive-threads* 3
+  "Forks one node drives at once in the watch.  Unbounded, every fork of every node ran
+   bitcoin-cli together (load 139, members missing their cosign windows).")
+(defvar *drive-threads* (make-hash-table :test #'equalp) "node pubkey -> forks being driven")
+(defvar *drive-threads-lock* (bt:make-lock "drive-threads"))
+
+(defun dormant-dispute-p (node fork)
+  "A fork the last pass found finished or stuck on a vault already spent: driven after the
+   live ones."
+  (let ((note (gethash (record-id-hex fork) (node-dispute-notes node))))
+    (and note (or (string= note "concluded")
+                  (search "reserves spent, but not by a confiscation" note)
+                  (search "yielded" note)))))
+
 (defun drive-disputes (node &key parallel)
-  "Drive every dispute fork we own.  PARALLEL (the once-a-minute watch): each fork on its
-   own thread, skipping a fork whose previous drive is still running.  Driven in turn, a
-   pass over old forks (a fruitless confiscation rebuild took 3 minutes each) held a live
-   dispute back 16 minutes, past the time its members had to reveal (check-obligations,
-   regtest 2026-10-14)."
-  (loop for rec in (loop for r being the hash-values of (node-ledgers node)
-                         when (and (record-fork-p r) (record-owned-p r)) collect r)
-        do (if parallel
-               (let ((lock (drive-lock node rec)) (rec rec))
-                 ;; The thread takes the lock itself (a mutex is released by its owner).
-                 (bt:make-thread (lambda ()
-                                   (when (bt:acquire-lock lock nil)
-                                     (unwind-protect (handler-case (drive-dispute node rec)
-                                                       (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))
-                                       (bt:release-lock lock))))
-                                 :name "drive-dispute"))
-               (bt:with-lock-held ((drive-lock node rec))
-                 (handler-case (drive-dispute node rec)
-                   (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))))))
+  "Drive every dispute fork we own.  PARALLEL (the once-a-minute watch): up to
+   *max-drive-threads* forks at once, live disputes first, skipping a fork whose previous
+   drive is still running.  Driven in turn, a pass over old forks (a fruitless
+   confiscation rebuild took minutes each) held a live dispute back 16 minutes, past the
+   time its members had to reveal (check-obligations, regtest 2026-10-14)."
+  (let ((forks (stable-sort (loop for r being the hash-values of (node-ledgers node)
+                                  when (and (record-fork-p r) (record-owned-p r)) collect r)
+                            (lambda (a b) (and (not (dormant-dispute-p node a)) (dormant-dispute-p node b))))))
+    (dolist (rec forks)
+      (if parallel
+          (let ((lock (drive-lock node rec)) (rec rec) (key (node-pubkey node)))
+            (when (bt:with-lock-held (*drive-threads-lock*)
+                    (when (< (gethash key *drive-threads* 0) *max-drive-threads*)
+                      (incf (gethash key *drive-threads* 0))))
+              ;; The thread takes the fork's lock itself (a mutex is released by its owner).
+              (bt:make-thread (lambda ()
+                                (unwind-protect
+                                     (when (bt:acquire-lock lock nil)
+                                       (unwind-protect (handler-case (drive-dispute node rec)
+                                                         (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))
+                                         (bt:release-lock lock)))
+                                  (bt:with-lock-held (*drive-threads-lock*) (decf (gethash key *drive-threads*)))))
+                              :name "drive-dispute")))
+          (bt:with-lock-held ((drive-lock node rec))
+            (handler-case (drive-dispute node rec)
+              (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e))))))))
 
 (defvar *drive-dispute-on-enter* t
   "Drive a dispute the moment we enter it (tests that stage arming by hand bind it to NIL).")
