@@ -156,8 +156,9 @@ Implemented cosigner contagion (DEP-19 §5): cl d4614e7 (produce and act) and de
   vault at Tier 0 is on-chain, not a ledger update. Both implementations now prove it
   (`UnauthorizedVaultSpend`, DEP-06 list item 7, wire type 10) against every witness signer, on every
   ledger the signer operates; `redteam/attack-vault-spend.sh` shows the contagion live (REDTEAM.md).
-  Limit: a confiscation is excused only if the verifier knows of it, so a verifier that missed a
-  dispute can wrongly accuse its signers.
+  A confiscation is excused iff it is the one the rules build from public state (DEP-06
+  "Authorised confiscation"): every verifier rebuilds it from the relay, including one that missed
+  the dispute, so no honest signer is accused (2026-10-14; vector `authorised_confiscation.txt`).
 
 ### 2d. Operator contagion quantified: more ledgers, more deterrent (simulation)
 

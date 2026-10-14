@@ -748,7 +748,8 @@ continues underneath.
 The 2026-09-30 run (`attack-vault-spend.sh`, claim #9) showed the gap: a colluding majority spent
 a vault at Tier 0 and no node reacted.  cl now closes it.  Each node scans every new block (once,
 node-wide, `getblock` verbosity 3) for inputs spending any vault outpoint it replicates; a spend
-that is not a txid a recorded QuorumBegin creates, nor the node's known confiscation, and whose
+that is not a txid a recorded QuorumBegin creates, nor (since 2026-10-14) the confiscation the rules
+rebuild from public state (DEP-06 "Authorised confiscation"), and whose
 tier witness verifies to threshold under the QuorumBegin's reserves, is an `UnauthorizedVaultSpend`
 (discriminant 10) against each signer, published on every ledger the signer operates.  A node that
 cosigns such a ledger verifies it against its own replica of the spent ledger and disputes.

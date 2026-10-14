@@ -303,6 +303,34 @@
                                 (coerce (gethash "participants" (gethash "expect" case)) 'list))
                    (check-equal (format nil "~a: snapshot" (gethash "name" case)) snapshot (gethash "snapshot" (gethash "expect" case)))))))))
 
+;;; inspect/vectors/authorised_confiscation.txt: DEP-06 "Authorised confiscation", shared with
+;;; deposits-rust (deposits-node/tests/vectors): a vault spend is excused iff it is the rebuild from
+;;; public state.  A node that never saw the dispute judges from the relay's updates alone.
+(with-gate ("DEP-06 authorised confiscation: the rebuild from public state, against the shared vector")
+  (let ((kv (make-hash-table :test #'equal)) (updates '()) (pledges (make-hash-table :test #'equalp)) (cases '()))
+    (with-open-file (in (vector-path "authorised_confiscation.txt"))
+      (loop for line = (read-line in nil) while line
+            unless (or (zerop (length line)) (char= (char line 0) #\#))
+              do (let ((w (uiop:split-string line :separator " ")))
+                   (cond ((string= (first w) "update") (push (up:decode-update (u:hex->bytes (second w))) updates))
+                         ((string= (first w) "pledge")
+                          (setf (gethash (u:hex->bytes (second w)) pledges) (list (parse-integer (fifth w)) (parse-integer (fourth w)))))
+                         ((string= (first w) "case") (push (rest w) cases))
+                         (t (setf (gethash (first w) kv) (second w)))))))
+    (let* ((proto (nd:make-node :priv 424242 :bus (bus:make-mock-bus) :network (gethash "network" kv)
+                                :height-fn (let ((h (parse-integer (gethash "spend_height" kv)))) (lambda () h))
+                                :pledge-fn (lambda (txid vout scan-from)
+                                             (declare (ignore vout scan-from))
+                                             (let ((f (gethash txid pledges)))
+                                               (and f (list :created (first f) :value-sats (second f) :spend :unspent))))))
+           (id (gethash "ledger" kv))
+           (view (nd::dispute-view proto id (reverse updates) :confiscated-at (parse-integer (gethash "spend_height" kv)))))
+      (dolist (c (reverse cases))
+        (destructuring-bind (name verdict hex) c
+          (check-equal (format nil "~a: ~:[not excused~;excused~]" name (string= verdict "1"))
+                       (and (nd::rebuild-matches-p view id (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes hex)))) t)
+                       (string= verdict "1")))))))
+
 ;;; inspect/vectors/dispute_rearm.json: DEP-03's re-arm shape, shared with deposits-rust
 ;;; (deposits-core/tests/vectors/dispute_rearm.json).
 (with-gate ("DEP-03 re-arm: the fold against the shared vector")

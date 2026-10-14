@@ -3202,7 +3202,7 @@
             (mapcar #'cdr (sort outs #'bytes< :key #'first))
             residue)))
 
-(defun build-confiscation (node id-hex &key respectful fee tier-index armers)
+(defun build-confiscation (node id-hex &key respectful fee tier-index armers snapshot)
   "The confiscation transaction for a disputed ledger, from public state only,
    so every cosigner rebuilds the same one.  It spends the reserves through
    TIER-INDEX (default: the tier open at our height), its nLockTime that tier's
@@ -3217,7 +3217,7 @@
                          (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword)))))
     (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node base)
       (multiple-value-bind (swept splice-outs residue)
-          (confiscation-obligations node id-hex armers (nth-value 2 (lottery-armers node id-hex)))
+          (confiscation-obligations node id-hex armers (or snapshot (nth-value 2 (lottery-armers node id-hex))))
         (let* ((tier-index (or tier-index (confiscation-tier reserves (height node))))
                (tx (lot:confiscation-tx :vault (list txid vout sats) :swept swept :lottery-spk (lot:lottery-spk lottery)
                                         :voters (1+ (length voters)) :locktime (rs:tier-locktime (nth tier-index (rs:reserves-tiers reserves)))
@@ -3482,7 +3482,7 @@
 
 (defun unsigned-bytes (tx) (btx:serialize-tx tx :witness nil))
 
-(defun confiscation-match (node id-hex tx)
+(defun confiscation-match (node id-hex tx &key (respectful (dispute-respectful-p node id-hex)))
   "TX is a confiscation of ID-HEX as the pinned builder makes it (DEP-03): every byte of our
    own rebuild at TX's tier, the shape our dispute's reason dictates, and the rule's fee.  The
    lottery output may pay a lottery over another subset of the armers (a proposer that saw a
@@ -3492,7 +3492,7 @@
          (ti (and reserves (position (btx:tx-locktime tx) (rs:reserves-tiers reserves) :key #'rs:tier-locktime))))
     (when (and ti (not (rs:tier-tie-breaker-p (nth ti (rs:reserves-tiers reserves)))) (btx:tx-outputs tx))
       (let ((ours (ignore-errors (multiple-value-list
-                                  (build-confiscation node id-hex :respectful (dispute-respectful-p node id-hex) :tier-index ti)))))
+                                  (build-confiscation node id-hex :respectful respectful :tier-index ti)))))
         (when ours
           (destructuring-bind (built lottery &rest _) ours
             (declare (ignore _))
@@ -3506,6 +3506,103 @@
                                                                     (rest (btx:tx-outputs built)))
                                                      :witnesses (list nil))))
                            (when (equalp (unsigned-bytes swapped) (unsigned-bytes tx)) (values :subset l)))))))))))))
+
+;;; DEP-06 "Authorised confiscation": a vault spend is a confiscation iff it is byte-identical to
+;;; the one the rules build from public state (the ledger's history, the public DisputeArmed
+;;; events, the eligibility cut as of the spend's block, the obligations, the fee rule), its
+;;; lottery over a set the cut yields for some subset of the arms.  Never "one we know of": a
+;;; member that missed the dispute rebuilds it from the relay like anyone else.
+
+(defun dispute-view (node id-hex updates &key confiscated-at)
+  "A scratch node holding ID-HEX's ledger and its dispute forks as UPDATES (the relay's, every
+   operator's) give them: the original operator's chain, and for each member that entered a
+   dispute, the base to its DisputeEnter's fork point then its own updates.  It shares NODE's
+   chain functions, so the eligibility cut and obligations are judged on the same chain."
+  (let* ((sorted (sort (copy-list updates) #'< :key #'up:update-seq))
+         (open (or (find-if (lambda (u) (and (zerop (up:update-seq u)) (fr:update-opens-ledger-p u (hex->bytes id-hex)))) sorted)
+                   (fail "no LedgerOpen for ~a" (subseq id-hex 0 8))))
+         (origin (up:update-operator-id open))
+         ;; The operator's chain by its hash links, from LedgerOpen until it forks (an
+         ;; equivocation): every dispute forks before its fault, so that prefix is the one
+         ;; the forks share.
+         (base (let* ((mine (remove-if-not (lambda (u) (equalp (up:update-operator-id u) origin)) sorted))
+                      (chain (list open)))
+                 (loop for next = (let ((tip (first chain)))
+                                    (remove-duplicates
+                                     (remove-if-not (lambda (u) (and (= (up:update-seq u) (1+ (up:update-seq tip)))
+                                                                     (equalp (up:update-prev-hash u) (up:chain-hash tip))))
+                                                    mine)
+                                     :test #'equalp :key #'up:chain-hash))
+                       while (= (length next) 1)
+                       do (push (first next) chain))
+                 (reverse chain)))
+         (s (%make-node :pubkey (let ((k (make-array 33 :element-type '(unsigned-byte 8))))
+                                  (setf (aref k 0) 2) (loop for i from 1 below 33 do (setf (aref k i) (random 256))) k)
+                        :network (node-network node) :height-fn (node-height-fn node) :chain-fn (node-chain-fn node)
+                        :pledge-fn (node-pledge-fn node) :spender-fn (node-spender-fn node) :feerate-fn (node-feerate-fn node)
+                        :height-of-block (node-height-of-block node) :block-hash-fn (node-block-hash-fn node))))
+    (setf (gethash id-hex (node-ledgers s)) (make-record :id-hex id-hex :ledger (lg:replay base) :history (reverse base)))
+    (dolist (op (remove-duplicates (loop for u in sorted unless (equalp (up:update-operator-id u) origin) collect (up:update-operator-id u))
+                                   :test #'equalp))
+      (let* ((mine (remove-if-not (lambda (u) (equalp (up:update-operator-id u) op)) sorted))
+             (enter (find :dispute-enter mine :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u)))))))
+        (when enter
+          (let ((lvs (op:field (op:decode-operation (up:update-message enter)) :last-valid-sequence)))
+            (setf (gethash (fork-key id-hex op) (node-ledgers s))
+                  (make-record :id-hex id-hex :ledger (lg:make-ledger) :fork-p t :fork-of id-hex :fork-operator op
+                               :history (reverse (append (remove-if (lambda (u) (> (up:update-seq u) lvs)) base)
+                                                         (remove-if (lambda (u) (<= (up:update-seq u) lvs)) mine)))))))))
+    (when confiscated-at (setf (gethash id-hex (node-confiscation-heights s)) confiscated-at))
+    s))
+
+(defun view-respectful-p (view id-hex)
+  "DEP-06: a confiscation is respectful iff every DisputeEnter of the dispute is for a lapsed
+   quorum; any punitive ground makes it punitive."
+  (let ((reasons (loop for f in (forks-of view id-hex)
+                       for (u o) = (multiple-value-list (fork-op f :dispute-enter))
+                       when u collect (op:field o :reason))))
+    (and reasons (every #'expiry-reason-p reasons))))
+
+(defun rebuild-matches-p (view id-hex tx)
+  "TX is byte for byte a confiscation VIEW builds: at TX's tier (a confiscation tier, never the
+   tie-breaker), in the dispute's shape, its lottery over the cut of some subset of the arms
+   counted as of the confiscation's block, with that subset's snapshot for the obligations (as a
+   proposer that saw only those arms builds it).  Mirrors deposits-rust's rebuild_matching."
+  (let* ((reserves (disputed-reserves view (find-record view id-hex)))
+         (tiers (rs:reserves-tiers reserves))
+         (ti (position (btx:tx-locktime tx) tiers :key #'rs:tier-locktime))
+         (all (sort (copy-list (armers-of view id-hex :until (gethash id-hex (node-confiscation-heights view)))) #'bytes< :key #'first))
+         (floor-sats (eligibility-floor-sats view id-hex))
+         (respectful (view-respectful-p view id-hex))
+         (want (unsigned-bytes tx))
+         (tried '()))
+    (when (and ti (not (rs:tier-tie-breaker-p (nth ti tiers))) all (<= (length all) 8))
+      (loop for mask from (1- (ash 1 (length all))) downto 1
+            for arms = (loop for a in all for i from 0 when (logbitp i mask) collect a)
+            thereis (multiple-value-bind (in out snapshot) (split-armers arms floor-sats (node-pledge-fn view) :tip (height view))
+                      (declare (ignore out))
+                      (let ((key (mapcar #'first in)))
+                        (when (and in (not (member key tried :test #'equalp)))
+                          (push key tried)
+                          (let ((built (ignore-errors (build-confiscation view id-hex :tier-index ti :respectful respectful
+                                                                                      :armers in :snapshot snapshot))))
+                            (and built (equalp (unsigned-bytes built) want))))))))))
+
+(defvar *rebuilt-confiscations* (make-hash-table :test #'equalp) "spend txid -> verdict, once judged")
+(defvar *rebuilt-confiscations-lock* (bt:make-lock "rebuilt-confiscations"))
+
+(defun rebuilt-confiscation-p (node id-hex tx &key spend-height updates)
+  "DEP-06: TX (a spend of ID-HEX's vault, confirmed at SPEND-HEIGHT) is the confiscation the
+   rules build from public state.  UPDATES default to the relay's.  Cached by txid."
+  (let ((txid (btx:tx-txid tx)))
+    (multiple-value-bind (hit found) (bt:with-lock-held (*rebuilt-confiscations-lock*) (gethash txid *rebuilt-confiscations*))
+      (when found (return-from rebuilt-confiscation-p hit)))
+    (let* ((updates (or updates (ledger-updates-from-relays node id-hex)))
+           (view (and updates (ignore-errors (dispute-view node id-hex updates :confiscated-at spend-height))))
+           (verdict (and view (forks-of view id-hex) (ignore-errors (rebuild-matches-p view id-hex tx)))))
+      ;; Only a match is final; a miss may be a relay that has not delivered every arm yet.
+      (when verdict (bt:with-lock-held (*rebuilt-confiscations-lock*) (setf (gethash txid *rebuilt-confiscations*) t)))
+      verdict)))
 
 (defun handle-confiscation-sign (node event params)
   "A recovery-quorum member: rebuild the confiscation from public state and sign
@@ -4144,27 +4241,23 @@
                                      (gethash (subseq line 0 sp) (node-known-confiscations node)) :test #'equalp))))))))
 
 (defun authorised-spend-txids (node rec)
-  "The txids that legitimately spend a vault of REC: every rotation it recorded
-   (a QuorumBegin's new outpoint is the previous vault's spender), and any confiscation we
-   know of.  A confiscation is kept on the dispute's fork records, not on REC."
+  "The rotations of REC's vault: every rotation it recorded (a QuorumBegin's new outpoint is the
+   previous vault's spender), and the ones we signed or broadcast whose QuorumBegin has not
+   landed yet.  A confiscation is authorised by AUTHORISED-SPEND-P, never by a list."
   (let ((ids '()))
     (dolist (u (record-history rec))
       (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
         (when (and o (eq (op:operation-type o) :quorum-begin)) (push (op:field o :new-outpoint-txid) ids))))
-    (dolist (r (cons rec (forks-of node (record-id-hex rec))))
-      (when (record-confiscation r) (pushnew (btx:tx-txid (record-confiscation r)) ids :test #'equalp)))
-    (dolist (e (gethash (record-id-hex rec) (node-signed-confiscations node))) (push (btx:tx-txid (car e)) ids))
-    ;; Rotations we signed or broadcast whose QuorumBegin has not landed yet.
     (dolist (txid (gethash (record-id-hex rec) (node-signed-rotations node))) (pushnew txid ids :test #'equalp))
     (let ((r (record-rotation rec))) (when r (pushnew (hex->bytes (getf r :txid)) ids :test #'equalp)))
-    ;; A proposal we saw but refused is still a confiscation if it is our rebuild with its
-    ;; lottery over another subset of the armers (never merely "pays a lottery": FINDINGS D2).
-    (dolist (tx (gethash (record-id-hex rec) (node-seen-confiscations node)))
-      (when (ignore-errors (confiscation-match node (record-id-hex rec) tx))
-        (pushnew (btx:tx-txid tx) ids :test #'equalp)))
-    (dolist (txid (gethash (record-id-hex rec) (node-known-confiscations node)))
-      (pushnew txid ids :test #'equalp))
     ids))
+
+(defun authorised-spend-p (node rec tx &key spend-height updates)
+  "DEP-06: TX's spend of REC's vault is a recorded rotation, or byte-for-byte the confiscation
+   the rules build from public state (REBUILT-CONFISCATION-P).  A verifier that missed the
+   dispute rebuilds it from the relay; nothing is excused because we happen to know of it."
+  (or (member (btx:tx-txid tx) (authorised-spend-txids node rec) :test #'equalp)
+      (rebuilt-confiscation-p node (record-id-hex rec) tx :spend-height spend-height :updates updates)))
 
 (defparameter *vault-spend-grace-blocks* 3
   "A rotation's QuorumBegin may reach us a block or two after the spend confirms, so a
@@ -4350,7 +4443,7 @@
                                                            (getf spend :prevouts) (getf spend :block-hash))))
         (multiple-value-bind (reserves vtxid vvout) (fr::spent-vault (record-history rec) qb)
           (let ((signers (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves vtxid vvout)))
-            (when (and signers (not (member (btx:tx-txid tx) (authorised-spend-txids node rec) :test #'equalp)))
+            (when (and signers (not (authorised-spend-p node rec tx :spend-height (getf spend :height))))
               (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"
                     (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16) (length signers))
               (setf (gethash key (node-reported-vault-spend node))
@@ -4422,8 +4515,16 @@
             (if (and hit (< (- (get-universal-time) (first hit)) *vault-spend-verdict-ttl*))
                 (values (second hit) (third hit))
                 (let* ((srec (find-record node spent-id))
-                       (history (if (and srec (not (record-fork-p srec))) (record-history srec) (ledger-updates-from-relays node spent-id)))
-                       (authorised (if srec (authorised-spend-txids node srec) '())))
+                       (relay (ledger-updates-from-relays node spent-id))
+                       (history (if (and srec (not (record-fork-p srec))) (record-history srec) relay))
+                       ;; DEP-06: the rotations, and the spend itself if it is the confiscation the
+                       ;; rules build from public state; a member that missed the dispute too.
+                       (tx (ignore-errors (btx:parse-tx (bw:make-reader (hex->bytes (getf ev :spend-tx-hex))))))
+                       (spend-height (ignore-errors (and (node-height-of-block node)
+                                                         (funcall (node-height-of-block node) (getf ev :spend-block-hash)))))
+                       (authorised (append (if srec (authorised-spend-txids node srec) '())
+                                           (and tx relay (rebuilt-confiscation-p node spent-id tx :spend-height spend-height :updates relay)
+                                                (list (btx:tx-txid tx))))))
                   (multiple-value-bind (ok why)
                       (fr:verify-unauthorized-vault-spend proof history (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
                                                           :authorised-txids authorised)
