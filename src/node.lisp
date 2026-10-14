@@ -82,6 +82,8 @@
   ;; request ids whose (late) answers feed each one.
   (cosign-rounds (make-hash-table :test #'equalp :synchronized t))
   (late-cosign-requests (make-hash-table :test #'equal :synchronized t))
+  ;; DEP-03 "When the set is final": ledger id -> the block its confiscation confirmed in.
+  (confiscation-heights (make-hash-table :test #'equal :synchronized t))
   (lock (bt:make-lock "node"))
   (height-fn (lambda () 0))
   (log '())
@@ -2142,17 +2144,25 @@
 (defvar *rebuild-misses* (make-hash-table :test #'equalp))
 (defvar *rebuild-misses-lock* (bt:make-lock "rebuild-misses"))
 
+(defun note-confiscation-height (node id-hex info)
+  "INFO is the chain-fn's view of a confiscation's lottery output: once confirmed, remember
+   the block it confirmed in (DEP-03: arms above it do not count).  Returns INFO."
+  (let ((c (getf info :confirmations)))
+    (when (and c (plusp c) (not (gethash id-hex (node-confiscation-heights node))))
+      (setf (gethash id-hex (node-confiscation-heights node)) (1+ (- (height node) c)))))
+  info)
+
 (defun confiscated-lottery (node id-hex)
   "The confiscation of ID-HEX that is on chain: one we signed, or rebuilt from
    public state.  (values tx lottery :pending) while its lottery output is unspent."
   (when (node-chain-fn node)
     (loop for (tx . l) in (gethash id-hex (node-signed-confiscations node))
-          when (funcall (node-chain-fn node) (btx:tx-txid tx) 0)
+          when (note-confiscation-height node id-hex (funcall (node-chain-fn node) (btx:tx-txid tx) 0))
             do (return-from confiscated-lottery (values tx l :pending)))
     ;; A proposal we saw but did not sign: its lottery output names its participant set, so
     ;; recover the set from it (DEP-03: final once a confiscation confirms).
     (loop for tx in (gethash id-hex (node-seen-confiscations node))
-          when (funcall (node-chain-fn node) (btx:tx-txid tx) 0)
+          when (note-confiscation-height node id-hex (funcall (node-chain-fn node) (btx:tx-txid tx) 0))
             do (let ((l (lottery-paid-by node id-hex (btx:txout-script (first (btx:tx-outputs tx))))))
                  (when l (return-from confiscated-lottery (values tx l :pending)))))
     ;; We hold this ledger's confiscation and its lottery output is gone (claimed): nothing
@@ -2898,14 +2908,16 @@
         (error (e) (log! node "adversary: could not spend our pledge: ~a" e))))
     preimage))
 
-(defun armers-of (node id-hex)
+(defun armers-of (node id-hex &key until)
   "Each armer's latest DisputeArmed (highest sequence) on any fork of the ledger:
    (pubkey33 commitment target collateral arm-height seq), ARM-HEIGHT being the
    update's signed-header block height.  A member may re-arm to add the replacement
    collateral its first arm lacked (DEP-03; the reference does after losing a
-   scantxoutset race); counting every arm listed it twice."
+   scantxoutset race); counting every arm listed it twice.  UNTIL: the block the
+   confiscation confirmed in; arms above it do not count (DEP-03)."
   (let ((arms (make-hash-table :test #'equalp)))
-    (dolist (a (%all-arms node id-hex)) (push a (gethash (first a) arms)))
+    (dolist (a (%all-arms node id-hex))
+      (unless (and until (> (fifth a) until)) (push a (gethash (first a) arms))))
     ;; Only the first +max-arms+ arms (by sequence) count, so a griefer cannot keep moving E.
     (loop for list being the hash-values of arms
           collect (let ((counted (subseq (sort (copy-list list) #'< :key #'sixth) 0 (min +max-arms+ (length list)))))
@@ -2978,10 +2990,13 @@
           (bt:with-lock-held (*pledge-verdicts-lock*) (setf (gethash key *pledge-verdicts*) verdict)))
         verdict))))
 
-(defun split-armers (armers floor-sats pledge-fn &key tip)
+(defun split-armers (armers floor-sats pledge-fn &key tip confiscated-at)
   "The DEP-03 cut over ARMERS (armers-of entries): (values participants excluded snapshot),
-   participants sorted by key, EXCLUDED ((entry . reason) ...)."
-  (let* ((armers (sort (copy-list armers) #'bytes< :key #'first))
+   participants sorted by key, EXCLUDED ((entry . reason) ...).  Once the confiscation has
+   confirmed in block CONFISCATED-AT, an arm above it does not count (DEP-03 \"When the set
+   is final\"): it neither moves E nor joins."
+  (let* ((armers (sort (remove-if (lambda (a) (and confiscated-at (> (fifth a) confiscated-at))) armers)
+                       #'bytes< :key #'first))
          (snapshot (reduce #'max armers :key #'fifth :initial-value 0))
          (in '()) (out '()))
     (dolist (a armers)
@@ -2990,10 +3005,12 @@
     (values (nreverse in) (nreverse out) snapshot)))
 
 (defun lottery-armers (node id-hex)
-  "The lottery's participants: (values participants excluded snapshot floor)."
-  (let ((floor-sats (eligibility-floor-sats node id-hex)))
+  "The lottery's participants: (values participants excluded snapshot floor).  Once the
+   confiscation has confirmed, the arms above its block do not count (DEP-03)."
+  (let ((floor-sats (eligibility-floor-sats node id-hex))
+        (c (gethash id-hex (node-confiscation-heights node))))
     (multiple-value-bind (in out snapshot)
-        (split-armers (armers-of node id-hex) floor-sats (node-pledge-fn node) :tip (height node))
+        (split-armers (armers-of node id-hex :until c) floor-sats (node-pledge-fn node) :tip (height node) :confiscated-at c)
       (dolist (x out)
         (log! node "armer ~a excluded from ~a's lottery: ~a" (subseq (bytes->hex (first (car x))) 0 8) (subseq id-hex 0 8) (cdr x)))
       ;; Comparable with the reference's "lottery participants of" line: the set and E.

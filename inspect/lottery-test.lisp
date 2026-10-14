@@ -295,12 +295,31 @@
                                     (list :created created :value-sats value
                                           :spend (cond ((null spent) :unspent) ((>= spent scan-from) (list :at spent)) (t :before)))))))
                  (multiple-value-bind (in out snapshot)
-                     (nd:split-armers armers (gethash "required_sats" case) pledge-fn)
+                     (nd:split-armers armers (gethash "required_sats" case) pledge-fn
+                                      :confiscated-at (let ((c (gethash "confiscation_height" case))) (and (integerp c) c)))
                    (declare (ignore out))
                    (check-equal (format nil "~a: participants" (gethash "name" case))
                                 (sort (mapcar (lambda (a) (gethash (first a) names)) in) #'string<)
                                 (coerce (gethash "participants" (gethash "expect" case)) 'list))
                    (check-equal (format nil "~a: snapshot" (gethash "name" case)) snapshot (gethash "snapshot" (gethash "expect" case)))))))))
+
+;;; inspect/vectors/dispute_rearm.json: DEP-03's re-arm shape, shared with deposits-rust
+;;; (deposits-core/tests/vectors/dispute_rearm.json).
+(with-gate ("DEP-03 re-arm: the fold against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "dispute_rearm.json")))))
+    (flet ((arm (c) (append (list :type :dispute-armed :armed-block 100 :commitment-hash (u:hex->bytes (gethash "commitment" c))
+                                  :target-reserves "t")
+                            (when (eq (gethash "collateral" c) t)
+                              (list :replacement-collateral-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
+                                    :replacement-collateral-vout 0 :replacement-collateral-amount 50000)))))
+      (loop for case across (gethash "cases" v)
+            do (let ((l (lg:make-ledger)))
+                 (setf (lg::ledger-dispute-state l) :disputed)
+                 (lg:apply-operation l (arm (gethash "prior" case)))
+                 (check-equal (format nil "re-arm: ~a" (gethash "name" case))
+                              (handler-case (progn (lg:apply-operation l (arm (gethash "next" case))) t)
+                                (lg:ledger-error () nil))
+                              (eq (gethash "ok" case) t)))))))
 
 ;;; inspect/vectors/cosign_refusal.json: DEP-05 "Deposed operator", shared with deposits-rust
 ;;; (deposits-node/tests/vectors/cosign_refusal.json).

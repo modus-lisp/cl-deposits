@@ -90,7 +90,8 @@
   (dormancy-notice nil)             ; outstanding DormancyNotice: (:height h :rotation-height r [:manifest :receiver :spk :total :premium])
   (dormancy-accept nil)             ; receiver: our DormancyAccept (:hash :spk :total :expires :premium-deposit :resolved :outpoint)
   (confiscation-txid nil)           ; DEP-06: the confiscation a custody change followed (DisputeAcquire)
-  (quorum-at-fork '()))             ; the quorum at the fork point (DisputeEnter), which a fork's records are judged by
+  (quorum-at-fork '())              ; the quorum at the fork point (DisputeEnter), which a fork's records are judged by
+  (arm-commitment nil))             ; the commitment_hash of this fork's DisputeArmed, which a re-arm must repeat (DEP-03)
 
 (defun make-ledger () (%make-ledger))
 
@@ -659,7 +660,15 @@
                       ;; a live fork cleared its quorum and set this already (MAKE-FORK); a replay sets it here
                       (when (ledger-quorum-members ledger)
                         (setf (ledger-quorum-at-fork ledger) (ledger-quorum-members ledger))))
-      (:dispute-armed (setf (ledger-dispute-state ledger) :armed))
+      (:dispute-armed
+       ;; DEP-03 (vector dispute_rearm.json): a re-arm repeats the commitment and declares
+       ;; collateral; a fresh pledge after a failed one is a valid re-arm.
+       (when (eq (ledger-dispute-state ledger) :armed)
+         (unless (equalp (f :commitment-hash) (ledger-arm-commitment ledger))
+           (fail :dispute-armed-commitment-changed "a re-arm must repeat the prior arm's commitment_hash"))
+         (unless (f :replacement-collateral-txid)
+           (fail :dispute-armed-no-upgrade "a re-arm must declare replacement collateral")))
+       (setf (ledger-dispute-state ledger) :armed (ledger-arm-commitment ledger) (f :commitment-hash)))
       (:dispute-acquire (setf (ledger-confiscation-txid ledger) (f :confiscation-txid)
                               (ledger-operator-key ledger) (f :new-custodian)
                               (ledger-vault-current-p ledger) nil (ledger-dormancy-notice ledger) nil
