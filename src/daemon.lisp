@@ -428,13 +428,16 @@
   ;; A confirmed spend never changes, so once found (a walk to the tip, a process pair per
   ;; block) it is remembered.  Without this every dispute pass re-walked the chain for every
   ;; obligation and pledge of every fork, and drive-disputes stopped reaching new disputes.
-  ;; Only spends 6+ deep are kept (reorgs); :before is not, since an unconfirmed output also
-  ;; reads as :before and may yet confirm.  An unspent output is one gettxout.
+  ;; Only spends 6+ deep are kept (reorgs); :before only per exact SCAN-FROM once 6 past it
+  ;; (an unconfirmed output also reads :before, but cannot become confirmed-at-the-snapshot
+  ;; later).  An unspent output is one gettxout.
   (let ((known (make-hash-table :test #'equal)) (lock (bt:make-lock "pledge-fn")))
     (lambda (txid vout scan-from)
       (block pledge
         (let* ((hex (txid-hex txid))
-               (hit (bt:with-lock-held (lock) (gethash (cons hex vout) known))))
+               (hit (bt:with-lock-held (lock) (gethash (cons hex vout) known)))
+               (before (bt:with-lock-held (lock) (gethash (list hex vout scan-from) known))))
+          (when before (return-from pledge before))
           (when hit
             (return-from pledge
               (if (>= (second (getf hit :spend)) scan-from)
@@ -464,7 +467,12 @@
                             (list :created 0 :value-sats most-positive-fixnum :spend :before))))))
             (let ((spend (getf result :spend)))
               (when (and (consp spend) tip (>= tip (+ (second spend) 6)))
-                (bt:with-lock-held (lock) (setf (gethash (cons hex vout) known) result))))
+                (bt:with-lock-held (lock) (setf (gethash (cons hex vout) known) result)))
+              ;; Not confirmed-and-unspent at snapshot SCAN-FROM - 1, with the tip 6 past it:
+              ;; final for that snapshot (an output still unconfirmed now was not confirmed
+              ;; then), so kept for exactly that SCAN-FROM.
+              (when (and (eq spend :before) tip (>= tip (+ scan-from 5)))
+                (bt:with-lock-held (lock) (setf (gethash (list hex vout scan-from) known) result))))
             result))))))
 
 (defun bitcoin-cli-feerate-fn (cli)
