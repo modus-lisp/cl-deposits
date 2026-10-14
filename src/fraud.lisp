@@ -866,6 +866,9 @@
             do (let ((kk (snake->kebab k)))
                  (setf ev (append ev (list kk (cond ((eq kk :original-proof) (json->proof v))
                                                      ((and (member kk +hex-fields+) (stringp v)) (hex->bytes v))
+                                                     ;; the earlier JSON form: an array of byte values
+                                                     ((and (member kk +hex-fields+) (vectorp v) (every #'integerp v))
+                                                      (coerce v '(vector (unsigned-byte 8))))
                                                      (t v))))))))
     (list :type type :accused (w:jget j "accused") :ledger-id (w:jget j "ledger_id") :evidence ev)))
 

@@ -556,3 +556,18 @@
                                        (w:json (fr:proof->json proof))
                                        (subseq line (+ (search (third w) line :start2 5) (length (third w)) 1)))))
                        (t (setf (gethash (first w) kv) (second w))))))))))
+
+;;; inspect/vectors/proof_json.txt: a proof's JSON form, shared with deposits-rust
+;;; (deposits-protocol/tests/fixtures/proof_json.txt): hex byte strings, arrays accepted.
+(with-gate ("DEP-06 proof JSON: hex byte strings, the earlier arrays accepted")
+  (let ((kv (make-hash-table :test #'equal)))
+    (with-open-file (in (vector-path "proof_json.txt"))
+      (loop for line = (read-line in nil) while line
+            unless (or (zerop (length line)) (char= (char line 0) #\#))
+              do (let ((sp (position #\Space line))) (setf (gethash (subseq line 0 sp) kv) (subseq line (1+ sp))))))
+    (dolist (form '("hex" "array"))
+      (let ((p (fr:json->proof (w:parse-json (gethash form kv)))))
+        (check-equal (format nil "the ~a form decodes to the proof with the vector's hash" form)
+                     (u:bytes->hex (fr:proof-hash p)) (gethash "hash" kv))
+        (check-equal (format nil "the ~a form re-encodes as the hex form" form)
+                     (w:json (fr:proof->json p)) (gethash "hex" kv))))))
