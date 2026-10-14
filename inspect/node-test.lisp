@@ -1858,4 +1858,69 @@
       (check "a spend that failed to judge holds the scan below its block" (< (nd::node-vault-scanned n2) 980)))
     (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))
 
+;;; DEP-05 §Cosign Rounds.  A member behind a burst of relay traffic answered a re-add after the
+;;; reference operator's 10 s window, and each retry was a new request it answered just as late
+;;; (regtest 1013-223054).  Its answer still binds the update: kept, and reused on the retry.
+(with-gate ("DEP-05 cosign rounds: late cosignatures kept and reused; cosign requests ahead of other ledgers")
+  (let* ((bus (bus:make-mock-bus))
+         (hf (lambda () *height*))
+         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
+         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
+         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
+         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:a" :reserves 15600000 :collateral 23400000))
+         (lb (nd:open-ledger b :reserves-id "genesis:b")))
+    (nd:open-ledger c :reserves-id "genesis:c") (nd:open-ledger d :reserves-id "genesis:d")
+    (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((signers (lg:ledger-quorum-members (nd:record-ledger la)))
+           (op (op:decode-operation (up:update-message (nd:tip la))))
+           (u (nd::new-update a la op))
+           (data (up::cosign-data u))
+           (round (nd::begin-cosign-round a u signers))
+           (mlh (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+      (flet ((answer (signer request-id &key (over u))
+               (let ((cs (up:sign-cosignature over (nd::node-priv signer) (nd:node-pubkey signer) mlh)))
+                 (nd::handle-response a (w:response-event (nd::node-keypair signer) request-id (nd:record-id-hex la) t
+                                                          :result (w:json-object "cosign_signature_hex" (u:bytes->hex (up:cosig-signature cs))
+                                                                                 "cosigner_pubkey" (u:bytes->hex (nd:node-pubkey signer))
+                                                                                 "member_ledger_hash_hex" (u:bytes->hex mlh))))))
+             (held () (length (nd::cosign-round-cosigs round))))
+        ;; req-1 was asked and its deadline passed: the operator no longer waits on it.
+        (setf (gethash "req-1" (nd::node-late-cosign-requests a)) data)
+        (push "req-1" (nd::cosign-round-request-ids round))
+        (answer b "req-1")
+        (check-equal "a late answer to a closed request lands in its round" (held) 1)
+        (answer c "req-1" :over (nd::new-update a la op :height (1+ *height*)))
+        (check-equal "a cosignature over other bytes is not kept" (held) 1)
+        (answer b "req-1")
+        (check-equal "one per member" (held) 1)
+        (answer c "req-1")
+        (check-equal "a second member's late answer" (held) 2)
+        ;; The retry of the same update: every member mute now, so only the round can supply them.
+        (dolist (n (list b c d)) (setf (getf (nd:node-adversary n) :mute) t))
+        (let ((done (nd::solicit-cosignatures a la u signers 2)))
+          (check "the retry of the same update reuses them, asking no one"
+                 (and (= 2 (length (up:update-cosignatures done)))
+                      (every (lambda (cs) (up:verify-cosignature done cs)) (up:update-cosignatures done)))))
+        (check "the round ends once the update has its cosignatures" (null (gethash data (nd::node-cosign-rounds a))))
+        (check "and its request ids are released" (null (gethash "req-1" (nd::node-late-cosign-requests a))))
+        ;; A short round keeps what it got for the next attempt.
+        (let ((u2 (nd::new-update a la op :height (+ 2 *height*))) (nd::*cosign-response-seconds* 1))
+          (check-signals "a round all members ignore falls short" nd::node-error
+            (nd::solicit-cosignatures a la u2 signers 2))
+          (check "and is kept for late answers" (gethash (up::cosign-data u2) (nd::node-cosign-rounds a)))))
+      (dolist (n (list b c d)) (setf (getf (nd:node-adversary n) :mute) nil)))
+    ;; The replica lane: a cosign request goes ahead of other ledgers' updates, never ahead of
+    ;; its own ledger's (the updates it chains onto) or of earlier cosign requests.
+    (let* ((n (nd::%make-node))
+           (ua1 (w:update-event (nd::node-keypair a) (second (nd:record-history la))))
+           (ua2 (w:update-event (nd::node-keypair a) (nd:tip la)))
+           (ub (w:update-event (nd::node-keypair b) (nd:tip lb)))
+           (req-c (w:request-event (nd::node-keypair a) (make-string 64 :initial-element #\c) "cosign_update" (w:json-object "x" 1)))
+           (req-b (w:request-event (nd::node-keypair a) (nd:record-id-hex lb) "cosign_update" (w:json-object "x" 1))))
+      (dolist (e (list ua1 ub ua2 req-c req-b)) (nd::enqueue-fast n e))
+      (check "cosign requests jump other ledgers' updates, not their own ledger's"
+             (equal (nd::node-fast-inbox n) (list req-c ua1 ub req-b ua2))))))
+
 (report)

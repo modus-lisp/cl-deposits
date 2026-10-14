@@ -44,7 +44,7 @@
            #:node-height-of-block #:fork-live-p #:live-fork #:fork-summaries #:equivocate #:node-spender-fn #:drive-vault-watch #:node-reported-vault-spend
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
-           #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
+           #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:*cosign-response-seconds* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
            #:dispute-expired-quorums #:start-expiry-watch #:*expiry-grace-blocks*
            #:required-replacement-sats #:pledge-collateral #:release-pledges #:our-utxos #:node-pledges
            #:drive-disputes #:dispute-arm-closes #:outpoint-key #:save-pledges
@@ -57,6 +57,11 @@
 (defun fail (fmt &rest args) (error 'node-error :detail (apply #'format nil fmt args)))
 
 (defparameter *cosign-timeout* 10 "Seconds to wait for a cosignature quorum.")
+(defparameter *cosign-response-seconds* 30
+  "DEP-05 cosign_response_seconds (advisory): how long a member has to answer a cosign request,
+   and so the least an operator waits before calling a round short.")
+(defparameter *cosign-round-keep* (* 30 60)
+  "Seconds a round that fell short is kept for late answers and retries (DEP-05 §Cosign Rounds).")
 
 (defstruct record
   id-hex ledger (history '()) owned-p reserves
@@ -73,6 +78,10 @@
   priv pubkey pubkey-hex keypair bus network
   (ledgers (make-hash-table :test #'equal :synchronized t))    ; ledger id hex -> record (both lanes add records)
   (pending (make-hash-table :test #'equal))    ; request event id -> waiter
+  ;; DEP-05 §Cosign Rounds: cosign_data -> cosign-round, kept past the deadline, and the
+  ;; request ids whose (late) answers feed each one.
+  (cosign-rounds (make-hash-table :test #'equalp :synchronized t))
+  (late-cosign-requests (make-hash-table :test #'equal :synchronized t))
   (lock (bt:make-lock "node"))
   (height-fn (lambda () 0))
   (log '())
@@ -225,9 +234,30 @@
                    (pop (node-inbox node)))))
       (unwind-protect (handle-event node event) (setf (node-busy node) nil)))))
 
+(defun cosign-request-event-p (event)
+  (and (= (ev:event-kind event) w:+kind-request+) (equal (w:event-action event) "cosign_update")))
+
+(defun fast-event-ledger (event)
+  "The ledger an event on the replica lane concerns, by its 16-hex prefix: an update's d
+   tag, a request's l tag."
+  (let ((id (if (= (ev:event-kind event) w:+kind-update+) (w:event-d-tag event) (w:event-ledger-id event))))
+    (and id (>= (length id) 16) (subseq id 0 16))))
+
 (defun enqueue-fast (node event)
+  ;; DEP-05 §Cosign Rounds: a member SHOULD answer cosign requests ahead of other relay
+  ;; traffic.  A cosign request goes ahead of everything queued except earlier cosign
+  ;; requests and its own ledger's events (the updates it chains onto, see the lane note
+  ;; on NODE).  Behind a burst of other ledgers' updates it missed the operator's window.
   (bt:with-lock-held ((node-fast-lock node))
-    (setf (node-fast-inbox node) (append (node-fast-inbox node) (list event)))
+    (setf (node-fast-inbox node)
+          (if (cosign-request-event-p event)
+              (let* ((inbox (node-fast-inbox node)) (ledger (fast-event-ledger event))
+                     (after (position-if (lambda (e) (or (cosign-request-event-p e) (equal (fast-event-ledger e) ledger)))
+                                         inbox :from-end t)))
+                (if after
+                    (append (subseq inbox 0 (1+ after)) (list event) (nthcdr (1+ after) inbox))
+                    (cons event inbox)))
+              (append (node-fast-inbox node) (list event))))
     (bt:condition-notify (node-fast-cv node))))
 
 (defun fast-worker-loop (node)
@@ -253,7 +283,8 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Waiting for responses
 
-(defstruct waiter (lock (bt:make-lock)) (cv (bt:make-condition-variable)) (responses '()) (done nil) want (successes-only nil) (ids '()) (counts nil))
+(defstruct waiter (lock (bt:make-lock)) (cv (bt:make-condition-variable)) (responses '()) (done nil) want (successes-only nil) (ids '()) (counts nil)
+  (settled nil))                               ; (lambda (responses)): nothing more is coming
 
 (defun waiter-count (wt)
   (cond ((waiter-counts wt) (count-if (waiter-counts wt) (waiter-responses wt)))
@@ -266,16 +297,21 @@
     (bt:with-lock-held ((waiter-lock wt))
       (loop with deadline = (+ (get-internal-real-time) (* timeout internal-time-units-per-second))
             until (or (waiter-done wt) (>= (waiter-count wt) want)
+                      (and (waiter-settled wt) (funcall (waiter-settled wt) (waiter-responses wt)))
                       (> (get-internal-real-time) deadline))
             do (bt:condition-wait (waiter-cv wt) (waiter-lock wt) :timeout 0.2)))
     (remhash request-id (node-pending node))
     (reverse (waiter-responses wt))))
 
-(defun send-request (node ledger-id-hex action params &key (want 1) (timeout *cosign-timeout*) extra-tags successes-only counts)
+(defun send-request (node ledger-id-hex action params &key (want 1) (timeout *cosign-timeout*) extra-tags successes-only counts
+                                                           settled on-publish)
   "Publish a Kind 20101 request and collect WANT Kind 20102 responses (successful
-   ones when SUCCESSES-ONLY; those satisfying COUNTS when given)."
+   ones when SUCCESSES-ONLY; those satisfying COUNTS when given), or stop early once
+   SETTLED says no more are coming.  ON-PUBLISH gets the request's event id first."
   (let ((event (w:request-event (node-keypair node) ledger-id-hex action params :extra-tags extra-tags)))
-    (setf (gethash (ev:event-id event) (node-pending node)) (make-waiter :want want :successes-only successes-only :counts counts))
+    (setf (gethash (ev:event-id event) (node-pending node))
+          (make-waiter :want want :successes-only successes-only :counts counts :settled settled))
+    (when on-publish (funcall on-publish (ev:event-id event)))
     (bus:bus-publish (node-bus node) event)
     (wait-for node (ev:event-id event) want :timeout timeout)))
 
@@ -326,10 +362,63 @@
 (defvar *extra-cosign-params* nil
   "Extra (key value ...) for the cosign request of the update being appended (DEP-20 §8.3's manifest).")
 
+;;; DEP-05 §Cosign Rounds.  A cosignature binds cosign_data, not the moment it arrived: one that
+;;; reaches us after we stopped waiting still counts for that update.  A round is kept per
+;;; cosign_data; late answers land in it (HANDLE-RESPONSE) and a retry of the same update
+;;; starts from them.
+
+(defstruct cosign-round (started (get-universal-time)) update signers (cosigs '()) (request-ids '()) (lock (bt:make-lock "round")))
+
+(defun response-cosignature (response)
+  "The cosignature a successful cosign_update response carries, or NIL."
+  (let ((res (w:jget response "result")))
+    (when (and (w:jget response "success") (hash-table-p res) (w:jget res "cosigner_pubkey"))
+      (ignore-errors
+       (up:make-cosignature :pubkey (hex->bytes (w:jget res "cosigner_pubkey"))
+                            :signature (hex->bytes (w:jget res "cosign_signature_hex"))
+                            :member-ledger-hash (hex->bytes (w:jget res "member_ledger_hash_hex")))))))
+
+(defun round-add (round c)
+  "Keep C if it is a signer's valid cosignature over the round's cosign_data, one per signer."
+  (when (and c (member (up:cosig-pubkey c) (cosign-round-signers round) :key #'lg:member-pubkey :test #'equalp)
+             (ignore-errors (up:verify-cosignature (cosign-round-update round) c)))
+    (bt:with-lock-held ((cosign-round-lock round))
+      (unless (member (up:cosig-pubkey c) (cosign-round-cosigs round) :key #'up:cosig-pubkey :test #'equalp)
+        (push c (cosign-round-cosigs round))
+        t))))
+
+(defun keep-late-cosignature (node data response)
+  (let ((round (gethash data (node-cosign-rounds node))))
+    (when (and round (round-add round (response-cosignature response)))
+      (log! node "late cosignature for seq ~a kept (~a held)" (up:update-seq (cosign-round-update round))
+            (length (cosign-round-cosigs round))))))
+
+(defun begin-cosign-round (node update signers)
+  "The round for UPDATE's cosign_data: the one kept from an earlier attempt, or a fresh one."
+  (let ((rounds (node-cosign-rounds node)) (now (get-universal-time)))
+    (sb-ext:with-locked-hash-table (rounds)
+      (loop for data being the hash-keys of rounds using (hash-value r)
+            when (> (- now (cosign-round-started r)) *cosign-round-keep*)
+              do (remhash data rounds)
+                 (dolist (id (cosign-round-request-ids r)) (remhash id (node-late-cosign-requests node))))
+      (let* ((data (up::cosign-data update))
+             (round (or (gethash data rounds)
+                        (setf (gethash data rounds) (make-cosign-round :update (up::copy-signed-update update) :signers signers)))))
+        (setf (cosign-round-signers round) signers)   ; the requirement may have moved (another tier)
+        round))))
+
+(defun end-cosign-round (node update)
+  (let ((round (gethash (up::cosign-data update) (node-cosign-rounds node))))
+    (when round
+      (dolist (id (cosign-round-request-ids round)) (remhash id (node-late-cosign-requests node)))
+      (remhash (up::cosign-data update) (node-cosign-rounds node)))))
+
 (defun solicit-cosignatures (node rec update signers required)
   "Ask the quorum; return when REQUIRED valid cosignatures are in the update."
-  (let* ((params (apply #'w:json-object "sequence_number" (up:update-seq update)
-                                "cosign_data_hex" (bytes->hex (up::cosign-data update))
+  (let* ((data (up::cosign-data update))
+         (round (begin-cosign-round node update signers))
+         (params (apply #'w:json-object "sequence_number" (up:update-seq update)
+                                "cosign_data_hex" (bytes->hex data)
                                 "content_hash_hex" (bytes->hex (up:content-hash update))
                                 "message_type" 32769
                                 "fork_operator" (and (record-fork-p rec) (bytes->hex (record-fork-operator rec)))
@@ -339,32 +428,42 @@
                                                      (eq (op:operation-type (op:decode-operation (up:update-message update))) :quorum-begin)
                                                      (getf r :tx)))
                                 *extra-cosign-params*))
+         (signer-xs (mapcar (lambda (m) (x-hex (lg:member-pubkey m))) signers))
          (attempt 0))
-    (flet ((collect (responses)
-             (dolist (r responses)
-               (let ((res (w:jget r "result")))
-                 (when (and (w:jget r "success") res)
-                   (let* ((pk (hex->bytes (w:jget res "cosigner_pubkey")))
-                          (c (up:make-cosignature :pubkey pk
-                                                  :signature (hex->bytes (w:jget res "cosign_signature_hex"))
-                                                  :member-ledger-hash (hex->bytes (w:jget res "member_ledger_hash_hex")))))
-                     (when (and (member pk signers :key #'lg:member-pubkey :test #'equalp)
-                                (up:verify-cosignature update c)
-                                (not (member pk (up:update-cosignatures update) :key #'up:cosig-pubkey :test #'equalp)))
-                       (push c (up:update-cosignatures update)))))))))
+    (labels ((take-round ()
+               ;; Everything the round holds (earlier attempts, late answers) into the update.
+               (dolist (c (bt:with-lock-held ((cosign-round-lock round)) (copy-list (cosign-round-cosigs round))))
+                 (unless (member (up:cosig-pubkey c) (up:update-cosignatures update) :key #'up:cosig-pubkey :test #'equalp)
+                   (push c (up:update-cosignatures update)))))
+             (enough () (>= (length (up:update-cosignatures update)) required))
+             (answered (r)
+               ;; Who answered, as x-only hex: the cosigner's key on a cosignature, the
+               ;; responder's on a refusal.
+               (let ((c (response-cosignature r)))
+                 (if c (x-hex (up:cosig-pubkey c)) (gethash "responder" r)))))
+      (take-round)
       ;; A member may still be applying the update this one chains onto (relays
       ;; reorder); ask again after a pause before giving up.
-      (loop do (collect (send-request node (record-id-hex rec) "cosign_update" params
-                                      :want (- required (length (up:update-cosignatures update)))
-                                      :counts (lambda (r) (let ((res (w:jget r "result")))
-                                                            (and (w:jget r "success") res
-                                                                 (member (hex->bytes (w:jget res "cosigner_pubkey")) signers :key #'lg:member-pubkey :test #'equalp))))
-                                      :timeout (if (zerop attempt) *cosign-timeout* 3)))
+      (loop until (or (enough) (>= attempt 3))
+            do (dolist (r (send-request node (record-id-hex rec) "cosign_update" params
+                                        :want (- required (length (up:update-cosignatures update)))
+                                        :counts (lambda (r) (let ((c (response-cosignature r)))
+                                                              (and c (member (up:cosig-pubkey c) signers :key #'lg:member-pubkey :test #'equalp))))
+                                        ;; Every signer has answered (signed or refused): nothing more is coming.
+                                        :settled (lambda (rs) (let ((who (mapcar #'answered rs)))
+                                                                (every (lambda (x) (member x who :test #'equal)) signer-xs)))
+                                        :on-publish (lambda (id)
+                                                      (bt:with-lock-held ((cosign-round-lock round))
+                                                        (push id (cosign-round-request-ids round)))
+                                                      (setf (gethash id (node-late-cosign-requests node)) data))
+                                        :timeout (if (zerop attempt) *cosign-response-seconds* 3)))
+                 (round-add round (response-cosignature r)))
+               (take-round)
                (incf attempt)
-            until (or (>= (length (up:update-cosignatures update)) required) (>= attempt 3))
-            do (sleep 0.3)))
+               (unless (enough) (sleep 0.3))))
     (when (< (length (up:update-cosignatures update)) required)
       (fail "only ~a of ~a cosignatures for seq ~a" (length (up:update-cosignatures update)) required (up:update-seq update)))
+    (end-cosign-round node update)
     update))
 
 (defun append-operation (node rec op &key (height (height node)))
@@ -798,7 +897,12 @@
 
 (defun handle-response (node event)
   (let ((wt (gethash (w:event-request-id event) (node-pending node))))
-    (when wt
+    (unless wt
+      ;; An answer to a cosign request after its round's deadline: kept for the retry.
+      (let ((data (gethash (w:event-request-id event) (node-late-cosign-requests node))))
+        (when data (keep-late-cosignature node data (w:parse-json (ev:event-content event)))))
+      (return-from handle-response nil))
+    (progn
       (bt:with-lock-held ((waiter-lock wt))
         ;; relays redeliver: one response per event id
         (when (member (ev:event-id event) (waiter-ids wt) :test #'string=) (return-from handle-response nil))
