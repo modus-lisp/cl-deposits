@@ -318,9 +318,150 @@
 
 ;;; bitcoin-cli as the chain view.
 
+;;; JSON-RPC straight to bitcoind over pooled keep-alive sockets, in place of forking
+;;; bitcoin-cli: each fork of a node's multi-gigabyte image cost ~175 ms (below), and with
+;;; 25 nodes walking blocks the regtest machine sat at load 60+ on cl alone (2026-10-14).
+;;; RUN-CLI keeps bitcoin-cli's contract (stdout text, "" on an error) so every caller is
+;;; unchanged; if bitcoind cannot be reached over HTTP it falls back to the process.
+
+(defstruct rpc-endpoint host port cookie user password (pool '()) (lock (bt:make-lock "rpc-pool")))
+
+(defvar *rpc-endpoints* (make-hash-table :test #'equal))
+(defvar *rpc-endpoints-lock* (bt:make-lock "rpc-endpoints"))
+(defparameter *rpc-idle-seconds* 20 "Drop a pooled connection idle this long (bitcoind's -rpcservertimeout is 30).")
+
+(defun rpc-endpoint-of (cli)
+  "The endpoint bitcoin-cli's flags in CLI name, or NIL when they cannot be read."
+  (bt:with-lock-held (*rpc-endpoints-lock*)
+    (multiple-value-bind (e found) (gethash cli *rpc-endpoints*)
+      (when found (return-from rpc-endpoint-of e))
+      (setf (gethash cli *rpc-endpoints*)
+            (ignore-errors
+             (let ((flags (make-hash-table :test #'equal)) (chain "main"))
+               (dolist (tok (rest (uiop:split-string cli :separator " ")))
+                 (cond ((member tok '("-regtest" "-signet" "-testnet" "-testnet4") :test #'string=)
+                        (setf chain (subseq tok 1)))
+                       ((and (> (length tok) 1) (char= (char tok 0) #\-) (find #\= tok))
+                        (let ((i (position #\= tok))) (setf (gethash (subseq tok 1 i) flags) (subseq tok (1+ i)))))))
+               (let* ((datadir (gethash "datadir" flags))
+                      (port (or (and (gethash "rpcport" flags) (parse-integer (gethash "rpcport" flags)))
+                                (cdr (assoc chain '(("main" . 8332) ("testnet" . 18332) ("testnet4" . 48332)
+                                                    ("signet" . 38332) ("regtest" . 18443)) :test #'string=))))
+                      (cookie (or (gethash "rpccookiefile" flags)
+                                  (and datadir (namestring (merge-pathnames
+                                                            (if (string= chain "main") ".cookie"
+                                                                (format nil "~a/.cookie" (if (string= chain "testnet") "testnet3" chain)))
+                                                            (uiop:ensure-directory-pathname datadir)))))))
+                 (make-rpc-endpoint :host (or (gethash "rpcconnect" flags) "127.0.0.1") :port port :cookie cookie
+                                    :user (gethash "rpcuser" flags) :password (gethash "rpcpassword" flags)))))))))
+
+(defun rpc-param (arg)
+  "ARG as bitcoin-cli would send it: a number, boolean, null, array or object literal as
+   JSON, anything else (hashes, addresses, \"start\") as a JSON string."
+  (if (or (member arg '("true" "false" "null") :test #'string=)
+          (and (plusp (length arg)) (member (char arg 0) '(#\[ #\{)))
+          (and (<= 1 (length arg) 15)
+               (every #'digit-char-p (string-left-trim "-" arg))
+               (string/= arg "-")))
+      arg
+      (with-output-to-string (o)
+        (write-char #\" o)
+        (loop for c across arg do (when (member c '(#\" #\\)) (write-char #\\ o)) (write-char c o))
+        (write-char #\" o))))
+
+(defun rpc-auth (e)
+  (let ((creds (if (rpc-endpoint-user e)
+                   (format nil "~a:~a" (rpc-endpoint-user e) (rpc-endpoint-password e))
+                   (string-trim '(#\Newline #\Space) (uiop:read-file-string (rpc-endpoint-cookie e))))))
+    (base64-encode (sb-ext:string-to-octets creds :external-format :utf-8))))
+
+(defun base64-encode (bytes)
+  (let ((abc "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"))
+    (with-output-to-string (o)
+      (loop for i from 0 below (length bytes) by 3
+            do (let* ((n (length bytes))
+                      (b (logior (ash (aref bytes i) 16)
+                                 (if (< (+ i 1) n) (ash (aref bytes (+ i 1)) 8) 0)
+                                 (if (< (+ i 2) n) (aref bytes (+ i 2)) 0))))
+                 (write-char (char abc (ldb (byte 6 18) b)) o)
+                 (write-char (char abc (ldb (byte 6 12) b)) o)
+                 (write-char (if (< (+ i 1) n) (char abc (ldb (byte 6 6) b)) #\=) o)
+                 (write-char (if (< (+ i 2) n) (char abc (ldb (byte 6 0) b)) #\=) o))))))
+
+(defun rpc-read-response (stream)
+  "Status and body of one HTTP/1.1 response on the byte STREAM."
+  (let ((head (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+    (loop for b = (read-byte stream)
+          do (vector-push-extend b head)
+          until (and (>= (length head) 4)
+                     (= (aref head (- (length head) 4)) 13) (= (aref head (- (length head) 3)) 10)
+                     (= (aref head (- (length head) 2)) 13) (= (aref head (- (length head) 1)) 10)))
+    (let* ((text (sb-ext:octets-to-string (coerce head '(vector (unsigned-byte 8))) :external-format :latin-1))
+           (status (parse-integer text :start 9 :end 12))
+           (lines (uiop:split-string text :separator (list #\Newline)))
+           (len (loop for l in lines
+                      for lc = (string-downcase (string-trim '(#\Return #\Space) l))
+                      when (and (> (length lc) 15) (string= "content-length:" lc :end2 15))
+                        return (parse-integer lc :start 15)))
+           (body (make-array (or len 0) :element-type '(unsigned-byte 8))))
+      (unless len (error "no Content-Length"))
+      (read-sequence body stream)
+      (values status (sb-ext:octets-to-string body :external-format :utf-8)))))
+
+(defun rpc-exchange (e request)
+  "One request on a pooled connection (a fresh one if the pooled one has gone away)."
+  (let ((now (get-universal-time)))
+    (loop for attempt from 0 below 2
+          do (let ((conn (bt:with-lock-held ((rpc-endpoint-lock e))
+                           (loop for c = (pop (rpc-endpoint-pool e)) while c
+                                 if (< (- now (cdr c)) *rpc-idle-seconds*) return (car c)
+                                   else do (ignore-errors (usocket:socket-close (car c)))))))
+               (when (or (null conn) (plusp attempt))
+                 (when conn (ignore-errors (usocket:socket-close conn)))
+                 (setf conn (usocket:socket-connect (rpc-endpoint-host e) (rpc-endpoint-port e)
+                                                    :element-type '(unsigned-byte 8) :timeout 10)))
+               (handler-case
+                   (let ((s (usocket:socket-stream conn)))
+                     (write-sequence request s) (finish-output s)
+                     (multiple-value-bind (status body) (rpc-read-response s)
+                       (bt:with-lock-held ((rpc-endpoint-lock e))
+                         (push (cons conn (get-universal-time)) (rpc-endpoint-pool e)))
+                       (return-from rpc-exchange (values status body))))
+                 (error (err)
+                   (ignore-errors (usocket:socket-close conn))
+                   (when (plusp attempt) (error err))))))))
+
+(defun rpc-call-text (e method args)
+  "bitcoin-cli's stdout for METHOD ARGS: a string result bare, null as \"\", anything else
+   as bitcoind's own JSON text; \"\" on an RPC error (bitcoin-cli writes those to stderr)."
+  (let* ((body (format nil "{\"jsonrpc\":\"1.0\",\"id\":\"cl\",\"method\":\"~a\",\"params\":[~{~a~^,~}]}"
+                       method (mapcar #'rpc-param args)))
+         (octets (sb-ext:string-to-octets body :external-format :utf-8))
+         (request (concatenate '(vector (unsigned-byte 8))
+                               (sb-ext:string-to-octets
+                                (format nil "POST / HTTP/1.1~c~cHost: ~a~c~cAuthorization: Basic ~a~c~cContent-Type: application/json~c~cContent-Length: ~d~c~c~c~c"
+                                        #\Return #\Newline (rpc-endpoint-host e) #\Return #\Newline (rpc-auth e) #\Return #\Newline
+                                        #\Return #\Newline (length octets) #\Return #\Newline #\Return #\Newline)
+                                :external-format :latin-1)
+                               octets)))
+    (multiple-value-bind (status text) (rpc-exchange e request)
+      (declare (ignore status))   ; bitcoind answers RPC errors with 500 and a JSON body
+      (let ((j (js:parse text)))
+        (if (and (hash-table-p j) (let ((err (gethash "error" j))) (and err (not (eq err 'null)))))
+            ""
+            (let ((r (and (hash-table-p j) (gethash "result" j))))
+              (cond ((or (null r) (eq r 'null)) "")
+                    ((stringp r) r)
+                    (t ;; bitcoind's own text for the result: {"result":<raw>,"error":...}
+                     (let ((start (+ (search "\"result\":" text) 9)) (end (search ",\"error\":" text :from-end t)))
+                       (string-trim '(#\Newline #\Space) (subseq text start end)))))))))))
+
 (defun run-cli (cli &rest args)
-  (string-trim '(#\Newline #\Space)
-               (uiop:run-program (append (uiop:split-string cli :separator " ") args) :output :string :ignore-error-status t)))
+  (let ((e (rpc-endpoint-of cli)))
+    (or (and e (handler-case (rpc-call-text e (first args) (rest args))
+                 (error () nil)))
+        (string-trim '(#\Newline #\Space)
+                     (uiop:run-program (append (uiop:split-string cli :separator " ") args) :output :string :ignore-error-status t)))))
 
 ;;; Every run-cli forks this process, and a node's heap is gigabytes: each call
 ;;; costs ~175 ms (docs/TRUST-MODEL.md, the Q = 7 soak).  The cosign path asks for
