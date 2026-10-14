@@ -1969,7 +1969,15 @@
                         (setf (gethash (nd::fork-key id winner) (nd:node-ledgers n))
                               (nd::make-record :id-hex id :ledger l :history (reverse history) :fork-p t :fork-of id
                                                :fork-operator winner))))))
-      (dolist (shape (list (cons "a replica" as-replica) (cons "the winner's fork" as-fork)))
+      (dolist (shape (list (cons "a replica" as-replica) (cons "the winner's fork" as-fork)
+                           ;; as the fold leaves it live: the fork's DisputeEnter cleared its
+                           ;; quorum and the DisputeAcquire its quorum-at-fork (regtest 2026-10-14:
+                           ;; no member found itself in the quorum, no one disputed)
+                           (cons "the winner's fork, quorum cleared by the acquire"
+                                 (lambda (n)
+                                   (funcall as-fork n)
+                                   (let ((l (nd:record-ledger (gethash (nd::fork-key id winner) (nd:node-ledgers n)))))
+                                     (setf (lg:ledger-quorum-at-fork l) '() (lg:ledger-quorum-members l) '()))))))
         (let ((n (funcall member-node)))
           (funcall (cdr shape) n)
           (nd::handle-operator-fraud n (funcall proof-at 12))

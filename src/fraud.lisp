@@ -840,10 +840,16 @@
                          (t v))))
     (w:json-object "proof_type" (cdr (assoc (getf proof :type) +type-names+))
                    "accused" (getf proof :accused) "ledger_id" (getf proof :ledger-id)
-                   "evidence" (w:json-object (if (e proof :source-qb-update) "UncreditedMigration" (evidence-variant (getf proof :type))) ev))))
+                   "evidence" (w:json-object (evidence-variant (getf proof :type) (e proof :source-qb-update)) ev))))
 
-(defun evidence-variant (type)
-  (case type (:uncredited-onchain-payment "UncreditedOnchain") (:uncredited-lightning-payment "UncreditedLightning")
+(defun evidence-variant (type &optional source-qb-update)
+  "The reference's serde variant for TYPE's evidence.  Only an UncreditedOnchainPayment's
+   migration form is UncreditedMigration: proof 11 carries a source_qb_update too, and
+   tagging it so (an empty string is true) made the reference drop every proof 11 we sent
+   (\"missing field confirmed_at_block_hash\", regtest 2026-10-14)."
+  (case type (:uncredited-onchain-payment (if (and source-qb-update (plusp (length source-qb-update)))
+                                              "UncreditedMigration" "UncreditedOnchain"))
+        (:uncredited-lightning-payment "UncreditedLightning")
         (:stale-cosignature "StaleCosign") (:non-conforming-update "NonConformingUpdate")
         (t (cdr (assoc type +type-names+)))))
 

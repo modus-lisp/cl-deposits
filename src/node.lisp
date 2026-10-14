@@ -4469,11 +4469,19 @@
    the winner's chain as its fork) the acquired fork.  Returns our new fork, or NIL."
   (let* ((id (record-id-hex chain)) (l (record-ledger chain))
          (accused (hex->bytes (getf proof :accused))) (us (node-pubkey node))
-         (members (or (lg:ledger-quorum-members l) (lg:ledger-quorum-at-fork l))))
+         ;; DEP-06: judged by the quorum the dispute forked from.  The acquired fork carries
+         ;; none (its DisputeEnter cleared it, the DisputeAcquire cleared quorum-at-fork), so
+         ;; every member found itself outside it and no one disputed (regtest 2026-10-14);
+         ;; the base replica holds the ledger's last QuorumBegin quorum.
+         (base (find-record node id))
+         (members (or (lg:ledger-quorum-members l) (lg:ledger-quorum-at-fork l)
+                      (and base (or (lg:ledger-quorum-members (record-ledger base))
+                                    (lg:ledger-quorum-at-fork (record-ledger base)))))))
     (cond ((equalp accused us) nil)
           ((not (equalp accused (lg:ledger-operator-key l)))
            (log! node "unhonoured-obligation proof on ~a names ~a, not its operator" (subseq id 0 8) (subseq (bytes->hex accused) 0 8)) nil)
-          ((not (member us members :key #'lg:member-pubkey :test #'equalp)) nil)
+          ((not (member us members :key #'lg:member-pubkey :test #'equalp))
+           (log! node "unhonoured-obligation proof on ~a: not a member of its quorum; not disputing" (subseq id 0 8)) nil)
           ;; already disputing it: our fork holds the custody change
           ((let ((own (find-fork node id us)))
              (and own (not (eq own chain))
