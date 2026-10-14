@@ -2286,7 +2286,9 @@
 (defun drive-dispute (node fork)
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (h (height node)))
     (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
-      (unless (and base enter) (return-from drive-dispute nil))
+      (unless (and base enter)
+        (return-from drive-dispute
+          (note-dispute node id "not driven: ~:[no replica of the ledger~;no DisputeEnter of ours on the fork~]" base)))
       (flet ((conclude (fmt &rest args)
                (commit-update node fork (new-update node fork (list :type :dispute-yield)))
                (release-pledges node id)
@@ -2367,11 +2369,26 @@
                           (error (e) (note-dispute node id "confiscation not yet: ~a" e))))
                        (t (note-dispute node id "armed; another armer proposes first"))))))))))))
 
+(defvar *drive-dispute-lock* (bt:make-lock "drive-dispute"))
+
 (defun drive-disputes (node)
   (loop for rec in (loop for r being the hash-values of (node-ledgers node)
                          when (and (record-fork-p r) (record-owned-p r)) collect r)
-        do (handler-case (drive-dispute node rec)
-             (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))))
+        do (bt:with-lock-held (*drive-dispute-lock*)
+             (handler-case (drive-dispute node rec)
+               (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e))))))
+
+(defvar *drive-dispute-on-enter* t
+  "Drive a dispute the moment we enter it (tests that stage arming by hand bind it to NIL).")
+
+(defun drive-dispute-now (node fork)
+  "Arm a dispute as soon as we enter it, as the reference does, rather than at the next
+   once-a-minute pass: the arm window can close first, leaving us out of the lottery.  Only
+   when no pass is driving (never two arms at once, never blocking the relay handler)."
+  (when (and *drive-dispute-on-enter* (bt:acquire-lock *drive-dispute-lock* nil))
+    (unwind-protect (handler-case (drive-dispute node fork)
+                      (error (e) (note-dispute node (record-id-hex fork) "error: ~a" e)))
+      (bt:release-lock *drive-dispute-lock*))))
 
 (defun start-expiry-watch (node &key (interval 60))
   (bt:make-thread (lambda () (loop (sleep interval)
@@ -2770,6 +2787,7 @@
                                                     (list :type :dispute-enter :last-valid-sequence last-valid-seq :reason reason
                                                           :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height
                                                           :fraud-proof-hash fraud-proof-hash))))
+    (drive-dispute-now node fork)
     fork))
 
 (defun dispute-lottery-n (rec &optional fork-point)

@@ -971,7 +971,7 @@
     (flet ((drive () (dolist (m (list b c d)) (nd:drive-disputes m))))
       (let ((expiry (lg:ledger-quorum-expiry (nd:record-ledger la))))
         (let ((*height* (+ expiry 4)))
-          (dolist (m (list b c)) (nd:dispute-expired-quorums m :grace 3))
+          (let ((nd::*drive-dispute-on-enter* nil)) (dolist (m (list b c)) (nd:dispute-expired-quorums m :grace 3)))
           ;; Q = 3, but only b and c arm; c will withhold its reveal.
           (nd:arm-dispute b (nd:find-fork b id (nd:node-pubkey b)) :replacement (nd:pledge-collateral b id))
           (nd:arm-dispute c (nd:find-fork c id (nd:node-pubkey c)) :replacement (nd:pledge-collateral c id))
