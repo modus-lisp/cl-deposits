@@ -44,7 +44,7 @@
            #:node-height-of-block #:fork-live-p #:live-fork #:fork-summaries #:equivocate #:node-spender-fn #:drive-vault-watch #:node-reported-vault-spend
            #:check-expired-quorums #:collateral-floor-sats #:follow-ledger #:wallet-escalate #:node-ignore-actions #:wallet-request-hash #:wallet-lock-to
            #:node-hooks #:add-hook #:wallet-pending-lock #:completion-satisfied-p #:node-busy
-           #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:*cosign-response-seconds* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
+           #:save-record #:load-record #:load-data-dir #:stop-node #:lottery-seed #:*cosign-timeout* #:*cosign-response-seconds* #:*drive-dispute-async* #:inbox-depths #:catch-up #:catch-up-all #:fail-expired-transfers #:start-transfer-timeout-poller #:node-adversary
            #:dispute-expired-quorums #:start-expiry-watch #:*expiry-grace-blocks*
            #:required-replacement-sats #:pledge-collateral #:release-pledges #:our-utxos #:node-pledges
            #:drive-disputes #:dispute-arm-closes #:outpoint-key #:save-pledges
@@ -2432,6 +2432,9 @@
             (handler-case (drive-dispute node rec)
               (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e))))))))
 
+(defvar *drive-dispute-async* nil
+  "Drive a newly entered dispute on its own thread (the daemon sets it; tests drive inline).")
+
 (defvar *drive-dispute-on-enter* t
   "Drive a dispute the moment we enter it (tests that stage arming by hand bind it to NIL).")
 
@@ -2441,10 +2444,19 @@
    when no pass is driving this ledger (never two arms at once, never blocking the relay
    handler)."
   (let ((lock (drive-lock node fork)))
-    (when (and *drive-dispute-on-enter* (bt:acquire-lock lock nil))
-      (unwind-protect (handler-case (drive-dispute node fork)
-                        (error (e) (note-dispute node (record-id-hex fork) "error: ~a" e)))
-        (bt:release-lock lock)))))
+    (flet ((drive ()
+             (when (bt:acquire-lock lock nil)
+               (unwind-protect (handler-case (drive-dispute node fork)
+                                 (error (e) (note-dispute node (record-id-hex fork) "error: ~a" e)))
+                 (bt:release-lock lock)))))
+      (when *drive-dispute-on-enter*
+        (if *drive-dispute-async*
+            ;; Off the caller's thread: entering is the worker handling a fraud proof, and a
+            ;; drive can walk the chain for minutes (a confiscation rebuild).  On the worker it
+            ;; held every request behind it: an operator's deposit_open timed out (regtest
+            ;; 2026-10-14).  The thread takes the lock itself (a mutex is released by its owner).
+            (bt:make-thread #'drive :name "drive-dispute-now")
+            (drive))))))
 
 (defun start-expiry-watch (node &key (interval 60))
   (bt:make-thread (lambda () (loop (sleep interval)
