@@ -1065,3 +1065,38 @@ declared collateral, so the pledge-failure re-arm DEP-03 allows could never land
 re-arm shape at all. Now both require the same commitment and declared collateral, and accept a
 fresh pledge (shared vector: `dispute_rearm.json`). After the restart, all six reference nodes
 skipped 4–27 finished disputes each, with no re-arms and no timeouts.
+
+### 2026-10-14 (evening): proof 11 live, authorised confiscation, and the full suite at 26/26
+
+Run 1014-164155, on a reset regtest network with deposits-rust 2e77b84 and cl-deposits 32049e7 (plus
+the check-obligations fix 2529b27): **all 26 scenarios PASS.** veto-pledge passed on its third
+try; the first two were INVALID because the spend confirmed after E. In **obligations** the cl
+winner (cld21) withheld the residue credit, and proof 11 was verified and disputed by cl members
+cld23 and cld22 and by reference members ref6 and ref7.
+
+Getting there took these cross-implementation fixes. Each one is a spec rule, a change in both
+implementations, and a shared vector.
+- **Proof 11, end to end.**
+  - cl tagged its JSON as `UncreditedMigration`, so the reference dropped it silently.
+  - cl members read the quorum off the acquired fork, which has none. DEP-06 now says proof 11 is
+    judged by the quorum the dispute forked from.
+  - The reference judged against its own replica. A member that lost the lottery does not follow
+    the winner's fork, so the reference now rebuilds the chain through `proof_update`
+    (`chain_through`) and adopts the new custodian's chain before disputing.
+- **Proof JSON (DEP-06).** Byte strings are hex and readers also accept arrays. The reference's
+  `anchor_block_hash` took only arrays, so it dropped every QuorumExpired proof cl sent (vector
+  `proof_json.txt`).
+- **Authorised confiscation (DEP-06).** A vault spend is excused iff it is byte-identical to the
+  confiscation the rules build from public state, with its lottery over the cut of some subset of
+  the arms. Being "known" no longer excuses anything. Before this, a restarted or new member
+  accused the signers of a real confiscation. Vector `authorised_confiscation.txt`.
+  - On its first run in CI the rule exposed an old reference bug: relay fetches deduplicated
+    updates by content hash. Disputants' DisputeEnters at one sequence have the same content, so
+    only one survived and the rebuild lost the other arms. Fixed in 2e77b84.
+- **Cosign rounds (DEP-05).** Late cosignatures are kept and reused on retry, with an advisory
+  `cosign_response_seconds` (30).
+- **Liveness.**
+  - The reference's tokio coop-budget stall (above).
+  - cl drives each dispute on its own thread, at most 3 per node, live disputes first.
+  - cl reaches bitcoind over JSON-RPC instead of forking `bitcoin-cli`: about 175 ms per call
+    before, under 1 ms now.
