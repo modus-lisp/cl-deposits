@@ -140,6 +140,12 @@ done
 [ -n "$acq" ] || fail "no DisputeAcquire of Y within ${WAIT}s"
 W=""; for n in $C1 $C2 $C3; do [ "$(pubkey_of $n | cut -c3-14)" = "${acq#* }" ] && W=$n; done
 echo "   custody: DisputeAcquire at seq ${acq% *} by ${acq#* } (${W:-a reference member}); credits after it (count op): $credits"
+if [ -z "$W" ] && [ "${OBL_WITHHOLD:-1}" = 1 ]; then
+  # Only a cl winner withholds (the adversary switch is cl's); a reference winner credited, so
+  # proof 11 was not exercised. INVALID: the harness reruns (the lottery picks anew).
+  echo "INVALID: a reference member won Y's lottery and credited the residue; proof 11 needs a cl winner"
+  exit 75
+fi
 if [ -n "$W" ] && [ "${OBL_WITHHOLD:-1}" = 1 ]; then
   [ -z "$credits" ] || fail "the withholding winner $W credited anyway: $credits"
   # The winner signs on, past its service_response_blocks (72), still not crediting: proof 11.
