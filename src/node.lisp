@@ -2393,7 +2393,8 @@
 (defparameter *max-drive-threads* 3
   "Forks one node drives at once in the watch.  Unbounded, every fork of every node ran
    bitcoin-cli together (load 139, members missing their cosign windows).")
-(defvar *drive-threads* (make-hash-table :test #'equalp) "node pubkey -> forks being driven")
+(defvar *drive-threads* (make-hash-table :test #'equalp)
+  "node pubkey -> live forks being driven; (:dormant . pubkey) -> dormant ones")
 (defvar *drive-threads-lock* (bt:make-lock "drive-threads"))
 
 (defun dormant-dispute-p (node fork)
@@ -2415,9 +2416,13 @@
                             (lambda (a b) (and (not (dormant-dispute-p node a)) (dormant-dispute-p node b))))))
     (dolist (rec forks)
       (if parallel
-          (let ((lock (drive-lock node rec)) (rec rec) (key (node-pubkey node)))
+          ;; Dormant forks share one slot, so live disputes always have the rest: three slow
+          ;; dormant drives once held every slot while a live dispute's members never got to
+          ;; reveal (check-obligations, regtest 2026-10-14).
+          (let* ((lock (drive-lock node rec)) (rec rec) (dormant (dormant-dispute-p node rec))
+                 (key (if dormant (cons :dormant (node-pubkey node)) (node-pubkey node))))
             (when (bt:with-lock-held (*drive-threads-lock*)
-                    (when (< (gethash key *drive-threads* 0) *max-drive-threads*)
+                    (when (< (gethash key *drive-threads* 0) (if dormant 1 *max-drive-threads*))
                       (incf (gethash key *drive-threads* 0))))
               ;; The thread takes the fork's lock itself (a mutex is released by its owner).
               (bt:make-thread (lambda ()
