@@ -2152,8 +2152,13 @@
           when (funcall (node-chain-fn node) (btx:tx-txid tx) 0)
             do (let ((l (lottery-paid-by node id-hex (btx:txout-script (first (btx:tx-outputs tx))))))
                  (when l (return-from confiscated-lottery (values tx l :pending)))))
-    (let ((built (rebuild-confiscation-on-chain node id-hex)))
-      (when built (values (first built) (second built) :pending)))))
+    ;; We hold this ledger's confiscation and its lottery output is gone (claimed): nothing
+    ;; pending, and rebuilding every shape x tier x subset would only rediscover that, at a
+    ;; chain walk per obligation, on every pass.
+    (unless (or (gethash id-hex (node-signed-confiscations node))
+                (gethash id-hex (node-seen-confiscations node)))
+      (let ((built (rebuild-confiscation-on-chain node id-hex)))
+        (when built (values (first built) (second built) :pending))))))
 
 (defun lottery-paid-by (node id-hex spk)
   "The lottery over a subset of ID-HEX's armers whose output script is SPK (our cut
@@ -3002,7 +3007,23 @@
          (let ((spend (getf facts :spend))) (or (eq spend :unspent) (and (consp spend) (> (second spend) snapshot))))
          (getf facts :value-sats))))
 
+(defvar *obligations-memo* (make-hash-table :test #'equalp))
+(defvar *obligations-memo-lock* (bt:make-lock "obligations-memo"))
+
 (defun confiscation-obligations (node id-hex participants snapshot)
+  "Memoized for a minute per (ID-HEX, SNAPSHOT, PARTICIPANTS): a rebuild tries every shape
+   and tier over the same set, and each computation can walk the chain."
+  (let ((key (list (node-pubkey node) id-hex snapshot (mapcar #'first participants) (height node))))
+    (multiple-value-bind (hit found) (bt:with-lock-held (*obligations-memo-lock*) (gethash key *obligations-memo*))
+      (if found
+          (values-list hit)
+          (let ((v (multiple-value-list (%confiscation-obligations node id-hex participants snapshot))))
+            (bt:with-lock-held (*obligations-memo-lock*)
+              (when (> (hash-table-count *obligations-memo*) 4096) (clrhash *obligations-memo*))
+              (setf (gethash key *obligations-memo*) v))
+            (values-list v))))))
+
+(defun %confiscation-obligations (node id-hex participants snapshot)
   "DEP-06 §Confiscation obligations: (values swept splice-outs residue-sats) for the confiscation of
    ID-HEX.  SWEPT ((txid vout sats) ...) ascending; SPLICE-OUTS ((spk . sats) ...) ascending by
    deposit id; RESIDUE-SATS the owed entries no splice-out pays.  From the ledger at the fork
