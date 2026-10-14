@@ -155,6 +155,8 @@
              (mk (lambda (amount)
                    (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id) :seq seq
                                                    :prev-hash (lg:ledger-chain-tip (nd:record-ledger la))
+                                                   ;; DEP-02: at the chain's height, naming a block
+                                                   :block-height *height* :block-hash (u:sha256 (u:ascii->bytes "block"))
                                                    :message (op:encode-operation (list :type :onchain-credit :txid (u:sha256 (hx "ee")) :vout 0
                                                                                        :deposit-id d1 :amount amount :funding-address "x")))))
                      (up:sign-operator u (nd::node-priv a)) u)))
@@ -381,7 +383,8 @@
           (check-equal "deadline not reached yet"
                        (nth-value 1 (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))))
                        "deadline not reached")
-          (let ((*height* (+ *height* 100)))
+          ;; Time moves on for good: an operator never signs below a height it signed (DEP-02).
+          (progn (incf *height* 100)
             (nd:credit-onchain a la d1 1 :txid (u:sha256 (hx "04")))
             (check "past the service deadline with no answer: censorship proven"
                    (fr:verify-censorship (w:json params) embed (reverse (nd:record-history lb)) (reverse (nd:record-history la))
@@ -408,7 +411,8 @@
                 (nd:wallet-escalate w3 (nd:record-id-hex lb) h4 ida (nd:node-pubkey-hex a))
                 (let ((embed4 (first (nd:record-history lb))))
                   (nd:wallet-transfer w3 ida d3 ka 150000 :height *height*)
-                  (let ((*height* (+ *height* 100)))
+                  ;; Time moves on for good: an operator never signs below a height it signed (DEP-02).
+                  (progn (incf *height* 100)
                     (nd:credit-onchain a la d3 1 :txid (u:sha256 (hx "d6")))
                     (multiple-value-bind (ok why)
                         (fr:verify-censorship (w:json p4) embed4 (reverse (nd:record-history lb)) (reverse (nd:record-history la))
@@ -442,6 +446,9 @@
             (check "route recorded the preimage" (equalp (getf (gethash (u:sha256 preimage) (cr:courier-routes k)) :preimage) preimage))))))))
 
 
+
+;; The messaging gate moved time on for good (an operator never signs below a height it signed).
+(setf *height* 1000)
 
 (with-gate ("lightning pay path and reference-shaped requests")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*)) (mock-ln (ln:make-mock-ln))

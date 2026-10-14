@@ -255,6 +255,9 @@
               ((and (plusp seq) (/= (gethash (up:update-prev-hash fault) bound) (1- seq)))
                (values t (format nil "fault at seq ~a follows seq ~a" seq (gethash (up:update-prev-hash fault) bound))))
               ((/= (length prefix) seq) (values nil "history does not reach the fault's predecessor"))
+              ((up:header-violation (car (last prefix)) fault)
+               ;; DEP-02 §Block height and hash: a height below its predecessor's, or no block
+               (values t (up:header-violation (car (last prefix)) fault)))
               (t
                ;; It chains onto its predecessor, so it must break a rule: the fold's,
                ;; or the depositor's (authorization, nonce window, expiry).
@@ -360,11 +363,10 @@
              (active (find (e proof :member-active-sequence) member-history :key #'up:update-seq))
              (anchor (up:update-block-height disc)))
         (flet ((confirmed-at-p (u)
-                 ;; A signed header dates the update when it names a block (the reference's do); one
-                 ;; with no block hash (cl's, so far) is dated by its signed block_height alone.
-                 (let ((bh (up:update-block-hash u)))
-                   (or (null bh) (every #'zerop bh)
-                       (eql (funcall height-of-block bh) (up:update-block-height u))))))
+                 ;; DEP-02 §Block height and hash: an update is dated by its signed block_height
+                 ;; alone; its hash is never resolved (a reorganised-out block is not a fault).
+                 (declare (ignore u))
+                 t))
           (cond
             ((not (string-equal (e proof :original-fraud-hash) (bytes->hex h)))
              (values nil "original_fraud_hash is not the carried proof's hash"))
@@ -568,7 +570,7 @@
                    (confirmed (funcall height-of-block (e proof :confirmed-at-block-hash)))
                    (pu (up:decode-update (hex->bytes (e proof :proof-update))))
                    (ours (find (up:update-seq pu) history :key #'up:update-seq))
-                   (ph (funcall height-of-block (up:update-block-hash pu)))
+                   (ph (up:update-block-height pu))       ; DEP-02: dated by its signed height
                    (srb (and au (governing-service-response-blocks history (up:update-seq au)))))
               (cond
                 ((not (and (equalp (up:update-operator-id nu) (up:update-operator-id qu))
@@ -595,8 +597,6 @@
                  (values nil "the proof update is not the accused's signed update on its ledger"))
                 ((not (and ours (equalp (up:chain-hash ours) (up:chain-hash pu))))
                  (values nil "the proof update is not in the accused's history"))
-                ((null ph) (values nil "the proof update's block is not in the verifier's chain"))
-                ((/= ph (up:update-block-height pu)) (values nil "the proof update's signed height is not its block's"))
                 ((< (- ph confirmed) srb)
                  (values nil (format nil "the proof update is fewer than ~a blocks (the accused's terms) after the migration confirmed" srb)))
                 ((migration-credited-p qb history (up:update-seq pu) txid vout)
@@ -623,14 +623,13 @@
                                              (e proof :deadline-block) (hex->bytes (e proof :cosigner-ledger-hash))))
              (confirmed (funcall height-of-block (let ((b (e proof :confirmed-at-block-hash))) (if (stringp b) (hex->bytes b) b))))
              (pu (find (e proof :proof-sequence) history :key #'up:update-seq))
-             (ph (and pu (funcall height-of-block (up:update-block-hash pu)))))
+             (ph (and pu (up:update-block-height pu))))       ; DEP-02: dated by its signed height
         (cond ((not (and (stringp (e proof :descriptor)) (equalp (op:deposit-id (e proof :descriptor)) deposit)))
                (values nil "descriptor does not hash to the offer's deposit_id"))
               ((not (schnorr:schnorr-verify (up:x-only (hex->bytes (e proof :cosigner-pubkey))) digest (hex->bytes (e proof :cosign-signature))))
                (values nil "offer cosignature does not verify"))
               ((null confirmed) (values nil "confirmed_at_block_hash not in the verifier's chain"))
               ((null pu) (values nil "proof_sequence not in the accused's history"))
-              ((null ph) (values nil "the proof_sequence update's block is not on the verifier's chain"))
               ((< (- ph confirmed) (governing-service-response-blocks history (e proof :proof-sequence)))
                (values nil (format nil "the proof update is fewer than ~a blocks (the ledger's terms) after the payment confirmed"
                                    (governing-service-response-blocks history (e proof :proof-sequence)))))
@@ -797,8 +796,8 @@
               (let* ((vault-qb (find :quorum-begin (reverse prefix) :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u))))))
                      (vo (and vault-qb (op:decode-operation (up:update-message vault-qb))))
                      (in0 (first (btx:tx-inputs tx)))
-                     (ah (funcall height-of-block (up:update-block-hash au)))
-                     (ph (funcall height-of-block (up:update-block-hash pu)))
+                     (ah (up:update-block-height au))        ; DEP-02: dated by signed heights
+                     (ph (up:update-block-height pu))
                      (srb (governing-service-response-blocks history (up:update-seq au))))
                 (cond
                   ((not (and vo (equalp (btx:txin-prev-hash in0) (op:field vo :new-outpoint-txid))
@@ -808,7 +807,6 @@
                   ((not (and (up:verify-operator-signature pu) (string-equal (bytes->hex (up:update-operator-id pu)) (getf proof :accused))
                              (equalp (up:update-ledger-id pu) (up:update-ledger-id au)) (funcall in pu)))
                    (values nil "proof_update is not the accused's update in its history"))
-                  ((not (and ah ph (= ph (up:update-block-height pu)))) (values nil "the updates' blocks are not on the verifier's chain"))
                   ((< (- ph ah) srb) (values nil (format nil "the proof update is fewer than ~a blocks after the custody change" srb)))
                   ((funcall credited-p (up:update-seq pu)) (values nil "the residue was credited: not fraud"))
                   (t (values t nil)))))))

@@ -340,6 +340,26 @@
                      (check-equal (format nil "feerate ~a" fs) (list m lo hi)
                                   (list (parse-integer (nth 8 w)) (parse-integer (nth 10 w)) (parse-integer (nth 12 w)))))))))))))
 
+(with-gate ("DEP-02 block height and hash: the shared header_conformance vector")
+  (let ((history '()) (fault nil) (name nil) (n 0))
+    (with-open-file (in (vector-path "header_conformance.txt"))
+      (loop for line = (read-line in nil) while line
+            unless (or (zerop (length line)) (char= (char line 0) #\#))
+              do (let ((w (uiop:split-string line :separator " ")))
+                   (cond
+                     ((string= (first w) "case") (setf name (second w) history '()))
+                     ((string= (first w) "update") (setf history (append history (list (up:decode-update (u:hex->bytes (second w)))))))
+                     ((string= (first w) "fault") (setf fault (up:decode-update (u:hex->bytes (second w)))))
+                     ((string= (first w) "verdict")
+                      (incf n)
+                      (check-equal (format nil "header case ~a" name)
+                                   (parse-integer (second w))
+                                   (if (fr::verify-non-conforming-update
+                                        (fr::make-non-conforming-update-proof (up:update-operator-id fault) (up:update-ledger-id fault) fault)
+                                        history)
+                                       1 0)))))))
+    (check-equal "header cases" 5 n)))
+
 (with-gate ("DEP-05/DEP-06 governing service_response_blocks: the shared vector")
   (let ((history '()) (n 0))
     (with-open-file (in (vector-path "service_terms.txt"))

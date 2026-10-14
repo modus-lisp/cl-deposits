@@ -45,12 +45,21 @@ OFFER=$(printf '%s' "$r" | python3 -c 'import sys,json; s=sys.stdin.read(); prin
 PT=$(wcli sendtoaddress "$OADDR" 0.0005); mine 8 >/dev/null; sleep 10
 PV=$(outpoint_vout "$PT" "$OADDR")
 echo "   w4 paid Y's offer $PT:$PV (50000 sats); Y never credits it"
+# a payment too small to splice out (400 - 86 < 330 sats): residue the winner must credit
+r=$(w w5 "$Y" offer 1000); expect "$r" "w5 offer"
+RADDR=$(sx "$r" ":FUNDING-ADDRESS"); RDESC=$(sx "$r" ":DESCRIPTOR")
+ROFFER=$(printf '%s' "$r" | python3 -c 'import sys,json; s=sys.stdin.read(); print(json.JSONDecoder().raw_decode(s.split(":OFFER ",1)[1])[0])')
+RT5=$(wcli sendtoaddress "$RADDR" 0.000004); mine 8 >/dev/null; sleep 10
+RV5=$(outpoint_vout "$RT5" "$RADDR")
+echo "   w5 paid Y's offer $RT5:$RV5 (400 sats, residue); Y never credits it"
 # Y's terms: no member declares service_response_blocks, so 72 (DEP-05). The proofs need an update
 # Y signed that long after the payment (and the migration) confirmed: a fresh deposit opens one.
 mine 72 >/dev/null; sleep 15
 [ -n "$(sx "$(w w2 "$Y" open)" ":DEPOSIT")" ] || fail "w2 open on Y (Y's late update)"
 r=$(cld_ctl $C1 "(:uncredited-offer-proof :ledger \"$Y\" :offer $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$OFFER") :descriptor \"$ODESC\" :txid \"$PT\" :vout $PV)")
 expect "$r" "uncredited-offer-proof (verifies, broadcast)"
+r=$(cld_ctl $C1 "(:uncredited-offer-proof :ledger \"$Y\" :offer $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$ROFFER") :descriptor \"$RDESC\" :txid \"$RT5\" :vout $RV5)")
+expect "$r" "uncredited-offer-proof of the residue payment"
 echo "== the members dispute Y; waiting for the confiscation (up to ${WAIT}s)"
 P3=$(sx "$(w w3 "$X" pubkey)" ":PUBKEY"); P4=$(sx "$(w w4 "$Y" pubkey)" ":PUBKEY")
 tr_of() { bcli deriveaddresses "$(bcli getdescriptorinfo "tr(${1:2})" | python3 -c 'import json,sys; print(json.load(sys.stdin)["descriptor"])')" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])'; }
@@ -73,4 +82,39 @@ sys.exit(0 if ok else 1)
 PY
 signed=0; for m in $R1 $R2; do sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$m/node.log" 2>/dev/null | grep -qi "Signed confiscation sighash for ledger ${Y:0:16}" && signed=$((signed+1)); done
 echo "   reference members that signed the confiscation: $signed"
-echo "PASS: the confiscation swept the migration output and paid both owed deposits to their owners."
+# DEP-06 §Residue: the lottery's winner takes custody (DisputeAcquire) and credits what the
+# confiscation did not pay: the dangling migration (MigrationCredit) and the 400-sat payment.
+ledger_ops() {   # "seq op" for every update the relay holds of Y
+  python3 - "$CLD_ROOT/beacon-data/events.log" "${Y:0:16}" <<'PY'
+import json, sys
+seen = set()
+for raw in open(sys.argv[1], "rb"):
+    s = raw.decode("latin-1")
+    if sys.argv[2] not in s: continue
+    j = 0
+    while True:
+        i = s.find('{"id"', j)
+        if i < 0: break
+        try: ev, end = json.JSONDecoder().raw_decode(s[i:])
+        except Exception: j = i + 5; continue
+        j = i + end
+        t = {x[0]: x[1] for x in ev.get("tags", []) if len(x) > 1}
+        if ev.get("kind") == 9100 and t.get("d") == sys.argv[2] and (t.get("n"), t.get("t"), ev["pubkey"]) not in seen:
+            seen.add((t.get("n"), t.get("t"), ev["pubkey"])); print(t.get("n"), t.get("t"), ev["pubkey"][:12])
+PY
+}
+acq=""; credits=""
+for i in $(seq 1 $((WAIT / 10))); do
+  acq=$(ledger_ops | awk '$2==55 {print $1, $3; exit}')
+  if [ -n "$acq" ]; then
+    set -- $acq
+    credits=$(ledger_ops | awk -v s="$1" -v k="$2" '$3==k && $1>s && ($2==35 || $2==105) {print $2}' | sort | uniq -c | tr '\n' ' ')
+    case "$credits" in *" 35"*) case "$credits" in *" 105"*) break;; esac;; esac
+  fi
+  mine 1 >/dev/null; sleep 10
+done
+[ -n "$acq" ] || fail "no DisputeAcquire of Y within ${WAIT}s"
+echo "   custody: DisputeAcquire at seq ${acq% *} by ${acq#* }; credits after it (count op): $credits"
+case "$credits" in *" 35"*) ;; *) fail "the winner did not credit the residue payment (OnchainCredit)";; esac
+case "$credits" in *" 105"*) ;; *) fail "the winner did not resolve the dangling migration (MigrationCredit)";; esac
+echo "PASS: the confiscation swept the migration output and paid both owed deposits; the winner credited the residue."

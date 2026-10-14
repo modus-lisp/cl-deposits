@@ -324,15 +324,24 @@
 ;;; Building and publishing our own updates
 
 (defun new-update (node rec op &key (height (height node)))
-  (let ((t0 (tip rec)))
+  "DEP-02 §Block height and hash: dated at our tip but never below the chain's last height (a
+   reorganisation that lowered our tip leaves us at that height), and naming a block."
+  (let* ((t0 (tip rec))
+         (height (max height (if t0 (up:update-block-height t0) 0))))
     (up:make-signed-update :operator-id (node-pubkey node) :ledger-id (hex->bytes (record-id-hex rec))
                            :seq (if t0 (1+ (up:update-seq t0)) 0)
                            :prev-hash (if t0 (up:chain-hash t0) (make-array 32 :element-type '(unsigned-byte 8)))
                            :message (op:encode-operation op) :block-height height
-                           ;; DEP-02: the block at HEIGHT, so the update is datable on chain (an
-                           ;; uncredited proof needs its proof update's block on the verifier's chain).
-                           :block-hash (or (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) height)))
-                                           (make-array 32 :element-type '(unsigned-byte 8))))))
+                           :block-hash (block-hash-at node height t0))))
+
+(defun block-hash-at (node height &optional predecessor)
+  "The block hash to sign at HEIGHT: PREDECESSOR's when it is at the same height (one block, one
+   hash, even after a reorganisation), else our chain's, else (no chain view) a stand-in.  Never
+   zero; never judged against anyone's chain (DEP-02)."
+  (or (and predecessor (= height (up:update-block-height predecessor))
+           (let ((h (up:update-block-hash predecessor))) (and h (not (zero-bytes-p h)) h)))
+      (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) height)))
+      (sha256 (ascii->bytes (format nil "deposits: no chain view at height ~a" height)))))
 
 (defun commit-update (node rec update)
   "Operator-sign, apply, record, publish, persist.  The update's cosignatures
@@ -354,6 +363,9 @@
   (save-record node rec)
   (run-hooks node rec update)
   update)
+
+(defparameter *cosign-tip-wait-seconds* 10
+  "How long a cosigner waits for its tip to reach a proposed height above it (within the tolerance).")
 
 (defparameter *cosign-height-tolerance* 6
   "A cosigner refuses an update whose (signed) block_height is further than this
@@ -1014,7 +1026,8 @@
         (multiple-value-bind (ok why)
             (up:verify-cosignatures update :quorum (mapcar #'lg:member-pubkey signers) :threshold required)
           (unless ok (fail "seq ~a: ~a" (up:update-seq update) why)))))
-    (handler-case (let ((v (cf:violation ledger op (up:update-block-height update))))
+    (handler-case (let ((v (or (up:header-violation (first (record-history rec)) update)
+                               (cf:violation ledger op (up:update-block-height update)))))
                     (when v (lg::fail :non-conforming v))
                     (lg:apply-update ledger update))
       (lg:ledger-error (e)
@@ -1219,17 +1232,22 @@
              (progn
                (unless (equalp ledger-id (hex->bytes (record-id-hex rec))) (fail "ledger_id mismatch"))
                (unless (record-fork-p rec) (check-not-deposed node rec))
-               (let ((ours (height node)))
-                 (when (and (plusp ours) (> (abs (- block-height ours)) *cosign-height-tolerance*))
-                   (fail "block_height ~a is not near our tip ~a" block-height ours))
-                 (when (and (not (zero-bytes-p block-hash)) (node-block-hash-fn node))
-                   (let ((h (ignore-errors (funcall (node-block-hash-fn node) block-height))))
-                     (when (and h (not (equalp h block-hash))) (fail "block_hash is not our chain's at ~a" block-height)))))
+               ;; DEP-02: our tip is only a bound.  A height a little above it we wait for (the
+               ;; operator saw a block before we did); the hash is never judged against our chain.
+               (let ((ours (loop repeat *cosign-tip-wait-seconds* while (> block-height (height node)) do (sleep 1)
+                                 finally (return (height node)))))
+                 (when (plusp ours)
+                   (when (> (- block-height ours) *cosign-height-tolerance*)
+                     (fail "block_height ~a is more than ~a above our tip ~a" block-height *cosign-height-tolerance* ours))
+                   (when (> (- ours block-height) *cosign-height-tolerance*)
+                     (fail "block_height ~a is more than ~a below our tip ~a" block-height *cosign-height-tolerance* ours))))
                (when (and (> seq (1+ (lg:ledger-sequence ledger))) (not (record-fork-p rec)))
                  (catch-up node rec))
                (unless (= seq (1+ (lg:ledger-sequence ledger)))
                  (fail "expected seq ~a" (1+ (lg:ledger-sequence ledger))))
                (unless (equalp prev (lg:ledger-chain-tip ledger)) (fail "chain mismatch: not our tip"))
+               (let ((v (up:header-violation (first (record-history rec)) candidate)))
+                 (when v (fail "~a" v)))
                (let ((o (op:decode-operation message)))
                  ;; Speculative apply on a fresh replica: the op must be valid on our state.
                  ;; ADVERSARY :cosign-blind — a member that signs whatever chains (red team #1).
@@ -2645,6 +2663,15 @@
             collect (record-fork-operator f) into keys
           finally (return (remove-duplicates keys :test #'equalp)))))
 
+(defun acquired-fork (node id-hex)
+  "The fork of ID-HEX's ledger whose DisputeAcquire took custody, if any."
+  (find-if (lambda (f) (fork-op f :dispute-acquire)) (forks-of node id-hex)))
+
+(defun ledger-chain-record (node id-hex)
+  "The record holding ID-HEX's ledger as it now runs: the acquired fork after a custody change
+   (cl keeps the winner's chain as its fork), else the replica."
+  (or (acquired-fork node id-hex) (find-record node id-hex)))
+
 (defun custody-moved-to (node rec)
   "The key a DisputeAcquire on any fork of REC's ledger gave custody to, when it is
    not ours: the ledger's operator from then on (DEP-06)."
@@ -3520,7 +3547,62 @@
                                                                  :claim-txid (btx:tx-txid signed) :new-reserves-address target
                                                                  ;; DEP-06: the confiscation whose residue we now owe
                                                                  :confiscation-txid txid)))
+            ;; DEP-06 §Residue: we owe it now, within the ledger's service_response_blocks.
+            ;; ADVERSARY :withhold-residue — a winner that never credits it (proof 11's target).
+            (unless (getf (node-adversary node) :withhold-residue)
+            (let ((ctx (if (and conf (equalp (btx:tx-txid conf) txid))
+                           conf
+                           (first (ignore-errors (rebuild-confiscation-on-chain node id-hex))))))
+              (if (and ctx (equalp (btx:tx-txid ctx) txid))
+                  (handler-case (credit-residue node fork ctx)
+                    (error (e) (log! node "residue of ~a: ~a" (subseq id-hex 0 8) e)))
+                  (log! node "residue of ~a: the confiscation ~a is not one we can rebuild" (subseq id-hex 0 8) (txid-hex txid)))))
             (values :won signed)))))))
+
+(defun credit-residue (node fork conf)
+  "DEP-06 §Residue, as the new operator after DisputeAcquire on FORK: credit every owed entry
+   the confiscation CONF did not pay.  A migration dangling at the fork point: one MigrationCredit
+   carrying CONF (the fold credits only its unpaid entries, and resolves the accept).  A payment
+   proven uncredited (recorded on a fork, or verified by us): its deposit opened if need be, then
+   an OnchainCredit of its outpoint.  Returns how many credits were appended."
+  (let* ((id (record-id-hex fork)) (base (find-record node id)) (lvs (dispute-last-valid-seq node id))
+         (l (and base lvs (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base))))))
+         (a (and l (lg:ledger-dormancy-accept l)))
+         (n 0))
+    (when (and a (not (getf a :resolved)) (getf a :source))
+      (multiple-value-bind (nu qu) (migration-source-updates node a (bytes->hex (getf a :source)))
+        (when qu
+          (commit-update node fork (new-update node fork (list :type :migration-credit
+                                                               :source-notice-update (up:encode-update nu)
+                                                               :source-qb-update (up:encode-update qu)
+                                                               :confiscation-tx (btx:serialize-tx conf :witness nil))))
+          (log! node "residue of ~a: credited the migration's unpaid entries" (subseq id 0 8))
+          (incf n))))
+    (let ((jsons (remove-duplicates
+                  (append (gethash id (node-obligation-proofs node))
+                          (loop for f in (forks-of node id)
+                                append (loop for u in (record-history f)
+                                             for o = (ignore-errors (op:decode-operation (up:update-message u)))
+                                             when (and o (eq (op:operation-type o) :obligation-record) (op:field o :uncredited-proof))
+                                               collect (bytes->ascii (op:field o :uncredited-proof)))))
+                  :test #'string=)))
+      (dolist (json jsons)
+        (handler-case
+            (let* ((proof (fr:json->proof (w:parse-json json))) (e (fr::payment-entry proof))
+                   (txid (hex->bytes (fr::e proof :txid))) (vout (fr::e proof :vout)))
+              (when (and (string-equal (getf proof :ledger-id) id)
+                         (fr::unpaid-in-tx (list e) conf)
+                         (not (fr::onchain-credited-p (reverse (record-history fork)) most-positive-fixnum txid vout)))
+                (unless (gethash (getf e :deposit-id) (lg:ledger-deposits (record-ledger fork)))
+                  (commit-update node fork (new-update node fork (list :type :deposit-open :deposit-id (getf e :deposit-id)
+                                                                       :descriptor (getf e :descriptor)))))
+                (commit-update node fork (new-update node fork (list :type :onchain-credit :txid txid :vout vout
+                                                                     :deposit-id (getf e :deposit-id) :amount (getf e :amount)
+                                                                     :funding-address (fr::e proof :funding-address))))
+                (log! node "residue of ~a: credited an uncredited payment (~a msat)" (subseq id 0 8) (getf e :amount))
+                (incf n)))
+          (error (err) (log! node "residue of ~a: a payment not credited: ~a" (subseq id 0 8) err)))))
+    n))
 
 (defun subset-attestations (node id-hex lottery idx tx prevouts sighash)
   "The recovery voters' signatures on a revealer-subset claim, parallel to the
@@ -3556,7 +3638,7 @@
                                    :message (op:encode-operation (append (list :type :onchain-credit :txid (random-aux) :vout 0
                                                                                :deposit-id (or (op:field o :deposit-id) (make-array 16 :element-type '(unsigned-byte 8)))
                                                                                :amount 1 :funding-address "equivocation")))
-                                   :block-height (up:update-block-height last))))
+                                   :block-height (up:update-block-height last) :block-hash (up:update-block-hash last))))
     (up:sign-operator u (node-priv node))
     (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) u))
     u))
@@ -4024,9 +4106,12 @@
    recorded on its history's forks (ObligationRecord) — once the new operator signs an update its
    service_response_blocks past the acquire without crediting the residue, broadcast
    UnhonouredObligation against it (once each)."
-  (loop for rec being the hash-values of (node-ledgers node)
-        for l = (record-ledger rec)
-        when (and (not (record-fork-p rec)) (lg:ledger-confiscation-txid l))
+  (loop for base being the hash-values of (node-ledgers node)
+        ;; the ledger's chain after a custody change: a replica that followed it, or the fork
+        ;; that acquired it (we keep the winner's chain as its fork)
+        for rec = (and (not (record-fork-p base)) (or (ledger-chain-record node (record-id-hex base)) base))
+        for l = (and rec (record-ledger rec))
+        when (and l (lg:ledger-confiscation-txid l))
           do (handler-case
                  (let* ((history (reverse (record-history rec)))
                         (au (find :dispute-acquire history :from-end t
@@ -4137,6 +4222,15 @@
     (loop for key being the hash-keys of (node-reported-vault-spend node) using (hash-value e)
           when (and (listp e) (not (getf e :done)))
             do (handler-case
+                   (if (and (node-height-of-block node) (getf e :block-hash)
+                            (null (funcall (node-height-of-block node) (hex->bytes (getf e :block-hash)))))
+                       ;; DEP-06: its block was reorganised out.  Not a fault, and not proof: forget
+                       ;; it and rescan from below it, so the spend is judged again where it confirms.
+                       (progn (remhash key (node-reported-vault-spend node))
+                              (when (getf e :height)
+                                (setf (node-vault-scanned node) (min (or (node-vault-scanned node) 0) (1- (getf e :height)))))
+                              (log! node "vault spend ~a: its block was reorganised out; re-checking" (subseq key 0 8))
+                              (setf changed t))
                    (let ((tx (btx:parse-tx (bw:make-reader (hex->bytes (getf e :tx)))))
                          (prevouts (coerce (fr::parse-prevouts (getf e :prevouts)) 'list))
                          (bh (hex->bytes (getf e :block-hash))) (complete t))
@@ -4156,7 +4250,7 @@
                                    (setf changed t))))))))
                      (when (and complete (> h (+ (or (getf e :height) 0) *vault-spend-publish-blocks*)))
                        (setf (getf e :done) t changed t))
-                     (setf (gethash key (node-reported-vault-spend node)) e))
+                     (setf (gethash key (node-reported-vault-spend node)) e)))
                  (error (err) (log! node "vault spend ~a: publishing failed (~a); retrying" (subseq key 0 8) err))))
     changed))
 
@@ -4228,6 +4322,18 @@
   (let* ((proof proof)
          (id (getf proof :ledger-id))
          (rec (find-record node id)))
+    ;; DEP-06 UnhonouredObligation accuses the new operator: judged on the chain after the
+    ;; custody change, never by disputing the old operator's chain.
+    (when (and rec (eq (getf proof :type) :unhonoured-obligation))
+      (let ((chain (ledger-chain-record node id)))
+        (multiple-value-bind (ok why)
+            (fr:verify-proof proof :history (reverse (record-history chain))
+                                   :height-of-block (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node))))
+          (if ok
+              (log! node "UNHONOURED OBLIGATION on ~a verified: its new operator ~a left residue uncredited"
+                    (subseq id 0 8) (subseq (getf proof :accused) 0 8))
+              (log! node "unhonoured-obligation proof on ~a rejected: ~a" (subseq id 0 8) why))))
+      (return-from handle-operator-fraud nil))
     ;; Already disputing (another proof came first): an offer proof is still owed at confiscation.
     (when (and rec (not (record-owned-p rec)) (offer-proof-p proof) (live-fork node id (node-pubkey node)))
       (ignore-errors (note-obligation-proof node rec proof)))
