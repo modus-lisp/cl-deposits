@@ -1022,3 +1022,45 @@ PASS.** Two failures on the way were harness faults:
   CLI exits 0 on error, so it reads the output. Why the cl members missed the 10 s window is not
   known: their logs were in memory and lost on the next scenario's restart. cl nodes now also
   append their log to `node.log` in the data dir.
+
+### 2026-10-14 — a reference node that sat out 60 s per pass, and disputes reopened by a restart
+
+**The claim pass's 60 s getblock stall (reference).** In check-obligations run 12 one `getblock`
+timed out at 60 s on every claim pass. It looked like a request that never reached bitcoind, but
+nothing was lost. With `-debug=http,rpc`, bitcoind logged every request as received and executed,
+and hyper's pool showed every checkout served. The cause is tokio's cooperative budget:
+- `reqwest::blocking` waits for each response on a `tokio::sync::oneshot`. Polled on a tokio
+  worker, that oneshot spends the calling task's budget, 128 operations per poll.
+- The claim pass walks blocks synchronously inside an async task. On the 129th call the budget is
+  spent: the receiver returns Pending and defers its wake-up until the task yields to the
+  scheduler. A task parked inside reqwest never yields.
+- So every later call sat out the full timeout, for every task walking blocks at the time
+  (`auto_confiscate` and `auto_reveal` too). This likely explains earlier "silent" reference nodes.
+
+deposits-rust 6fbb240 runs blocking I/O through `block_in_place`, which unsets the budget. A stub
+RPC server test reproduces the stall and checks the fix. Live, ref6's claim pass went from 60.3 s
+to 1.7 s. `DEPOSITS_STACK_DUMP` now dumps every thread on SIGUSR1; ptrace is restricted here, so
+the in-process dump was the only way to see the parked thread.
+
+**Disputes reopened after a restart (reference).** On restart a member re-entered and re-armed
+disputes whose confiscation had confirmed long before:
+- A replayed fork DisputeEnter, or the expiry watch, reached `arm_dispute`.
+- The pledge that the confiscation had itself spent read as "failed", so the member re-armed, and
+  the re-arm moved E.
+- The search for the landed confiscation started at E, so it lost the confiscation. Every armer
+  then computed a different winner.
+
+Fixed per the standing rule:
+- DEP-03 "When the set is final" now says it concretely. An arm above the confiscation's block
+  does not count. No member enters or arms a dispute whose vault is spent. The search starts at
+  the first arm.
+- deposits-rust d0a7877 and f0ceba1 add the guard: the on-disk lottery marker, the replica or its
+  forks, or the relay. They apply C to the cut and start the search at the first arm.
+- cl applies C to `lottery-armers`.
+- Shared vector: `armer_eligibility.json`, the `confiscation_height` case.
+
+On the same path the two folds disagreed about re-arming. Rust rejected a re-arm whose prior arm
+declared collateral, so the pledge-failure re-arm DEP-03 allows could never land. cl checked no
+re-arm shape at all. Now both require the same commitment and declared collateral, and accept a
+fresh pledge (shared vector: `dispute_rearm.json`). After the restart, all six reference nodes
+skipped 4–27 finished disputes each, with no re-arms and no timeouts.
