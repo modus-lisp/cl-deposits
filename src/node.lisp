@@ -2390,12 +2390,26 @@
     (bt:with-lock-held (*drive-locks-lock*)
       (or (gethash key *drive-locks*) (setf (gethash key *drive-locks*) (bt:make-lock "drive-fork"))))))
 
-(defun drive-disputes (node)
+(defun drive-disputes (node &key parallel)
+  "Drive every dispute fork we own.  PARALLEL (the once-a-minute watch): each fork on its
+   own thread, skipping a fork whose previous drive is still running.  Driven in turn, a
+   pass over old forks (a fruitless confiscation rebuild took 3 minutes each) held a live
+   dispute back 16 minutes, past the time its members had to reveal (check-obligations,
+   regtest 2026-10-14)."
   (loop for rec in (loop for r being the hash-values of (node-ledgers node)
                          when (and (record-fork-p r) (record-owned-p r)) collect r)
-        do (bt:with-lock-held ((drive-lock node rec))
-             (handler-case (drive-dispute node rec)
-               (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e))))))
+        do (if parallel
+               (let ((lock (drive-lock node rec)) (rec rec))
+                 ;; The thread takes the lock itself (a mutex is released by its owner).
+                 (bt:make-thread (lambda ()
+                                   (when (bt:acquire-lock lock nil)
+                                     (unwind-protect (handler-case (drive-dispute node rec)
+                                                       (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))
+                                       (bt:release-lock lock))))
+                                 :name "drive-dispute"))
+               (bt:with-lock-held ((drive-lock node rec))
+                 (handler-case (drive-dispute node rec)
+                   (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))))))
 
 (defvar *drive-dispute-on-enter* t
   "Drive a dispute the moment we enter it (tests that stage arming by hand bind it to NIL).")
@@ -2414,7 +2428,7 @@
 (defun start-expiry-watch (node &key (interval 60))
   (bt:make-thread (lambda () (loop (sleep interval)
                                    (ignore-errors (dispute-expired-quorums node))
-                                   (ignore-errors (drive-disputes node))
+                                   (ignore-errors (drive-disputes node :parallel t))
                                    (ignore-errors (drive-dereliction node))
                                    (ignore-errors (drive-vault-watch node))
                                    (ignore-errors (drive-migration-watch node))
