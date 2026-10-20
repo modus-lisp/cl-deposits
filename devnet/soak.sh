@@ -191,7 +191,7 @@ start() {
   echo "== starting soak processes (logs in $SOAK/log)"
   alive mine || spawn mine "$SIGNET_ROOT/mine.sh" --every "$SOAK_BLOCK_EVERY"
   while IFS=$'\t' read -r name _ _ _ _; do
-    alive "swarm-$name" || spawn "swarm-$name" "$DEPOSITS_RUST/../../bin/swarm.sh" --data-dir "$SOAK/refwallet-$name" --relay "$RELAY_URL" --network "$CLD_CHAIN" \
+    alive "swarm-$name" || spawn "swarm-$name" env DEPOSIT_BOT="$DEPOSITS_RUST/deposit-bot" "${DEPOSITS_RUST_SRC:-$HOME/workspace/deposits-rust}/bin/swarm.sh" --data-dir "$SOAK/refwallet-$name" --relay "$RELAY_URL" --network "$CLD_CHAIN" \
         --bitcoin-cli "$BCLI" --interval-ms "$SOAK_BOT_INTERVAL_MS" --floor-sats 500 --reserve-sats 100
   done <"$SOAK/ledgers.tsv"
   for i in $(seq 1 "$SOAK_CL_WORKERS"); do alive "clbot-$i" || spawn "clbot-$i" env SOAK_WORKER="$i" "$CLD_SRC/devnet/soak-clbot.sh"; done
