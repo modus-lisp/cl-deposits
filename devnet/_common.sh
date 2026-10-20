@@ -118,8 +118,8 @@ start_ref() {
   ref_running "$n" && { echo "$n already running"; return 0; }
   [ -f "$dir/seed.hex" ] || head -c 32 /dev/urandom | xxd -p -c 64 >"$dir/seed.hex"
   local from=$(( $(stat -c %s "$dir/node.log" 2>/dev/null || echo 0) + 1 ))   # the log is ~1 GB: grep only this run's part
-  ( cd "$dir" && setsid nohup env $(ref_env) "$REF_NODE_BIN" run --network "$CLD_CHAIN" --relay "$RELAY_URL" --esplora "$ESPLORA_URL" \
-      --data-dir "$dir" --seed-file "$dir/seed.hex" --name "$n" --admin-bind "127.0.0.1:$(ref_port "$n")" >>"$dir/node.log" 2>&1 &
+  ( cd "$dir" && setsid -f nohup env $(ref_env) "$REF_NODE_BIN" run --network "$CLD_CHAIN" --relay "$RELAY_URL" --esplora "$ESPLORA_URL" \
+      --data-dir "$dir" --seed-file "$dir/seed.hex" --name "$n" --admin-bind "127.0.0.1:$(ref_port "$n")" >>"$dir/node.log" 2>&1 </dev/null
     sleep 1; pgrep -nf "deposits-node run .*--data-dir $dir " >"$dir/ref.pid" )
   for i in $(seq 1 120); do tail -c +"$from" "$dir/node.log" 2>/dev/null | grep -q 'Wallet synced' && { echo "$n up (admin $(ref_port "$n"))"; return 0; }; ref_running "$n" || break; sleep 1; done
   echo "$n did not come up; see $dir/node.log" >&2; return 1
@@ -178,12 +178,15 @@ start_cld() {
   cld_running "$n" && { echo "$n already running"; return 0; }
   (echo >/dev/tcp/127.0.0.1/$(cld_port "$n")) 2>/dev/null && { echo "$n: control port $(cld_port "$n") already bound by another process; stop_cld first" >&2; return 1; }
   local lnenv=(); [ "$n" = cld1 ] && lnenv=("CLD_LN_CONTROL=$CLD_LN_CONTROL")
-  ( cd "$CLD_SRC" && setsid nohup env CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=$CLD_CHAIN \
+  ( cd "$CLD_SRC" && exec setsid -f nohup env CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=$CLD_CHAIN \
       CLD_BITCOIN_CLI="$BCLI" CLD_MIN_CONFS=1 "${lnenv[@]}" \
       CL_SOURCE_REGISTRY="(:source-registry (:tree \"$CLD_SRC\") :inherit-configuration)" \
-      "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --dynamic-space-size "${CLD_HEAP_MB:-32768}" --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 & ) </dev/null >/dev/null 2>&1
-      # The wrapper subshell outlives this call as the node's parent: it must not hold the
-      # caller's stdout/stderr, or a check piped to tail/a log reader never sees EOF (2026-10-08).
+      "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --dynamic-space-size "${CLD_HEAP_MB:-32768}" --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 ) </dev/null >/dev/null 2>&1
+      # setsid -f: the node is its own session leader, reparented to init, and no wrapper
+      # shell survives as its parent.  A surviving wrapper carried its caller's argv, so
+      # every node the chaos loop restarted showed up as another "soak-chaos.sh" in pgrep,
+      # which read as leaked loops (25 by 2026-10-14); it also held the caller's stdout
+      # unless redirected (2026-10-08).
       # A pinned SBCL, not whatever is first on PATH: under the 2.6.8 in ~/.local/bin
       # secp256k1-fast derives a WRONG public key and no signature verifies — a node
       # started with it comes back as a stranger to its own ledgers (2026-09-24 night).
