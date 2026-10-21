@@ -34,7 +34,7 @@ expect "$r" "begin-quorum"
 mine 2 >/dev/null; sleep 10
 tx=$(bcli getrawtransaction "$RT" true) || fail "rotation $RT is not on chain"
 read -r n0 v1 a1 <<<"$(python3 -c "import json,sys; t=json.loads(sys.argv[1]); o=t['vout']; print(len(o), round(o[1]['value']*1e8) if len(o)>1 else 0, o[1]['scriptPubKey'].get('address','') if len(o)>1 else '')" "$tx")"
-[ "$n0" = 2 ] || fail "the rotation has $n0 outputs; expected the new vault and one exit"
+[ "$n0" = 3 ] || fail "the rotation has $n0 outputs; expected the new vault, one exit and the anchor"
 [ "$a1" = "$A1" ] || fail "output 1 pays $a1, not the requested $A1"
 # DEP-20 §3: the exit pays its own output's cost, feerate (2) x (9 + 34-byte P2TR script).
 [ "$v1" = $((1000 - 2 * 43)) ] || fail "output 1 pays $v1 sats, expected 1000 less its own cost = $((1000 - 86))"
