@@ -4476,7 +4476,10 @@
         (multiple-value-bind (reserves vtxid vvout) (fr::spent-vault (record-history rec) qb)
           (let ((signers (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves vtxid vvout)))
             (when (and signers (not (authorised-spend-p node rec tx :spend-height (getf spend :height)))
-                       (not (recorded-rotation-p node rec qb (btx:tx-txid tx))))
+                       (not (when (recorded-rotation-p node rec qb (btx:tx-txid tx))
+                              (log! node "vault watch: ~a's spend ~a is a rotation recorded on the relay (our replica lags)"
+                                    (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16))
+                              t)))
               (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"
                     (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16) (length signers))
               (setf (gethash key (node-reported-vault-spend node))
