@@ -9,7 +9,7 @@
 # judge looks for the answer (the QuorumBegin) on its replica, the relay and published answers,
 # and when it finds none it challenges instead of proving anything.
 #
-# A fresh mixed-quorum ledger (two cl members, two reference members, and two lagging cl members).
+# A fresh mixed-quorum ledger (three cl members, two reference members, and two lagging cl members).
 # LAG's replica applies nothing from just before the rotation (fault :lag-replica); BLIND lags too
 # and reads nothing of the ledger on the relay (fault :blind-relay), so only an answer can clear
 # the spend for it.  Both sign nothing (:mute).  The operator rotates.
@@ -17,11 +17,11 @@
 # reported nothing; BLIND challenged, an honest node answered (Kind 9112), BLIND accepted the
 # answer; nobody reported a theft or proved one.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
-pick OP C1 C2 LAG BLIND
+pick OP C1 C2 C3 LAG BLIND
 R1=${R1:-ref6}; R2=${R2:-ref7}
-X=$(form_ledger "${REDTEAM_LAG:-LAG$RANDOM}" $OP "" $C1 $C2 $LAG $BLIND $R1 $R2) || exit 1
+X=$(form_ledger "${REDTEAM_LAG:-LAG$RANDOM}" $OP "" $C1 $C2 $C3 $LAG $BLIND $R1 $R2) || exit 1
 echo "== ledger $X"
-consent "$X" $OP $C1 $C2 $LAG $BLIND $R1 $R2
+consent "$X" $OP $C1 $C2 $C3 $LAG $BLIND $R1 $R2
 trap 'for n in $LAG $BLIND; do cld_ctl $n "(:adversary :set :lag-replica nil)" >/dev/null 2>&1; done; cld_ctl $BLIND "(:adversary :set :blind-relay nil)" >/dev/null 2>&1; disarm :mute $LAG $BLIND' EXIT
 for n in $LAG $BLIND; do expect "$(cld_ctl $n "(:adversary :set :lag-replica \"${X:0:16}\")")" "lag-replica"; done
 expect "$(cld_ctl $BLIND "(:adversary :set :blind-relay \"${X:0:16}\")")" "blind-relay"
@@ -57,7 +57,7 @@ for i in $(seq 1 30); do
 done
 cld_ctl $BLIND "(:log :n 4000)" | grep -q "VAULT SPEND CHALLENGED: ${X:0:8}" || fail "$BLIND never challenged the spend"
 cld_ctl $BLIND "(:log :n 4000)" | grep -q "challenge of ${X:0:8}'s spend recorded on our ledger" || fail "$BLIND did not record its challenge"
-answered_by=$(for n in $OP $C1 $C2; do cld_ctl $n "(:log :n 4000)" | grep -q "answering the challenge of ${X:0:8}" && echo $n; done)
+answered_by=$(for n in $OP $C1 $C2 $C3; do cld_ctl $n "(:log :n 4000)" | grep -q "answering the challenge of ${X:0:8}" && echo $n; done)
 for n in $R1 $R2; do grep -q "answering the challenge of ${X:0:8}" "$(ref_dir $n)/node.log" 2>/dev/null && answered_by="$answered_by $n"; done
 echo "   answered by:${answered_by:- (none logged)}"
 [ -n "$ok" ] || fail "$BLIND never accepted an answer to its challenge"

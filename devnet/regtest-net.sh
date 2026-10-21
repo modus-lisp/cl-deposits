@@ -11,6 +11,7 @@
 #   devnet/regtest-net.sh down     stop everything (state kept)
 #   devnet/regtest-net.sh reset    down, then delete the data dir (fresh chain, fresh keys)
 #   devnet/regtest-net.sh status
+#   devnet/regtest-net.sh ticker stop|start   pause / resume the block ticker
 #   DEVNET=regtest redteam/run-all.sh [--tags ...]     the suite against it
 export DEVNET=regtest CLD_CHAIN=regtest
 source "$(dirname "$0")/_common.sh"
@@ -62,6 +63,9 @@ status() {
 }
 case "${1:-}" in
   up) up;; down) down;; status) status;;
+  ticker) case "${2:-}" in   # ticker start|stop: a scenario that must hold a transaction in the mempool pauses it
+            stop) p=$(ticker_pid) && kill "$p" 2>/dev/null; rm -f "$CLD_ROOT/ticker.pid";;
+            *) start_ticker;; esac;;
   reset) down; case "$CLD_ROOT" in /mnt/lisp/regtest-devnet*|/tmp/*) rm -rf "$CLD_ROOT"; echo "reset $CLD_ROOT";; *) echo "refusing to delete $CLD_ROOT" >&2; exit 1;; esac;;
   *) sed -n '2,15p' "$0"; exit 2;;
 esac

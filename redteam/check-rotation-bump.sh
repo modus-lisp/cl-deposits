@@ -18,6 +18,9 @@ rotate() {
   for i in 1 2 3; do r=$(cld_ctl $OP "(:begin-quorum :ledger \"$X\")"); case "$r" in *":STATUS :OK"*) break;; esac; echo "   begin-quorum retry $i: $r" >&2; sleep 15; done
   expect "$r" "begin-quorum"; echo "$r"
 }
+# The block ticker would mine rung 0 before we can stall it: pause it for the run.
+"$CLD_SRC/devnet/regtest-net.sh" ticker stop
+trap '"$CLD_SRC/devnet/regtest-net.sh" ticker start' EXIT
 r=$(rotate); RUNGS=$(sx "$r" ":RUNGS"); set -- $RUNGS
 echo "== rungs: $*"
 [ $# -ge 2 ] || fail "the rotation has $# rung(s); a ladder needs two or more"
@@ -26,7 +29,7 @@ sleep 5
 bcli getmempoolentry "$R0" >/dev/null 2>&1 || fail "rung 0 $R0 is not in the mempool"
 bcli prioritisetransaction "$R0" 0 -100000000 >/dev/null
 echo "== rung 0 made unmineable; mining 7 blocks"
-for i in $(seq 1 7); do mine 1 >/dev/null; sleep 6; done
+for i in $(seq 1 7); do mine 1 >/dev/null; sleep 8; done
 sleep 30; mine 1 >/dev/null; sleep 10
 conf=
 for t in "$@"; do
