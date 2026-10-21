@@ -464,13 +464,17 @@
 (defun rotation-answer (updates anchor txid reserves tier-index)
   "The update among UPDATES that answers an anchored spend of RESERVES' vault as a rotation, or
    NIL: a QuorumBegin whose previous_hash is ANCHOR, signed by RESERVES' operator, whose rungs
-   include TXID, carrying valid cosignatures over it from at least the threshold of the tier
-   TIER-INDEX (the tier the spend's witness uses), by keys of that tier."
+   include TXID, and whose signatures by keys of the tier TIER-INDEX (the tier the spend's witness
+   uses) reach its threshold: valid cosignatures over it, and the operator's own signature when
+   the operator's key is one of the tier's."
   (let* ((tier (nth tier-index (rs:reserves-tiers reserves)))
          (keys (rs:tier-keys tier))
          ;; the operator's solo tier: its own signature on the QuorumBegin is the authority
-         (needed (if (and (= (rs:tier-threshold tier) 1) (rs:tier-tie-breaker-p tier)) 0 (rs:tier-threshold tier)))
-         (operator (rs:reserves-operator reserves)))
+         (operator (rs:reserves-operator reserves))
+         ;; the operator's own signature on the QuorumBegin counts when its key is the tier's
+         (needed (cond ((and (= (rs:tier-threshold tier) 1) (rs:tier-tie-breaker-p tier)) 0)
+                       ((member (up:x-only operator) keys :test #'equalp) (1- (rs:tier-threshold tier)))
+                       (t (rs:tier-threshold tier)))))
     (find-if (lambda (u)
                (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
                  (and o (eq (op:operation-type o) :quorum-begin)
