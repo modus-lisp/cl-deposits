@@ -36,7 +36,7 @@ disarm :mute $W
 # so the watcher that signed nothing authorises it at once; mine past the grace and judge.
 mine 6 >/dev/null; sleep 10
 cld_ctl $W "(:vault-watch)" >/dev/null 2>&1
-if cld_ctl $W "(:log :n 4000)" | grep -q "signing rotation of ${X:0:8}"; then fail "the watcher $W signed the rotation; it was meant not to"; fi
+if cld_ctl $W "(:log :n 4000)" | grep -q "signing the .* rungs of ${X:0:8}"; then fail "the watcher $W signed the rotation; it was meant not to"; fi
 if accused $W "$X" 20; then fail "the watcher $W, which signed nothing, reported the rotation as a theft"; fi
 echo "   watcher $W signed nothing and did not report the rotation"
 [ -z "$(bcli gettxout "${OLD%:*}" "${OLD#*:}")" ] || fail "the old vault $OLD is unspent after the rotation"
@@ -45,7 +45,7 @@ spender=$(bcli getrawtransaction "$RT" true | python3 -c "import json,sys; t=jso
 NEW=$(cld_ctl $OP "(:vaults)" | grep -oE "\"$X\" \([^)]*\)" | grep -oE '[0-9a-f]{64}:[0-9]+' | tail -1)
 [ "$NEW" = "$RT:0" ] || fail "the QuorumBegin names $NEW, not the rotation's output $RT:0"
 [ -n "$(bcli gettxout "$RT" 0)" ] || fail "the new vault $RT:0 is not unspent"
-signers=$(cld_ctl $C1 "(:log :n 2000)" | grep -c "signing rotation of ${X:0:8}")
+signers=$(cld_ctl $C1 "(:log :n 2000)" | grep -c "signing the .* rungs of ${X:0:8}")
 echo "   rotation signed: cl member signed $signers; reference successes $(cat "$CLD_ROOT/$R1/node.log" "$CLD_ROOT/$R2/node.log" 2>/dev/null | grep -c "action=rotation_sign, ledger=${X:0:16}.*success=true")"
 echo "== mixed-quorum rotation on chain: $OLD -> $RT:0"
 # Leftovers: across every cl node's owned ledgers.

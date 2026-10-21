@@ -73,5 +73,5 @@ txb=$(bcli getrawtransaction "$RTB" true) || fail "B: rotation $RTB is not on ch
 echo "   B: rotation $RTB spends the vault and the splice"
 C1B=$(coll $C1 "$RL"); [ -n "$C1B" ] && [ "$C1B" -gt $(( C0B + SPLICE_SATS * 1000 / 2 )) ] || fail "B: $C1's collateral $C0B -> $C1B did not take the splice"
 echo "   B: cl member $C1 cosigned and records collateral $C0B -> $C1B msat"
-cld_ctl $C1 "(:log :n 4000)" | grep -q "signing rotation of ${RL:0:8}" || fail "B: the cl member did not sign the reference operator's spliced rotation"
+cld_ctl $C1 "(:log :n 4000)" | grep -qE "signing the .* rungs of ${RL:0:8}" || fail "B: the cl member did not sign the reference operator's spliced rotation"
 echo "PASS: both operators spliced a UTXO into the vault at rotation, signed across implementations."
