@@ -29,7 +29,7 @@ if [ -f "$DL_ROW" ]; then read -r DL txid vout < "$DL_ROW"; echo "== reusing DL 
   echo "== forming DL ($OP operates; $ACT..$DER cosign; dispute_response_blocks=$RESP)"
   DL=$(sx "$(cld_ctl $OP "(:open-ledger :reserves-id \"genesis:$OP:derelict:$RANDOM\" :reserves-msat 20000000000 :collateral-msat 20000000000)")" ":LEDGER"); [ -n "$DL" ] || fail "open DL"
   for m in $ACT cld3 cld4 cld5 $DER; do
-    ml=$(eval echo "\${L${m#cld}}")
+    ml=$(own_ledger $m)
     expect "$(cld_ctl $OP "(:add-member :ledger \"$DL\" :member \"$(pubkey_of $m)\" :member-ledger \"$ml\" :dispute-response-blocks $RESP)")"
   done
   prep=$(cld_ctl $OP "(:prepare-quorum :ledger \"$DL\" :expiry-blocks 4320)"); expect "$prep"; addr=$(sx "$prep" ":ADDRESS")
