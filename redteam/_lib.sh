@@ -91,8 +91,8 @@ fresh_deposits() {
 }
 # vault_spend OPERATOR LEDGER ADDRESS [TIER] — the colluders must already be armed (:theft-sign).
 # Talks to the control port directly: the daemon's signature window (90 s) outlasts cld_ctl's 60 s.
-vault_spend() {
-  printf '%s\n' "(:vault-spend :ledger \"$2\" :address \"$3\" :tier ${4:-0})" |
+vault_spend() {   # [ANCHOR]: "tip" or 64 hex, a forged anchor (DEP-06 §Spend challenge)
+  printf '%s\n' "(:vault-spend :ledger \"$2\" :address \"$3\" :tier ${4:-0}${5:+ :anchor \"$5\"})" |
     timeout 180 bash -c "exec 3<>/dev/tcp/127.0.0.1/$(cld_port "$1"); cat >&3; head -n1 <&3"
 }
 # accused NODE LEDGER [SECS] — run NODE's vault watch now; true if it logs VAULT SPEND for LEDGER
@@ -104,6 +104,16 @@ accused() {
   for i in $(seq 1 $(( ${3:-180} / 10 ))); do
     cld_ctl "$1" '(:log)' 2>/dev/null | grep -q "VAULT SPEND: ${2:0:8}" && return 0
     sleep 10; cld_ctl "$1" '(:vault-watch)' >/dev/null 2>&1
+  done; return 1
+}
+# proved_lapsed NODE LEDGER [SECS] — run NODE's vault watch until it publishes a lapsed-challenge
+# proof for a spend of LEDGER (DEP-06): true if it does within SECS (default 300).
+proved_lapsed() {
+  local i
+  for i in $(seq 1 $(( ${3:-300} / 10 ))); do
+    cld_ctl "$1" '(:vault-watch)' >/dev/null 2>&1
+    cld_ctl "$1" '(:log)' 2>/dev/null | grep -q "lapsed-challenge proof against" && return 0
+    sleep 10
   done; return 1
 }
 arm()    { local k=$1 n; shift; for n in "$@"; do expect "$(cld_ctl "$n" "(:adversary :set $k t)")"; done; }

@@ -204,7 +204,10 @@
                                 :amount-msats (* 1000 (arg form :sats 0)) :collateral-msats (* 1000 (arg form :collateral-sats 0)))
              ;; :txid the rotation broadcast (rung 0), once its rungs are signed (DEP-03 Rotation ordering)
              (ok :seq (up:update-seq u) :cosigs (length (up:update-cosignatures u)) :address (rs:reserves-address r)
-                 :txid (and txid (bytes->hex (reverse txid)))))))
+                 :txid (and txid (bytes->hex (reverse txid)))
+                 ;; DEP-03 §Fee ladder: every rung the QuorumBegin names (display order), space-separated
+                 :rungs (format nil "~{~a~^ ~}" (mapcar (lambda (x) (bytes->hex (reverse x)))
+                                                        (cl-deposits.fraud:rotation-rungs (op:decode-operation (up:update-message u)))))))))
         (:deposit-open
          (let* ((rec (rec! node form)) (d (arg form :descriptor)) (id (op:deposit-id d)))
            (nd:append-operation node rec (list :type :deposit-open :deposit-id id :descriptor d :receive-requires-sig nil))
@@ -224,8 +227,13 @@
         (:equivocate (nd:equivocate node (rec! node form)) (ok :warning "published a conflicting update at the tip sequence"))
         (:vault-spend   ; red team: (:vault-spend :ledger L :address "tb1..." [:tier N]) — spend the
                         ; vault outside any rotation or dispute (docs/MISSING.md, DEP-06 type 7 gap)
+         ;; :anchor "tip" (the ledger's tip chain hash) or 64 hex: a forged anchor, DEP-06 §Spend challenge
          (multiple-value-bind (tx n) (nd:vault-spend node (arg form :ledger) (arg form :address)
-                                                     :tier-index (arg form :tier 0) :broadcast-p nil)
+                                                     :tier-index (arg form :tier 0) :broadcast-p nil
+                                                     :anchor (let ((a (arg form :anchor)))
+                                                               (cond ((null a) nil)
+                                                                     ((string-equal a "tip") (lg:ledger-chain-tip (nd:record-ledger (rec! node form))))
+                                                                     (t (hex->bytes a)))))
            ;; Broadcast here, not through the node's fire-and-forget broadcast-fn: a rejected
            ;; theft (non-final, bad witness) must fail the command, not report a txid.
            (multiple-value-bind (out err code)

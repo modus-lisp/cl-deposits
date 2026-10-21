@@ -3484,7 +3484,7 @@
 ;;; confiscation: nothing in either implementation watches for it.  This is the
 ;;; theft the contagion simulation models, made concrete on the devnet.
 
-(defun build-vault-theft (node id-hex destination-address &key (tier-index 0))
+(defun build-vault-theft (node id-hex destination-address &key (tier-index 0) anchor)
   "The theft transaction: the reserves outpoint spent through TIER-INDEX (default
    Tier 0, the majority leaf, open at any height) to DESTINATION-ADDRESS.  Built
    from public state only, like build-confiscation, so every colluder rebuilds
@@ -3499,15 +3499,25 @@
                     (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
              (prevouts (vector (cons sats (rs:reserves-spk reserves))))
              (tx (rot:build-spend :prev-txid txid :prev-vout vout :reserves-amount sats
-                                  :destination-spk spk :fee-rate 1 :locktime locktime)))
+                                  :destination-spk spk :fee-rate 1 :locktime locktime))
+             ;; ANCHOR: a forged anchor (red team: a theft that names a place in the ledger no
+             ;; rotation answers for, DEP-06 §Spend challenge), as the last output
+             (tx (if anchor
+                     (btx:parse-tx (bw:make-reader
+                                    (btx:serialize-tx
+                                     (btx:make-tx :version 2 :locktime locktime :segwit-p t :inputs (btx:tx-inputs tx)
+                                                  :outputs (append (btx:tx-outputs tx)
+                                                                   (list (btx:make-txout :value 0 :script (rot:anchor-script anchor))))
+                                                  :witnesses (list nil)))))
+                     tx)))
         (values tx prevouts reserves tier-index)))))
 
-(defun vault-spend (node id-hex destination-address &key (tier-index 0) (broadcast-p t))
+(defun vault-spend (node id-hex destination-address &key (tier-index 0) (broadcast-p t) anchor)
   "Spend a ledger's vault outside any recorded rotation or dispute: build the
    tier-0 theft, sign with our key, collect the rest of the threshold's
    signatures from our co-conspirators over the relay (theft_sign), assemble,
    and broadcast.  Returns (values tx sig-count)."
-  (multiple-value-bind (tx prevouts reserves tier-index) (build-vault-theft node id-hex destination-address :tier-index tier-index)
+  (multiple-value-bind (tx prevouts reserves tier-index) (build-vault-theft node id-hex destination-address :tier-index tier-index :anchor anchor)
     (let* ((sighash (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves reserves))))
            (tier (nth tier-index (rs:reserves-tiers reserves)))
            (keys (rs:tier-keys tier))
@@ -3515,6 +3525,7 @@
            (sigs (list (cons (up:x-only (node-pubkey node)) ours)))
            (responses (send-request node id-hex "theft_sign"
                                     (w:json-object "sighash" (bytes->hex sighash) "tier_index" tier-index
+                                                   "anchor" (and anchor (bytes->hex anchor))
                                                    "unsigned_tx" (unsigned-tx-hex tx))
                                     :want (1- (rs:tier-threshold tier)) :timeout 90 :successes-only t)))
       (log! node "vault-spend: ~a of ~a theft_sign responses in time"
@@ -3547,7 +3558,8 @@
                (tier-index (or (w:jget params "tier_index") 0))
                (destination (arg-theft-destination node proposed)))
           (multiple-value-bind (tx prevouts reserves tier-index)
-              (build-vault-theft node id destination :tier-index tier-index)
+              (build-vault-theft node id destination :tier-index tier-index
+                                                     :anchor (let ((a (w:jget params "anchor"))) (and a (hex->bytes a))))
             (declare (ignore tx))
             (let ((expected (rot:tier-sighash proposed 0 prevouts (nth tier-index (rs:reserves-leaves reserves)))))
               (unless (equalp expected (hex->bytes (w:jget params "sighash")))
@@ -4429,8 +4441,12 @@
    and the answers published to challenges of it."
   (let* ((rec (find-record node id-hex))
          (history (and rec (not (record-fork-p rec)) (record-history rec)))
-         (relay (relay-updates-past node id-hex (1+ gseq))))
-    (unless (or relay (ledger-updates-from-relays node id-hex :from gseq :to gseq))
+         ;; FAULT :blind-relay (a ledger id prefix): we read none of that ledger's updates on the
+         ;; relay, only our replica and published answers (redteam/check-rotation-lag.sh)
+         (blind (let ((p (getf (node-adversary node) :blind-relay)))
+                  (and (stringp p) (>= (length id-hex) (length p)) (string-equal p (subseq id-hex 0 (length p))))))
+         (relay (and (not blind) (relay-updates-past node id-hex (1+ gseq)))))
+    (unless (or blind relay (ledger-updates-from-relays node id-hex :from gseq :to gseq))
       (error "the relay holds nothing of ~a at ~a" (subseq id-hex 0 8) gseq))
     (append history relay (gethash id-hex (node-spend-answers node)))))
 
@@ -4444,7 +4460,9 @@
       (let ((updates (spend-answer-updates node id-hex gseq)))
         (or (fr:rotation-answer updates anchor (btx:tx-txid tx) reserves tier-index)
             (rebuilt-confiscation-p node id-hex tx :spend-height spend-height
-                                                   :updates (append (ledger-updates-from-relays node id-hex) updates)))))))
+                                                   :updates (append (unless (getf (node-adversary node) :blind-relay)
+                                                                      (ledger-updates-from-relays node id-hex))
+                                                                    updates)))))))
 
 (defun authorised-spend-p (node rec tx &key spend-height)
   "DEP-06 §Spend challenge: TX's spend of one of REC's vaults is answered (a rotation naming it,

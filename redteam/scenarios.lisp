@@ -44,6 +44,8 @@
             :note "a cl rotation spends its old vault on chain (mixed quorum); no leftovers")
    (make-sc :name "rotation-lag" :script "check-rotation-lag.sh" :ledger-var "REDTEAM_LAG" :timeout 1200
             :note "a watcher whose replica lags behind the QuorumBegin does not take the rotation for a theft")
+   (make-sc :name "rotation-bump" :script "check-rotation-bump.sh" :ledger-var "REDTEAM_BUMP" :timeout 1800
+            :note "DEP-03 fee ladder: a stuck rung 0 is replaced by a higher rung, and the next rotation spends it")
    (make-sc :name "exit" :script "check-exit.sh" :ledger-var "REDTEAM_EXIT" :timeout 1200
             :note "DEP-20 exits settle at the rotation (mixed quorum); dust carried; cancel releases")
    (make-sc :name "splice" :script "check-splice.sh" :ledger-var "REDTEAM_SPLICE" :timeout 2400
@@ -64,6 +66,9 @@
             :env '("WAIT=300") :timeout 1800 :tags '(:contagion))
    (make-sc :name "vault-spend" :script "attack-vault-spend.sh" :ledger-var "REDTEAM_V"
             :env '("REFS=" "WAIT=300") :timeout 1200 :tags '(:contagion))
+   (make-sc :name "vault-anchored" :script "attack-vault-anchored.sh" :ledger-var "REDTEAM_VA"
+            :env '("REFS=") :timeout 1800 :tags '(:contagion)
+            :note "DEP-06 §Spend challenge: a theft with a forged anchor is challenged, then proven once the challenge lapses")
    (make-sc :name "vault-recovery-tier" :script "attack-vault-recovery-tier.sh" :ledger-var "REDTEAM_RT"
             :timeout 1800 :tags '(:contagion :disruptive :slow) :note "mines past expiry + 720")
    (make-sc :name "vault-rotate-late" :script "attack-vault-rotate-grace.sh" :args '("late")
@@ -83,7 +88,7 @@
    (make-sc :name "rollback-depth" :script "attack-rollback-depth.sh" :ledger-var "REDTEAM_R"
             :timeout 2400 :tags '(:contagion :disruptive :slow))))
 
-(defparameter *switches* '(:cosign-blind :ignore-fraud :ignore-requests :mute :sign-invalid :spend-pledge :theft-sign :withhold-reveal))
+(defparameter *switches* '(:blind-relay :cosign-blind :ignore-fraud :ignore-requests :lag-replica :mute :sign-invalid :spend-pledge :theft-sign :withhold-reveal))
 
 ;;; --- the devnet, as devnet/_common.sh describes it -------------------------------------
 
