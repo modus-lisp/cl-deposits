@@ -10,6 +10,14 @@ set -u
 CLD_CHAIN="${CLD_CHAIN:-${DEVNET:-signet}}"
 SIGNET_ROOT="${SIGNET_ROOT:-/mnt/lisp/signet}"
 CLD_SRC="${CLD_SRC:-$HOME/cl-deposits}"
+# ASDF registry for every cl process the devnet starts: the source tree, then Quicklisp's
+# software, then whatever the user's config inherits.  The inherited config here is
+# (:tree ~/), so any other project's same-named system under ~ competed with Quicklisp's
+# copy: a stripped /home/claude/ironclad-zero (another project's, 2026-10-20 21:03) won,
+# every fresh cl process failed to compile cl-consensus, and the soak's cl bots read every
+# balance as 0.  Quicklisp's tree first settles it; the vendored deps/ still come first.
+CLD_QL_SOFTWARE="${CLD_QL_SOFTWARE:-$HOME/quicklisp/dists/quicklisp/software}"
+cld_registry() { echo "(:source-registry (:tree \"${1:-$CLD_SRC}\")$([ -d "$CLD_QL_SOFTWARE" ] && echo " (:tree \"$CLD_QL_SOFTWARE\")") :inherit-configuration)"; }
 MINER_WALLET="${MINER_WALLET:-miner}"
 case "$CLD_CHAIN" in
   signet)
@@ -180,7 +188,7 @@ start_cld() {
   local lnenv=(); [ "$n" = cld1 ] && lnenv=("CLD_LN_CONTROL=$CLD_LN_CONTROL")
   ( cd "$CLD_SRC" && exec setsid -f nohup env CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=$CLD_CHAIN \
       CLD_BITCOIN_CLI="$BCLI" CLD_MIN_CONFS=1 "${lnenv[@]}" \
-      CL_SOURCE_REGISTRY="(:source-registry (:tree \"$CLD_SRC\") :inherit-configuration)" \
+      CL_SOURCE_REGISTRY="$(cld_registry)" \
       "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --dynamic-space-size "${CLD_HEAP_MB:-32768}" --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 ) </dev/null >/dev/null 2>&1
       # setsid -f: the node is its own session leader, reparented to init, and no wrapper
       # shell survives as its parent.  A surviving wrapper carried its caller's argv, so

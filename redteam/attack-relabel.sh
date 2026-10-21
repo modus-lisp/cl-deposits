@@ -18,7 +18,7 @@ echo "== target $T ($TS…, operated by $OP); source: $OP's own ledger ${SRC:0:1
 echo "== members replicating $T: $(echo $MEMBERS)"
 echo "== before: forks $(forks)"
 declare -A E0 F0; for n in $MEMBERS; do E0[$n]=$(seen $n "EQUIVOCATION on $TS"); F0[$n]=$(seen $n "fraud proof .* on $TS"); done
-cd "$CLD_SRC" && CLD_RELAYS="$RELAY_URL" CL_SOURCE_REGISTRY="(:source-registry (:tree \"$CLD_SRC\") :inherit-configuration)" \
+cd "$CLD_SRC" && CLD_RELAYS="$RELAY_URL" CL_SOURCE_REGISTRY="$(cld_registry)" \
   "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --non-interactive --load redteam/relabel.lisp -- "$FILE" "$TID" 2>&1 | grep -E "^\(" | sed 's/^/   /'
 echo "== waiting $WAIT s"; sleep $WAIT
 fail=0

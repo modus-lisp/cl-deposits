@@ -5,7 +5,8 @@
 set -u
 cd "$(dirname "$0")/.."
 ROOT="$(pwd -P)"; SBCL="${SBCL:-sbcl}"
-export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$ROOT\") (:tree \"$ROOT/..\") :inherit-configuration)"
+QL="${CLD_QL_SOFTWARE:-$HOME/quicklisp/dists/quicklisp/software}"; [ -d "$QL" ] && QL=" (:tree \"$QL\")" || QL=""   # ahead of ~: see cld_registry in devnet/_common.sh
+export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$ROOT\")$QL (:tree \"$ROOT/..\") :inherit-configuration)"
 export PROPERTY_SEED=31337
 OUT="${MUTATE_OUT:-/tmp/cl-deposits-mutants.txt}"; : > "$OUT"
 gate() { "$SBCL" --non-interactive --eval '(require :asdf)' --eval '(handler-bind ((warning #'"'"'muffle-warning)) (asdf:load-system "cl-deposits"))' --load inspect/harness.lisp "$@" >/tmp/mutant.log 2>&1; }
