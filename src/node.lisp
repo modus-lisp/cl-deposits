@@ -955,10 +955,16 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Inbound: another operator's published update (we replicate ledgers we cosign)
 
+(defun lagging-p (node id-hex)
+  "Fault switch :lag-replica (a ledger id prefix): our replica of that ledger applies nothing, as a
+   replica under backpressure that keeps missing updates (red team: a lagging honest watcher)."
+  (let ((p (getf (node-adversary node) :lag-replica)))
+    (and (stringp p) (plusp (length p)) (<= (length p) (length id-hex)) (string= p id-hex :end2 (length p)))))
+
 (defun handle-update (node event)
   (let* ((update (w:event->update event))
          (id (bytes->hex (up:update-ledger-id update)))
-         (rec (find-record node id))
+         (rec (and (not (lagging-p node id)) (find-record node id)))
          (signer (up:update-operator-id update)))
     (when rec
       (cond
@@ -1081,7 +1087,8 @@
     ;; The operator's next update was already refused by the rules (reported and
     ;; disputed then): nothing past it can chain onto our tip.  Every later update
     ;; showed a gap and sent us back into the same refusal, logged each time.
-    (when (eql (gethash (record-id-hex rec) (node-refused node)) (1+ (lg:ledger-sequence ledger)))
+    (when (or (eql (gethash (record-id-hex rec) (node-refused node)) (1+ (lg:ledger-sequence ledger)))
+              (lagging-p node (record-id-hex rec)))
       (return-from catch-up 0))
     ;; Windows of WINDOW sequences past our tip, until a window adds nothing.
     (loop
@@ -4259,6 +4266,31 @@
   (or (member (btx:tx-txid tx) (authorised-spend-txids node rec) :test #'equalp)
       (rebuilt-confiscation-p node (record-id-hex rec) tx :spend-height spend-height :updates updates)))
 
+;; DEP-06 proof 10 "Recorded rotation": a replica that lags (a gap, an update it never received)
+;; must not mistake a rotation for a theft.  The QuorumBegin is on the relay before the rotation
+;; is broadcast (DEP-03 Rotation ordering), so a judge consults the relay's updates past its
+;; replica before it calls a spend unauthorised; one that cannot read the relay judges nothing.
+
+(defun relay-updates-past (node id-hex from &key (page 200) (max-pages 1000))
+  "Every update the relays hold of ID-HEX at sequence FROM or later, a page of sequences at a
+   time until a page comes back empty."
+  (loop for lo from from by page repeat max-pages
+        for got = (ledger-updates-from-relays node id-hex :from lo :to (+ lo page -1))
+        while got append got))
+
+(defun recorded-rotation-p (node rec qb-seq txid)
+  "TXID is a recorded rotation of REC's vault under the QuorumBegin at QB-SEQ, judged on our
+   replica and the relay's updates past it together (FR:ROTATION-EXCUSED-P).  Signals when the
+   relay holds nothing at our tip (unreachable), so the caller retries instead of judging."
+  (let* ((id (record-id-hex rec)) (history (record-history rec))
+         (tip (lg:ledger-sequence (record-ledger rec))))
+    (unless (ledger-updates-from-relays node id :from tip :to tip)
+      (error "the relay holds nothing of ~a at our tip ~a" (subseq id 0 8) tip))
+    (let ((open (or (find 0 history :key #'up:update-seq)
+                    (first (ledger-updates-from-relays node id :from 0 :to 0)))))
+      (fr:rotation-excused-p (append (and open (list open)) history (relay-updates-past node id (1+ tip)))
+                             qb-seq txid))))
+
 (defparameter *vault-spend-grace-blocks* 3
   "A rotation's QuorumBegin may reach us a block or two after the spend confirms, so a
    spend is judged only once it is this deep.")
@@ -4443,7 +4475,8 @@
                                                            (getf spend :prevouts) (getf spend :block-hash))))
         (multiple-value-bind (reserves vtxid vvout) (fr::spent-vault (record-history rec) qb)
           (let ((signers (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves vtxid vvout)))
-            (when (and signers (not (authorised-spend-p node rec tx :spend-height (getf spend :height))))
+            (when (and signers (not (authorised-spend-p node rec tx :spend-height (getf spend :height)))
+                       (not (recorded-rotation-p node rec qb (btx:tx-txid tx))))
               (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"
                     (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16) (length signers))
               (setf (gethash key (node-reported-vault-spend node))
@@ -4522,7 +4555,17 @@
                        (tx (ignore-errors (btx:parse-tx (bw:make-reader (hex->bytes (getf ev :spend-tx-hex))))))
                        (spend-height (ignore-errors (and (node-height-of-block node)
                                                          (funcall (node-height-of-block node) (getf ev :spend-block-hash)))))
+                       (gseq (getf ev :governing-quorumbegin-seq))
+                       ;; DEP-06 "Recorded rotation": on our replica and the relay together; a
+                       ;; replica that lags, or none at all, must not turn a rotation into a theft.
+                       (rotation (and tx (handler-case
+                                             (if (and srec (not (record-fork-p srec)))
+                                                 (recorded-rotation-p node srec gseq (btx:tx-txid tx))
+                                                 (fr:rotation-excused-p (append relay (relay-updates-past node spent-id gseq)) gseq (btx:tx-txid tx)))
+                                           (error (e) (return-from handle-vault-spend-fraud
+                                                        (log! node "vault-spend proof against ~a not judged yet: ~a" (subseq (getf proof :accused) 0 8) e))))))
                        (authorised (append (if srec (authorised-spend-txids node srec) '())
+                                           (and rotation (list (btx:tx-txid tx)))
                                            (and tx relay (rebuilt-confiscation-p node spent-id tx :spend-height spend-height :updates relay)
                                                 (list (btx:tx-txid tx))))))
                   (multiple-value-bind (ok why)

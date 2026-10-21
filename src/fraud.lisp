@@ -19,7 +19,7 @@
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:uncredited-migration-proof #:latest-migration #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
-           #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers
+           #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers #:rotation-excused-p
            #:unhonoured-obligation-proof #:verify-unhonoured-obligation #:make-uncredited-offer-proof))
 (in-package #:cl-deposits.fraud)
 
@@ -432,6 +432,43 @@
                                  :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
                                  :ruleset (or (op:field qb :protocol-version) "cltv-offset-v2"))
               (op:field qb :new-outpoint-txid) (op:field qb :new-outpoint-vout)))))
+
+;;; DEP-06 proof 10 "Recorded rotation".  A judge's replica may lag (a gap it has not filled, an
+;;; update it never received), so a rotation is judged against every update the judge can find of
+;;; the ledger, its replica and the relay's copies together: whatever else they hold (forks,
+;;; duplicates, variants of one update with different cosignature sets), only hash links count.
+
+(defun rotation-excused-p (updates governing-seq txid)
+  "TXID (internal byte order) is a recorded rotation of the vault the QuorumBegin at GOVERNING-SEQ
+   creates: the new_outpoint_txid of a QuorumBegin, signed by the ledger's operator (its
+   LedgerOpen's), reachable from that QuorumBegin by previous_hash links through updates at each
+   next sequence by the same operator.  Only the matching QuorumBegin's signature is checked: it
+   commits to the whole path by hash."
+  (let* ((open (find-if (lambda (u) (and (zerop (up:update-seq u))
+                                         (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                                           (and o (eq (op:operation-type o) :ledger-open)))))
+                        updates))
+         (operator (and open (up:update-operator-id open)))
+         (by-prev (make-hash-table :test #'equalp)) (seen (make-hash-table :test #'equalp)) (frontier '()))
+    (flet ((qb (u) (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                     (and o (eq (op:operation-type o) :quorum-begin) o))))
+      (when operator
+        (dolist (u updates)
+          (when (equalp (up:update-operator-id u) operator)
+            (if (and (= (up:update-seq u) governing-seq) (qb u))
+                (push u frontier)
+                (when (> (up:update-seq u) governing-seq) (push u (gethash (up:update-prev-hash u) by-prev))))))
+        (loop while frontier
+              do (let* ((cur (pop frontier)) (h (up:chain-hash cur)))
+                   (unless (gethash h seen)
+                     (setf (gethash h seen) t)
+                     (dolist (n (gethash h by-prev))
+                       (when (= (up:update-seq n) (1+ (up:update-seq cur)))
+                         (let ((o (qb n)))
+                           (when (and o (equalp (op:field o :new-outpoint-txid) txid) (up:verify-operator-signature n))
+                             (return-from rotation-excused-p t)))
+                         (push n frontier))))))))
+    nil))
 
 (defun vault-spend-signers (tx prevouts reserves txid vout)
   "Run the witness of the input of TX spending (TXID, VOUT) against RESERVES's tier
