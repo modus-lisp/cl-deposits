@@ -248,15 +248,17 @@
                                                                        :target (format nil "tb1p~a" i))))
          (l (lot:build-lottery parts voters 2 :network :signet))
          (fee (lot:confiscation-fee 8))
+         (anchor (u:hex->bytes (funcall vec "anchor")))
          (operator (up:compressed-pubkey (funcall seed-priv 9))))
-    (check-equal "DEP-03 fee for 8 voters" (princ-to-string fee) (funcall vec "fee"))
+    (check-equal "DEP-03 fee for 8 voters (the anchor's 43 vB included)" (princ-to-string fee) (funcall vec "fee"))
     (loop for (name respectful locktime) in '(("punitive" nil 0) ("respectful" t 1234))
           do (let* ((outs (lot:confiscation-outputs (lot:lottery-spk l) 50000000 fee :respectful respectful
                                                     :obligations-sats 10000000 :operator-pubkey33 operator))
                     (tx (btx:make-tx :version 2 :locktime locktime :segwit-p nil
                                      :inputs (list (btx:make-txin :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11)
                                                                   :prev-index 1 :script (u:octets) :sequence #xfffffffd))
-                                     :outputs (loop for (spk . v) in outs collect (btx:make-txout :value v :script spk))
+                                     :outputs (append (loop for (spk . v) in outs collect (btx:make-txout :value v :script spk))
+                                                      (list (btx:make-txout :value 0 :script (cl-deposits.rotation:anchor-script anchor))))
                                      :witnesses nil)))
                (check-equal (format nil "~a confiscation tx" name) (u:bytes->hex (btx:serialize-tx tx)) (funcall vec name))))))
 
@@ -363,37 +365,65 @@
                           (and (cl-deposits.node::cosign-refusal "m0" members (gethash "latest_quorum_begin_seq" c) disputes) t)
                           (gethash "refuse" c)))))
 
-;;; inspect/vectors/rotation_tx.txt: DEP-03 "Rotation transaction", shared with deposits-rust
-;;; (deposits-core/tests/vectors/rotation_tx.txt).  Txids there are display (reversed) hex.
-(with-gate ("DEP-03 rotation transaction: byte for byte against the shared vector")
-  (let ((cases '()) (cur nil))
+;;; inspect/vectors/rotation_tx.txt: DEP-03 "Rotation transaction" and §Fee ladder, shared with
+;;; deposits-rust (deposits-core/tests/vectors/rotation_tx.txt).  Txids there are display (reversed)
+;;; hex.  Each case gives the inputs (vault, voters, feerate, locktime, new vault, extras, splice, the
+;;; anchor, the collateral bounding the ladder, at most how many rungs) and every rung's unsigned
+;;; bytes.  With CL_DEPOSITS_WRITE_VECTORS the rung lines are rewritten from our builder.
+(with-gate ("DEP-03 rotation transaction and fee ladder: byte for byte against the shared vector")
+  (let ((cases '()) (header '()))
     (with-open-file (in (vector-path "rotation_tx.txt"))
       (loop for line = (read-line in nil) while line
             for words = (uiop:split-string line :separator " ")
             for key = (first words)
-            do (cond ((or (zerop (length line)) (char= (char line 0) #\#)))
-                     ((string= key "case") (setf cur (list :name (second words) :extras '())) (push cur cases))
+            do (cond ((or (zerop (length line)) (char= (char line 0) #\#)) (unless cases (push line header)))
+                     ((string= key "case") (push (list :name (second words) :extras '() :rungs '() :lines (list line)) cases))
                      (t (let ((outpoint (lambda (s) (let ((c (position #\: s)))
                                                       (list (reverse (u:hex->bytes (subseq s 0 c))) (parse-integer s :start (1+ c)))))))
+                          (unless (string= key "rung") (setf (getf (car cases) :lines) (append (getf (car cases) :lines) (list line))))
                           (cond ((string= key "vault") (setf (getf (car cases) :vault) (append (funcall outpoint (second words)) (list (parse-integer (third words))))))
                                 ((string= key "splice") (setf (getf (car cases) :splice) (append (funcall outpoint (second words)) (list (parse-integer (third words))))))
                                 ((string= key "out") (setf (getf (car cases) :extras) (append (getf (car cases) :extras) (list (cons (u:hex->bytes (second words)) (parse-integer (third words)))))))
                                 ((string= key "new_vault_spk") (setf (getf (car cases) :spk) (u:hex->bytes (second words))))
-                                ((string= key "tx") (setf (getf (car cases) :tx) (second words)))
+                                ((string= key "anchor") (setf (getf (car cases) :anchor) (u:hex->bytes (second words))))
+                                ((string= key "rung") (setf (getf (car cases) :rungs) (append (getf (car cases) :rungs) (list (third words)))))
                                 (t (setf (getf (car cases) (intern (string-upcase key) :keyword)) (parse-integer (second words))))))))))
+    (setf cases (reverse cases))
     (check-equal "five shapes" (length cases) 5)
-    (dolist (c (reverse cases))
-      (destructuring-bind (txid vout sats) (getf c :vault)
-        (let ((tx (cl-deposits.rotation:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
-                                                       :voters (getf c :voters) :feerate (getf c :feerate) :locktime (getf c :locktime)
-                                                       :new-vault-spk (getf c :spk) :splice (getf c :splice) :extras (getf c :extras)
-                                                       :splice-vault-p (eql (getf c :splice_vault) 1))))
-          (check-equal (format nil "~a rotation tx" (getf c :name))
-                       (and tx (u:bytes->hex (btx:serialize-tx tx :witness nil))) (getf c :tx)))))
+    (flet ((ladder (c)
+             (destructuring-bind (txid vout sats) (getf c :vault)
+               (cl-deposits.rotation:build-ladder :vault-txid txid :vault-vout vout :vault-sats sats
+                                                  :voters (getf c :voters) :feerate (getf c :feerate) :locktime (getf c :locktime)
+                                                  :new-vault-spk (getf c :spk) :splice (getf c :splice) :extras (getf c :extras)
+                                                  :splice-vault-p (eql (getf c :splice_vault) 1) :anchor (getf c :anchor)
+                                                  :collateral-msats (getf c :collateral) :max-rungs (or (getf c :max_rungs) 4)))))
+      (when (uiop:getenv "CL_DEPOSITS_WRITE_VECTORS")
+        (with-open-file (o (vector-path "rotation_tx.txt") :direction :output :if-exists :supersede)
+          (dolist (h (reverse header)) (format o "~a~%" h))
+          (dolist (c cases)
+            (dolist (l (getf c :lines)) (format o "~a~%" l))
+            (loop for tx in (ladder c) for i from 0
+                  do (format o "rung ~a ~a~%" i (u:bytes->hex (btx:serialize-tx tx :witness nil)))))))
+      (dolist (c cases)
+        (let ((ours (mapcar (lambda (tx) (u:bytes->hex (btx:serialize-tx tx :witness nil))) (ladder c))))
+          (unless (uiop:getenv "CL_DEPOSITS_WRITE_VECTORS")
+            (check-equal (format nil "~a: ~a rungs" (getf c :name) (length (getf c :rungs))) (length ours) (length (getf c :rungs)))
+            (loop for a in ours for b in (getf c :rungs) for i from 0
+                  do (check-equal (format nil "~a rung ~a" (getf c :name) i) a b)))))
+      ;; the ladder's own rules, on the first case
+      (let* ((c (first cases)) (rungs (ladder c))
+             (fee (lambda (tx) (- (third (getf c :vault)) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))))
+        (check "every rung's last output is the anchor" (every (lambda (tx) (equalp (cl-deposits.rotation:anchor-of tx) (getf c :anchor))) rungs))
+        (check "each rung pays twice its predecessor's fee (BIP-125: more fee, higher feerate, same inputs)"
+               (loop for (a b) on rungs while b always (= (funcall fee b) (* 2 (funcall fee a)))))
+        (check "rungs differ only in the new vault"
+               (loop for r in (rest rungs) always (equalp (mapcar #'btx:txout-script (btx:tx-outputs r)) (mapcar #'btx:txout-script (btx:tx-outputs (first rungs))))))))
     (check "a rotation leaving the vault below dust is refused"
            (null (cl-deposits.rotation:build-rotation :vault-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
-                                                      :vault-vout 0 :vault-sats 900 :voters 8
-                                                      :new-vault-spk (make-array 34 :element-type '(unsigned-byte 8) :initial-element 0))))))
+                                                      :vault-vout 0 :vault-sats 900 :voters 8 :anchor (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)
+                                                      :new-vault-spk (make-array 34 :element-type '(unsigned-byte 8) :initial-element 0))))
+    (check "the anchor is 43 vB in the fee rule (9 + 34)"
+           (= (- (cl-deposits.rotation:rotation-vsize 8 '(34 34) nil) (cl-deposits.rotation:rotation-vsize 8 '(34) nil)) 43))))
 
 (with-gate ("DEP-06 recovery voters: the shared vector (deposits-rust generated, cl reproduces)")
   (let ((cases '()) (cur nil))

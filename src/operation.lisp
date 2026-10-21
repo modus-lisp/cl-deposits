@@ -49,7 +49,8 @@
      (:splice-in-outpoint 282 :bytes :optional) (:splice-in-amount 284 :u64 :optional)
      (:reference-feerate 292 :u32 :optional) (:dormancy-outputs 336 :exit-outputs :optional)
      (:migration-manifest 316 :manifest :optional) (:migration-receiver 288 :pubkey :optional)
-     (:migration-vout 290 :u32 :optional) (:consumed-notice 344 :bytes32 :optional))
+     (:migration-vout 290 :u32 :optional) (:consumed-notice 344 :bytes32 :optional)
+     (:rotation-rungs 358 :bytes :optional))
     (20 :deposit-open
      (:deposit-id 200 :deposit-id) (:descriptor 202 :string) (:fees 12 :fees :optional)
      (:transfer-fees 226 :transfer-fees :optional) (:payment-hash 14 :bytes32 :optional)
@@ -106,6 +107,8 @@
     (44 :quorum-remove-member (:quorum-member 44 :pubkey) (:operator-signature 48 :bytes64))
     (45 :quorum-upgrade (:new-protocol-version 286 :string))
     (46 :quorum-join (:operator-id 56 :pubkey) (:ledger-id 58 :string) (:membership-expires 82 :u32))
+    (47 :quorum-challenge
+     (:challenged-ledger-id 360 :bytes32) (:challenged-txid 362 :bytes32) (:challenged-anchor 364 :bytes32))
     (50 :fee-collect
      (:deposit-id 200 :deposit-id) (:amount 2 :u64) (:block-height 36 :u32)
      (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))

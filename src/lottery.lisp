@@ -279,9 +279,10 @@
 (defconstant +confiscation-default-feerate+ 2 "sat/vB while no reference_feerate_sat_vb is recorded.")
 
 (defun confiscation-fee (voters &optional (feerate +confiscation-default-feerate+))
-  "DEP-03 \"Confiscation fee\": feerate x (120 + 30 x VOTERS) sats, VOTERS counting the
-   vault's members and operator.  Deterministic, so every cosigner builds the same tx."
-  (* feerate (+ 120 (* 30 voters))))
+  "DEP-03 \"Confiscation fee\": feerate x (163 + 30 x VOTERS) sats, VOTERS counting the
+   vault's members and operator, 43 of it the anchor.  Deterministic, so every cosigner
+   builds the same tx."
+  (* feerate (+ 163 (* 30 voters))))
 
 (defconstant +claim-fee-floor+ 5000 "DEP-03 claim_fee_floor with no reference_feerate_sat_vb recorded.")
 
@@ -298,13 +299,15 @@
                :witnesses (make-list (if collateral 2 1) :initial-element nil)))
 
 (defun confiscation-tx (&key vault swept lottery-spk voters locktime respectful fee obligations-sats (residue-sats 0)
-                             splice-outs operator-pubkey33 (feerate +confiscation-default-feerate+))
+                             splice-outs operator-pubkey33 (feerate +confiscation-default-feerate+) anchor)
   "DEP-03 \"Confiscation fee\" / DEP-06 §Confiscation obligations, unsigned: version 2, nLockTime
    LOCKTIME; input 0 VAULT (txid vout sats), then SWEPT ((txid vout sats) ...), all #xfffffffd;
    output 0 the lottery (punitive: inputs - fee - splice-outs; respectful: max(obligations +
    residue, 330), the rest to the operator's P2WPKH unless dust), then SPLICE-OUTS ((spk . sats)
-   ...).  FEE defaults to feerate x (120 + 30 x VOTERS + |SWEPT| x (41 + 30 x VOTERS))."
-  (let* ((fee (or fee (* feerate (+ 120 (* 30 voters) (* (length swept) (+ 41 (* 30 voters)))))))
+   ...), last the ANCHOR (OP_RETURN <chain hash at the fork point>, DEP-03 §On-Chain State Anchor).
+   FEE defaults to feerate x (163 + 30 x VOTERS + |SWEPT| x (41 + 30 x VOTERS))."
+  (unless anchor (error "a confiscation carries an anchor (DEP-03)"))
+  (let* ((fee (or fee (* feerate (+ 163 (* 30 voters) (* (length swept) (+ 41 (* 30 voters)))))))
          (inputs (+ (third vault) (reduce #'+ swept :key #'third)))
          (paid (reduce #'+ splice-outs :key #'cdr))
          (outs (append (confiscation-outputs lottery-spk (- inputs paid) fee :respectful respectful
@@ -317,7 +320,8 @@
        (btx:make-tx :version 2 :locktime locktime :segwit-p t
                     :inputs (loop for (tx vo) in (cons vault swept)
                                   collect (btx:make-txin :prev-hash tx :prev-index vo :script (octets) :sequence #xfffffffd))
-                    :outputs (loop for (spk . val) in outs collect (btx:make-txout :value val :script spk))
+                    :outputs (append (loop for (spk . val) in outs collect (btx:make-txout :value val :script spk))
+                                     (list (btx:make-txout :value 0 :script (cl-deposits.rotation:anchor-script anchor))))
                     :witnesses (make-list (1+ (length swept)))))))))
 
 (defun confiscation-outputs (lottery-spk reserves-sats fee-sats &key respectful obligations-sats operator-pubkey33)

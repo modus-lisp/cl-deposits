@@ -282,7 +282,9 @@
             (handler-case (nd:confiscate b id)
               (error (e) (format t "      confiscate failed: ~a~%      c log: ~{~a~^ | ~}~%      d log: ~{~a~^ | ~}~%" e (reverse (nd:node-log c)) (reverse (nd:node-log d))) (error e)))
           (check "confiscation spends the reserves via tier 0 (verified under consensus)" (and ctx t))
-          (check-equal "punitive: one output, to the lottery" (length (btx:tx-outputs ctx)) 1)
+          (check-equal "punitive: the lottery output, then the anchor" (length (btx:tx-outputs ctx)) 2)
+          (check "the confiscation's anchor is the chain hash at the dispute's fork point"
+                 (equalp (rot:anchor-of ctx) (nd::dispute-anchor b id)))
           (check "lottery output pays the lottery script" (equalp (btx:txout-script (first (btx:tx-outputs ctx))) (lot:lottery-spk lottery)))
           (check "other members rebuilt the same lottery" (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey m)))) (and (nd:record-lottery f) (equalp (lot:lottery-spk (nd:record-lottery f)) (lot:lottery-spk lottery))))) (list c d)))
           (check "signers kept the unsigned confiscation (same txid as the broadcast one)"
@@ -635,7 +637,7 @@
         (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 0 10000000)))
         (multiple-value-bind (ctx lottery) (nd:confiscate b id :respectful t)
           (declare (ignore lottery))
-          (check-equal "respectful confiscation: lottery output + operator change" (length (btx:tx-outputs ctx)) 2)
+          (check-equal "respectful confiscation: lottery output + operator change + anchor" (length (btx:tx-outputs ctx)) 3)
           (dolist (m (list b c d)) (nd:publish-reveal m id))
           (let* ((outcomes (mapcar (lambda (m) (multiple-value-list (nd:claim-or-yield m id))) (list b c d)))
                  (winner (nth (position :won outcomes :key #'first) (list b c d)))
@@ -1428,40 +1430,10 @@
                                              (string= (u:bytes->hex (fr:proof-hash (fr:json->proof (gethash "proof" k)))) (gethash "proof_hash" k)))))
                                     (gethash "cases" v))))))))))))))
 
-;; Shape of a reference operator's auto_rotation: a 1-in/1-out spend of the current
-;; vault at a tier into the next quorum's reserves.  A cl member rebuilds both ends.
-(with-gate ("rotation_sign: a cl member signs a reference-shaped vault rotation, and only that")
-  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
-         (a (nd:make-node :priv 11111111111111111111 :bus bus :height-fn hf))
-         (b (nd:make-node :priv 22222222222222222222 :bus bus :height-fn hf))
-         (c (nd:make-node :priv 33333333333333333333 :bus bus :height-fn hf))
-         (d (nd:make-node :priv 44444444444444444444 :bus bus :height-fn hf))
-         (la (nd:open-ledger a :reserves-id "genesis:a10" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
-    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
-      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
-    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00e1")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
-    (let ((rb (nd:find-record b id)) (hash (u:sha256 (hx "a5"))) (expiry (+ *height* 4320)))
-      (multiple-value-bind (cur txid vout sats operator) (nd::disputed-reserves b rb)
-        (let* ((next (rs:build-reserves :operator operator :members (rs:reserves-members cur) :ledger-hash hash
-                                        :quorum-expiry expiry :network :signet))
-               (prevouts (vector (cons sats (rs:reserves-spk cur)))))
-          (flet ((tx (&key (spk (rs:reserves-spk next)) (prev txid) (locktime 0) (feerate 2) extras)
-                   (rot:build-rotation :vault-txid prev :vault-vout vout :vault-sats sats :voters (length (rs:reserves-voters cur))
-                                       :feerate feerate :locktime locktime :new-vault-spk spk :extras extras))
-                 (refused (tx) (handler-case (progn (nd::check-rotation b rb tx 0 hash expiry) nil) (error () t))))
-            (check-equal "the rotation's tier-0 sighash is what the member signs"
-                         (nd::check-rotation b rb (tx) 0 hash expiry)
-                         (rot:tier-sighash (tx) 0 prevouts (first (rs:reserves-leaves cur))))
-            (check "a different destination is refused" (refused (tx :spk (rs:reserves-spk cur))))
-            (check "a different input is refused" (refused (tx :prev (u:sha256 (hx "beef")))))
-            (check "a lock_time not the tier's is refused" (refused (tx :locktime 99)))
-            (check "a fee other than DEP-03's is refused" (refused (tx :feerate 5)))
-            (check "an output the replica records no exit for is refused"
-                   (refused (tx :extras (list (cons (rs:reserves-spk cur) 1000)))))
-            (check "a claimed expiry the output was not built for is refused"
-                   (handler-case (progn (nd::check-rotation b rb (tx) 0 hash (1+ expiry)) nil) (error () t)))))))))
-
-(with-gate ("DEP-03 rotation: a cl operator spends the old vault into the new one, members sign it")
+;; DEP-03 Rotation ordering and §Fee ladder: the operator records the QuorumBegin naming every
+;; rung (each anchored at the tip it extends), cosigners rebuild the unsigned ladder byte for byte,
+;; and only then do members sign the rungs (rotation_sign carries the final QuorumBegin).
+(with-gate ("DEP-03 rotation: the QuorumBegin names the ladder, members rebuild it, and sign only after it is final")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (sent '())
          (a (nd:make-node :priv 11111111111111111181 :bus bus :height-fn hf
@@ -1477,39 +1449,60 @@
       (nd:begin-quorum a la :funding-txid (u:sha256 (hx "70f1")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000))
     (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
     (multiple-value-bind (txid sats) (nd:rotate-vault a la :timeout 20)
-      (check "the rotation was signed to threshold and assembled" (and txid t))
-      (check-equal "the new vault is the old less the DEP-03 fee (4 voters, one P2TR output)"
-                   sats (- 39000 (* 2 (rot:rotation-vsize 4 '(34) nil))))
+      (check "rotate-vault plans rung 0" (and txid t))
+      (check-equal "the new vault is the old less the DEP-03 fee (4 voters, one P2TR output and the anchor)"
+                   sats (- 39000 (* 2 (rot:rotation-vsize 4 '(34 34) nil))))
       (check "it is remembered until its QuorumBegin" (nd:pending-rotation a la))
-      (check "and not broadcast before it (DEP-03 Rotation ordering)" (not (member txid sent :test #'equalp)))
-      (let* ((rb (nd:find-record b id))
-             (o (list :type :quorum-begin :new-outpoint-txid txid :new-outpoint-vout 0
-                      :reserves-id (rs:reserves-address (car (nd:record-pinned la)))
-                      :amount (- (* 1000 sats) (floor (* 23400000 sats 1000) 39000000))
-                      :collateral-amount (floor (* 23400000 sats 1000) 39000000)))
-             (hex (getf (nd:pending-rotation a la) :tx))
-             (bad (let ((b (u:hex->bytes hex))) (setf (aref b (- (length b) 40)) (logxor 1 (aref b (- (length b) 40)))) (u:bytes->hex b))))
-        (check-signals "a member refuses a rotating QuorumBegin without its rotation_tx" nd:node-error
-          (nd::check-quorum-begin-vault b rb o (w:json-object "x" 1)))
-        (check "a member accepts it with the signed rotation"
-               (progn (nd::check-quorum-begin-vault b rb o (w:json-object "rotation_tx" hex)) t))
-        (check-signals "and refuses a rotation whose witness was tampered with" nd:node-error
-          (nd::check-quorum-begin-vault b rb o (w:json-object "rotation_tx" bad))))
-      (check "a member that signed treats it as authorised before the QuorumBegin"
-             (member txid (nd::authorised-spend-txids b (nd:find-record b id)) :test #'equalp))
-      (check-signals "a second rotation is refused while one awaits its QuorumBegin" nd:node-error (nd:rotate-vault a la :timeout 5))
-      (let* ((u (nd:begin-quorum a la))
-             (o (op:decode-operation (up:update-message u))))
-        (check-bytes "the QuorumBegin names the rotation's output" (op:field o :new-outpoint-txid) txid)
-        (check-equal "at vout 0" (op:field o :new-outpoint-vout) 0)
-        (check-equal "and its amounts sum to the new vault" (+ (op:field o :amount) (op:field o :collateral-amount)) (* 1000 sats))
-        (check "the rotation is no longer pending" (null (nd:pending-rotation a la)))
-        (check "it was broadcast once the QuorumBegin was published" (member txid sent :test #'equalp))
-        (check "cosigners hold it to rebroadcast until it confirms"
-               (some (lambda (m) (gethash txid (nd::node-inflight-rotations m))) (list b c d)))
-        (check "cosigned by the members" (>= (length (up:update-cosignatures u)) 2))
-        (check "the rotation txid is authorised by every replica once recorded"
-               (every (lambda (m) (member txid (nd::authorised-spend-txids m (nd:find-record m id)) :test #'equalp)) (list b c d)))))))
+      (check "nothing is signed or broadcast before the QuorumBegin (DEP-03 Rotation ordering)"
+             (and (null sent) (null (getf (nd:pending-rotation a la) :rungs))))
+      (check-signals "a second rotation is refused while one is pending" nd:node-error (nd:rotate-vault a la :timeout 5))
+      (multiple-value-bind (u r2 rtxid) (nd:begin-quorum a la)
+        (declare (ignore r2))
+        (let* ((o (op:decode-operation (up:update-message u)))
+               (rungs (fr:rotation-rungs o)))
+          (check-bytes "the QuorumBegin names rung 0 as its new outpoint" (op:field o :new-outpoint-txid) (first rungs))
+          (check-equal "at vout 0" (op:field o :new-outpoint-vout) 0)
+          (check-equal "four rungs (DEP-03 §Fee ladder)" (length rungs) 4)
+          (check-bytes "rung 0 is what was broadcast" rtxid (first rungs))
+          (check-equal "its amounts sum to rung 0's new vault" (+ (op:field o :amount) (op:field o :collateral-amount)) (* 1000 sats))
+          (check "the rotation is no longer pending" (null (nd:pending-rotation a la)))
+          (check "rung 0 was broadcast once its rungs were signed" (member (first rungs) sent :test #'equalp))
+          (check "cosigned by the members" (>= (length (up:update-cosignatures u)) 2))
+          (let ((held (some (lambda (m) (gethash (first rungs) (nd::node-inflight-rotations m))) (list b c d))))
+            (check "cosigners hold every signed rung (Kind 9107) to rebroadcast and bump" (and held (= (length (getf held :rungs)) 4) (every #'identity (getf held :rungs))))
+            (let ((signed (mapcar (lambda (b) (btx:parse-tx (cl-consensus.wire:make-reader b))) (getf held :rungs))))
+              (check "every signed rung's anchor is the QuorumBegin's previous_hash"
+                     (every (lambda (tx) (equalp (rot:anchor-of tx) (up:update-prev-hash u))) signed))
+              (check "every replica finds rung 0 and rung 3 answered by the QuorumBegin"
+                     (every (lambda (m) (and (nd::authorised-spend-p m (nd:find-record m id) (first signed))
+                                             (nd::authorised-spend-p m (nd:find-record m id) (fourth signed))))
+                            (list b c d)))
+              (check "an unanchored spend of the same vault is answered by nothing"
+                     (not (nd::authorised-spend-p b (nd:find-record b id)
+                                                  (btx:make-tx :version 2 :locktime 0 :segwit-p t :inputs (btx:tx-inputs (first signed))
+                                                               :outputs (butlast (btx:tx-outputs (first signed)))
+                                                               :witnesses (btx:tx-witnesses (first signed)))))))))
+        ;; cosigners rebuild the ladder; any change is refused
+        (let* ((rb (nd:find-record b id)) (view (nd::pre-update-view rb (up:update-seq u)))
+               (o (op:decode-operation (up:update-message u)))
+               (rungs (nd::expected-ladder b view o (up:update-block-height u) (up:update-prev-hash u) 0)))
+          (flet ((refused (txs) (handler-case (progn (nd::check-rotation-rungs b view o txs (up:update-block-height u)) nil) (error () t)))
+                 (tweak (tx &key outputs locktime) (btx:make-tx :version 2 :locktime (or locktime (btx:tx-locktime tx)) :segwit-p t
+                                                                :inputs (btx:tx-inputs tx) :outputs (or outputs (btx:tx-outputs tx)) :witnesses (list nil))))
+            (check "the rebuilt ladder is accepted" (not (refused rungs)))
+            (check "a ladder missing a rung is refused" (refused (butlast rungs)))
+            (check "rungs in another order are refused" (refused (reverse rungs)))
+            (check "a rung with another anchor is refused"
+                   (refused (cons (tweak (first rungs) :outputs (append (butlast (btx:tx-outputs (first rungs)))
+                                                                         (list (btx:make-txout :value 0 :script (rot:anchor-script (u:sha256 (hx "0dd")))))))
+                                  (rest rungs))))
+            (check "a rung without its anchor is refused" (refused (cons (tweak (first rungs) :outputs (butlast (btx:tx-outputs (first rungs)))) (rest rungs))))
+            (check "a rung paying elsewhere is refused"
+                   (refused (cons (tweak (first rungs) :outputs (cons (btx:make-txout :value (btx:txout-value (first (btx:tx-outputs (first rungs))))
+                                                                                      :script (rs:reserves-spk (nd::disputed-reserves b view)))
+                                                                      (rest (btx:tx-outputs (first rungs)))))
+                                  (rest rungs))))
+            (check "a lock_time not the tier's is refused" (refused (cons (tweak (first rungs) :locktime 99) (rest rungs))))))))))
 
 (with-gate ("DEP-20 exits: a request settles at the next rotation; cancel, dust and expiry release")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
@@ -1549,15 +1542,16 @@
         (multiple-value-bind (txid sats) (nd:rotate-vault a la :timeout 20)
           (let* ((tx (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes (getf (nd:pending-rotation a la) :tx)))))
                  (outs (btx:tx-outputs tx)))
-            (check-equal "the rotation pays the due exit after the new vault" (length outs) 2)
+            (check-equal "the rotation pays the due exit after the new vault, then the anchor" (length outs) 3)
             (check-bytes "to the request's address" (btx:txout-script (second outs)) (nd:address->spk addr1))
             (check-equal "floor(amount / 1000) sats less the exit's own cost (DEP-20 §3)"
                          (btx:txout-value (second outs)) (- 1000 (* 2 (+ 9 34))))
             (check-equal "the vault pays the exit output and the rest of the fee"
-                         sats (- 39000 (- 1000 (* 2 (+ 9 34))) (* 2 (rot:rotation-vsize 4 '(34 34) nil)))))
+                         sats (- 39000 (- 1000 (* 2 (+ 9 34))) (* 2 (rot:rotation-vsize 4 '(34 34 34) nil)))))
           (let* ((u (nd:begin-quorum a la))
                  (o (op:decode-operation (up:update-message u)))
                  (fee (- 39000 (- 1000 (* 2 (+ 9 34))) sats (* 2 (+ 9 34)))))
+            (check "the exit rotation is laddered too" (= (length (fr:rotation-rungs o)) 4))
             (check-bytes "the QuorumBegin names the rotation" (op:field o :new-outpoint-txid) txid)
             (check-equal "and records its exit outputs" (op:field o :exit-outputs) (list (list dep 1000000 1)))
             (check "with its cutoff" (integerp (op:field o :exit-cutoff-height)))
@@ -1592,7 +1586,7 @@
     (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
     (multiple-value-bind (txid sats) (nd:rotate-vault a la :timeout 20 :splice (list splice-txid 2))
       (let* ((tx (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes (getf (nd:pending-rotation a la) :tx)))))
-             (fee (* 2 (rot:rotation-vsize 4 '(34) t))))
+             (fee (* 2 (rot:rotation-vsize 4 '(34 34) t))))
         (check-equal "the rotation spends the vault and the splice" (length (btx:tx-inputs tx)) 2)
         (check-bytes "input 1 is the splice outpoint" (btx:txin-prev-hash (second (btx:tx-inputs tx))) splice-txid)
         (check-equal "the new vault adds the splice, less the fee" sats (- (+ 39000 70000) fee))
@@ -1641,7 +1635,7 @@
         (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
         (multiple-value-bind (txid) (nd:rotate-vault a la :timeout 20)
           (nd:begin-quorum a la)
-          (let* ((tx (btx:parse-tx (cl-consensus.wire:make-reader (gethash txid (nd::node-inflight-rotations a)))))
+          (let* ((tx (btx:parse-tx (cl-consensus.wire:make-reader (first (getf (gethash txid (nd::node-inflight-rotations a)) :rungs)))))
                  (out (second (btx:tx-outputs tx))))
             (check-equal "the rotation pays 1000 sats less the exit's own cost to the offer's address"
                          (btx:txout-value out) (- 1000 (* 2 (+ 9 34))))

@@ -19,7 +19,8 @@
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:uncredited-migration-proof #:latest-migration #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
-           #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers #:rotation-excused-p
+           #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers
+           #:rotation-rungs #:rotation-answer #:spend-window #:challenge-op #:spent-vault
            #:unhonoured-obligation-proof #:verify-unhonoured-obligation #:make-uncredited-offer-proof))
 (in-package #:cl-deposits.fraud)
 
@@ -68,7 +69,9 @@
          (cat (s :original-fraud-hash) (s :disclosure-update) (s :quorum-begin-update) (s :visibility-update)
               (s :member-ledger-id) (s :member-pubkey) (int->le (getf ev :member-active-sequence) 8)))
         (:unauthorized-vault-spend
-         (cat (s :spent-ledger-id) (int->le (getf ev :governing-quorumbegin-seq) 8) (s :spend-tx-hex) (b :spend-block-hash)))
+         ;; DEP-06: the lapsed form appends the challenge and the block that ends its window.
+         (cat (s :spent-ledger-id) (int->le (getf ev :governing-quorumbegin-seq) 8) (s :spend-tx-hex) (b :spend-block-hash)
+              (if (getf ev :challenge-update) (cat (s :challenge-update) (b :lapse-block-hash)) (octets))))
         (:winner-collateral-deviation (cat (s :winner-armed-update-hex) (s :claim-txid) (b :claim-block-hash)))
         (:unhonoured-obligation
          (cat (s :source-notice-update) (s :source-qb-update) (ascii->bytes (or (getf ev :uncredited-proof) ""))
@@ -120,17 +123,22 @@
 
 ;; DEP-06 "unauthorised vault spend" (the spec's type 7; see the discriminant note in
 ;; docs/MISSING.md: 7 is WinnerCollateralDeviation in both implementations, so this is 10).
-(defun make-unauthorized-vault-spend-proof (signer33 target-ledger-id32 spent-ledger-id32 governing-qb-seq spend-tx prevouts block-hash32)
-  "SIGNER33 signed SPEND-TX, which spent SPENT-LEDGER's reserves outpoint (the one its
-   QuorumBegin at GOVERNING-QB-SEQ names) to outputs no QuorumBegin or confiscation
-   accounts for.  Presented against TARGET-LEDGER, a ledger SIGNER33 operates.  PREVOUTS
-   is the spend's (amount . spk) per input, which a script-path sighash commits to."
+(defun make-unauthorized-vault-spend-proof (signer33 target-ledger-id32 spent-ledger-id32 governing-qb-seq spend-tx prevouts block-hash32
+                                            &key challenge-update lapse-block-hash)
+  "SIGNER33 signed SPEND-TX, which spent SPENT-LEDGER's reserves outpoint (output 0 of a rung of
+   its QuorumBegin at GOVERNING-QB-SEQ).  Unanchored form: SPEND-TX carries no anchor.  Lapsed
+   form: CHALLENGE-UPDATE (a signed QuorumChallenge of its anchor) went unanswered until the block
+   LAPSE-BLOCK-HASH (DEP-06 §Spend challenge).  Presented against TARGET-LEDGER, a ledger SIGNER33
+   operates.  PREVOUTS is the spend's (amount . spk) per input, which a script-path sighash commits to."
   (list :type :unauthorized-vault-spend :accused (bytes->hex signer33) :ledger-id (bytes->hex target-ledger-id32)
-        :evidence (list :spent-ledger-id (bytes->hex spent-ledger-id32)
-                        :governing-quorumbegin-seq governing-qb-seq
-                        :spend-tx-hex (bytes->hex (btx:serialize-tx spend-tx))
-                        :spend-block-hash block-hash32
-                        :prevouts (mapcar (lambda (pv) (format nil "~a:~a" (car pv) (bytes->hex (cdr pv)))) (coerce prevouts 'list)))))
+        :evidence (append (list :spent-ledger-id (bytes->hex spent-ledger-id32)
+                                :governing-quorumbegin-seq governing-qb-seq
+                                :spend-tx-hex (bytes->hex (btx:serialize-tx spend-tx))
+                                :spend-block-hash block-hash32
+                                :prevouts (mapcar (lambda (pv) (format nil "~a:~a" (car pv) (bytes->hex (cdr pv)))) (coerce prevouts 'list)))
+                          (when challenge-update
+                            (list :challenge-update (bytes->hex (up:encode-update challenge-update))
+                                  :lapse-block-hash lapse-block-hash)))))
 
 (defun make-non-conforming-update-proof (accused33 ledger-id32 fault-update)
   (list :type :non-conforming-update :accused (bytes->hex accused33) :ledger-id (bytes->hex ledger-id32)
@@ -417,65 +425,77 @@
                           (cons (parse-integer str :end c) (hex->bytes (subseq str (1+ c))))))
           'vector))
 
+(defun rotation-rungs (o)
+  "DEP-03 §Fee ladder: the txids of QuorumBegin O's rungs, rung 0 first; a QuorumBegin with no
+   rotation_rungs names one, its new_outpoint_txid."
+  (let ((r (op:field o :rotation-rungs)))
+    (if (and r (plusp (length r)) (zerop (mod (length r) 32)))
+        (loop for i from 0 below (length r) by 32 collect (subseq r i (+ i 32)))
+        (list (op:field o :new-outpoint-txid)))))
+
 (defun spent-vault (history governing-seq)
-  "(values reserves txid vout) for the QuorumBegin at GOVERNING-SEQ in HISTORY (the
-   spent ledger's chain, any order), or NIL."
+  "(values reserves rung-txids vout operator33) for the QuorumBegin at GOVERNING-SEQ in HISTORY
+   (the spent ledger's chain, any order), or NIL.  The vault is output VOUT of whichever rung
+   confirmed (DEP-03 §Fee ladder)."
   (let ((operator nil) (qb nil))
     (dolist (u (sort (copy-list history) #'< :key #'up:update-seq))
       (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
         (when o
           (case (op:operation-type o)
-            (:ledger-open (setf operator (op:field o :operator-id)))
+            (:ledger-open (when (zerop (up:update-seq u)) (setf operator (op:field o :operator-id))))
             (:quorum-begin (when (= (up:update-seq u) governing-seq) (setf qb o)))))))
     (when (and qb operator)
       (values (rs:build-reserves :operator operator :members (op:field qb :quorum-members)
                                  :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
                                  :ruleset (or (op:field qb :protocol-version) "cltv-offset-v2"))
-              (op:field qb :new-outpoint-txid) (op:field qb :new-outpoint-vout)))))
+              (rotation-rungs qb) (op:field qb :new-outpoint-vout) operator))))
 
-;;; DEP-06 proof 10 "Recorded rotation".  A judge's replica may lag (a gap it has not filled, an
-;;; update it never received), so a rotation is judged against every update the judge can find of
-;;; the ledger, its replica and the relay's copies together: whatever else they hold (forks,
-;;; duplicates, variants of one update with different cosignature sets), only hash links count.
+;;; DEP-06 §Spend challenge.  An anchored spend names, by its anchor H, the one place in the
+;;; ledger that must answer for it: a rotation is the QuorumBegin whose previous_hash is H and
+;;; whose rungs include the spend.  The search is over every update a judge holds of the ledger,
+;;; any order, any fork; it either finds an answer (positive evidence) or finds nothing, and
+;;; finding nothing proves nothing: the judge challenges instead.
 
-(defun rotation-excused-p (updates governing-seq txid)
-  "TXID (internal byte order) is a recorded rotation of the vault the QuorumBegin at GOVERNING-SEQ
-   creates: the new_outpoint_txid of a QuorumBegin, signed by the ledger's operator (its
-   LedgerOpen's), reachable from that QuorumBegin by previous_hash links through updates at each
-   next sequence by the same operator.  Only the matching QuorumBegin's signature is checked: it
-   commits to the whole path by hash."
-  (let* ((open (find-if (lambda (u) (and (zerop (up:update-seq u))
-                                         (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-                                           (and o (eq (op:operation-type o) :ledger-open)))))
-                        updates))
-         (operator (and open (up:update-operator-id open)))
-         (by-prev (make-hash-table :test #'equalp)) (seen (make-hash-table :test #'equalp)) (frontier '()))
-    (flet ((qb (u) (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-                     (and o (eq (op:operation-type o) :quorum-begin) o))))
-      (when operator
-        (dolist (u updates)
-          (when (equalp (up:update-operator-id u) operator)
-            (if (and (= (up:update-seq u) governing-seq) (qb u))
-                (push u frontier)
-                (when (> (up:update-seq u) governing-seq) (push u (gethash (up:update-prev-hash u) by-prev))))))
-        (loop while frontier
-              do (let* ((cur (pop frontier)) (h (up:chain-hash cur)))
-                   (unless (gethash h seen)
-                     (setf (gethash h seen) t)
-                     (dolist (n (gethash h by-prev))
-                       (when (= (up:update-seq n) (1+ (up:update-seq cur)))
-                         (let ((o (qb n)))
-                           (when (and o (equalp (op:field o :new-outpoint-txid) txid) (up:verify-operator-signature n))
-                             (return-from rotation-excused-p t)))
-                         (push n frontier))))))))
-    nil))
+(defun spend-window (history governing-seq)
+  "DEP-06 §Spend challenge: w, the spent ledger's service_response_blocks at the governing
+   QuorumBegin (the largest a seated member declared, 72 if none)."
+  (governing-service-response-blocks (sort (copy-list history) #'< :key #'up:update-seq) governing-seq))
+
+(defun rotation-answer (updates anchor txid reserves tier-index)
+  "The update among UPDATES that answers an anchored spend of RESERVES' vault as a rotation, or
+   NIL: a QuorumBegin whose previous_hash is ANCHOR, signed by RESERVES' operator, whose rungs
+   include TXID, carrying valid cosignatures over it from at least the threshold of the tier
+   TIER-INDEX (the tier the spend's witness uses), by keys of that tier."
+  (let* ((tier (nth tier-index (rs:reserves-tiers reserves)))
+         (keys (rs:tier-keys tier))
+         ;; the operator's solo tier: its own signature on the QuorumBegin is the authority
+         (needed (if (and (= (rs:tier-threshold tier) 1) (rs:tier-tie-breaker-p tier)) 0 (rs:tier-threshold tier)))
+         (operator (rs:reserves-operator reserves)))
+    (find-if (lambda (u)
+               (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                 (and o (eq (op:operation-type o) :quorum-begin)
+                      (equalp (up:update-prev-hash u) anchor)
+                      (equalp (up:update-operator-id u) operator)
+                      (member txid (rotation-rungs o) :test #'equalp)
+                      (up:verify-operator-signature u)
+                      (>= (count-if (lambda (c) (and (member (up:x-only (up:cosig-pubkey c)) keys :test #'equalp)
+                                                     (up:verify-cosignature u c)))
+                                    (remove-duplicates (up:update-cosignatures u) :key #'up:cosig-pubkey :test #'equalp))
+                          needed))))
+             updates)))
+
+(defun challenge-op (update)
+  "UPDATE's QuorumChallenge operation, when it is one and its operator's signature verifies."
+  (let ((o (ignore-errors (op:decode-operation (up:update-message update)))))
+    (and o (eq (op:operation-type o) :quorum-challenge) (up:verify-operator-signature update) o)))
 
 (defun vault-spend-signers (tx prevouts reserves txid vout)
   "Run the witness of the input of TX spending (TXID, VOUT) against RESERVES's tier
-   leaves.  (values signer-xonly-list input-index tier-index): the keys whose Schnorr
-   signature verifies over the script-path sighash, provided at least the tier's
-   threshold did; else NIL."
-  (let* ((idx (position-if (lambda (i) (and (equalp (btx:txin-prev-hash i) txid) (= (btx:txin-prev-index i) vout)))
+   leaves; TXID may be a list (the rungs of a fee ladder, DEP-03).  (values signer-xonly-list
+   input-index tier-index): the keys whose Schnorr signature verifies over the script-path
+   sighash, provided at least the tier's threshold did; else NIL."
+  (let* ((txids (if (and (consp txid) (not (typep txid 'vector))) txid (list txid)))
+         (idx (position-if (lambda (i) (and (member (btx:txin-prev-hash i) txids :test #'equalp) (= (btx:txin-prev-index i) vout)))
                            (btx:tx-inputs tx)))
          (stack (and idx (nth idx (btx:tx-witnesses tx))))
          (n (length stack)))
@@ -495,26 +515,53 @@
             (when (>= (length signers) (rs:tier-threshold tier))
               (values signers idx tier-index))))))))
 
-(defun verify-unauthorized-vault-spend (proof spent-history height-of-block &key authorised-txids)
-  "SPENT-HISTORY is the spent ledger's own chain.  Valid when the accused signed (to
-   threshold) a spend of the vault outpoint its QuorumBegin names, the spend is in a block
-   we confirm, and its txid is none of AUTHORISED-TXIDS (the txids of the ledger's recorded
-   rotations, whichever QuorumBegin created them, and any confiscation the verifier knows)."
+(defun verify-unauthorized-vault-spend (proof spent-history height-of-block &key answered-fn)
+  "DEP-06 UnauthorizedVaultSpend.  SPENT-HISTORY is what we hold of the spent ledger (any order).
+   The accused must have signed (to threshold) a spend of the vault (output 0 of a rung of the
+   governing QuorumBegin) confirmed in a block we know.  Unanchored form: the spend carries no
+   anchor.  Lapsed form: its anchor H was challenged by CHALLENGE-UPDATE, and LAPSE-BLOCK-HASH is a
+   block at least the spent ledger's service window past the later of the challenge and the
+   spend.  ANSWERED-FN (txid anchor reserves tier-index) -> true when the verifier knows an answer
+   (a rotation or an authorised confiscation); a known answer rebuts the lapsed form."
   (handler-case
       (let* ((ev (getf proof :evidence))
              (tx (btx:parse-tx (bw:make-reader (hex->bytes (getf ev :spend-tx-hex)))))
              (txid (btx:tx-txid tx))
-             (prevouts (parse-prevouts (getf ev :prevouts))))
-        (multiple-value-bind (reserves vtxid vvout) (spent-vault spent-history (getf ev :governing-quorumbegin-seq))
+             (anchor (rot:anchor-of tx))
+             (prevouts (parse-prevouts (getf ev :prevouts)))
+             (spend-height (funcall height-of-block (getf ev :spend-block-hash))))
+        (multiple-value-bind (reserves rungs vvout) (spent-vault spent-history (getf ev :governing-quorumbegin-seq))
           (cond ((null reserves) (values nil "no such QuorumBegin on the spent ledger"))
                 ((/= (length prevouts) (length (btx:tx-inputs tx))) (values nil "prevouts do not match the inputs"))
-                ((null (funcall height-of-block (getf ev :spend-block-hash))) (values nil "spend block not in our chain"))
-                ((member txid authorised-txids :test #'equalp) (values nil "the spend is a recorded rotation or confiscation"))
-                (t (let ((signers (vault-spend-signers tx prevouts reserves vtxid vvout)))
-                     (cond ((null signers) (values nil "no tier witness on the vault input verifies"))
-                           ((not (member (up:x-only (hex->bytes (getf proof :accused))) signers :test #'equalp))
-                            (values nil "the accused is not among the verified signers"))
-                           (t (values t nil))))))))
+                ((null spend-height) (values nil "spend block not in our chain"))
+                (t
+                 (multiple-value-bind (signers idx tier-index) (vault-spend-signers tx prevouts reserves rungs vvout)
+                   (declare (ignore idx))
+                   (cond ((null signers) (values nil "no tier witness on the vault input verifies"))
+                         ((not (member (up:x-only (hex->bytes (getf proof :accused))) signers :test #'equalp))
+                          (values nil "the accused is not among the verified signers"))
+                         ((null anchor)
+                          (if (getf ev :challenge-update)
+                              (values nil "an unanchored spend needs no challenge")
+                              (values t nil)))
+                         ((null (getf ev :challenge-update))
+                          (values nil "an anchored spend is proven only by a lapsed challenge"))
+                         (t
+                          (let* ((cu (up:decode-update (hex->bytes (getf ev :challenge-update))))
+                                 (co (challenge-op cu))
+                                 (lapse (and (getf ev :lapse-block-hash) (funcall height-of-block (getf ev :lapse-block-hash))))
+                                 (w (spend-window spent-history (getf ev :governing-quorumbegin-seq))))
+                            (cond ((null co) (values nil "the challenge is not a signed QuorumChallenge"))
+                                  ((not (and (equalp (op:field co :challenged-ledger-id) (hex->bytes (getf ev :spent-ledger-id)))
+                                             (equalp (op:field co :challenged-txid) txid)
+                                             (equalp (op:field co :challenged-anchor) anchor)))
+                                   (values nil "the challenge names another spend"))
+                                  ((null lapse) (values nil "the lapse block is not in our chain"))
+                                  ((< lapse (+ (max (up:update-block-height cu) spend-height) w))
+                                   (values nil (format nil "the challenge's window (~a blocks) has not lapsed" w)))
+                                  ((and answered-fn (funcall answered-fn txid anchor reserves tier-index))
+                                   (values nil "the spend is answered"))
+                                  (t (values t nil)))))))))))
     (error (c) (values nil (princ-to-string c)))))
 
 (defun latest-migration (source-history)
@@ -890,7 +937,7 @@
         (:stale-cosignature "StaleCosign") (:non-conforming-update "NonConformingUpdate")
         (t (cdr (assoc type +type-names+)))))
 
-(defparameter +hex-fields+ '(:spend-block-hash :anchor-block-hash :confirmed-at-block-hash :claim-block-hash :deposit-id))
+(defparameter +hex-fields+ '(:spend-block-hash :lapse-block-hash :anchor-block-hash :confirmed-at-block-hash :claim-block-hash :deposit-id))
 
 (defun json->proof (j)
   (let* ((type (car (rassoc (w:jget j "proof_type") +type-names+ :test #'string=)))

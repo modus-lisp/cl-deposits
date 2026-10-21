@@ -823,6 +823,8 @@
                (%unlock src (+ (getf p :amount) (getf p :fee)))
                (%charge-fixed ledger src))))))
       (:delivery-embed nil)
+      ;; DEP-06 §Spend challenge: a notice on the challenger's own ledger; no state.
+      (:quorum-challenge nil)
       (:batch (fail :unsupported "batch")))
     ledger))
 

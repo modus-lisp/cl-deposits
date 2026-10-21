@@ -4,7 +4,7 @@
 ;;;;   (:open-ledger :reserves-id "s" :reserves-msat N :collateral-msat M)
 ;;;;   (:add-member :ledger "hex" :member "pubkey hex" [:membership-blocks N] [:dispute-response-blocks N])
 ;;;;   (:prepare-quorum :ledger "hex" [:expiry-blocks N] [:ruleset "s"])  -> :address to fund
-;;;;   (:begin-quorum :ledger "hex" :txid "hex" :vout N :sats N :collateral-sats M)
+;;;;   (:begin-quorum :ledger "hex" :txid "hex" :vout N :sats N :collateral-sats M)   ; a rotation's: -> :txid its rung 0
 ;;;;   (:deposit-open :ledger "hex" :descriptor "pk(...)")
 ;;;;   (:credit :ledger "hex" :deposit "hex" :msat N :txid "hex" [:vout N])
 ;;;;   (:balance :ledger "hex" :deposit "hex")
@@ -199,10 +199,12 @@
          ;; The first QuorumBegin names its funding outpoint; a later one takes the
          ;; rotation :rotate-vault broadcast (DEP-03) and ignores :txid / :sats.
          (let ((rec (rec! node form)))
-           (multiple-value-bind (u r)
+           (multiple-value-bind (u r txid)
                (nd:begin-quorum node rec :funding-txid (and (arg form :txid) (txid-bytes (arg form :txid))) :funding-vout (arg form :vout 0)
                                 :amount-msats (* 1000 (arg form :sats 0)) :collateral-msats (* 1000 (arg form :collateral-sats 0)))
-             (ok :seq (up:update-seq u) :cosigs (length (up:update-cosignatures u)) :address (rs:reserves-address r)))))
+             ;; :txid the rotation broadcast (rung 0), once its rungs are signed (DEP-03 Rotation ordering)
+             (ok :seq (up:update-seq u) :cosigs (length (up:update-cosignatures u)) :address (rs:reserves-address r)
+                 :txid (and txid (bytes->hex (reverse txid)))))))
         (:deposit-open
          (let* ((rec (rec! node form)) (d (arg form :descriptor)) (id (op:deposit-id d)))
            (nd:append-operation node rec (list :type :deposit-open :deposit-id id :descriptor d :receive-requires-sig nil))

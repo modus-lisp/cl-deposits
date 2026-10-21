@@ -1,10 +1,11 @@
 ;;;; src/rotation.lisp — spending the reserves: rotation and recovery transactions.
 ;;;;
 ;;;; A rotation spends the old reserves UTXO through tier 0 into the new reserves
-;;;; output, with an OP_RETURN carrying the chain_hash at QuorumBegin (DEP-03
-;;;; §On-Chain State Anchor).  Recovery spends use the timelocked tiers and set
-;;;; nLockTime accordingly.  Every transaction built here is validated by
-;;;; cl-consensus's script interpreter in the gate before we trust it.
+;;;; output, with an OP_RETURN anchor carrying its QuorumBegin's previous_hash
+;;;; (DEP-03 §On-Chain State Anchor), at four feerates (§Fee ladder).  Recovery
+;;;; spends use the timelocked tiers and set nLockTime accordingly.  Every
+;;;; transaction built here is validated by cl-consensus's script interpreter in
+;;;; the gate before we trust it.
 
 (defpackage #:cl-deposits.rotation
   (:use #:cl #:cl-deposits.util)
@@ -13,12 +14,28 @@
                     (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:build-spend #:op-return-script #:tier-sighash #:sign-tier #:attach-tier-witness
            #:estimate-fee #:+sequence-rbf+ #:verify-spend
-           #:rotation-vsize #:build-rotation #:+default-feerate+))
+           #:rotation-vsize #:build-rotation #:+default-feerate+
+           #:anchor-script #:anchor-of #:+rungs+ #:build-ladder #:ladder-fee-delta))
 (in-package #:cl-deposits.rotation)
 
 (defconstant +sequence-rbf+ #xfffffffd "ENABLE_RBF_NO_LOCKTIME: RBF on, CLTV usable.")
 
 (defun op-return-script (data) (cat (octets #x6a (length data)) data))
+
+(defconstant +rungs+ 4 "DEP-03 §Fee ladder: a rotation is signed at m, 2m, 4m and 8m.")
+
+(defun anchor-script (h)
+  "DEP-03 §On-Chain State Anchor: OP_RETURN <H>, the last output of every authorised vault spend."
+  (unless (= (length h) 32) (error "an anchor is 32 bytes"))
+  (cat (octets #x6a #x20) h))
+
+(defun anchor-of (tx)
+  "The 32-byte anchor H of TX: its last output, zero-valued, script exactly 6a20 || H.  NIL if none."
+  (let ((o (car (last (btx:tx-outputs tx)))))
+    (when o
+      (let ((spk (btx:txout-script o)))
+        (and (zerop (btx:txout-value o)) (= (length spk) 34) (= (aref spk 0) #x6a) (= (aref spk 1) #x20)
+             (subseq spk 2))))))
 
 (defun estimate-fee (n-outputs fee-rate-sat-vb)
   "The reference's estimate: 135 vbytes + 43 per output."
@@ -56,23 +73,52 @@
      (cond ((not splice-p) 0) (splice-vault-p (+ 41 (* 30 voters))) (t 68))))
 
 (defun build-rotation (&key vault-txid vault-vout vault-sats voters (feerate +default-feerate+) (locktime 0)
-                            new-vault-spk splice extras splice-vault-p)
+                            new-vault-spk splice extras splice-vault-p anchor (rung 0))
   "DEP-03 \"Rotation transaction\", unsigned: version 2, nLockTime the tier's CLTV;
    input 0 the vault and input 1 SPLICE (txid vout sats), both #xfffffffd; output 0
    the new vault, then EXTRAS ((spk . sats) ...: the exits in recorded order, then the
-   migration).  Fee feerate x rotation-vsize.  NIL if the new vault falls below 330."
-  (let* ((fee (* feerate (rotation-vsize voters (cons (length new-vault-spk) (mapcar (lambda (e) (length (car e))) extras))
-                                         (and splice t) splice-vault-p)))
+   migration), last the ANCHOR (OP_RETURN <the QuorumBegin's previous_hash>).  RUNG i
+   pays FEERATE x 2^i x rotation-vsize (§Fee ladder).  NIL if the new vault falls below 330."
+  (unless anchor (error "a rotation carries an anchor (DEP-03)"))
+  (let* ((fee (* feerate (expt 2 rung)
+                 (rotation-vsize voters (append (list (length new-vault-spk)) (mapcar (lambda (e) (length (car e))) extras) (list 34))
+                                 (and splice t) splice-vault-p)))
          (new (- (+ vault-sats (if splice (third splice) 0)) (reduce #'+ extras :key #'cdr) fee)))
     (when (>= new 330)
-      (btx:make-tx :version 2 :locktime locktime :segwit-p t
-                   :inputs (cons (btx:make-txin :prev-hash vault-txid :prev-index vault-vout :script (octets) :sequence +sequence-rbf+)
-                                 (when splice
-                                   (list (btx:make-txin :prev-hash (first splice) :prev-index (second splice) :script (octets)
-                                                        :sequence +sequence-rbf+))))
-                   :outputs (cons (btx:make-txout :value new :script new-vault-spk)
-                                  (loop for (spk . sats) in extras collect (btx:make-txout :value sats :script spk)))
-                   :witnesses (make-list (if splice 2 1))))))
+      ;; round-tripped, so the struct carries its txid (a rung's txid is recorded before it is signed)
+      (btx:parse-tx
+       (bw:make-reader
+        (btx:serialize-tx
+         (btx:make-tx :version 2 :locktime locktime :segwit-p t
+                      :inputs (cons (btx:make-txin :prev-hash vault-txid :prev-index vault-vout :script (octets) :sequence +sequence-rbf+)
+                                    (when splice
+                                      (list (btx:make-txin :prev-hash (first splice) :prev-index (second splice) :script (octets)
+                                                           :sequence +sequence-rbf+))))
+                      :outputs (append (list (btx:make-txout :value new :script new-vault-spk))
+                                       (loop for (spk . sats) in extras collect (btx:make-txout :value sats :script spk))
+                                       (list (btx:make-txout :value 0 :script (anchor-script anchor))))
+                      :witnesses (make-list (if splice 2 1)))))))))
+
+(defun build-ladder (&rest args &key collateral-msats (max-rungs +rungs+) &allow-other-keys)
+  "DEP-03 §Fee ladder: the rungs of a rotation, rung 0 first, each BUILD-ROTATION at 2^i x the
+   feerate.  Rung i > 0 exists only while its new vault is at least 330 sats and its extra fee over
+   rung 0 is at most COLLATERAL-MSATS / 1000 (the recording QuorumBegin's collateral_amount): the
+   ladder stops at the first rung that fails.  MAX-RUNGS 1 for a rotation paying a migration
+   output (DEP-03: its outpoint must not depend on which rung confirms).  NIL if rung 0 itself
+   is below dust."
+  (let* ((args (loop for (k v) on args by #'cddr unless (member k '(:collateral-msats :max-rungs)) append (list k v)))
+         (r0 (apply #'build-rotation :rung 0 args)))
+    (when r0
+      (let ((v0 (btx:txout-value (first (btx:tx-outputs r0)))))
+        (cons r0 (loop for i from 1 below (min max-rungs +rungs+)
+                       for r = (apply #'build-rotation :rung i args)
+                       while (and r (<= (* 1000 (- v0 (btx:txout-value (first (btx:tx-outputs r))))) (or collateral-msats 0)))
+                       collect r))))))
+
+(defun ladder-fee-delta (rungs txid)
+  "Sats by which the rung with TXID pays more than rung 0 (the collateral it costs), or NIL."
+  (let ((r (find txid rungs :key #'btx:tx-txid :test #'equalp)))
+    (and r (- (btx:txout-value (first (btx:tx-outputs (first rungs)))) (btx:txout-value (first (btx:tx-outputs r)))))))
 
 (defun tier-sighash (tx in-index prevouts leaf)
   "BIP-341 script-path sighash (SIGHASH_DEFAULT) for LEAF.  PREVOUTS is a vector
@@ -98,7 +144,11 @@
   (let* ((leaf (nth tier-index (rs:reserves-leaves reserves)))
          (control (rs:control-block-for-tier reserves tier-index))
          (stack (append (mapcar (lambda (s) (or s (octets))) (reverse signatures)) (list leaf control)))
-         (witnesses (let ((w (copy-list (btx:tx-witnesses tx)))) (setf (nth in-index w) stack) w)))
+         ;; an unsigned transaction parsed from its legacy form carries no witness list
+         (witnesses (let ((w (copy-list (btx:tx-witnesses tx))))
+                      (when (< (length w) (length (btx:tx-inputs tx)))
+                        (setf w (append w (make-list (- (length (btx:tx-inputs tx)) (length w))))))
+                      (setf (nth in-index w) stack) w)))
     (btx:parse-tx (bw:make-reader
                    (btx:serialize-tx
                     (btx:make-tx :version (btx:tx-version tx) :inputs (btx:tx-inputs tx) :outputs (btx:tx-outputs tx)

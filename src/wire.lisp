@@ -14,6 +14,7 @@
                     (#:ev #:cl-nostr.event) (#:k #:cl-nostr.keys) (#:js #:json-simple))
   (:export #:+kind-update+ #:+kind-request+ #:+kind-response+ #:+kind-advertisement+
            #:+kind-fraud-proof+ #:+kind-lottery-reveal+ #:+kind-rotation-tx+ #:rotation-tx-event #:fraud-event #:reveal-event #:reveal-message
+           #:+kind-spend-challenge+ #:+kind-challenge-answer+ #:spend-challenge-event #:challenge-answer-event
            #:event-member #:event-d-tag
            #:nostr-keypair #:update-event #:event->update #:ledger-tag
            #:request-event #:response-event #:advertisement-event
@@ -27,7 +28,9 @@
 (defconstant +kind-advertisement+ 39100)
 (defconstant +kind-fraud-proof+ 9101)
 (defconstant +kind-lottery-reveal+ 9106)
-(defconstant +kind-rotation-tx+ 9107 "DEP-03 Rotation ordering: the signed rotation a QuorumBegin names.")
+(defconstant +kind-rotation-tx+ 9107 "DEP-03 Rotation ordering: a signed rung of the rotation a QuorumBegin names.")
+(defconstant +kind-spend-challenge+ 9111 "DEP-06 §Spend challenge: a QuorumChallenge update, tagged with the spent ledger.")
+(defconstant +kind-challenge-answer+ 9112 "DEP-06 §Spend challenge: the updates that answer a challenge.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys.  A node's protocol key is also its Nostr key.  Nostr sees only the
@@ -138,10 +141,24 @@
                                      "preimage_hex" (bytes->hex preimage) "signature" (bytes->hex signature64)))
                   :tags (list (list "l" ledger-id-hex) (list "member" member-pubkey-hex))))
 
-(defun rotation-tx-event (keypair ledger-id-hex sequence tx-hex)
+(defun rotation-tx-event (keypair ledger-id-hex sequence tx-hex &optional (rung 0))
   (ev:build-event keypair +kind-rotation-tx+
-                  (json (json-object "ledger_id" ledger-id-hex "sequence" sequence "tx" tx-hex))
+                  (json (json-object "ledger_id" ledger-id-hex "sequence" sequence "rung" rung "tx" tx-hex))
                   :tags (list (list "l" ledger-id-hex) (list "d" (subseq ledger-id-hex 0 16)))))
+
+(defun spend-challenge-event (keypair spent-ledger-id-hex txid-hex anchor-hex update-b64)
+  "Kind 9111: the challenger's signed QuorumChallenge update (base64 TLV), tagged l = the spent ledger."
+  (ev:build-event keypair +kind-spend-challenge+
+                  (json (json-object "challenged_ledger_id" spent-ledger-id-hex "txid" txid-hex "anchor" anchor-hex
+                                     "update" update-b64))
+                  :tags (list (list "l" spent-ledger-id-hex) (list "d" (subseq spent-ledger-id-hex 0 16)))))
+
+(defun challenge-answer-event (keypair spent-ledger-id-hex txid-hex anchor-hex updates-b64)
+  "Kind 9112: the signed updates (base64 TLV) answering a challenge of the spent ledger's vault."
+  (ev:build-event keypair +kind-challenge-answer+
+                  (json (json-object "challenged_ledger_id" spent-ledger-id-hex "txid" txid-hex "anchor" anchor-hex
+                                     "updates" (coerce updates-b64 'vector)))
+                  :tags (list (list "l" spent-ledger-id-hex) (list "d" (subseq spent-ledger-id-hex 0 16)))))
 
 (defun event-member (event) (ev:first-tag-value event "member"))
 (defun event-d-tag (event) (ev:first-tag-value event "d"))

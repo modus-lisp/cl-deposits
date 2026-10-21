@@ -138,7 +138,8 @@
   ;; proposers can race (cl and reference); whichever lands is one we verified.
   (signed-confiscations (make-hash-table :test (quote equal) :synchronized t))
   (signed-rotations (make-hash-table :test (quote equal) :synchronized t))   ; ledger id hex -> rotation txids we signed
-  (inflight-rotations (make-hash-table :test (quote equalp) :synchronized t)) ; rotation txid -> signed tx bytes, rebroadcast until confirmed
+  (inflight-rotations (make-hash-table :test (quote equalp) :synchronized t)) ; rung-0 txid -> (:rungs signed bytes :qb-height h), rebroadcast and bumped until one confirms
+  (spend-answers (make-hash-table :test (quote equal) :synchronized t))   ; ledger id hex -> updates answering spend challenges (Kind 9112)
   ;; ledger id hex -> proposed confiscation txs we received, signed or not: a proposal we
   ;; refused (a different view of the cut, a fee we would not pick) may be the one that lands.
   (seen-confiscations (make-hash-table :test (quote equal) :synchronized t))
@@ -202,7 +203,8 @@
           ;; (tens of thousands of events) into this subscription at every start;
           ;; anything we missed while down, catch-up fetches per ledger on demand.
           (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-update+ w:+kind-request+ w:+kind-response+
-                                                              w:+kind-fraud-proof+ w:+kind-lottery-reveal+ w:+kind-rotation-tx+)
+                                                              w:+kind-fraud-proof+ w:+kind-lottery-reveal+ w:+kind-rotation-tx+
+                                                              w:+kind-spend-challenge+ w:+kind-challenge-answer+)
                                                   :since (if (bus:bus-async-p bus) (- (get-universal-time) 2208988800 60) nil))
                              (lambda (event)
                                (cond ((or (null (node-worker node)) (= (ev:event-kind event) w:+kind-response+))
@@ -436,11 +438,11 @@
                                 "content_hash_hex" (bytes->hex (up:content-hash update))
                                 "message_type" 32769
                                 "fork_operator" (and (record-fork-p rec) (bytes->hex (record-fork-operator rec)))
-                                ;; DEP-03 Rotation ordering: cosigners verify the signed rotation itself.
-                                "rotation_tx" (let ((r (record-rotation rec)))
-                                                (and r (getf r :tx)
-                                                     (eq (op:operation-type (op:decode-operation (up:update-message update))) :quorum-begin)
-                                                     (getf r :tx)))
+                                ;; DEP-03 Rotation ordering: cosigners rebuild every rung, unsigned.
+                                "rotation_rungs_tx" (let ((r (record-rotation rec)))
+                                                      (and r (getf r :rungs) (not (getf r :qb-seq))
+                                                           (eq (op:operation-type (op:decode-operation (up:update-message update))) :quorum-begin)
+                                                           (coerce (getf r :rungs) 'vector)))
                                 *extra-cosign-params*))
          (signer-xs (mapcar (lambda (m) (x-hex (lg:member-pubkey m))) signers))
          (attempt 0))
@@ -480,9 +482,10 @@
     (end-cosign-round node update)
     update))
 
-(defun append-operation (node rec op &key (height (height node)))
+(defun append-operation (node rec op &key (height (height node)) op-fn)
   "The operator's one entry point: chain OP onto REC's ledger with whatever
-   cosignatures DEP-05 requires at HEIGHT."
+   cosignatures DEP-05 requires at HEIGHT.  With OP-FN, OP is (funcall OP-FN tip-chain-hash),
+   built under the append lock on the tip it extends (a rotation's anchor, DEP-03)."
   (unless (record-owned-p rec) (fail "not our ledger"))
   ;; Serialised per ledger, cosign round included: the control socket (a
   ;; rotation's QuorumAddMember) and the worker (a wallet's transfer) both
@@ -491,6 +494,7 @@
   ;; traffic a rotation never won that race and only succeeded post-expiry,
   ;; when value-moving operations were being refused and nothing competed.
   (bt:with-lock-held ((record-append-lock rec))
+    (when op-fn (setf op (funcall op-fn (up:chain-hash (tip rec)))))
     ;; Would it apply?  Check on a copy before asking anyone to cosign it.
     ;; ADVERSARY :sign-invalid — an operator that asks its quorum to cosign an
     ;; operation its own validator rejects (red team #1).
@@ -707,14 +711,16 @@
     (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) (- vault-sats fee-sats) 1000) old) 0)))
 
 (defun rotate-vault (node rec &key (ruleset "cltv-offset-v2") (expiry-blocks 4320) (timeout 90) splice)
-  "DEP-03 rotation: spend the current vault into the reserves of the staged quorum
-   with the shared builder (rot:build-rotation), gather the tier's signatures from
-   the current members (rotation_sign; cl and reference members rebuild and verify
-   it identically), assemble, broadcast, and remember it for BEGIN-QUORUM.
-   Returns (values txid new-vault-sats)."
+  "DEP-03 rotation, first step: plan the spend of the current vault into the reserves of the
+   staged quorum with the shared builder (rot:build-ladder).  Nothing is signed yet: BEGIN-QUORUM
+   records the QuorumBegin naming every rung, then gathers the members' signatures on the rungs
+   (rotation_sign), assembles and broadcasts (DEP-03 Rotation ordering).  Returns (values txid
+   new-vault-sats): rung 0 as it would be built on our current tip (BEGIN-QUORUM's answer is the
+   one recorded)."
+  (declare (ignore timeout))
   (unless (record-owned-p rec) (fail "not our ledger"))
   (unless (has-quorum-begin-p rec) (fail "no vault yet: the first QuorumBegin is funded, not rotated"))
-  (when (pending-rotation node rec) (fail "a rotation is already broadcast and awaits its QuorumBegin"))
+  (when (pending-rotation node rec) (fail "a rotation is already recorded and awaits its signatures"))
   (let* ((staged (mapcar #'lg:member-pubkey (lg:ledger-next-quorum-members (record-ledger rec))))
          (new (if (and (record-pinned rec) (equalp (rs:reserves-members (car (record-pinned rec))) staged))
                   (car (record-pinned rec))       ; prepared already (prepare-quorum)
@@ -733,102 +739,162 @@
                             (list (first splice) (second splice) ssats sspk))))
              ;; DEP-20 §8.3: a migration output at our own vault script is spent through the same tier.
              (vault-splice (and splice-in (equalp (fourth splice-in) (rs:reserves-spk cur))))
-             (tx (or (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
-                                         :voters (length (rs:reserves-voters cur))
-                                         :feerate (lg:rotation-feerate (record-ledger rec))
-                                         :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk new)
-                                         :extras extras :splice (and splice-in (subseq splice-in 0 3))
-                                         :splice-vault-p vault-splice)
+             (plan (list :vault-txid (bytes->hex txid) :vault-vout vout :vault-sats sats
+                         :voters (length (rs:reserves-voters cur)) :feerate (lg:rotation-feerate (record-ledger rec))
+                         :locktime (rs:tier-locktime tier) :tier-index tier-index
+                         :new-vault-spk (bytes->hex (rs:reserves-spk new))
+                         :extras (mapcar (lambda (e) (cons (bytes->hex (car e)) (cdr e))) extras)
+                         :splice-in (and splice-in (list (bytes->hex (first splice-in)) (second splice-in) (third splice-in)
+                                                         (bytes->hex (fourth splice-in))))
+                         :splice-vault-p vault-splice
+                         ;; DEP-03 §Fee ladder: a migration output's outpoint is named by txid, so one rung
+                         :max-rungs (if (nth-value 5 (settlement (record-ledger rec) (height node) cutoff)) 1 rot:+rungs+)
+                         :governing-seq (governing-quorum-begin-seq rec (lg:ledger-sequence (record-ledger rec)))))
+             (tx (or (first (plan-ladder plan (up:chain-hash (tip rec)) 0))
                      (fail "the rotation leaves the new vault below dust")))
-             (prevouts (if splice-in
-                           (vector (cons sats (rs:reserves-spk cur)) (cons (third splice-in) (fourth splice-in)))
-                           (vector (cons sats (rs:reserves-spk cur)))))
-             (sighash (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves cur))))
-             (sighash1 (and vault-splice (rot:tier-sighash tx 1 prevouts (nth tier-index (rs:reserves-leaves cur)))))
-             (keys (rs:tier-keys tier))
-             (sigs (list (cons (up:x-only (node-pubkey node)) (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))
-             (sigs1 (and vault-splice
-                         (list (cons (up:x-only (node-pubkey node)) (schnorr:schnorr-sign (node-priv node) sighash1 (random-aux))))))
-             (responses (send-request node (record-id-hex rec) "rotation_sign"
-                                      (w:json-object "sighash" (bytes->hex sighash) "unsigned_tx" (unsigned-tx-hex tx)
-                                                     "tier_index" tier-index
-                                                     "ledger_hash" (bytes->hex (rs:reserves-ledger-hash new))
-                                                     "new_quorum_expiry" expiry "exit_cutoff_height" cutoff
-                                                     "splice_in_outpoint" (and splice-in (format nil "~a:~a" (bytes->hex (first splice-in)) (second splice-in)))
-                                                     "splice_sighash" (and sighash1 (bytes->hex sighash1)))
-                                      :want (max 0 (1- (rs:tier-threshold tier))) :timeout timeout :successes-only t)))
-        (dolist (r responses)
-          (let ((res (w:jget r "result")))
-            (when (and (w:jget r "success") res)
-              (let ((res (if (stringp res) (w:parse-json res) res)))
-                (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
-                  (when (and (member pk keys :test #'equalp) (schnorr:schnorr-verify pk sighash sig)
-                             (not (assoc pk sigs :test #'equalp))
-                             ;; a vault-script splice needs the member's signature on input 1 too
-                             (or (not vault-splice)
-                                 (let ((s1 (and (w:jget res "splice_signature") (hex->bytes (w:jget res "splice_signature")))))
-                                   (and s1 (schnorr:schnorr-verify pk sighash1 s1) (push (cons pk s1) sigs1)))))
-                    (push (cons pk sig) sigs)))))))
-        (when (< (length sigs) (rs:tier-threshold tier))
-          (fail "rotation: only ~a of ~a signatures" (length sigs) (rs:tier-threshold tier)))
-        (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
-               (signed (let ((s (rot:attach-tier-witness tx 0 cur tier-index ordered)))
-                         (cond (vault-splice
-                                (rot:attach-tier-witness s 1 cur tier-index
-                                                         (mapcar (lambda (k) (cdr (assoc k sigs1 :test #'equalp))) keys)))
-                               (splice-in (attach-key-path-witness s 1 (key-path-signature node s 1 prevouts)))
-                               (t s))))
-               (new-sats (btx:txout-value (first (btx:tx-outputs tx)))))
-          (dotimes (i (length (btx:tx-inputs signed)))
-            (unless (rot:verify-spend signed i prevouts) (fail "assembled rotation input ~a does not verify" i)))
-          ;; DEP-03 Rotation ordering: broadcast only after its QuorumBegin (begin-quorum).
-          (let ((rtxid (btx:tx-txid signed)))
-            (save-rotation node rec (list :txid (bytes->hex rtxid) :sats new-sats :vault-sats sats :cutoff cutoff
-                                          :fee (- (+ sats (if splice-in (third splice-in) 0)) (reduce #'+ extras :key #'cdr) new-sats exits-cost dorm-cost)
-                                          :dormancy-cost dorm-cost
-                                          :premium (nth-value 6 (settlement (record-ledger rec) (height node) cutoff))
-                                          :splice (and splice-in (list (bytes->hex (first splice-in)) (second splice-in) (third splice-in)))
-                                          :tx (bytes->hex (btx:serialize-tx signed))
-                                          :ledger-hash (bytes->hex (rs:reserves-ledger-hash new)) :expiry expiry
-                                          :ruleset (rs:reserves-ruleset new)
-                                          :members (mapcar #'bytes->hex (rs:reserves-members new))))
-            (log! node "rotation of ~a signed: ~a:0 (~a sats) spends ~a:~a at tier ~a; awaiting its QuorumBegin" (subseq (record-id-hex rec) 0 8)
-                  (subseq (bytes->hex rtxid) 0 16) new-sats (subseq (bytes->hex txid) 0 16) vout tier-index)
-            (values rtxid new-sats)))))))
+             (new-sats (btx:txout-value (first (btx:tx-outputs tx)))))
+        (save-rotation node rec (list :plan plan :sats new-sats :vault-sats sats :cutoff cutoff
+                                      :tx (unsigned-tx-hex tx)    ; rung 0 as planned on this tip (inspection only)
+                                      :fee (- (+ sats (if splice-in (third splice-in) 0)) (reduce #'+ extras :key #'cdr) new-sats exits-cost dorm-cost)
+                                      :dormancy-cost dorm-cost
+                                      :premium (nth-value 6 (settlement (record-ledger rec) (height node) cutoff))
+                                      :splice (and splice-in (list (bytes->hex (first splice-in)) (second splice-in) (third splice-in)))
+                                      :ledger-hash (bytes->hex (rs:reserves-ledger-hash new)) :expiry expiry
+                                      :ruleset (rs:reserves-ruleset new)
+                                      :members (mapcar #'bytes->hex (rs:reserves-members new))))
+        (log! node "rotation of ~a planned: ~a sats into the next vault, spending ~a:~a at tier ~a; recording its QuorumBegin next"
+              (subseq (record-id-hex rec) 0 8) new-sats (subseq (bytes->hex txid) 0 16) vout tier-index)
+        (values (btx:tx-txid tx) new-sats)))))
+
+(defun plan-ladder (plan anchor collateral-msats)
+  "DEP-03 §Fee ladder: the unsigned rungs ROTATE-VAULT's PLAN gives under ANCHOR (the chain hash
+   the QuorumBegin extends) and COLLATERAL-MSATS (its collateral_amount)."
+  (rot:build-ladder :vault-txid (hex->bytes (getf plan :vault-txid)) :vault-vout (getf plan :vault-vout)
+                    :vault-sats (getf plan :vault-sats) :voters (getf plan :voters) :feerate (getf plan :feerate)
+                    :locktime (getf plan :locktime) :new-vault-spk (hex->bytes (getf plan :new-vault-spk))
+                    :extras (mapcar (lambda (e) (cons (hex->bytes (car e)) (cdr e))) (getf plan :extras))
+                    :splice (let ((sp (getf plan :splice-in))) (and sp (list (hex->bytes (first sp)) (second sp) (third sp))))
+                    :splice-vault-p (getf plan :splice-vault-p) :anchor anchor :collateral-msats collateral-msats
+                    :max-rungs (or (getf plan :max-rungs) rot:+rungs+)))
+
+(defun plan-prevouts (plan cur)
+  (let ((sp (getf plan :splice-in)))
+    (if sp
+        (vector (cons (getf plan :vault-sats) (rs:reserves-spk cur)) (cons (third sp) (hex->bytes (fourth sp))))
+        (vector (cons (getf plan :vault-sats) (rs:reserves-spk cur))))))
+
+(defun sign-rotation-rungs (node rec qb-update &key (timeout 90))
+  "DEP-03 Rotation ordering, steps 3-4: QB-UPDATE (final, published) names the rungs of the
+   pending rotation.  Gather the spent vault's tier signatures on every rung from its members
+   (rotation_sign, carrying QB-UPDATE: a member signs only rungs a final QuorumBegin names),
+   assemble, verify, broadcast rung 0, publish every rung (Kind 9107) and keep them to
+   rebroadcast and bump.  Returns rung 0's txid; signals when too few members sign (the
+   rotation stays pending: DRIVE-ROTATION-REBROADCAST retries)."
+  (let* ((r (or (pending-rotation node rec) (fail "no pending rotation")))
+         (plan (getf r :plan))
+         (rungs (mapcar (lambda (h) (btx:parse-tx (bw:make-reader (hex->bytes h)))) (getf r :rungs)))
+         (cur (or (fr:spent-vault (record-history rec) (getf plan :governing-seq)) (fail "the spent vault's QuorumBegin is gone")))
+         (tier-index (getf plan :tier-index))
+         (tier (nth tier-index (rs:reserves-tiers cur)))
+         (leaf (nth tier-index (rs:reserves-leaves cur)))
+         (prevouts (plan-prevouts plan cur))
+         (vault-splice (getf plan :splice-vault-p))
+         (hashes (mapcar (lambda (tx) (rot:tier-sighash tx 0 prevouts leaf)) rungs))
+         (hashes1 (and vault-splice (mapcar (lambda (tx) (rot:tier-sighash tx 1 prevouts leaf)) rungs)))
+         (keys (if (and (= (rs:tier-threshold tier) 1) (rs:tier-tie-breaker-p tier))
+                   (list (up:x-only (node-pubkey node)))
+                   (rs:tier-keys tier)))
+         (me (up:x-only (node-pubkey node)))
+         ;; (xonly sigs-per-rung splice-sigs-per-rung)
+         (sigs (list (list me (mapcar (lambda (h) (schnorr:schnorr-sign (node-priv node) h (random-aux))) hashes)
+                           (mapcar (lambda (h) (schnorr:schnorr-sign (node-priv node) h (random-aux))) hashes1))))
+         (need (rs:tier-threshold tier)))
+    (when (< (count-if (lambda (s) (member (first s) keys :test #'equalp)) sigs) need)
+      (let ((responses (send-request node (record-id-hex rec) "rotation_sign"
+                                     (w:json-object "quorum_begin" (base64-encode (up:encode-update qb-update))
+                                                    "unsigned_rungs" (coerce (getf r :rungs) 'vector)
+                                                    "tier_index" tier-index
+                                                    "splice_in_outpoint" (let ((sp (getf plan :splice-in)))
+                                                                           (and sp (format nil "~a:~a" (first sp) (second sp)))))
+                                     :want (max 0 (- need (count-if (lambda (s) (member (first s) keys :test #'equalp)) sigs)))
+                                     :timeout timeout :successes-only t)))
+        (dolist (resp responses)
+          (let ((res (w:jget resp "result")))
+            (when (and (w:jget resp "success") res)
+              (let* ((res (if (stringp res) (w:parse-json res) res))
+                     (pk (up:x-only (hex->bytes (w:jget res "signer"))))
+                     (ss (mapcar #'hex->bytes (coerce (or (w:jget res "signatures") #()) 'list)))
+                     (ss1 (mapcar #'hex->bytes (coerce (or (w:jget res "splice_signatures") #()) 'list))))
+                (when (and (member pk keys :test #'equalp) (not (assoc pk sigs :test #'equalp))
+                           (= (length ss) (length hashes)) (every (lambda (h sg) (schnorr:schnorr-verify pk h sg)) hashes ss)
+                           (or (not vault-splice)
+                               (and (= (length ss1) (length hashes1)) (every (lambda (h sg) (schnorr:schnorr-verify pk h sg)) hashes1 ss1))))
+                  (push (list pk ss ss1) sigs))))))))
+    (let ((have (remove-if-not (lambda (s) (member (first s) keys :test #'equalp)) sigs)))
+      (when (< (length have) need)
+        (fail "rotation: only ~a of ~a signatures on its rungs" (length have) need))
+      (let ((signed
+              (loop for tx in rungs for i from 0
+                    collect (let* ((ordered (mapcar (lambda (k) (let ((e (assoc k have :test #'equalp))) (and e (nth i (second e))))) keys))
+                                   (s (rot:attach-tier-witness tx 0 cur tier-index ordered)))
+                              (cond (vault-splice
+                                     (rot:attach-tier-witness s 1 cur tier-index
+                                                              (mapcar (lambda (k) (let ((e (assoc k have :test #'equalp))) (and e (nth i (third e))))) keys)))
+                                    ((getf plan :splice-in) (attach-key-path-witness s 1 (key-path-signature node s 1 prevouts)))
+                                    (t s))))))
+        (dolist (s signed)
+          (dotimes (i (length (btx:tx-inputs s)))
+            (unless (rot:verify-spend s i prevouts) (fail "assembled rotation input ~a does not verify" i))))
+        (let ((bytes (mapcar #'btx:serialize-tx signed)))
+          (note-rotation-rungs node (btx:tx-txid (first signed)) bytes (up:update-block-height qb-update))
+          (when (node-broadcast-fn node)
+            (handler-case (funcall (node-broadcast-fn node) (first bytes))
+              (error (c) (log! node "rotation ~a broadcast failed: ~a" (subseq (bytes->hex (btx:tx-txid (first signed))) 0 16) c))))
+          (loop for b in bytes for i from 0
+                do (bus:bus-publish (node-bus node) (w:rotation-tx-event (node-keypair node) (record-id-hex rec)
+                                                                         (up:update-seq qb-update) (bytes->hex b) i)))
+          (log! node "rotation of ~a broadcast after its QuorumBegin (seq ~a): ~a rungs signed by ~a"
+                (subseq (record-id-hex rec) 0 8) (up:update-seq qb-update) (length signed) (length have))
+          (clear-rotation node rec)
+          (btx:tx-txid (first signed)))))))
 
 (defun begin-quorum (node rec &key funding-txid funding-vout amount-msats collateral-msats splice-collateral-msats
                                    (ruleset "cltv-offset-v2") (expiry-blocks 4320) (spending-txid funding-txid))
   "Promote the staged members: chain a QuorumBegin.  The first one points at the
    outpoint funding the reserves output prepared by PREPARE-QUORUM (or built now);
-   every later one at the rotation ROTATE-VAULT broadcast (DEP-03): a vault is
-   never replaced by a fresh one while the old lingers.  Returns (values update reserves)."
+   every later one names the rungs of the rotation ROTATE-VAULT planned (DEP-03): built on
+   the tip the QuorumBegin extends (their anchor), recorded, then signed and broadcast.  A
+   vault is never replaced by a fresh one while the old lingers.  Returns (values update
+   reserves rotation-txid), the last NIL for a first QuorumBegin or while the rungs await
+   signatures."
   (let ((rotation (and (has-quorum-begin-p rec)
                        (or (pending-rotation node rec)
                            (fail "a rotation must spend the old vault: rotate-vault first")))))
+    (when (and rotation (getf rotation :qb-seq))
+      ;; recorded already; only its signatures are missing
+      (let ((qu (find (getf rotation :qb-seq) (record-history rec) :key #'up:update-seq)))
+        (return-from begin-quorum
+          (values qu (record-reserves rec) (ignore-errors (sign-rotation-rungs node rec qu))))))
     (when rotation
       (let* ((new-msats (* 1000 (getf rotation :sats)))
              (ledger (record-ledger rec))
-             (coll (if (getf rotation :vault-sats)
-                       ;; DEP-20 §4: a splice's value goes to collateral unless told otherwise.
-                       (+ (rotation-collateral ledger (getf rotation :vault-sats) (getf rotation :fee))
-                          (- (* 1000 (+ (or (getf rotation :dormancy-cost) 0) (or (getf rotation :premium) 0))))
-                          (if (getf rotation :splice)
-                              (min (* 1000 (third (getf rotation :splice)))
-                                   (or splice-collateral-msats (* 1000 (third (getf rotation :splice)))))
-                              0))
-                       ;; a rotation saved before DEP-20 exits: no exits, the proportional split
-                       (let ((old (+ (lg:ledger-reserves-amount ledger) (lg:ledger-collateral-amount ledger))))
-                         (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) new-msats) old) 0)))))
-        (setf funding-txid (hex->bytes (getf rotation :txid)) funding-vout 0 spending-txid funding-txid
-              amount-msats (- new-msats coll) collateral-msats coll)
+             (coll (+ (rotation-collateral ledger (getf rotation :vault-sats) (getf rotation :fee))
+                      (- (* 1000 (+ (or (getf rotation :dormancy-cost) 0) (or (getf rotation :premium) 0))))
+                      ;; DEP-20 §4: a splice's value goes to collateral unless told otherwise.
+                      (if (getf rotation :splice)
+                          (min (* 1000 (third (getf rotation :splice)))
+                               (or splice-collateral-msats (* 1000 (third (getf rotation :splice)))))
+                          0))))
+        (setf funding-vout 0 amount-msats (- new-msats coll) collateral-msats coll)
         (unless (record-pinned rec)
           (setf (record-pinned rec)
                 (cons (rs:build-reserves :operator (node-pubkey node) :members (mapcar #'hex->bytes (getf rotation :members))
                                          :ledger-hash (hex->bytes (getf rotation :ledger-hash)) :quorum-expiry (getf rotation :expiry)
                                          :ruleset (getf rotation :ruleset)
                                          :network (intern (string-upcase (node-network node)) :keyword))
-                      (getf rotation :expiry))))))
-  (let* ((ledger (record-ledger rec))
+                      (getf rotation :expiry)))))))
+  (let* ((rotation (and (has-quorum-begin-p rec) (pending-rotation node rec)))
+         (ledger (record-ledger rec))
          (staged (lg:ledger-next-quorum-members ledger))
          (members (mapcar #'lg:member-pubkey staged))
          (pinned (or (record-pinned rec) (progn (prepare-quorum node rec :ruleset ruleset :expiry-blocks expiry-blocks)
@@ -836,13 +902,24 @@
          (reserves (car pinned)) (expiry (cdr pinned)))
     (unless (equalp (rs:reserves-members reserves) members)
       (fail "staged members changed since the reserves were prepared; prepare again"))
-    (let* ((op (list :type :quorum-begin :reserves-id (rs:reserves-address reserves)
-                   :spending-txid spending-txid :new-outpoint-txid funding-txid :new-outpoint-vout funding-vout
-                   :amount amount-msats :quorum-expiry expiry :ledger-hash (rs:reserves-ledger-hash reserves)
-                   :quorum-members members :collateral-amount collateral-msats
-                   :quorum-member-ledger-ids (mapcar #'lg:member-ledger-id staged)
-                   :protocol-version (rs:reserves-ruleset reserves)))
-           (op (if (and rotation (getf rotation :cutoff))
+    (flet ((build-op (anchor)
+             ;; DEP-03: a rotation's rungs carry the chain hash the QuorumBegin extends, so they are
+             ;; built here, on the tip, under the append lock.
+             (let* ((rungs (and rotation
+                                (or (plan-ladder (getf rotation :plan) anchor collateral-msats)
+                                    (fail "the rotation leaves the new vault below dust"))))
+                    (txid (if rungs (btx:tx-txid (first rungs)) funding-txid))
+                    (op (list :type :quorum-begin :reserves-id (rs:reserves-address reserves)
+                              :spending-txid (if rungs txid spending-txid) :new-outpoint-txid txid :new-outpoint-vout funding-vout
+                              :amount amount-msats :quorum-expiry expiry :ledger-hash (rs:reserves-ledger-hash reserves)
+                              :quorum-members members :collateral-amount collateral-msats
+                              :quorum-member-ledger-ids (mapcar #'lg:member-ledger-id staged)
+                              :protocol-version (rs:reserves-ruleset reserves))))
+               (when rungs
+                 (unless (= (btx:txout-value (first (btx:tx-outputs (first rungs)))) (getf rotation :sats))
+                   (fail "the rotation's new vault moved since it was planned; rotate-vault again"))
+                 (setf (getf (record-rotation rec) :rungs) (mapcar #'unsigned-tx-hex rungs)))
+               (if (and rotation (getf rotation :cutoff))
                    (let ((entries (nth-value 1 (settlement ledger (height node) (getf rotation :cutoff))))
                          (dentries (nth-value 2 (settlement ledger (height node) (getf rotation :cutoff))))
                          (mig (nth-value 5 (settlement ledger (height node) (getf rotation :cutoff))))
@@ -857,22 +934,21 @@
                                              :migration-receiver (getf (lg:ledger-dormancy-notice ledger) :receiver)
                                              :migration-vout (getf mig :vout)))
                              (when sp (list :splice-in-outpoint (splice-outpoint-bytes (hex->bytes (first sp)) (second sp))
-                                            :splice-in-amount (* 1000 (third sp))))))
-                   op))
-           (update (append-operation node rec op)))
-      (setf (record-reserves rec) reserves (record-pinned rec) nil)
-      (let ((r (record-rotation rec)))
-        (when (and r (getf r :tx))
-          (let ((tx (hex->bytes (getf r :tx))))
-            (setf (gethash (hex->bytes (getf r :txid)) (node-inflight-rotations node)) tx)
-            (when (node-broadcast-fn node)
-              (handler-case (funcall (node-broadcast-fn node) tx)
-                (error (c) (log! node "rotation ~a broadcast failed: ~a" (getf r :txid) c))))
-            (bus:bus-publish (node-bus node) (w:rotation-tx-event (node-keypair node) (record-id-hex rec)
-                                                                   (up:update-seq update) (getf r :tx)))
-            (log! node "rotation of ~a broadcast after its QuorumBegin (seq ~a)" (subseq (record-id-hex rec) 0 8) (up:update-seq update)))))
-      (clear-rotation node rec)
-      (values update reserves)))))
+                                            :splice-in-amount (* 1000 (third sp))))
+                             (when rungs (list :rotation-rungs (apply #'cat (mapcar #'btx:tx-txid rungs))))))
+                   op))))
+      (let ((update (append-operation node rec nil :op-fn #'build-op)))
+        (setf (record-reserves rec) reserves (record-pinned rec) nil)
+        (if (null rotation)
+            (values update reserves nil)
+            (progn
+              ;; Persisted before anyone signs: a restart resumes at the signatures.
+              (save-rotation node rec (append (list :qb-seq (up:update-seq update)) (record-rotation rec)))
+              (values update reserves
+                      (handler-case (sign-rotation-rungs node rec update)
+                        (error (c) (log! node "rotation of ~a recorded at seq ~a; its rungs await signatures: ~a"
+                                         (subseq (record-id-hex rec) 0 8) (up:update-seq update) c)
+                          nil)))))))))
 
 (defun credit-onchain (node rec deposit-id amount-msats &key txid (vout 0) (funding-address ""))
   (append-operation node rec (list :type :onchain-credit :txid txid :vout vout :deposit-id deposit-id
@@ -906,7 +982,9 @@
                              (handle-update node event)))
         (#.w:+kind-fraud-proof+ (handle-fraud node event))
         (#.w:+kind-lottery-reveal+ (handle-reveal node event))
-        (#.w:+kind-rotation-tx+ (handle-rotation-tx node event)))
+        (#.w:+kind-rotation-tx+ (handle-rotation-tx node event))
+        (#.w:+kind-spend-challenge+ (handle-spend-challenge node event))
+        (#.w:+kind-challenge-answer+ (handle-challenge-answer node event)))
     (error (e) (log! node "event ~a (kind ~a from ~a): ~a" (subseq (ev:event-id event) 0 8) (ev:event-kind event) (subseq (ev:event-pubkey event) 0 8) e))))
 
 (defun handle-response (node event)
@@ -1353,17 +1431,24 @@
   "DEP-20 §3: every output of a rotation must relay — a standard type at or above its dust
    floor — or one bad exit makes the whole rotation unbroadcastable."
   (loop for out in (btx:tx-outputs tx) for i from 0
-        unless (lg:standard-output-p (btx:txout-script out) (btx:txout-value out))
+        unless (or (lg:standard-output-p (btx:txout-script out) (btx:txout-value out))
+                   ;; DEP-03: the anchor, a zero-value OP_RETURN, last (standard: one 32-byte push)
+                   (and (= i (1- (length (btx:tx-outputs tx)))) (rot:anchor-of tx)))
           do (fail "rotation output ~a (~a sats, ~a) would not relay" i (btx:txout-value out)
                    (or (lg:spk-type (btx:txout-script out)) "non-standard script"))))
 
-(defun check-rotation-tx (node rec o tx &optional (height (height node)))
-  "DEP-03 Rotation ordering: TX (signed) is the rotation QuorumBegin O names, of REC's current
-   vault: its txid and output 0, byte-identical unsigned to the rotation we build, and a
-   witness satisfying a tier of the vault to threshold.  Signals otherwise."
-  (unless (and (equalp (btx:tx-txid tx) (op:field o :new-outpoint-txid)) (eql (op:field o :new-outpoint-vout) 0))
-    (fail "rotation_tx is not the QuorumBegin's new outpoint"))
-  (multiple-value-bind (cur txid vout sats) (disputed-reserves node rec)
+(defun rung-tier-index (cur locktime height)
+  "The tier of CUR whose CLTV is LOCKTIME (a rung's nLockTime), when it is open at HEIGHT."
+  (let ((i (position locktime (rs:reserves-tiers cur) :key #'rs:tier-locktime)))
+    (unless (and i (<= locktime (max height 0))) (fail "nLockTime ~a names no tier open at ~a" locktime height))
+    i))
+
+(defun expected-ladder (node rec o height anchor tier-index)
+  "DEP-03: the rungs of the rotation the QuorumBegin O (signed at HEIGHT, extending the update
+   whose chain hash is ANCHOR) records, built from REC as it stood before O at TIER-INDEX.  The
+   new vault is the reserves O's own fields give (members, ledger hash, expiry, ruleset), which
+   must be O's reserves_id.  (values rungs prevouts reserves splice)."
+  (multiple-value-bind (cur txid vout sats operator) (disputed-reserves node rec)
     (let* ((sp (op:field o :splice-in-outpoint))
            (splice (when sp
                      (let ((stxid (subseq sp 0 32)) (svout (be->int sp :start 32)))
@@ -1373,37 +1458,60 @@
                          (list stxid svout ssats sspk)))))
            (prevouts (if splice
                          (vector (cons sats (rs:reserves-spk cur)) (cons (third splice) (fourth splice)))
-                         (vector (cons sats (rs:reserves-spk cur))))))
-      (when splice
-        (unless (rot:verify-spend tx 1 prevouts) (fail "rotation_tx's splice input does not verify")))
-      (multiple-value-bind (signers input tier-index) (fr:vault-spend-signers tx prevouts cur txid vout)
-        (declare (ignore input))
-        (unless tier-index (fail "rotation_tx does not spend the current vault through a tier leaf"))
-        (let ((tier (nth tier-index (rs:reserves-tiers cur))))
-          (unless (>= (length signers) (rs:tier-threshold tier))
-            (fail "rotation_tx carries ~a of ~a valid signatures" (length signers) (rs:tier-threshold tier)))
-          (let* ((ledger (record-ledger rec))
-                 (cutoff (or (op:field o :exit-cutoff-height) (- height lg:+exit-cutoff-margin+)))
-                 (extras (settlement ledger height cutoff))
-                 (exits-cost (nth-value 3 (settlement ledger height cutoff)))
-                 (dorm-cost (nth-value 4 (settlement ledger height cutoff)))
-                 (ours (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
-                                           :feerate (lg:rotation-feerate ledger)
-                                           :voters (length (rs:reserves-voters cur)) :locktime (rs:tier-locktime tier)
-                                           :new-vault-spk (address-spk node (op:field o :reserves-id)) :extras extras
-                                           :splice (and splice (subseq splice 0 3))
-                                           :splice-vault-p (and splice (equalp (fourth splice) (rs:reserves-spk cur))))))
-            (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx tx :witness nil)))
-              (fail "rotation_tx differs from the DEP-03 rotation we build"))
-            (check-relayable tx)
-            (let ((new (btx:txout-value (first (btx:tx-outputs tx)))))
-              (unless (= new (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000))
-                (fail "QuorumBegin amounts do not sum to the rotation's new vault"))
-              (let* ((added (if splice (third splice) 0))
-                     (c0 (- (rotation-collateral ledger sats (- (+ sats added) (reduce #'+ extras :key #'cdr) new exits-cost dorm-cost))
-                            (* 1000 (+ dorm-cost (nth-value 6 (settlement ledger height cutoff)))))))
-                (unless (<= c0 (op:field o :collateral-amount) (+ c0 (* 1000 added)))
-                  (fail "QuorumBegin collateral is not the DEP-20 §3-4 share"))))))))))
+                         (vector (cons sats (rs:reserves-spk cur)))))
+           (tier (or (nth tier-index (rs:reserves-tiers cur)) (fail "tier ~a out of range" tier-index)))
+           (next (rs:build-reserves :operator operator :members (op:field o :quorum-members)
+                                    :ledger-hash (op:field o :ledger-hash) :quorum-expiry (op:field o :quorum-expiry)
+                                    :ruleset (or (op:field o :protocol-version) "cltv-offset-v2")
+                                    :network (intern (string-upcase (node-network node)) :keyword)))
+           (ledger (record-ledger rec))
+           (cutoff (or (op:field o :exit-cutoff-height) (- height lg:+exit-cutoff-margin+))))
+      (unless (equalp (address-spk node (op:field o :reserves-id)) (rs:reserves-spk next))
+        (fail "reserves_id is not the reserves the QuorumBegin's quorum gives"))
+      (values (rot:build-ladder :vault-txid txid :vault-vout vout :vault-sats sats
+                                :feerate (lg:rotation-feerate ledger)
+                                :voters (length (rs:reserves-voters cur)) :locktime (rs:tier-locktime tier)
+                                :new-vault-spk (rs:reserves-spk next) :extras (settlement ledger height cutoff)
+                                :splice (and splice (subseq splice 0 3))
+                                :splice-vault-p (and splice (equalp (fourth splice) (rs:reserves-spk cur)))
+                                :anchor anchor :collateral-msats (op:field o :collateral-amount)
+                                :max-rungs (if (op:field o :migration-manifest) 1 rot:+rungs+))
+              prevouts cur splice))))
+
+(defun check-rotation-rungs (node rec o proposed &optional (height (height node)))
+  "DEP-03 Rotation ordering, step 2: PROPOSED (unsigned rungs, rung order) is, byte for byte, the
+   ladder we build for the QuorumBegin O extending our tip, their txids are O's rotation_rungs
+   (rung 0's its new outpoint), every output relays, and rung 0's amounts are O's.  Signals
+   otherwise.  Nothing is signed on chain yet, so there is no witness to check."
+  (unless proposed (fail "a rotating QuorumBegin must carry rotation_rungs_tx"))
+  (unless (and (equalp (btx:tx-txid (first proposed)) (op:field o :new-outpoint-txid)) (eql (op:field o :new-outpoint-vout) 0)
+               (equalp (op:field o :spending-txid) (op:field o :new-outpoint-txid)))
+    (fail "rung 0 is not the QuorumBegin's new outpoint"))
+  (multiple-value-bind (cur) (disputed-reserves node rec)
+    (let ((tier-index (rung-tier-index cur (btx:tx-locktime (first proposed)) height)))
+      (multiple-value-bind (ours prevouts cur2 splice)
+          (expected-ladder node rec o height (lg:ledger-chain-tip (record-ledger rec)) tier-index)
+        (declare (ignore prevouts cur2))
+        (unless (and ours (= (length ours) (length proposed))
+                     (every (lambda (a b) (equalp (btx:serialize-tx a :witness nil) (btx:serialize-tx b :witness nil))) ours proposed))
+          (fail "rotation_rungs_tx differ from the DEP-03 ladder we build"))
+        (unless (equal (mapcar #'bytes->hex (mapcar #'btx:tx-txid ours)) (mapcar #'bytes->hex (fr:rotation-rungs o)))
+          (fail "rotation_rungs is not the ladder's txids"))
+        (dolist (tx proposed) (check-relayable tx))
+        (let* ((ledger (record-ledger rec)) (tx (first proposed))
+               (vault-sats (nth-value 3 (disputed-reserves node rec)))
+               (cutoff (or (op:field o :exit-cutoff-height) (- height lg:+exit-cutoff-margin+)))
+               (extras (settlement ledger height cutoff))
+               (exits-cost (nth-value 3 (settlement ledger height cutoff)))
+               (dorm-cost (nth-value 4 (settlement ledger height cutoff)))
+               (new (btx:txout-value (first (btx:tx-outputs tx)))))
+          (unless (= new (floor (+ (op:field o :amount) (op:field o :collateral-amount)) 1000))
+            (fail "QuorumBegin amounts do not sum to the rotation's new vault"))
+          (let* ((added (if splice (third splice) 0))
+                 (c0 (- (rotation-collateral ledger vault-sats (- (+ vault-sats added) (reduce #'+ extras :key #'cdr) new exits-cost dorm-cost))
+                        (* 1000 (+ dorm-cost (nth-value 6 (settlement ledger height cutoff)))))))
+            (unless (<= c0 (op:field o :collateral-amount) (+ c0 (* 1000 added)))
+              (fail "QuorumBegin collateral is not the DEP-20 §3-4 share"))))))))
 
 (defun check-reference-feerate (node o height)
   "DEP-03: a recorded reference feerate must lie within the bounds the last 6 blocks give."
@@ -1413,35 +1521,69 @@
         (unless (<= lo f hi) (fail "reference feerate ~a outside [~a, ~a] (median ~a)" f lo hi m))))))
 
 (defun check-quorum-begin-vault (node rec o params &optional (height (height node)))
-  "A QuorumBegin that rotates a current vault is checked against the signed rotation it
-   carries (DEP-03 Rotation ordering), which we then keep rebroadcasting; one with no
-   current vault (the first, or the first after a DisputeAcquire) against the chain."
+  "A QuorumBegin that rotates a current vault is checked against the unsigned rungs it carries
+   (DEP-03 Rotation ordering); one with no current vault (the first, or the first after a
+   DisputeAcquire) against the chain."
   (if (and (has-quorum-begin-p rec) (not (record-fork-p rec)))
-      (let ((hex (or (w:jget params "rotation_tx") (fail "a rotating QuorumBegin must carry rotation_tx"))))
-        (let ((tx (btx:parse-tx (bw:make-reader (hex->bytes hex)))))
-          (check-rotation-tx node rec o tx height)
-          (check-reference-feerate node o height)
-          (setf (gethash (btx:tx-txid tx) (node-inflight-rotations node)) (hex->bytes hex))))
+      (let ((rungs (mapcar (lambda (h) (btx:parse-tx (bw:make-reader (hex->bytes h))))
+                           (coerce (or (w:jget params "rotation_rungs_tx") #()) 'list))))
+        (check-rotation-rungs node rec o rungs height)
+        (check-reference-feerate node o height))
       (progn (check-reserves-outpoint node o) (check-reference-feerate node o height))))
 
+;;; DEP-03 §Fee ladder: every rung of a recorded rotation we hold, (re)broadcast until one confirms.
+;;; Rung i goes out once the QuorumBegin is 6·i blocks old with none confirmed: every holder
+;;; computes the same schedule, so all of them push the same rung.
+
+(defparameter *rung-bump-blocks* 6 "DEP-03: blocks a rung may stay unconfirmed before the next replaces it.")
+
+(defun note-rotation-rungs (node rung0-txid rung-bytes qb-height)
+  "Keep RUNG-BYTES (signed, rung order; NIL where unknown) of the rotation whose rung 0 is RUNG0-TXID."
+  (let* ((e (gethash rung0-txid (node-inflight-rotations node)))
+         (have (and e (getf e :rungs)))
+         (n (max (length rung-bytes) (length have)))
+         (merged (loop for i below n collect (or (nth i rung-bytes) (nth i have)))))
+    (setf (gethash rung0-txid (node-inflight-rotations node))
+          (list :rungs merged :qb-height (or qb-height (and e (getf e :qb-height)) 0)))))
+
 (defun handle-rotation-tx (node event)
-  "Kind 9107: keep a recorded rotation to (re)broadcast, as any watcher may."
+  "Kind 9107: keep a rung of a recorded rotation to (re)broadcast and bump, as any watcher may."
   (ignore-errors
    (let* ((c (w:parse-json (ev:event-content event)))
           (rec (find-record node (w:jget c "ledger_id")))
           (bytes (hex->bytes (w:jget c "tx")))
-          (txid (btx:tx-txid (btx:parse-tx (bw:make-reader bytes)))))
-     (when (and rec (member txid (authorised-spend-txids node rec) :test #'equalp))
-       (setf (gethash txid (node-inflight-rotations node)) bytes)))))
+          (txid (btx:tx-txid (btx:parse-tx (bw:make-reader bytes))))
+          (qu (and rec (find (w:jget c "sequence") (record-history rec) :key #'up:update-seq)))
+          (o (and qu (op:decode-operation (up:update-message qu))))
+          (rungs (and o (eq (op:operation-type o) :quorum-begin) (fr:rotation-rungs o)))
+          (i (and rungs (position txid rungs :test #'equalp))))
+     (when i
+       (note-rotation-rungs node (first rungs) (loop for k from 0 to i collect (and (= k i) bytes)) (up:update-block-height qu))))))
 
 (defun drive-rotation-rebroadcast (node)
-  "DEP-03: rebroadcast every recorded rotation we hold until it confirms."
+  "DEP-03: rebroadcast every recorded rotation we hold until a rung confirms, moving to rung i
+   once its QuorumBegin is 6·i blocks old.  Also resumes the signing of a rotation of ours that
+   was recorded but not yet signed (a restart, or too few members answered)."
+  (loop for rec being the hash-values of (node-ledgers node)
+        when (and (record-owned-p rec) (not (record-fork-p rec)))
+          do (let ((r (pending-rotation node rec)))
+               (when (and r (getf r :qb-seq))
+                 (let ((qu (find (getf r :qb-seq) (record-history rec) :key #'up:update-seq)))
+                   (if qu
+                       (handler-case (sign-rotation-rungs node rec qu :timeout 30)
+                         (error (c) (log! node "rotation of ~a still awaits its rung signatures: ~a" (subseq (record-id-hex rec) 0 8) c)))
+                       (clear-rotation node rec))))))
   (when (and (node-broadcast-fn node) (node-chain-fn node))
-    (loop for txid being the hash-keys of (node-inflight-rotations node) using (hash-value bytes)
-          do (let ((info (ignore-errors (funcall (node-chain-fn node) txid 0))))
-               (if (and info (>= (or (getf info :confirmations) 0) 1))
-                   (remhash txid (node-inflight-rotations node))
-                   (ignore-errors (funcall (node-broadcast-fn node) bytes)))))))
+    (loop for rung0 being the hash-keys of (node-inflight-rotations node) using (hash-value e)
+          do (let* ((rungs (getf e :rungs))
+                    (confirmed (loop for b in rungs
+                                     thereis (and b (let ((info (ignore-errors (funcall (node-chain-fn node) (btx:tx-txid (btx:parse-tx (bw:make-reader b))) 0))))
+                                                      (and info (>= (or (getf info :confirmations) 0) 1)))))))
+               (if confirmed
+                   (remhash rung0 (node-inflight-rotations node))
+                   (let* ((want (min (1- (length rungs)) (max 0 (floor (- (height node) (getf e :qb-height)) *rung-bump-blocks*))))
+                          (b (loop for i from want downto 0 thereis (nth i rungs))))
+                     (when b (ignore-errors (funcall (node-broadcast-fn node) b)))))))))
 
 (defun check-reserves-outpoint (node o)
   "DEP-03: a cosigner verifies the QuorumBegin outpoint against its own chain
@@ -3010,6 +3152,20 @@
         for (u o) = (multiple-value-list (fork-op f :dispute-enter))
         when u minimize (op:field o :last-valid-sequence)))
 
+(defun dispute-anchor (node id-hex)
+  "DEP-03 §On-Chain State Anchor: a confiscation's anchor, the chain hash of the update at the
+   dispute's fork point (the update the DisputeEnter at the lowest last_valid_sequence extends)."
+  (let ((best nil))
+    (dolist (f (forks-of node id-hex))
+      (multiple-value-bind (u o) (fork-op f :dispute-enter)
+        (when (and u (or (null best) (< (op:field o :last-valid-sequence) (car best))))
+          (setf best (cons (op:field o :last-valid-sequence) (up:update-prev-hash u))))))
+    (or (cdr best)
+        (let* ((base (find-record node id-hex)) (lvs (dispute-last-valid-seq node id-hex))
+               (u (and base lvs (find lvs (record-history base) :key #'up:update-seq))))
+          (and u (up:chain-hash u)))
+        (fail "no fork point for ~a's confiscation anchor" (subseq id-hex 0 8)))))
+
 (defun eligibility-floor-sats (node id-hex)
   "obligations x collateral/reserves at the fork point, + the claim fee floor, in the
    reference's integer arithmetic (floor the product, then round msat up to sats)."
@@ -3098,13 +3254,33 @@
           (:ledger-open (setf operator (op:field o :operator-id)))
           (:quorum-begin (setf qb o)))))
     (unless qb (fail "no QuorumBegin"))
-    (values (rs:build-reserves :operator operator :members (op:field qb :quorum-members)
-                               :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
-                               :ruleset (or (op:field qb :protocol-version) "cltv-offset-v2")
-                               :network (intern (string-upcase (node-network node)) :keyword))
-            (op:field qb :new-outpoint-txid) (op:field qb :new-outpoint-vout)
-            (floor (+ (op:field qb :amount) (op:field qb :collateral-amount)) 1000)
-            operator)))
+    (multiple-value-bind (txid sats) (vault-rung node qb)
+      (values (rs:build-reserves :operator operator :members (op:field qb :quorum-members)
+                                 :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
+                                 :ruleset (or (op:field qb :protocol-version) "cltv-offset-v2")
+                                 :network (intern (string-upcase (node-network node)) :keyword))
+              txid (op:field qb :new-outpoint-vout) sats operator))))
+
+(defvar *vault-rungs* (make-hash-table :test #'equalp :synchronized t)
+  "rung-0 txid -> (txid sats): which rung of a fee ladder confirmed (DEP-03), once seen confirmed.")
+
+(defun vault-rung (node qb)
+  "DEP-03 §Fee ladder: the vault QuorumBegin QB created, (values txid sats): output 0 of the rung
+   our chain holds (unspent; once spent, the one we saw confirm), else rung 0 at QB's amounts."
+  (let* ((rungs (fr:rotation-rungs qb)) (vout (op:field qb :new-outpoint-vout))
+         (recorded (floor (+ (op:field qb :amount) (op:field qb :collateral-amount)) 1000))
+         (known (gethash (first rungs) *vault-rungs*)))
+    (cond (known (values-list known))
+          ((or (null (cdr rungs)) (null (node-chain-fn node))) (values (first rungs) recorded))
+          (t (loop for txid in rungs for i from 0
+                   for info = (ignore-errors (funcall (node-chain-fn node) txid vout))
+                   when info
+                     ;; rung 0 holds the recorded amounts; a higher rung, what the chain says
+                     do (let ((sats (if (zerop i) recorded (getf info :value-sats))))
+                          (when (>= (or (getf info :confirmations) 0) 1)
+                            (setf (gethash (first rungs) *vault-rungs*) (list txid sats)))
+                          (return (values txid sats)))
+                   finally (return (values (first rungs) recorded)))))))
 
 (defun confiscation-tier (reserves h)
   "The reserves tier a confiscation signs at height H: the lowest threshold whose
@@ -3227,6 +3403,7 @@
           (confiscation-obligations node id-hex armers (or snapshot (nth-value 2 (lottery-armers node id-hex))))
         (let* ((tier-index (or tier-index (confiscation-tier reserves (height node))))
                (tx (lot:confiscation-tx :vault (list txid vout sats) :swept swept :lottery-spk (lot:lottery-spk lottery)
+                                        :anchor (dispute-anchor node id-hex)
                                         :voters (1+ (length voters)) :locktime (rs:tier-locktime (nth tier-index (rs:reserves-tiers reserves)))
                                         :respectful respectful :fee fee
                                         :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
@@ -3386,88 +3563,73 @@
 ;;; `rotation_sign` {sighash, unsigned_tx, tier_index, ledger_hash, new_quorum_expiry}.
 ;;; A member rebuilds both ends from the replica it holds and signs only that.
 
-(defun check-rotation (node rec proposed tier-index claimed-hash claimed-expiry &optional cutoff splice)
-  "Signal unless PROPOSED is the rotation of REC's current vault at TIER-INDEX into the
-   reserves of its next quorum (staged members, else the current ones) under
-   CLAIMED-HASH / CLAIMED-EXPIRY.  Returns the script-path sighash to sign."
-  (when (record-fork-p rec) (fail "not a base ledger"))
-  (check-not-deposed node rec)
-  (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node rec)
-    (let* ((ledger (record-ledger rec))
-           (me (node-pubkey node))
-           (current (rs:reserves-members reserves))
-           (staged (mapcar #'lg:member-pubkey (lg:ledger-next-quorum-members ledger)))
-           (next (or staged current))
-           (in (first (btx:tx-inputs proposed)))
-           (out (first (btx:tx-outputs proposed)))
-           (tier (or (nth tier-index (rs:reserves-tiers reserves)) (fail "tier_index ~a out of range" tier-index))))
-      (unless (member me current :test #'equalp) (fail "not a current quorum member"))
-      (unless (and (equalp (btx:txin-prev-hash in) txid) (= (btx:txin-prev-index in) vout))
-        (fail "input is not the vault outpoint"))
-      (when (and (node-chain-fn node) (null (funcall (node-chain-fn node) txid vout)))
-        (fail "vault outpoint is spent or unknown"))
-      (unless (= (btx:tx-locktime proposed) (rs:tier-locktime tier))
-        (fail "lock_time ~a is not tier ~a's ~a" (btx:tx-locktime proposed) tier-index (rs:tier-locktime tier)))
-      (let ((expected (rs:build-reserves :operator operator :members next :ledger-hash claimed-hash
-                                         :quorum-expiry claimed-expiry
-                                         :ruleset (or (lg:ledger-active-ruleset ledger) "cltv-offset-v2")
-                                         :network (intern (string-upcase (node-network node)) :keyword))))
-        (unless (equalp (btx:txout-script out) (rs:reserves-spk expected))
-          (fail "output is not the next quorum's reserves"))
-        ;; DEP-03 "Rotation transaction": shape and fee are rules; sign only the one we build.
-        (let* ((h (height node))
-               (cutoff (or cutoff (- h lg:+exit-cutoff-margin+)))
-               (ours (progn (unless (<= (- h lg:+exit-cutoff-margin+ 6) cutoff (+ h 6))
-                              (fail "exit_cutoff_height ~a outside [~a, ~a]" cutoff (- h lg:+exit-cutoff-margin+ 6) (+ h 6)))
-                            (rot:build-rotation :vault-txid txid :vault-vout vout :vault-sats sats
-                                                :feerate (lg:rotation-feerate ledger)
-                                                :voters (length (rs:reserves-voters reserves))
-                                                :locktime (rs:tier-locktime tier) :new-vault-spk (rs:reserves-spk expected)
-                                                :extras (settlement ledger h cutoff)
-                                                :splice (and splice (list (first splice) (second splice) (third splice)))
-                                                :splice-vault-p (and splice (equalp (fourth splice) (rs:reserves-spk reserves)))))))
-          (unless (and ours (equalp (btx:serialize-tx ours :witness nil) (btx:serialize-tx proposed :witness nil)))
-            (fail "rotation tx differs from the DEP-03 rotation we build"))))
-      (let ((prevouts (if splice
-                          (vector (cons sats (rs:reserves-spk reserves)) (cons (third splice) (fourth splice)))
-                          (vector (cons sats (rs:reserves-spk reserves)))))
-            (leaf (nth tier-index (rs:reserves-leaves reserves))))
-        ;; second value: input 1's sighash when the splice-in sits at the vault's own script
-        (values (rot:tier-sighash proposed 0 prevouts leaf)
-                (and splice (equalp (fourth splice) (rs:reserves-spk reserves))
-                     (rot:tier-sighash proposed 1 prevouts leaf)))))))
-
 (defun parse-splice-param (node param)
   "\"txidhex:vout\" (rotation_sign) -> (txid vout sats spk), looked up on our chain (DEP-20 §4)."
   (when param
     (let* ((colon (position #\: param)) (txid (hex->bytes (subseq param 0 colon))) (vout (parse-integer param :start (1+ colon))))
       (multiple-value-bind (sats spk) (splice-prevout node txid vout) (list txid vout sats spk)))))
 
+(defun pre-update-view (rec seq)
+  "REC as it stood before sequence SEQ: a scratch record whose history and ledger stop at SEQ - 1."
+  (if (< (lg:ledger-sequence (record-ledger rec)) seq)
+      rec
+      (let ((hist (remove-if (lambda (u) (>= (up:update-seq u) seq)) (record-history rec))))
+        (make-record :id-hex (record-id-hex rec) :owned-p (record-owned-p rec) :history hist
+                     :ledger (lg:replay (reverse hist))))))
+
 (defun handle-rotation-sign (node event params)
+  "DEP-03 Rotation ordering, step 3: sign the rungs a FINAL QuorumBegin names, never a vault
+   spend no QuorumBegin names.  The QuorumBegin (carried) must be operator-signed and cosigned to
+   its requirement, extend our replica, and its rungs be the ladder we build from the ledger as it
+   stood before it.  One signature per rung (and per rung for a vault-script splice-in)."
   (let* ((id (w:event-ledger-id event)) (rec (find-record node id)))
     (unless rec (return-from handle-rotation-sign nil))
     (handler-case
-        (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (fail "no unsigned_tx"))))))
-               (tier-index (or (w:jget params "tier_index") 0))
-               (claimed-hash (hex->bytes (or (w:jget params "ledger_hash") (fail "no ledger_hash"))))
-               (claimed-expiry (or (w:jget params "new_quorum_expiry") (fail "no new_quorum_expiry")))
-               (expected1 nil)
-               (expected (multiple-value-bind (s0 s1)
-                             (check-rotation node rec proposed tier-index claimed-hash claimed-expiry
-                                             (w:jget params "exit_cutoff_height")
-                                             (parse-splice-param node (w:jget params "splice_in_outpoint")))
-                           (setf expected1 s1) s0)))
-          (unless (equalp expected (hex->bytes (or (w:jget params "sighash") (fail "no sighash"))))
-            (fail "sighash is not the rotation's"))
-          (check-relayable proposed)
-          (log! node "signing rotation of ~a at tier ~a" (subseq id 0 8) tier-index)
-          ;; Its QuorumBegin follows only once the rotation confirms; until then the
-          ;; vault watch must not take our own signature for a theft.
-          (pushnew (btx:tx-txid proposed) (gethash id (node-signed-rotations node)) :test #'equalp)
-          (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
-                                                       "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux)))
-                                                       ;; DEP-03: a vault-script splice-in is signed through the same tier
-                                                       "splice_signature" (and expected1 (bytes->hex (schnorr:schnorr-sign (node-priv node) expected1 (random-aux)))))))
+        (let* ((qu (up:decode-update (base64-decode (or (w:jget params "quorum_begin") (fail "no quorum_begin")))))
+               (o (op:decode-operation (up:update-message qu)))
+               (proposed (mapcar (lambda (h) (btx:parse-tx (bw:make-reader (hex->bytes h))))
+                                 (coerce (or (w:jget params "unsigned_rungs") (fail "no unsigned_rungs")) 'list)))
+               (tier-index (or (w:jget params "tier_index") 0)))
+          (when (record-fork-p rec) (fail "not a base ledger"))
+          (unless (eq (op:operation-type o) :quorum-begin) (fail "not a QuorumBegin"))
+          (unless (and (equalp (up:update-ledger-id qu) (hex->bytes id)) (equalp (up:update-operator-id qu) (lg:ledger-operator-key (record-ledger rec)))
+                       (up:verify-operator-signature qu))
+            (fail "the QuorumBegin is not this ledger's operator's"))
+          ;; it extends what we hold: our tip, or (applied already) the update before it
+          (when (< (lg:ledger-sequence (record-ledger rec)) (1- (up:update-seq qu))) (catch-up node rec))
+          (let* ((view (pre-update-view rec (up:update-seq qu)))
+                 (vtip (tip view)))
+            (unless (and vtip (equalp (up:chain-hash vtip) (up:update-prev-hash qu)) (= (up:update-seq qu) (1+ (up:update-seq vtip))))
+              (fail "the QuorumBegin does not extend our replica"))
+            (multiple-value-bind (required signers) (lg:cosign-requirement (record-ledger view) o (up:update-block-height qu))
+              (multiple-value-bind (ok why) (up:verify-cosignatures qu :quorum (mapcar #'lg:member-pubkey signers) :threshold required)
+                (unless ok (fail "the QuorumBegin is not final: ~a" why))))
+            (check-not-deposed node view)
+            (multiple-value-bind (cur) (disputed-reserves node view)
+              (unless (member (node-pubkey node) (rs:reserves-members cur) :test #'equalp) (fail "not a member of the spent vault"))
+              (unless (eql tier-index (rung-tier-index cur (btx:tx-locktime (first proposed)) (up:update-block-height qu)))
+                (fail "tier_index is not the rungs' tier")))
+            (multiple-value-bind (ours prevouts cur splice)
+                (expected-ladder node view o (up:update-block-height qu) (up:update-prev-hash qu) tier-index)
+              (unless (and ours (= (length ours) (length proposed))
+                           (every (lambda (a b) (equalp (btx:serialize-tx a :witness nil) (btx:serialize-tx b :witness nil))) ours proposed)
+                           (equal (mapcar #'bytes->hex (mapcar #'btx:tx-txid ours)) (mapcar #'bytes->hex (fr:rotation-rungs o))))
+                (fail "the rungs are not the ladder the QuorumBegin names"))
+              (when (and (node-chain-fn node) (null (funcall (node-chain-fn node) (btx:txin-prev-hash (first (btx:tx-inputs (first ours))))
+                                                             (btx:txin-prev-index (first (btx:tx-inputs (first ours)))))))
+                (fail "vault outpoint is spent or unknown"))
+              (dolist (tx ours) (check-relayable tx))
+              (let ((leaf (nth tier-index (rs:reserves-leaves cur)))
+                    (vault-splice (and splice (equalp (fourth splice) (rs:reserves-spk cur)))))
+                (log! node "signing the ~a rungs of ~a's rotation (QuorumBegin seq ~a) at tier ~a"
+                      (length ours) (subseq id 0 8) (up:update-seq qu) tier-index)
+                (respond node event t
+                         :result (w:json-object
+                                  "signer" (node-pubkey-hex node)
+                                  "signatures" (coerce (mapcar (lambda (tx) (bytes->hex (schnorr:schnorr-sign (node-priv node) (rot:tier-sighash tx 0 prevouts leaf) (random-aux)))) ours) 'vector)
+                                  ;; DEP-03: a vault-script splice-in is signed through the same tier
+                                  "splice_signatures" (and vault-splice
+                                                           (coerce (mapcar (lambda (tx) (bytes->hex (schnorr:schnorr-sign (node-priv node) (rot:tier-sighash tx 1 prevouts leaf) (random-aux)))) ours) 'vector))))))))
       (error (e) (log! node "refused rotation_sign for ~a: ~a" (subseq id 0 8) e)
         (respond node event nil :error (princ-to-string e))))))
 
@@ -4247,29 +4409,12 @@
                    (when sp (pushnew (reverse (hex->bytes (subseq line (1+ sp))))
                                      (gethash (subseq line 0 sp) (node-known-confiscations node)) :test #'equalp))))))))
 
-(defun authorised-spend-txids (node rec)
-  "The rotations of REC's vault: every rotation it recorded (a QuorumBegin's new outpoint is the
-   previous vault's spender), and the ones we signed or broadcast whose QuorumBegin has not
-   landed yet.  A confiscation is authorised by AUTHORISED-SPEND-P, never by a list."
-  (let ((ids '()))
-    (dolist (u (record-history rec))
-      (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-        (when (and o (eq (op:operation-type o) :quorum-begin)) (push (op:field o :new-outpoint-txid) ids))))
-    (dolist (txid (gethash (record-id-hex rec) (node-signed-rotations node))) (pushnew txid ids :test #'equalp))
-    (let ((r (record-rotation rec))) (when r (pushnew (hex->bytes (getf r :txid)) ids :test #'equalp)))
-    ids))
-
-(defun authorised-spend-p (node rec tx &key spend-height updates)
-  "DEP-06: TX's spend of REC's vault is a recorded rotation, or byte-for-byte the confiscation
-   the rules build from public state (REBUILT-CONFISCATION-P).  A verifier that missed the
-   dispute rebuilds it from the relay; nothing is excused because we happen to know of it."
-  (or (member (btx:tx-txid tx) (authorised-spend-txids node rec) :test #'equalp)
-      (rebuilt-confiscation-p node (record-id-hex rec) tx :spend-height spend-height :updates updates)))
-
-;; DEP-06 proof 10 "Recorded rotation": a replica that lags (a gap, an update it never received)
-;; must not mistake a rotation for a theft.  The QuorumBegin is on the relay before the rotation
-;; is broadcast (DEP-03 Rotation ordering), so a judge consults the relay's updates past its
-;; replica before it calls a spend unauthorised; one that cannot read the relay judges nothing.
+;;; DEP-06 §Spend challenge.  A vault spend is judged by its anchor H (its last output): none is
+;;; theft on its face; with one, H names the one place in the ledger that must answer for it.  A
+;;; judge looks for the answer among everything it holds of the spent ledger, the relay's copies,
+;;; and the answers others published (Kind 9112).  Finding nothing proves nothing: the judge
+;;; challenges (QuorumChallenge on its own ledger, Kind 9111) and proves the spend only when the
+;;; challenge lapses unanswered.
 
 (defun relay-updates-past (node id-hex from &key (page 200) (max-pages 1000))
   "Every update the relays hold of ID-HEX at sequence FROM or later, a page of sequences at a
@@ -4278,18 +4423,102 @@
         for got = (ledger-updates-from-relays node id-hex :from lo :to (+ lo page -1))
         while got append got))
 
-(defun recorded-rotation-p (node rec qb-seq txid)
-  "TXID is a recorded rotation of REC's vault under the QuorumBegin at QB-SEQ, judged on our
-   replica and the relay's updates past it together (FR:ROTATION-EXCUSED-P).  Signals when the
-   relay holds nothing at our tip (unreachable), so the caller retries instead of judging."
-  (let* ((id (record-id-hex rec)) (history (record-history rec))
-         (tip (lg:ledger-sequence (record-ledger rec))))
-    (unless (ledger-updates-from-relays node id :from tip :to tip)
-      (error "the relay holds nothing of ~a at our tip ~a" (subseq id 0 8) tip))
-    (let ((open (or (find 0 history :key #'up:update-seq)
-                    (first (ledger-updates-from-relays node id :from 0 :to 0)))))
-      (fr:rotation-excused-p (append (and open (list open)) history (relay-updates-past node id (1+ tip)))
-                             qb-seq txid))))
+(defun spend-answer-updates (node id-hex gseq)
+  "Everything we can find of ID-HEX past its QuorumBegin at GSEQ: our replica, the relay's copies
+   past it (signals when the relay holds nothing at all of the ledger, so the caller judges later),
+   and the answers published to challenges of it."
+  (let* ((rec (find-record node id-hex))
+         (history (and rec (not (record-fork-p rec)) (record-history rec)))
+         (relay (relay-updates-past node id-hex (1+ gseq))))
+    (unless (or relay (ledger-updates-from-relays node id-hex :from gseq :to gseq))
+      (error "the relay holds nothing of ~a at ~a" (subseq id-hex 0 8) gseq))
+    (append history relay (gethash id-hex (node-spend-answers node)))))
+
+(defun spend-answered-p (node id-hex tx gseq reserves tier-index &key spend-height)
+  "DEP-06 §Spend challenge: TX's spend of ID-HEX's vault (under the QuorumBegin at GSEQ, its
+   witness at TIER-INDEX of RESERVES) has an answer we can find: the QuorumBegin that is the child
+   of its anchor and names it (FR:ROTATION-ANSWER), or the confiscation the rules rebuild from
+   public state.  NIL for an unanchored spend.  Signals when we cannot read the relay."
+  (let ((anchor (rot:anchor-of tx)))
+    (when anchor
+      (let ((updates (spend-answer-updates node id-hex gseq)))
+        (or (fr:rotation-answer updates anchor (btx:tx-txid tx) reserves tier-index)
+            (rebuilt-confiscation-p node id-hex tx :spend-height spend-height
+                                                   :updates (append (ledger-updates-from-relays node id-hex) updates)))))))
+
+(defun authorised-spend-p (node rec tx &key spend-height)
+  "DEP-06 §Spend challenge: TX's spend of one of REC's vaults is answered (a rotation naming it,
+   or the confiscation the rules rebuild from public state).  The tier is read from TX's witness
+   leaf (0 when unsigned)."
+  (loop for u in (record-history rec)
+        for o = (ignore-errors (op:decode-operation (up:update-message u)))
+        thereis (and o (eq (op:operation-type o) :quorum-begin)
+                     (multiple-value-bind (reserves rungs vout) (fr:spent-vault (record-history rec) (up:update-seq u))
+                       (let ((i (and reserves (position-if (lambda (in) (and (member (btx:txin-prev-hash in) rungs :test #'equalp)
+                                                                             (= (btx:txin-prev-index in) vout)))
+                                                           (btx:tx-inputs tx)))))
+                         (when i
+                           (let* ((stack (nth i (btx:tx-witnesses tx)))
+                                  (tier (or (and (>= (length stack) 3) (position (nth (- (length stack) 2) stack) (rs:reserves-leaves reserves) :test #'equalp)) 0)))
+                             (spend-answered-p node (record-id-hex rec) tx (up:update-seq u) reserves tier :spend-height spend-height))))))))
+
+(defun open-spend-challenge (node e)
+  "Record the challenge of owed entry E's anchored spend on our own ledger (QuorumChallenge,
+   cosigned as any update) and publish it (Kind 9111).  Returns the challenge update, or NIL when
+   we hold no ledger of our own to record it on."
+  (let ((own (and (node-member-ledger-hex node) (find-record node (node-member-ledger-hex node)))))
+    (when (and own (record-owned-p own))
+      (let* ((tx (btx:parse-tx (bw:make-reader (hex->bytes (getf e :tx)))))
+             (u (append-operation node own (list :type :quorum-challenge
+                                                 :challenged-ledger-id (hex->bytes (getf e :id))
+                                                 :challenged-txid (btx:tx-txid tx)
+                                                 :challenged-anchor (rot:anchor-of tx)))))
+        (bus:bus-publish (node-bus node) (w:spend-challenge-event (node-keypair node) (getf e :id) (bytes->hex (btx:tx-txid tx))
+                                                                  (bytes->hex (rot:anchor-of tx)) (base64-encode (up:encode-update u))))
+        u))))
+
+(defun handle-spend-challenge (node event)
+  "Kind 9111: a challenge of a spend of a vault we follow.  If we hold its answer (the rotation's
+   QuorumBegin, or the confiscation's dispute on our fork), publish it (Kind 9112): anyone may
+   answer, not only the accused."
+  (ignore-errors
+   (let* ((c (w:parse-json (ev:event-content event)))
+          (id (w:jget c "challenged_ledger_id"))
+          (txid (hex->bytes (w:jget c "txid"))) (anchor (hex->bytes (w:jget c "anchor")))
+          (rec (find-record node id)))
+     (when (and rec (not (record-fork-p rec)))
+       (let ((answer (find-if (lambda (u) (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                                            (and o (eq (op:operation-type o) :quorum-begin) (equalp (up:update-prev-hash u) anchor)
+                                                 (member txid (fr:rotation-rungs o) :test #'equalp))))
+                              (record-history rec)))
+             (fork (find-if (lambda (f) (and (record-confiscation f) (equalp (btx:tx-txid (record-confiscation f)) txid)))
+                            (forks-of node id))))
+         (cond (answer
+                (log! node "answering the challenge of ~a's spend ~a: its rotation's QuorumBegin (seq ~a)"
+                      (subseq id 0 8) (subseq (bytes->hex txid) 0 16) (up:update-seq answer))
+                (bus:bus-publish (node-bus node) (w:challenge-answer-event (node-keypair node) id (bytes->hex txid) (bytes->hex anchor)
+                                                                           (list (base64-encode (up:encode-update answer))))))
+               (fork
+                (log! node "answering the challenge of ~a's spend ~a: our dispute fork" (subseq id 0 8) (subseq (bytes->hex txid) 0 16))
+                (bus:bus-publish (node-bus node) (w:challenge-answer-event (node-keypair node) id (bytes->hex txid) (bytes->hex anchor)
+                                                                           (mapcar (lambda (u) (base64-encode (up:encode-update u)))
+                                                                                   (remove-if (lambda (u) (equalp (up:update-operator-id u)
+                                                                                                                  (lg:ledger-operator-key (record-ledger rec))))
+                                                                                              (record-history fork))))))))))))
+
+(defun handle-challenge-answer (node event)
+  "Kind 9112: keep the updates answering a challenge, for every later judgement of that ledger's spends."
+  (ignore-errors
+   (let* ((c (w:parse-json (ev:event-content event)))
+          (id (w:jget c "challenged_ledger_id"))
+          (updates (loop for b in (coerce (or (w:jget c "updates") #()) 'list)
+                         for u = (ignore-errors (up:decode-update (base64-decode b)))
+                         when (and u (equalp (up:update-ledger-id u) (hex->bytes id))) collect u)))
+     (when updates
+       (let ((have (gethash id (node-spend-answers node))))
+         (dolist (u updates)
+           (unless (member (up:chain-hash u) have :key #'up:chain-hash :test #'equalp) (push u have)))
+         (setf (gethash id (node-spend-answers node)) (subseq have 0 (min 64 (length have)))))))))
 
 (defparameter *vault-spend-grace-blocks* 3
   "A rotation's QuorumBegin may reach us a block or two after the spend confirms, so a
@@ -4334,8 +4563,9 @@
                                  when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
                                    collect (up:update-seq u))))
                   (dolist (seq (subseq qbs 0 (min 2 (length qbs))))
-                    (multiple-value-bind (reserves txid vout) (fr::spent-vault (record-history rec) seq)
-                      (when reserves (push (list rec seq txid vout) out)))))))
+                    ;; DEP-03 §Fee ladder: output 0 of every rung (only one can confirm)
+                    (multiple-value-bind (reserves rungs vout) (fr:spent-vault (record-history rec) seq)
+                      (when reserves (dolist (txid rungs) (push (list rec seq txid vout) out))))))))
     out))
 
 (defun drive-vault-watch (node)
@@ -4464,8 +4694,10 @@
 (defun vault-spend-key (id-hex txid) (format nil "~a:~a" id-hex (txid-hex txid)))
 
 (defun note-vault-spend (node rec spend &optional qb-seq)
-  "If SPEND (of REC's vault under the QuorumBegin at QB-SEQ, default the latest) is a theft,
-   record what we owe for it; T when newly recorded."
+  "DEP-06: judge SPEND of REC's vault (under the QuorumBegin at QB-SEQ, default the latest).
+   Answered (a rotation or confiscation names it): nothing.  Unanchored: an owed theft, proven at
+   once.  Anchored and unanswered: an owed challenge, never a proof until it lapses.  T when newly
+   recorded; signals (the scan retries) when we cannot read the relay."
   (let* ((id (record-id-hex rec))
          (tx (btx:parse-tx (bw:make-reader (hex->bytes (getf spend :tx)))))
          (key (vault-spend-key id (btx:tx-txid tx))))
@@ -4473,24 +4705,52 @@
       (let* ((qb (or qb-seq (governing-quorum-begin-seq rec (lg:ledger-sequence (record-ledger rec)))))
              (probe (fr:make-unauthorized-vault-spend-proof (node-pubkey node) (hex->bytes id) (hex->bytes id) qb tx
                                                            (getf spend :prevouts) (getf spend :block-hash))))
-        (multiple-value-bind (reserves vtxid vvout) (fr::spent-vault (record-history rec) qb)
-          (let ((signers (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves vtxid vvout)))
-            (when (and signers (not (authorised-spend-p node rec tx :spend-height (getf spend :height)))
-                       (not (when (recorded-rotation-p node rec qb (btx:tx-txid tx))
-                              (log! node "vault watch: ~a's spend ~a is a rotation recorded on the relay (our replica lags)"
-                                    (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16))
-                              t)))
-              (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which no rotation or confiscation accounts for; ~a signers"
-                    (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16) (length signers))
-              (setf (gethash key (node-reported-vault-spend node))
-                    (list :id id :qb qb :tx (getf spend :tx) :height (getf spend :height)
-                          :block-hash (bytes->hex (getf spend :block-hash))
-                          :prevouts (getf (getf probe :evidence) :prevouts)
-                          :signers (mapcar #'bytes->hex signers) :published '()))
-              t)))))))
+        (multiple-value-bind (reserves rungs vvout) (fr:spent-vault (record-history rec) qb)
+          (multiple-value-bind (signers idx tier-index)
+              (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves rungs vvout)
+            (declare (ignore idx))
+            (when signers
+              (let ((anchor (rot:anchor-of tx)))
+                (cond ((spend-answered-p node id tx qb reserves tier-index :spend-height (getf spend :height))
+                       (log! node "vault watch: ~a's spend ~a is answered by its anchor (~a)" (subseq id 0 8)
+                             (subseq (txid-hex (btx:tx-txid tx)) 0 16) (if (rot:anchor-of tx) "a rotation or confiscation" "-"))
+                       nil)
+                      (t
+                       (if anchor
+                           (log! node "VAULT SPEND CHALLENGED: ~a's reserves were spent by ~a, anchored at ~a, and nothing we hold answers it; challenging (~a signers)"
+                                 (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16) (subseq (bytes->hex anchor) 0 16) (length signers))
+                           (log! node "VAULT SPEND: ~a's reserves were spent by ~a, which carries no anchor: theft on its face; ~a signers"
+                                 (subseq id 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16) (length signers)))
+                       (setf (gethash key (node-reported-vault-spend node))
+                             (list :id id :qb qb :tx (getf spend :tx) :height (getf spend :height)
+                                   :block-hash (bytes->hex (getf spend :block-hash))
+                                   :prevouts (getf (getf probe :evidence) :prevouts)
+                                   :form (if anchor :challenge :unanchored) :tier tier-index
+                                   :signers (mapcar #'bytes->hex signers) :published '()))
+                       t))))))))))
+
+(defun lapsed-challenge (node e)
+  "For owed challenge E: (values challenge-update lapse-block-hash new-challenge-hex), the first
+   two once its window has passed (the caller then checks for an answer); NIL while open.  Opens
+   the challenge first if it is not yet (third value: the update to remember)."
+  (let* ((opened (unless (getf e :challenge)
+                   (let ((u (ignore-errors (open-spend-challenge node e))))
+                     (when u
+                       (log! node "challenge of ~a's spend recorded on our ledger at seq ~a" (subseq (getf e :id) 0 8) (up:update-seq u))
+                       (bytes->hex (up:encode-update u))))))
+         (hex (or (getf e :challenge) opened))
+         (cu (and hex (up:decode-update (hex->bytes hex)))))
+    (if (null cu)
+        (values nil nil opened)
+        (let* ((rec (find-record node (getf e :id)))
+               (w (fr:spend-window (if rec (record-history rec) (ledger-updates-from-relays node (getf e :id))) (getf e :qb)))
+               (end (+ (max (up:update-block-height cu) (or (getf e :height) 0)) w))
+               (hash (and (>= (height node) end) (node-block-hash-fn node) (funcall (node-block-hash-fn node) end))))
+          (values (and hash cu) hash opened)))))
 
 (defun publish-owed-vault-spends (node)
-  "Publish every owed theft proof not yet published; T if anything changed."
+  "Publish every owed theft proof not yet published; T if anything changed.  An owed challenge
+   is re-judged each pass: answered, it is done; lapsed, its proofs go out in the lapsed form."
   (let ((changed nil) (h (height node)))
     (loop for key being the hash-keys of (node-reported-vault-spend node) using (hash-value e)
           when (and (listp e) (not (getf e :done)))
@@ -4504,24 +4764,41 @@
                                 (setf (node-vault-scanned node) (min (or (node-vault-scanned node) 0) (1- (getf e :height)))))
                               (log! node "vault spend ~a: its block was reorganised out; re-checking" (subseq key 0 8))
                               (setf changed t))
-                   (let ((tx (btx:parse-tx (bw:make-reader (hex->bytes (getf e :tx)))))
-                         (prevouts (coerce (fr::parse-prevouts (getf e :prevouts)) 'list))
-                         (bh (hex->bytes (getf e :block-hash))) (complete t))
-                     (dolist (xh (getf e :signers))
-                       (let ((x (hex->bytes xh)))
-                         ;; x-only key; the operated ledgers are advertised under the full key, either parity
-                         (dolist (full (list (cat (octets 2) x) (cat (octets 3) x)))
-                           (multiple-value-bind (targets ok) (ledgers-operated-by node full :strict t)
-                             (unless ok (setf complete nil))
-                             (dolist (target targets)
-                               (let ((pk (format nil "~a:~a" (bytes->hex full) target)))
-                                 (unless (member pk (getf e :published) :test #'string=)
-                                   (log! node "vault spend: ~a signed it; proof against its ledger ~a" (subseq xh 0 8) (subseq target 0 8))
-                                   (broadcast-fraud node (fr:make-unauthorized-vault-spend-proof
-                                                          full (hex->bytes target) (hex->bytes (getf e :id)) (getf e :qb) tx prevouts bh))
-                                   (push pk (getf e :published))
-                                   (setf changed t))))))))
-                     (when (and complete (> h (+ (or (getf e :height) 0) *vault-spend-publish-blocks*)))
+                   (let* ((tx (btx:parse-tx (bw:make-reader (hex->bytes (getf e :tx)))))
+                          (prevouts (coerce (fr::parse-prevouts (getf e :prevouts)) 'list))
+                          (bh (hex->bytes (getf e :block-hash))) (complete t)
+                          (lapse nil) (cu nil))
+                     ;; an entry kept before forms existed is judged by its anchor
+                     (unless (getf e :form) (setf (getf e :form) (if (rot:anchor-of tx) :challenge :unanchored)))
+                     (when (eq (getf e :form) :challenge)
+                       (multiple-value-bind (c l opened) (lapsed-challenge node e)
+                         (setf cu c lapse l)
+                         (when opened (setf (getf e :challenge) opened changed t)))
+                       (multiple-value-bind (reserves) (fr:spent-vault (let ((r (find-record node (getf e :id)))) (if r (record-history r) '())) (getf e :qb))
+                         (when (and reserves (ignore-errors (spend-answered-p node (getf e :id) tx (getf e :qb) reserves (getf e :tier)
+                                                                              :spend-height (getf e :height))))
+                           (log! node "the challenge of ~a's spend ~a is answered; nothing to prove" (subseq (getf e :id) 0 8)
+                                 (subseq (txid-hex (btx:tx-txid tx)) 0 16))
+                           (setf (getf e :done) t (getf e :answered) t lapse nil changed t))))
+                     (when (or (eq (getf e :form) :unanchored) lapse)
+                       (dolist (xh (getf e :signers))
+                         (let ((x (hex->bytes xh)))
+                           ;; x-only key; the operated ledgers are advertised under the full key, either parity
+                           (dolist (full (list (cat (octets 2) x) (cat (octets 3) x)))
+                             (multiple-value-bind (targets ok) (ledgers-operated-by node full :strict t)
+                               (unless ok (setf complete nil))
+                               (dolist (target targets)
+                                 (let ((pk (format nil "~a:~a" (bytes->hex full) target)))
+                                   (unless (member pk (getf e :published) :test #'string=)
+                                     (log! node "vault spend: ~a signed it; ~a proof against its ledger ~a" (subseq xh 0 8)
+                                           (if lapse "lapsed-challenge" "unanchored") (subseq target 0 8))
+                                     (broadcast-fraud node (fr:make-unauthorized-vault-spend-proof
+                                                            full (hex->bytes target) (hex->bytes (getf e :id)) (getf e :qb) tx prevouts bh
+                                                            :challenge-update cu :lapse-block-hash lapse))
+                                     (push pk (getf e :published))
+                                     (setf changed t)))))))))
+                     (when (and complete (or (eq (getf e :form) :unanchored) lapse)
+                                (> h (+ (or (getf e :height) 0) *vault-spend-publish-blocks*)))
                        (setf (getf e :done) t changed t))
                      (setf (gethash key (node-reported-vault-spend node)) e)))
                  (error (err) (log! node "vault spend ~a: publishing failed (~a); retrying" (subseq key 0 8) err))))
@@ -4546,34 +4823,28 @@
                           collect rec)))
     (when targets
       (multiple-value-bind (ok why)
-          (let* ((key (list (getf proof :accused) spent-id (getf ev :spend-tx-hex) (getf ev :governing-quorumbegin-seq)))
+          (let* ((key (list (getf proof :accused) spent-id (getf ev :spend-tx-hex) (getf ev :governing-quorumbegin-seq)
+                            (getf ev :challenge-update)))
                  (hit (gethash key (node-vault-spend-verdicts node))))
             (if (and hit (< (- (get-universal-time) (first hit)) *vault-spend-verdict-ttl*))
                 (values (second hit) (third hit))
                 (let* ((srec (find-record node spent-id))
                        (relay (ledger-updates-from-relays node spent-id))
-                       (history (if (and srec (not (record-fork-p srec))) (record-history srec) relay))
-                       ;; DEP-06: the rotations, and the spend itself if it is the confiscation the
-                       ;; rules build from public state; a member that missed the dispute too.
+                       (history (if (and srec (not (record-fork-p srec))) (append (record-history srec) relay) relay))
                        (tx (ignore-errors (btx:parse-tx (bw:make-reader (hex->bytes (getf ev :spend-tx-hex))))))
                        (spend-height (ignore-errors (and (node-height-of-block node)
                                                          (funcall (node-height-of-block node) (getf ev :spend-block-hash)))))
-                       (gseq (getf ev :governing-quorumbegin-seq))
-                       ;; DEP-06 "Recorded rotation": on our replica and the relay together; a
-                       ;; replica that lags, or none at all, must not turn a rotation into a theft.
-                       (rotation (and tx (handler-case
-                                             (if (and srec (not (record-fork-p srec)))
-                                                 (recorded-rotation-p node srec gseq (btx:tx-txid tx))
-                                                 (fr:rotation-excused-p (append relay (relay-updates-past node spent-id gseq)) gseq (btx:tx-txid tx)))
-                                           (error (e) (return-from handle-vault-spend-fraud
-                                                        (log! node "vault-spend proof against ~a not judged yet: ~a" (subseq (getf proof :accused) 0 8) e))))))
-                       (authorised (append (if srec (authorised-spend-txids node srec) '())
-                                           (and rotation (list (btx:tx-txid tx)))
-                                           (and tx relay (rebuilt-confiscation-p node spent-id tx :spend-height spend-height :updates relay)
-                                                (list (btx:tx-txid tx))))))
+                       (gseq (getf ev :governing-quorumbegin-seq)))
                   (multiple-value-bind (ok why)
-                      (fr:verify-unauthorized-vault-spend proof history (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
-                                                          :authorised-txids authorised)
+                      (handler-case
+                          (fr:verify-unauthorized-vault-spend
+                           proof history (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
+                           ;; DEP-06: a lapsed challenge is rebutted by any answer we can find
+                           :answered-fn (lambda (txid anchor reserves tier-index)
+                                          (declare (ignore txid anchor))
+                                          (spend-answered-p node spent-id tx gseq reserves tier-index :spend-height spend-height)))
+                        (error (e) (return-from handle-vault-spend-fraud
+                                     (log! node "vault-spend proof against ~a not judged yet: ~a" (subseq (getf proof :accused) 0 8) e))))
                     (setf (gethash key (node-vault-spend-verdicts node)) (list (get-universal-time) ok why))
                     (values ok why)))))
           (if (not ok)
