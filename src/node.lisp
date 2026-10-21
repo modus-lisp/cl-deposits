@@ -3152,19 +3152,21 @@
         for (u o) = (multiple-value-list (fork-op f :dispute-enter))
         when u minimize (op:field o :last-valid-sequence)))
 
+(defun fork-point-anchor (update)
+  "DEP-03 §On-Chain State Anchor: a confiscation's anchor from the update at the dispute's fork
+   point, tagged_hash(\"deposits/fork-point\", cosign_data): its signatures are left out, so every
+   variant of the update (one cosignature set or another) gives the same anchor."
+  (tagged-hash "deposits/fork-point" (up::cosign-data update)))
+
 (defun dispute-anchor (node id-hex)
-  "DEP-03 §On-Chain State Anchor: a confiscation's anchor, the chain hash of the update at the
-   dispute's fork point (the update the DisputeEnter at the lowest last_valid_sequence extends)."
-  (let ((best nil))
-    (dolist (f (forks-of node id-hex))
-      (multiple-value-bind (u o) (fork-op f :dispute-enter)
-        (when (and u (or (null best) (< (op:field o :last-valid-sequence) (car best))))
-          (setf best (cons (op:field o :last-valid-sequence) (up:update-prev-hash u))))))
-    (or (cdr best)
-        (let* ((base (find-record node id-hex)) (lvs (dispute-last-valid-seq node id-hex))
-               (u (and base lvs (find lvs (record-history base) :key #'up:update-seq))))
-          (and u (up:chain-hash u)))
-        (fail "no fork point for ~a's confiscation anchor" (subseq id-hex 0 8)))))
+  "A confiscation's anchor (FORK-POINT-ANCHOR) from the update at the dispute's fork point (the
+   lowest last_valid_sequence any DisputeEnter names), as any fork or our replica holds it."
+  (let ((lvs (dispute-last-valid-seq node id-hex)))
+    (unless lvs (fail "no fork point for ~a's confiscation anchor" (subseq id-hex 0 8)))
+    (let ((u (or (loop for r in (cons (find-record node id-hex) (forks-of node id-hex))
+                       thereis (and r (find lvs (record-history r) :key #'up:update-seq)))
+                 (fail "no update at ~a's fork point ~a" (subseq id-hex 0 8) lvs))))
+      (fork-point-anchor u))))
 
 (defun eligibility-floor-sats (node id-hex)
   "obligations x collateral/reserves at the fork point, + the claim fee floor, in the

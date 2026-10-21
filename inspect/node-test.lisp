@@ -283,7 +283,7 @@
               (error (e) (format t "      confiscate failed: ~a~%      c log: ~{~a~^ | ~}~%      d log: ~{~a~^ | ~}~%" e (reverse (nd:node-log c)) (reverse (nd:node-log d))) (error e)))
           (check "confiscation spends the reserves via tier 0 (verified under consensus)" (and ctx t))
           (check-equal "punitive: the lottery output, then the anchor" (length (btx:tx-outputs ctx)) 2)
-          (check "the confiscation's anchor is the chain hash at the dispute's fork point"
+          (check "the confiscation's anchor is its dispute's fork-point anchor"
                  (equalp (rot:anchor-of ctx) (nd::dispute-anchor b id)))
           (check "lottery output pays the lottery script" (equalp (btx:txout-script (first (btx:tx-outputs ctx))) (lot:lottery-spk lottery)))
           (check "other members rebuilt the same lottery" (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey m)))) (and (nd:record-lottery f) (equalp (lot:lottery-spk (nd:record-lottery f)) (lot:lottery-spk lottery))))) (list c d)))
