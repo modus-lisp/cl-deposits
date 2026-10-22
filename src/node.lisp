@@ -2658,7 +2658,11 @@
             until (or (waiter-responses wt) (> (get-internal-real-time) deadline))
             do (bt:condition-wait (waiter-cv wt) (waiter-lock wt) :timeout 0.2)))
     (remhash (ev:event-id event) (wallet-pending wal))
-    (let ((r (first (waiter-responses wt))) (h (sha256 (ascii->bytes (ev:event-content event)))))
+    ;; The FIRST response is the answer.  An operator that receives the request twice
+    ;; (a relay redelivery) answers twice, and the second answer to a lock is "nonce
+    ;; already accepted": the signet soak (2026-10-21) took that one, since responses
+    ;; are pushed newest first, and logged a committed lock as a failure.
+    (let ((r (car (last (waiter-responses wt)))) (h (sha256 (ascii->bytes (ev:event-content event)))))
       (if r (values (w:jget r "success") (w:jget r "result") (w:jget r "error") h) (values nil nil "timeout" h)))))
 
 (defun wallet-request-hash (wal ledger-id-hex action params)
