@@ -62,7 +62,7 @@ ln_cli() { "$SIGNET_ROOT/bin/lightning-cli" --lightning-dir="$SIGNET_ROOT/$1" "$
 cld_names() { for e in "${CLD_NODES[@]}"; do echo "${e%%:*}"; done; }
 cld_port()  { for e in "${CLD_NODES[@]}"; do [ "${e%%:*}" = "$1" ] && echo "${e##*:}" && return; done; return 1; }
 cld_dir()   { echo "$CLD_ROOT/$1"; }
-cld_ctl()   { local n=$1; shift; printf '%s\n' "$*" | timeout 60 bash -c "exec 3<>/dev/tcp/127.0.0.1/$(cld_port "$n"); cat >&3; head -n1 <&3"; }
+cld_ctl()   { local n=$1; shift; printf '%s\n' "$*" | timeout "${CLD_CTL_TIMEOUT:-60}" bash -c "exec 3<>/dev/tcp/127.0.0.1/$(cld_port "$n"); cat >&3; head -n1 <&3"; }
 cld_pid()   { cat "$(cld_dir "$1")/cld.pid" 2>/dev/null; }
 cld_running(){ local p; p=$(cld_pid "$1") && [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
 cld_pubkey(){ cld_ctl "$1" "(:info)" | sed -E 's/.*:PUBKEY "([0-9a-f]+)".*/\1/'; }

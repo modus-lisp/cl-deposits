@@ -209,10 +209,7 @@
                              (lambda (event)
                                (cond ((or (null (node-worker node)) (= (ev:event-kind event) w:+kind-response+))
                                       (handle-event node event))
-                                     ((or (= (ev:event-kind event) w:+kind-update+)
-                                          (and (= (ev:event-kind event) w:+kind-request+)
-                                               (equal (w:event-action event) "cosign_update")))
-                                      (enqueue-fast node event))
+                                     ((replica-lane-event-p event) (enqueue-fast node event))
                                      (t (enqueue node event))))))
     node))
 
@@ -240,6 +237,16 @@
 
 (defun cosign-request-event-p (event)
   (and (= (ev:event-kind event) w:+kind-request+) (equal (w:event-action event) "cosign_update")))
+
+(defun replica-lane-event-p (event)
+  "Events the replica lane (the cosigner thread) handles: updates, which it applies to the
+   replicas, and the member requests that read a replica and must see it between updates,
+   never during one.  rotation_sign rebuilds the ladder from the replica: on the main worker it
+   raced the replica lane applying the QuorumBegin it names, read the new vault as the one being
+   spent and refused an honest rotation (signet soak, 2026-10-22)."
+  (or (= (ev:event-kind event) w:+kind-update+)
+      (and (= (ev:event-kind event) w:+kind-request+)
+           (member (w:event-action event) '("cosign_update" "rotation_sign") :test #'equal))))
 
 (defun fast-event-ledger (event)
   "The ledger an event on the replica lane concerns, by its 16-hex prefix: an update's d

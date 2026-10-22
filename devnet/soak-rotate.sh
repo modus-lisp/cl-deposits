@@ -28,14 +28,19 @@ rotate() {   # rotate NAME ID OPERATOR "m1,m2,m3"
   done
   # DEP-03: the rotation spends the old vault into the new one (no fresh funding); a
   # rotation already broadcast but not yet recorded is resumed by :begin-quorum.
+  # A rotation recorded already (an earlier pass's begin-quorum outlived its control call)
+  # only awaits its rung signatures: :begin-quorum resumes it.
   r=$(cld_ctl "$op" "(:rotate-vault :ledger \"$id\" :expiry-blocks 4320)")
-  if [[ "$r" == *":STATUS :OK"* ]]; then txid=$(sx "$r" ":TXID"); vout=0
-  elif [[ "$r" == *"already broadcast"* ]]; then txid=""; vout=0
-  else echo "   rotate-vault: $r"; return 1; fi
+  if [[ "$r" == *":STATUS :OK"* || "$r" == *"already recorded"* ]]; then :
+  else echo "   rotate-vault: ${r:-no answer in ${CLD_CTL_TIMEOUT:-60}s}"; return 1; fi
   mine 3
   sleep 25   # reference members' wallets see the outpoint through the shim on a timer
-  r=$(cld_ctl "$op" "(:begin-quorum :ledger \"$id\")")
-  [[ "$r" == *":STATUS :OK"* ]] || { echo "   begin-quorum: $r"; return 1; }
+  # begin-quorum cosigns the QuorumBegin, then gathers the rung signatures (up to 90 s): give
+  # it the time.  The rung recorded is its :TXID, not the one rotate-vault planned on an older tip.
+  r=$(CLD_CTL_TIMEOUT=${SOAK_BEGIN_QUORUM_TIMEOUT:-300} cld_ctl "$op" "(:begin-quorum :ledger \"$id\")")
+  [[ "$r" == *":STATUS :OK"* ]] || { echo "   begin-quorum: ${r:-no answer in ${SOAK_BEGIN_QUORUM_TIMEOUT:-300}s (the node may still finish it)}"; return 1; }
+  txid=$(sx "$r" ":TXID"); vout=0
+  [ -n "$txid" ] || echo "   begin-quorum: QuorumBegin seq $(sx "$r" ":SEQ") recorded; its rungs still await signatures (the node rebroadcasts once signed)"
   [ -n "$txid" ] && python3 - "$SOAK/ledgers.tsv" "$name" "$txid" "$vout" <<'PY'
 import sys; p,name,txid,vout=sys.argv[1:]
 rows=[l.rstrip('\n').split('\t') for l in open(p)]

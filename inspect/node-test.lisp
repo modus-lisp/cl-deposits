@@ -1968,7 +1968,16 @@
            (req-b (w:request-event (nd::node-keypair a) (nd:record-id-hex lb) "cosign_update" (w:json-object "x" 1))))
       (dolist (e (list ua1 ub ua2 req-c req-b)) (nd::enqueue-fast n e))
       (check "cosign requests jump other ledgers' updates, not their own ledger's"
-             (equal (nd::node-fast-inbox n) (list req-c ua1 ub req-b ua2))))))
+             (equal (nd::node-fast-inbox n) (list req-c ua1 ub req-b ua2))))
+    ;; rotation_sign reads the replica the QuorumBegin it names is applied to: it is handled on
+    ;; the replica lane, after that ledger's queued updates, never beside them on the main worker.
+    (let ((rot (w:request-event (nd::node-keypair a) (nd:record-id-hex la) "rotation_sign" (w:json-object "x" 1)))
+          (wallet (w:request-event (nd::node-keypair a) (nd:record-id-hex la) "transfer_lock" (w:json-object "x" 1))))
+      (check "rotation_sign is a replica-lane event" (nd::replica-lane-event-p rot))
+      (check "updates and cosign requests are too"
+             (and (nd::replica-lane-event-p (w:update-event (nd::node-keypair a) (nd:tip la)))
+                  (nd::replica-lane-event-p (w:request-event (nd::node-keypair a) (nd:record-id-hex la) "cosign_update" (w:json-object "x" 1)))))
+      (check "a wallet request to the operator is not" (not (nd::replica-lane-event-p wallet))))))
 
 
 (with-gate ("DEP-06 proof 11: a member disputes the new operator, however it holds the chain")
