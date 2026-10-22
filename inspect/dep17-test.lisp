@@ -75,3 +75,18 @@
                    (d17:verify-operation-witness o (format nil "pk(~a)" (u:bytes->hex pub)) (d17:sign-operation o priv))
                    :ok))))
 
+
+;;; inspect/vectors/nonce_delivery.json: DEP-17 §nonce and expiry and §duplicate delivery, shared
+;;; with deposits-rust (deposits-protocol/tests/vectors/nonce_delivery.json).
+(with-gate ("DEP-17 nonce uniqueness and duplicate delivery against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "nonce_delivery.json")))))
+    (check "the vector has cases" (>= (length (gethash "cases" v)) 10))
+    (loop for c across (gethash "cases" v)
+          for o = (gethash "op" c)
+          for accepted = (loop for a across (gethash "accepted" c)
+                               collect (list (gethash "nonce" a) (gethash "expiry" a) (u:hex->bytes (gethash "sighash" a))))
+          do (check-equal (gethash "name" c)
+                          (string-downcase (symbol-name (cl-deposits.conformance:nonce-verdict
+                                                         accepted (gethash "nonce" o) (gethash "expiry" o)
+                                                         (u:hex->bytes (gethash "sighash" o)) (gethash "height" c))))
+                          (gethash "verdict" c)))))

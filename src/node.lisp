@@ -1867,10 +1867,7 @@
                 (src (lg:find-deposit (record-ledger rec) (op:field o :source-deposit-id))))
            (unless (eq (op:operation-type o) :transfer-lock) (fail "not a TransferLock"))
            (unless (authorized-p node rec o src (op:field o :witness)) (fail "witness does not authorize this operation"))
-           (when (> (height node) (op:field o :expiry)) (fail "operation expired"))
-           (when (member (cons (op:field o :nonce) (op:field o :expiry)) (lg:deposit-seen-nonces src) :test #'equal)
-             (fail "nonce replayed"))
-           (append-operation node rec o)
+           (unless (check-nonce node rec o) (append-operation node rec o))
            (respond node event t :result (w:json-object "transfer_id" (bytes->hex (op:field o :transfer-id))))))
         ((member action '("exit_request" "exit_cancel") :test #'string=)
          ;; DEP-20 §3: a depositor-signed ExitRequest / ExitCancel, appended as signed.
@@ -1879,10 +1876,7 @@
                 (d (lg:find-deposit (record-ledger rec) (op:field o :deposit-id))))
            (unless (eq (op:operation-type o) want) (fail "not an ~a" want))
            (unless (authorized-p node rec o d (op:field o :witness)) (fail "witness does not authorize this operation"))
-           (when (> (height node) (op:field o :expiry)) (fail "operation expired"))
-           (when (member (cons (op:field o :nonce) (op:field o :expiry)) (lg:deposit-seen-nonces d) :test #'equal)
-             (fail "nonce replayed"))
-           (let ((u (append-operation node rec o)))
+           (let ((u (or (nth-value 1 (check-nonce node rec o)) (append-operation node rec o))))
              (respond node event t :result (w:json-object "exit_request_id" (bytes->hex (if (eq want :exit-request)
                                                                                           (sha256 (op:encode-operation o))
                                                                                           (op:field o :exit-request-id)))
@@ -1983,6 +1977,47 @@
 
 (defvar *pay-poll-rounds* 60 "Half-second polls a pay_invoice handler waits before answering pending.")
 
+;;; DEP-17 §duplicate delivery.  A relay can deliver one request twice, and a wallet retries a
+;;; request whose answer it missed.  The operation it carries is then already on the ledger:
+;;; answer as we answered it, never append it again and never answer with a replay error.
+
+(defun nonce-check (node rec o)
+  "Classify depositor-signed operation O against REC's ledger at our height:
+   (values verdict original-op original-update), VERDICT one of cf:nonce-verdict's.  The
+   ledger's seen nonces say whether a live operation shares O's nonce; only then is the history
+   read for those operations' sighashes."
+  (let* ((h (height node)) (nonce (op:field o :nonce)) (expiry (op:field o :expiry))
+         (d (lg:find-deposit (record-ledger rec) (cf:operation-deposit-id o)))
+         (live (count-if (lambda (seen) (and (eql (car seen) nonce) (cdr seen) (>= (cdr seen) h)))
+                         (lg:deposit-seen-nonces d)))
+         (sighash (cf:signed-sighash o)) (accepted '()) (hit nil))
+    (when (plusp live)
+      (loop for u in (record-history rec)
+            for a = (ignore-errors (op:decode-operation (up:update-message u)))
+            when (and a (eql (ignore-errors (op:field a :nonce)) nonce)
+                      (equalp (cf:operation-deposit-id a) (cf:operation-deposit-id o))
+                      (cf:signed-sighash a))
+              do (let ((sh (cf:signed-sighash a)))
+                   (push (list nonce (op:field a :expiry) sh) accepted)
+                   (when (and (null hit) (equalp sh sighash)) (setf hit (cons a u))))
+            until (>= (count-if (lambda (x) (>= (second x) h)) accepted) live)))
+    (values (cf:nonce-verdict accepted nonce expiry sighash h) (car hit) (cdr hit))))
+
+(defun check-nonce (node rec o)
+  "Fail on an expired or replayed O; return the accepted original when O is its duplicate."
+  (multiple-value-bind (verdict original update) (nonce-check node rec o)
+    (ecase verdict
+      (:expired (fail "operation expired"))
+      (:replay (fail "nonce replayed"))
+      (:duplicate (values original update))
+      (:accept nil))))
+
+(defun invoice-fulfill-preimage (rec payment-id)
+  (loop for u in (record-history rec)
+        for a = (ignore-errors (op:decode-operation (up:update-message u)))
+        when (and a (eq (op:operation-type a) :invoice-fulfill) (equalp (op:field a :payment-id) payment-id))
+          return (op:field a :preimage)))
+
 (defun handle-pay-invoice (node rec event params)
   (unless (node-ln node) (fail "no lightning node"))
   (let* ((deposit-id (deposit-id-param params))
@@ -2004,7 +2039,18 @@
     (when (and asked (/= asked (op:field o :amount)))
       (fail (format nil "the invoice is for ~d msat but the lock is for ~d" asked (op:field o :amount))))
     (unless (authorized-p node rec o d (op:field o :witness)) (fail "witness does not authorize this lock"))
-    (when (> (height node) (op:field o :expiry)) (fail "operation expired"))
+    (when (check-nonce node rec o)
+      ;; Already locked: answer as the original does now, and never pay twice.
+      (let* ((pid (op:field o :payment-id)) (preimage (invoice-fulfill-preimage rec pid)))
+        (return-from handle-pay-invoice
+          (cond (preimage
+                 (respond node event t :result (w:json-object "payment_id" (bytes->hex pid)
+                                                              "deposit_id" (bytes->hex (op:field o :deposit-id))
+                                                              "amount_msat" (op:field o :amount) "preimage" (bytes->hex preimage)
+                                                              "status" "succeeded")))
+                ((gethash pid (lg:ledger-open-invoice-locks (record-ledger rec)))
+                 (respond node event nil :error "payment pending; the lock stays until it settles or fails"))
+                (t (respond node event nil :error "payment failed; lock released"))))))
     (append-operation node rec o)
     (let ((pid (op:field o :payment-id)) (outcome :pending) (preimage nil))
       (setf (gethash pid (node-ln-polling node)) t)

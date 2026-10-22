@@ -93,6 +93,33 @@
       (let ((forged (nd:make-wallet :priv 55555555555555555555 :bus bus)))  ; same key, stale nonce counter
         (check-signals "replayed nonce is refused" nd:node-error
           (nd:wallet-transfer forged id d1 d2 1000 :height *height*)))
+      ;; DEP-17 §duplicate delivery: one transfer_lock delivered twice is committed once, and both
+      ;; deliveries get the original answer (the signet soak, 2026-10-21, answered the second
+      ;; "nonce already accepted").
+      (let* ((tn (u:sha256 (hx "d0d0"))) (tid (u:sha256 (u:cat tn d1 d2)))
+             (o (list :type :transfer-lock :transfer-nonce tn :source-deposit-id d1 :destination-deposit-id d2
+                      :amount 500 :fee 0 :completion-script (format nil "sha256(~a)" (u:bytes->hex (u:sha256 (hx "01"))))
+                      :timeout-height (+ *height* 144) :transfer-id tid
+                      :nonce 424242 :expiry (+ *height* 144) :witness '())))
+        (setf (getf o :witness) (d17:sign-operation o (cl-deposits.node::wallet-priv w1)))
+        (let* ((params (w:json-object "operation" (u:base64-encode (op:encode-operation o))))
+               (before (lg:ledger-sequence (nd:record-ledger la))))
+          (multiple-value-bind (ok1 r1) (nd:wallet-request w1 id "transfer_lock" params)
+            (multiple-value-bind (ok2 r2 err2) (nd:wallet-request w1 id "transfer_lock" params)
+              (check "the first delivery commits" ok1)
+              (check "the second delivery is answered, not refused" ok2 err2)
+              (check-equal "both answers name the same transfer"
+                           (list (w:jget r1 "transfer_id") (w:jget r2 "transfer_id"))
+                           (list (u:bytes->hex tid) (u:bytes->hex tid)))
+              (check-equal "the lock is committed once" (lg:ledger-sequence (nd:record-ledger la)) (1+ before))))
+          ;; A different operation on the same nonce is still refused.
+          (let ((o2 (copy-list o)))
+            (setf (getf o2 :amount) 501 (getf o2 :witness) '())
+            (setf (getf o2 :witness) (d17:sign-operation o2 (cl-deposits.node::wallet-priv w1)))
+            (multiple-value-bind (ok3 r3 err3)
+                (nd:wallet-request w1 id "transfer_lock" (w:json-object "operation" (u:base64-encode (op:encode-operation o2))))
+              (declare (ignore r3))
+              (check "a different operation reusing the nonce is refused" (and (not ok3) (search "nonce replayed" err3)) err3)))))
       ;; Replicas agree, and everything published re-verifies from scratch.
       (check "all replicas at A's tip"
              (every (lambda (n) (equalp (lg:ledger-chain-tip (nd:record-ledger (nd:find-record n id)))

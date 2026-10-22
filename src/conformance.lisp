@@ -19,7 +19,7 @@
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:op #:cl-deposits.operation) (#:lg #:cl-deposits.ledger)
                     (#:d16 #:cl-deposits.dep16) (#:d17 #:cl-deposits.dep17))
-  (:export #:violation #:authorized-p))
+  (:export #:violation #:authorized-p #:nonce-verdict #:operation-deposit-id #:signed-sighash))
 (in-package #:cl-deposits.conformance)
 
 (defun field (o name) (ignore-errors (op:field o name)))
@@ -74,3 +74,26 @@
                               (lg:deposit-seen-nonces d)))
              (format nil "NonceReplay: nonce ~a" nonce))
             ((not (authorized-p o d height)) "Unauthorized: the depositor's witness does not authorize this operation")))))
+
+;;; DEP-17 §duplicate delivery: what an operator does with a request whose operation reuses
+;;; a nonce.  Pinned by inspect/vectors/nonce_delivery.json, shared with deposits-rust.
+
+(defun nonce-verdict (accepted nonce expiry sighash height)
+  "ACCEPTED is the deposit's accepted operations as (nonce expiry sighash) lists.  Returns
+   :EXPIRED (expiry below HEIGHT), :DUPLICATE (the accepted operation with this nonce, still
+   within its expiry, has this SIGHASH: the same operation delivered again), :REPLAY (a different
+   operation reusing a live nonce) or :ACCEPT.  A lower nonce than the last is accepted."
+  (let ((live (remove-if-not (lambda (a) (and (eql (first a) nonce) (>= (second a) height))) accepted)))
+    (cond ((< expiry height) :expired)
+          ((find sighash live :key #'third :test #'equalp) :duplicate)
+          (live :replay)
+          (t :accept))))
+
+(defun operation-deposit-id (o)
+  "The deposit a depositor-signed operation is signed for."
+  (or (field o :source-deposit-id) (field o :deposit-id)))
+
+(defun signed-sighash (o)
+  "The DEP-17 operation sighash O's depositor signs, or NIL for operations no depositor signs."
+  (multiple-value-bind (id type args nonce expiry) (d17:operation->dep16 o)
+    (when id (d17:operation-sighash (d17:operation-preimage id type args nonce expiry)))))
