@@ -5,6 +5,9 @@
 cd "$(dirname "$0")/.." || exit 1
 case " $* " in *" --list "*|*" --dry-run "*) exec "${CLD_SBCL:-/usr/bin/sbcl}" --script redteam/scenarios.lisp -- "$@";; esac
 source devnet/_common.sh >/dev/null 2>&1
+if [ "${CLD_CHAIN:-}" = signet ] && [ "${REDTEAM_ON_SIGNET:-}" != 1 ]; then   # see redteam/_lib.sh
+  echo "refusing to attack the signet devnet (its soak); run with DEVNET=regtest, or REDTEAM_ON_SIGNET=1" >&2; exit 2
+fi
 CHAOS_PID="$CLD_ROOT/soak/pids/chaos"
 restore_soak=""
 if p=$(cat "$CHAOS_PID" 2>/dev/null) && kill -0 "$p" 2>/dev/null; then

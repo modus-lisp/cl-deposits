@@ -5,7 +5,7 @@
 # operates (A, cld1), at sequences A already has.  PASS = no member of A takes them
 # for an equivocation or a non-conforming update: no fraud proof on A, no fork.
 #   redteam/attack-relabel.sh [TARGET-LETTER] [OPERATOR]     default: A cld1
-source "$(dirname "$0")/../devnet/_common.sh"
+source "$(dirname "$0")/../devnet/_common.sh"; source "$(dirname "$0")/_lib.sh"
 S="$CLD_ROOT/soak"; T=${1:-A}; OP=${2:-cld1}; WAIT=${WAIT:-60}
 TID=$(awk -F'\t' -v t="$T" '$1==t{print $2}' "$S/ledgers.tsv"); TS=${TID:0:8}
 # The operator's other ledgers: owned, signed by the same key, not the target.

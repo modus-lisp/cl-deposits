@@ -1,5 +1,11 @@
 # redteam/_lib.sh — shared by the scenario scripts.  Source after devnet/_common.sh and $S/env.
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# The red team attacks whatever devnet _common.sh selected, and that defaults to signet, where the
+# overnight soak runs.  A scenario run without DEVNET=regtest once attacked the live soak, so
+# signet takes an explicit opt-in.
+if [ "${CLD_CHAIN:-}" = signet ] && [ "${REDTEAM_ON_SIGNET:-}" != 1 ]; then
+  echo "FAIL: refusing to attack the signet devnet (its soak); run with DEVNET=regtest, or REDTEAM_ON_SIGNET=1" >&2; exit 2
+fi
 # Every check times out instead of hanging: CHECK_TIMEOUT seconds (default 2700), then FAIL.
 if [ -z "${CHECK_WATCHDOG:-}" ]; then
   export CHECK_WATCHDOG=1
