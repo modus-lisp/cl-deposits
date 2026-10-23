@@ -110,7 +110,7 @@ setup() {
   if [ ! -f "$SOAK/.collateral-funded" ]; then   # replacement collateral at each reference's operator-key address, for disputes
     for n in $(ref_names); do
       CA=$(env $(ref_env) RUST_LOG=error "$REF_NODE_BIN" pubkey-to-p2wpkh --network "$CLD_CHAIN" --seed-file "$(ref_dir "$n")/seed.hex" --data-dir "$(ref_dir "$n")" 2>&1 | grep -oE '(tb1|bcrt1)[0-9a-z]+' | head -1)
-      for i in $(seq 1 "${SOAK_REF_COLLATERAL_COINS:-8}"); do wcli sendtoaddress "$CA" 0.01 >/dev/null; done   # one per concurrent dispute (Q = 7: 7 quorums each)
+      for i in $(seq 1 "${SOAK_REF_COLLATERAL_COINS:-8}"); do wcli sendtoaddress "$CA" "$SOAK_COLLATERAL_COIN" >/dev/null; done   # one per concurrent dispute (Q = 7: 7 quorums each)
     done; mine 1; touch "$SOAK/.collateral-funded"
   fi
   fund_cl_collateral
@@ -169,6 +169,9 @@ collateral_addr() {   # cached: the reference CLI takes minutes on a soaked data
   esac
   [ -n "$a" ] && echo "$a" | tee "$f"
 }
+# A reference arm pledges ONE coin, which must cover the ledger's obligations x ratio + 5000 sats
+# (DEP-03): 0.01 BTC fell below that once a soak ledger held about 1.3M sats of deposits.
+SOAK_COLLATERAL_COIN=${SOAK_COLLATERAL_COIN:-0.05}
 topup_collateral() {   # disputes pledge these coins and red-team runs leave disputes open: keep SOAK_COLLATERAL_MIN spare
   local n a have sent=0 min=${SOAK_COLLATERAL_MIN:-6}
   for n in $(cld_names) $(ref_names); do
@@ -179,7 +182,7 @@ topup_collateral() {   # disputes pledge these coins and red-team runs leave dis
         cld_ctl "$n" '(:log)' 2>/dev/null | tr '"' '\n' | grep "^collateral for" | tail -1 | grep -q "have 0 unpledged" || [ "$have" -lt "$min" ] || continue;;
       *) [ "$have" -ge "$min" ] && continue;;
     esac
-    for i in $(seq 1 8); do wcli sendtoaddress "$a" 0.01 >/dev/null && sent=$((sent+1)); done
+    for i in $(seq 1 8); do wcli sendtoaddress "$a" "$SOAK_COLLATERAL_COIN" >/dev/null && sent=$((sent+1)); done
     echo "$(date +%FT%T) collateral $n: had $have coins (short); sent 8"
   done
   [ $sent -gt 0 ] && mine 1 >/dev/null

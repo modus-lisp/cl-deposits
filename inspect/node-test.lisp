@@ -1482,7 +1482,11 @@
       (check "it is remembered until its QuorumBegin" (nd:pending-rotation a la))
       (check "nothing is signed or broadcast before the QuorumBegin (DEP-03 Rotation ordering)"
              (and (null sent) (null (getf (nd:pending-rotation a la) :rungs))))
-      (check-signals "a second rotation is refused while one is pending" nd:node-error (nd:rotate-vault a la :timeout 5))
+      ;; Planned but unrecorded, nothing signed: a second rotate-vault plans again on this tip
+      ;; (a stale plan's exit cutoff ages out of the window its QuorumBegin may name).
+      (check-equal "a second rotate-vault re-plans an unrecorded rotation, on the same tip the same rung"
+                   (nd:rotate-vault a la :timeout 5) txid)
+      (check "and it is still the pending rotation" (nd:pending-rotation a la))
       (multiple-value-bind (u r2 rtxid) (nd:begin-quorum a la)
         (declare (ignore r2))
         (let* ((o (op:decode-operation (up:update-message u)))

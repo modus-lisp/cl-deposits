@@ -727,7 +727,11 @@
   (declare (ignore timeout))
   (unless (record-owned-p rec) (fail "not our ledger"))
   (unless (has-quorum-begin-p rec) (fail "no vault yet: the first QuorumBegin is funded, not rotated"))
-  (when (pending-rotation node rec) (fail "a rotation is already recorded and awaits its signatures"))
+  (let ((pending (pending-rotation node rec)))
+    (when (and pending (getf pending :qb-seq)) (fail "a rotation is already recorded and awaits its signatures"))
+    ;; Planned but never recorded (its begin-quorum fell short): nothing is signed yet, and its
+    ;; exit cutoff ages out of the window a QuorumBegin may name, so plan again on this tip.
+    (when pending (clear-rotation node rec)))
   (let* ((staged (mapcar #'lg:member-pubkey (lg:ledger-next-quorum-members (record-ledger rec))))
          (new (if (and (record-pinned rec) (equalp (rs:reserves-members (car (record-pinned rec))) staged))
                   (car (record-pinned rec))       ; prepared already (prepare-quorum)
