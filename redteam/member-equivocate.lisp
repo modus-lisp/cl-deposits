@@ -8,7 +8,7 @@
 (require :asdf)
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-deposits"))
 (let* ((args (cdr (member "--" sb-ext:*posix-argv* :test #'string=)))
-       (priv (cl-deposits.util:be->int (cl-deposits.util:hex->bytes (string-trim '(#\Newline #\Space) (uiop:read-file-string (first args))))))
+       (priv (cl-deposits.wire:read-key-file (first args)))   ; fixed; EVEN-Y-PRIVKEY copies it
        (priv (cl-deposits.wire:even-y-privkey priv))
        (pub (cl-deposits.update:compressed-pubkey priv))
        (updates (sort (mapcar (lambda (b) (cl-deposits.update:decode-update (cl-deposits.util:base64-decode b)))

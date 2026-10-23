@@ -2,8 +2,8 @@
 
 (in-package #:cl-deposits.test)
 
-(defun lot-keys (n) (loop for i from 1 to n collect (+ 424242424242 (* i 1000000007))))
-(defun xonly-of (priv) (up:x-only (up:compressed-pubkey priv)))
+(defun lot-keys (n) (loop for i from 1 to n collect (tk (+ 424242424242 (* i 1000000007)))))
+(defun xonly-of (priv) (up:x-only (up:compressed-pubkey (tk priv))))
 
 (defun random-preimage (&optional (range lot:+contribution-range+))
   (let ((len (+ 17 (random range))))
@@ -44,7 +44,7 @@
 
 (defun sig-for (l tx prevouts leaf priv)
   (declare (ignore l))
-  (secp256k1-fast.schnorr:schnorr-sign priv (rot:tier-sighash tx 0 prevouts leaf)))
+  (secp256k1-fast.schnorr:schnorr-sign (tk priv) (rot:tier-sighash tx 0 prevouts leaf)))
 
 (dolist (n '(2 3 5 7))
   (with-gate ((format nil "lottery: k=~a, every revealer subset, spent under consensus" n))
@@ -164,16 +164,16 @@
     (check-equal "confiscation: punitive = everything to the lottery"
                  (lot:confiscation-outputs (hx "5120aa") 100000 500) (list (cons (hx "5120aa") 99500)))
     (check-equal "confiscation: respectful = obligations to lottery, change to operator p2wpkh"
-                 (mapcar #'cdr (lot:confiscation-outputs (hx "5120aa") 100000 500 :respectful t :obligations-sats 40000 :operator-pubkey33 (up:compressed-pubkey 9)))
+                 (mapcar #'cdr (lot:confiscation-outputs (hx "5120aa") 100000 500 :respectful t :obligations-sats 40000 :operator-pubkey33 (up:compressed-pubkey (tk 9))))
                  '(40000 59500))
     (check-equal "confiscation: respectful with dust change collapses to punitive"
-                 (length (lot:confiscation-outputs (hx "5120aa") 40700 500 :respectful t :obligations-sats 40000 :operator-pubkey33 (up:compressed-pubkey 9)))
+                 (length (lot:confiscation-outputs (hx "5120aa") 40700 500 :respectful t :obligations-sats 40000 :operator-pubkey33 (up:compressed-pubkey (tk 9))))
                  1)))
 
 (with-gate ("reserves: the reference's pinned cltv-offset-v2 seven-voter script")
   ;; deposits-core CLTV_OFFSET_V2_SEVEN_VOTERS_HEX: operator key [1;32], members [2..7;32],
   ;; quorum_expiry 800000, ledger hash [0x5a;32], signet.  Tier 1 is ceil(7/2) - 1 = 3 of 7.
-  (let* ((key (lambda (i) (up:compressed-pubkey (u:be->int (make-array 32 :element-type '(unsigned-byte 8) :initial-element i)))))
+  (let* ((key (lambda (i) (up:compressed-pubkey (tk (u:be->int (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))))))
          (r (rs:build-reserves :operator (funcall key 1) :members (loop for i from 2 to 7 collect (funcall key i))
                                :ledger-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5a)
                                :quorum-expiry 800000 :ruleset "cltv-offset-v2" :network :signet)))
@@ -192,7 +192,7 @@
          (vec (lambda (key) (let ((pfx (format nil "VEC ~a=" key)))
                               (let ((l (find pfx lines :test (lambda (p l) (and (>= (length l) (length p)) (string= p (subseq l 0 (length p))))))))
                                 (and l (subseq l (length pfx)))))))
-         (seed-priv (lambda (i) (u:be->int (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))))
+         (seed-priv (lambda (i) (gossamer:pooled-copy (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))))
          (voters (mapcar (lambda (i) (xonly-of (funcall seed-priv i))) '(21 22 23)))
          (name (lambda (idx) (format nil "~{~a~^,~}" idx))))
     (dolist (k '(1 2 3 7))
@@ -241,7 +241,7 @@
          (vec (lambda (key) (let ((pfx (format nil "VEC ~a=" key)))
                               (let ((l (find-if (lambda (l) (and (>= (length l) (length pfx)) (string= pfx (subseq l 0 (length pfx))))) lines)))
                                 (and l (subseq l (length pfx)))))))
-         (seed-priv (lambda (i) (u:be->int (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))))
+         (seed-priv (lambda (i) (gossamer:pooled-copy (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))))
          (voters (mapcar (lambda (i) (xonly-of (funcall seed-priv i))) '(21 22 23)))
          (parts (loop for i from 1 to 3 collect (lot:make-participant :pubkey (xonly-of (funcall seed-priv i))
                                                                        :commitment (make-array 20 :element-type '(unsigned-byte 8) :initial-element i)
@@ -249,7 +249,7 @@
          (l (lot:build-lottery parts voters 2 :network :signet))
          (fee (lot:confiscation-fee 8))
          (anchor (u:hex->bytes (funcall vec "anchor")))
-         (operator (up:compressed-pubkey (funcall seed-priv 9))))
+         (operator (up:compressed-pubkey (tk (funcall seed-priv 9)))))
     (check-equal "DEP-03 fee for 8 voters (the anchor's 43 vB included)" (princ-to-string fee) (funcall vec "fee"))
     (loop for (name respectful locktime) in '(("punitive" nil 0) ("respectful" t 1234))
           do (let* ((outs (lot:confiscation-outputs (lot:lottery-spk l) 50000000 fee :respectful respectful
@@ -319,7 +319,7 @@
                           (setf (gethash (u:hex->bytes (second w)) pledges) (list (parse-integer (fifth w)) (parse-integer (fourth w)))))
                          ((string= (first w) "case") (push (rest w) cases))
                          (t (setf (gethash (first w) kv) (second w)))))))
-    (let* ((proto (nd:make-node :priv 424242 :bus (bus:make-mock-bus) :network (gethash "network" kv)
+    (let* ((proto (nd:make-node :priv (tk 424242) :bus (bus:make-mock-bus) :network (gethash "network" kv)
                                 :height-fn (let ((h (parse-integer (gethash "spend_height" kv)))) (lambda () h))
                                 :pledge-fn (lambda (txid vout scan-from)
                                              (declare (ignore vout scan-from))

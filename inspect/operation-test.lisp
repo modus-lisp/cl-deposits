@@ -86,7 +86,7 @@
 
 (with-gate ("ledger rules at their boundaries (mutation survivors)")
   (flet ((fresh () (let ((l (lg:make-ledger)) (d (op:deposit-id "b")))
-                     (lg:apply-operation l (list :type :ledger-open :operator-id (up:compressed-pubkey 7) :reserves-id "g" :genesis-block 0 :reserves-amount 100000000 :collateral-amount 0))
+                     (lg:apply-operation l (list :type :ledger-open :operator-id (up:compressed-pubkey (tk 7)) :reserves-id "g" :genesis-block 0 :reserves-amount 100000000 :collateral-amount 0))
                      (lg:apply-operation l (list :type :deposit-open :deposit-id d :descriptor "b" :receive-requires-sig nil))
                      (lg:apply-operation l (list :type :onchain-credit :txid (u:sha256 (hx "01")) :vout 0 :deposit-id d :amount 1000 :funding-address "x"))
                      (values l d))))
@@ -127,14 +127,14 @@
       (check-bytes "and hash the same" (up:content-hash y) (up:content-hash x)))))
 
 (with-gate ("sequence continuity is checked independently of the hash chain")
-  (let* ((priv 424242) (pub (up:compressed-pubkey priv)) (lid (u:sha256 (hx "1d")))
+  (let* ((priv 424242) (pub (up:compressed-pubkey (tk priv))) (lid (u:sha256 (hx "1d")))
          (genesis (up:make-signed-update :operator-id pub :ledger-id lid :seq 0 :prev-hash (make-array 32 :element-type '(unsigned-byte 8))
                                          :message (op:encode-operation (list :type :ledger-open :operator-id pub :reserves-id "g" :genesis-block 0 :reserves-amount 1 :collateral-amount 0))))
          (l (lg:make-ledger)))
-    (up:sign-operator genesis priv)
+    (up:sign-operator genesis (tk priv))
     (lg:apply-update l genesis)
     ;; correct prev_hash, wrong sequence: only the sequence rule can refuse this
     (let ((skip (up:make-signed-update :operator-id pub :ledger-id lid :seq 5 :prev-hash (up:chain-hash genesis)
                                        :message (op:encode-operation (list :type :fee-change :deposit-id (op:deposit-id "x") :new-fees (op:make-fees) :effective-block 1)))))
-      (up:sign-operator skip priv)
+      (up:sign-operator skip (tk priv))
       (check-signals "seq 5 after seq 0 is refused even though it chains" lg:ledger-error (lg:apply-update l skip)))))

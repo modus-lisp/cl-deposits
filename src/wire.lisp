@@ -16,7 +16,7 @@
            #:+kind-fraud-proof+ #:+kind-lottery-reveal+ #:+kind-rotation-tx+ #:rotation-tx-event #:fraud-event #:reveal-event #:reveal-message
            #:+kind-spend-challenge+ #:+kind-challenge-answer+ #:spend-challenge-event #:challenge-answer-event
            #:event-member #:event-d-tag
-           #:nostr-keypair #:update-event #:event->update #:ledger-tag
+           #:nostr-keypair #:even-y-privkey #:read-key-file #:write-new-key-file #:update-event #:event->update #:ledger-tag
            #:request-event #:response-event #:advertisement-event
            #:event-action #:event-ledger-id #:event-request-id #:parse-json #:json
            #:jget #:json-object #:affected-deposit-ids #:hex-of #:even-y-privkey))
@@ -38,12 +38,32 @@
 ;;; 02 prefix — so protocol keys must have even Y to be one identity on both
 ;;; layers.  EVEN-Y-PRIVKEY negates a private key whose public Y is odd.
 
+;;;
+;;; Private keys are FIXED 32-byte buffers (secp256k1-fast refuses integers and
+;;; heap vectors); EVEN-Y-PRIVKEY returns a fresh POOLED buffer the caller owns.
+
 (defun even-y-privkey (priv)
   (secp256k1-fast:secp-init)
-  (let ((pt (secp256k1-fast:secp-pubkey priv)))
-    (if (evenp (secp256k1-fast:secp-y pt)) priv (- secp256k1-fast:*secp256k1-n* priv))))
+  (let ((pt (secp256k1-fast:secp-pubkey priv)) (out (gossamer:acquire :octets 32)))
+    (secp256k1-fast:seckey-negate-into priv out :negate (oddp (secp256k1-fast:secp-y pt)))
+    out))
 
-(defun nostr-keypair (priv) (k:keypair-from-secret (int->be priv 32)))
+(defun read-key-file (path)
+  "The private key stored as hex in PATH, as a pooled fixed buffer (the caller FREEs
+it or hands it to an owner).  The decoded heap copy is wiped at once."
+  (let ((b (hex->bytes (string-trim '(#\Newline #\Space #\Return) (uiop:read-file-string path)))))
+    (unless (= (length b) 32) (fill b 0) (error "~a: expected a 32-byte hex key" path))
+    (prog1 (gossamer:pooled-copy b) (fill b 0))))
+
+(defun write-new-key-file (path)
+  "Create PATH holding a fresh random private key as hex (an explicit export: the hex
+string is the key file's content)."
+  (gossamer:with-fixed-scratch ((k :octets 32))
+    (loop (natrium:random-bytes-into k) (when (secp256k1-fast:seckey-valid-p k) (return)))
+    (with-open-file (s path :direction :output :if-exists :error)
+      (format s "~a~%" (bytes->hex k)))))
+
+(defun nostr-keypair (priv) (k:keypair-from-secret priv))
 
 (defun hex-of (bytes) (bytes->hex bytes))
 

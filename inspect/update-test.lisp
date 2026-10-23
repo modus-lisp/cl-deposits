@@ -26,14 +26,14 @@
   (let* ((key (lambda (b) (u:be->int (make-array 32 :element-type '(unsigned-byte 8) :initial-element b))))
          (fill (lambda (b) (make-array 32 :element-type '(unsigned-byte 8) :initial-element b)))
          (aux (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-         (u (up:make-signed-update :operator-id (up:compressed-pubkey (funcall key #x11)) :ledger-id (funcall fill #xaa)
+         (u (up:make-signed-update :operator-id (up:compressed-pubkey (tk (funcall key #x11))) :ledger-id (funcall fill #xaa)
                                    :seq 7 :block-height 850000 :block-hash (funcall fill #xbb)
                                    :prev-hash (funcall fill #xcc) :message (hx "00012a"))))
     (setf (up:update-cosignatures u)
-          (list (up:sign-cosignature u (funcall key #x22) (up:compressed-pubkey (funcall key #x22)) (funcall fill #x01) :aux aux)
-                (up:sign-cosignature u (funcall key #x33) (up:compressed-pubkey (funcall key #x33)) (funcall fill #x02) :aux aux)))
+          (list (up:sign-cosignature u (tk (funcall key #x22)) (up:compressed-pubkey (tk (funcall key #x22))) (funcall fill #x01) :aux aux)
+                (up:sign-cosignature u (tk (funcall key #x33)) (up:compressed-pubkey (tk (funcall key #x33))) (funcall fill #x02) :aux aux)))
     (setf (up:update-cosignatures u) (up:sorted-cosignatures u))
-    (up:sign-operator u (funcall key #x11) :aux aux)
+    (up:sign-operator u (tk (funcall key #x11)) :aux aux)
     u))
 
 (defun pget (plist key) (second (member key plist :test #'equal)))
@@ -130,12 +130,12 @@
   (let* ((op 12345678901234567890) (cos (list 98765432109876543210 1111111111111111111 2222222222222222222))
          (lid (u:sha256 (hx "01"))) (prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
          (chain (loop for seq below 52
-                      collect (let ((x (up:make-signed-update :operator-id (up:compressed-pubkey op) :ledger-id lid :seq seq
+                      collect (let ((x (up:make-signed-update :operator-id (up:compressed-pubkey (tk op)) :ledger-id lid :seq seq
                                                               :prev-hash prev :message (hx (format nil "0001~2,'0x" seq))
                                                               :block-height (+ 800000 seq))))
                                 (dolist (c (subseq cos 0 (case (mod seq 3) (0 0) (1 2) (t 3))))
-                                  (push (up:sign-cosignature x c (up:compressed-pubkey c) (u:sha256 (u:int->be seq 4))) (up:update-cosignatures x)))
-                                (up:sign-operator x op)
+                                  (push (up:sign-cosignature x (tk c) (up:compressed-pubkey (tk c)) (u:sha256 (u:int->be seq 4))) (up:update-cosignatures x)))
+                                (up:sign-operator x (tk op))
                                 (setf prev (up:chain-hash x))
                                 x))))
     (check "every update round-trips byte for byte"

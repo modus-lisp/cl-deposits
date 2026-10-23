@@ -142,14 +142,14 @@
                                           (first witness))
                     :ok))))))
 
-(defun %sign-preimage (privkey-int preimage)
+(defun %sign-preimage (privkey preimage)
   "A one-element witness signing PREIMAGE's sighash (used by the calculus tests)."
-  (multiple-value-bind (r s) (secp:ecdsa-sign-raw privkey-int (operation-sighash preimage))
+  (multiple-value-bind (r s) (secp:ecdsa-sign-raw privkey (operation-sighash preimage))
     (list (cat (int->be r 32) (int->be s 32)))))
 
-(defun sign-operation (o privkey-int)
+(defun sign-operation (o privkey)
   "A one-element witness: the compact ECDSA signature over the operation's sighash."
   (multiple-value-bind (id type args nonce expiry) (operation->dep16 o)
     (unless id (error "operation ~a is not depositor-signed" (op:operation-type o)))
-    (multiple-value-bind (r s) (secp:ecdsa-sign-raw privkey-int (operation-sighash (operation-preimage id type args nonce expiry)))
+    (multiple-value-bind (r s) (secp:ecdsa-sign-raw privkey (operation-sighash (operation-preimage id type args nonce expiry)))
       (list (cat (int->be r 32) (int->be s 32))))))

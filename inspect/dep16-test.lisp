@@ -35,12 +35,12 @@
     (check "the five concrete texts parse to their canonical bytes" (= parsed 5))))
 
 (with-gate ("dep16: parser and evaluator beyond the vectors")
-  (let* ((priv 123456789) (pub (up:compressed-pubkey priv))
+  (let* ((priv 123456789) (pub (up:compressed-pubkey (tk priv)))
          (d (d16:parse-descriptor (format nil "wsh(with(K = ~a, cap = 1000, in and(pk(K), amount_at_most(cap), older(10))))" (u:bytes->hex pub))))
          (op (d16:make-operation :deposit-id (make-array 32 :element-type '(unsigned-byte 8)) :op-type "spend"
                                  :args '(("amount" . (:int 500)) ("kind" . (:symbol "invoice")))))
          (st (d16:make-snapshot :balance 10000 :blocks-since-activity 12 :height 500))
-         (sig (first (d17::%sign-preimage priv (d16::operation-preimage op)))))
+         (sig (first (d17::%sign-preimage (tk priv) (d16::operation-preimage op)))))
     (check "descriptor id is a tagged hash" (= 32 (length (d16:descriptor-id d))))
     (check "constants + pk + amount + older authorize" (d16:evaluate d op st (d16:make-witness :signatures (list (cons pub sig)))))
     (check "over the cap: refused" (not (d16:evaluate d (d16:make-operation :deposit-id (make-array 32 :element-type '(unsigned-byte 8)) :op-type "spend" :args '(("amount" . (:int 5000)))) st (d16:make-witness :signatures (list (cons pub sig))))))
@@ -56,7 +56,7 @@
       (check "hashlock refused with a wrong preimage" (not (d16:evaluate hl op st (d16:make-witness :preimages (list (cons (cons :sha256 h) (u:sha256 (hx "bb"))))))))
       (check "witness-from-stack maps a ledger witness stack onto the calculus witness"
              (d16:evaluate hl op st (d16:witness-from-stack (list pre) hl op))))
-    (let* ((s 987654321) (point (up:compressed-pubkey s))
+    (let* ((s 987654321) (point (up:compressed-pubkey (tk s)))
            (pl (d16:parse-descriptor (format nil "wsh(pointlock(~a))" (u:bytes->hex point)))))
       (check "pointlock satisfied by the scalar" (d16:evaluate pl op st (d16:make-witness :scalars (list (cons point (u:int->be s 32))))))
       (check "pointlock refused with a wrong scalar" (not (d16:evaluate pl op st (d16:make-witness :scalars (list (cons point (u:int->be (1+ s) 32))))))))

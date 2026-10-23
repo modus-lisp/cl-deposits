@@ -10,12 +10,17 @@
                     (#:bus #:cl-deposits.bus) (#:ln #:cl-deposits.lightning) (#:fr #:cl-deposits.fraud) (#:cr #:cl-deposits.courier)
                     (#:secp #:secp256k1-fast.schnorr))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:with-gate #:report
-           #:*failures* #:*checks* #:hx #:read-json-string-array #:vector-path))
+           #:*failures* #:*checks* #:tk #:hx #:read-json-string-array #:vector-path))
 (in-package #:cl-deposits.test)
 
 (defvar *checks* 0)
 (defvar *failures* '())
 (defvar *gate* "")
+
+(defun tk (k)
+  "A test private key as the fixed 32-byte buffer the signers take.  K is a PUBLIC
+test integer (or already such a buffer, returned as is).  Tests only."
+  (if (integerp k) (gossamer:pooled-copy (u:int->be k 32)) k))
 
 (defun hx (s) (u:hex->bytes (remove-if (lambda (ch) (member ch '(#\Space #\Newline))) s)))
 

@@ -9,7 +9,7 @@
 (let* ((args (cdr (member "--" sb-ext:*posix-argv* :test #'string=)))
        (lid (first args)) (opx (second args))
        (bus (cl-deposits.nostr-bus:make-nostr-bus (uiop:split-string (or (uiop:getenv "CLD_RELAYS") "ws://127.0.0.1:7777") :separator ",")))
-       (kp (cl-deposits.wire:nostr-keypair (cl-deposits.util:be->int (cl-deposits.node::random-aux))))
+       (kp (cl-deposits.wire:nostr-keypair (cl-deposits.node::random-aux)))
        (hexs (lambda (n) (make-string n :initial-element #\a)))
        (valid (json-simple:stringify
                (cl-deposits.fraud:broadcast->json

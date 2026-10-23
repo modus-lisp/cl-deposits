@@ -22,9 +22,9 @@
   "Apply STEPS random operations; return (values ledger model history) where
    HISTORY is the list of (op . outcome) with outcome :ok or the error kind."
   (let* ((ledger (lg:make-ledger)) (m (make-model)) (history '())
-         (deposits (loop for i below 3 collect (op:deposit-id (format nil "pk(~a)" (u:bytes->hex (up:compressed-pubkey (+ 1000 i)))))))
+         (deposits (loop for i below 3 collect (op:deposit-id (format nil "pk(~a)" (u:bytes->hex (up:compressed-pubkey (tk (+ 1000 i))))))))
          (pending-invoices '()) (pending-withdrawals '()) (pending-transfers '()) (n 0))
-    (lg:apply-operation ledger (list :type :ledger-open :operator-id (up:compressed-pubkey 7) :reserves-id "g" :genesis-block 0
+    (lg:apply-operation ledger (list :type :ledger-open :operator-id (up:compressed-pubkey (tk 7)) :reserves-id "g" :genesis-block 0
                                      :reserves-amount (* 1000 1000000) :collateral-amount 0))
     (dolist (d deposits)
       (lg:apply-operation ledger (list :type :deposit-open :deposit-id d :descriptor (u:bytes->hex d) :receive-requires-sig nil
@@ -132,7 +132,7 @@
   ;; Documented in UPSTREAM-NOTES: FeeCollect uses saturating subtraction on the
   ;; whole balance, ignoring locked_balance.  Our fold mirrors it.
   (let* ((l (lg:make-ledger)) (d (op:deposit-id "q")))
-    (lg:apply-operation l (list :type :ledger-open :operator-id (up:compressed-pubkey 7) :reserves-id "g" :genesis-block 0 :reserves-amount 1000000000 :collateral-amount 0))
+    (lg:apply-operation l (list :type :ledger-open :operator-id (up:compressed-pubkey (tk 7)) :reserves-id "g" :genesis-block 0 :reserves-amount 1000000000 :collateral-amount 0))
     (lg:apply-operation l (list :type :deposit-open :deposit-id d :descriptor "q" :receive-requires-sig nil))
     (lg:apply-operation l (list :type :onchain-credit :txid (rbytes 32) :vout 0 :deposit-id d :amount 1000 :funding-address "x"))
     (lg:apply-operation l (list :type :invoice-lock :deposit-id d :amount 800 :payment-id (rbytes 32) :sequence-number 1 :nonce 1 :expiry 9 :witness '() :fee 0))
@@ -149,8 +149,8 @@
         (declare (ignore m))
         ;; Replaying only the accepted operations must reproduce the same state.
         (let ((again (lg:make-ledger)))
-          (lg:apply-operation again (list :type :ledger-open :operator-id (up:compressed-pubkey 7) :reserves-id "g" :genesis-block 0 :reserves-amount (* 1000 1000000) :collateral-amount 0))
-          (dolist (d (loop for i below 3 collect (op:deposit-id (format nil "pk(~a)" (u:bytes->hex (up:compressed-pubkey (+ 1000 i)))))))
+          (lg:apply-operation again (list :type :ledger-open :operator-id (up:compressed-pubkey (tk 7)) :reserves-id "g" :genesis-block 0 :reserves-amount (* 1000 1000000) :collateral-amount 0))
+          (dolist (d (loop for i below 3 collect (op:deposit-id (format nil "pk(~a)" (u:bytes->hex (up:compressed-pubkey (tk (+ 1000 i))))))))
             (unless (gethash d (lg:ledger-deposits again))
               (let ((orig (gethash d (lg:ledger-deposits ledger))))
                 (lg:apply-operation again (list :type :deposit-open :deposit-id d :descriptor (u:bytes->hex d) :receive-requires-sig nil
@@ -173,8 +173,8 @@
 (with-gate ("property: signed-update codec and hash chain under random inputs")
   (let ((bad 0))
     (dotimes (i 200)
-      (let* ((cosigs (loop repeat (rnd 4) collect (up:make-cosignature :pubkey (up:compressed-pubkey (+ 5000 (rnd 1000))) :signature (rbytes 64) :member-ledger-hash (rbytes 32))))
-             (u (up:make-signed-update :operator-id (up:compressed-pubkey 77) :ledger-id (rbytes 32) :seq (rnd 100000) :prev-hash (rbytes 32)
+      (let* ((cosigs (loop repeat (rnd 4) collect (up:make-cosignature :pubkey (up:compressed-pubkey (tk (+ 5000 (rnd 1000)))) :signature (rbytes 64) :member-ledger-hash (rbytes 32))))
+             (u (up:make-signed-update :operator-id (up:compressed-pubkey (tk 77)) :ledger-id (rbytes 32) :seq (rnd 100000) :prev-hash (rbytes 32)
                                        :message (rbytes (1+ (rnd 300))) :block-height (rnd 2) :block-hash (if (zerop (rnd 2)) (rbytes 32) (make-array 32 :element-type '(unsigned-byte 8)))
                                        :operator-sig (rbytes 64) :cosignatures (remove-duplicates cosigs :key #'up:cosig-pubkey :test #'equalp)))
              (bytes (up:encode-update u))

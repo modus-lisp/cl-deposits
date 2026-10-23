@@ -15,7 +15,7 @@
                         (coerce (json-simple:parse (uiop:read-file-string source)) 'list)))
        (bus (cl-deposits.nostr-bus:make-nostr-bus
              (uiop:split-string (or (uiop:getenv "CLD_RELAYS") "ws://127.0.0.1:7777") :separator ",")))
-       (keypair (cl-deposits.wire:nostr-keypair (cl-deposits.util:be->int (cl-deposits.node::random-aux))))
+       (keypair (cl-deposits.wire:nostr-keypair (cl-deposits.node::random-aux)))
        (*print-pretty* nil))
   (cl-deposits.nostr-bus:wait-for-bus bus)
   (dolist (u updates)

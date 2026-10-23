@@ -13,7 +13,7 @@
 
 (defun boot (priv bus hf)
   "A fresh node (process) for PRIV, reloading whatever its data dir holds."
-  (let ((n (nd:make-node :priv priv :bus bus :height-fn hf :data-dir (dir-for priv))))
+  (let ((n (nd:make-node :priv (tk priv) :bus bus :height-fn hf :data-dir (dir-for priv))))
     (nd:load-data-dir n)
     n))
 
@@ -40,7 +40,7 @@
                (every (lambda (m) (and (nd::node-member-ledger-hex m) (nd:record-owned-p (nd:own-ledger m)))) (list b c d)))
         (check "members hold A as a replica at the same tip"
                (every (lambda (m) (equalp (lg:ledger-chain-tip (nd:record-ledger (nd:find-record m id))) (lg:ledger-chain-tip (nd:record-ledger la)))) (list b c d)))
-        (let* ((w1 (nd:make-wallet :priv 55555555555555555555 :bus bus)) (w2 (nd:make-wallet :priv 66666666666666666666 :bus bus))
+        (let* ((w1 (nd:make-wallet :priv (tk 55555555555555555555) :bus bus)) (w2 (nd:make-wallet :priv (tk 66666666666666666666) :bus bus))
                (d1 (nd:wallet-open-deposit w1 id)) (d2 (nd:wallet-open-deposit w2 id)))
           (check "credit after restart needs cosignatures and gets them"
                  (nd:credit-onchain a la d1 100000 :txid (u:sha256 (hx "c0ffee5"))))

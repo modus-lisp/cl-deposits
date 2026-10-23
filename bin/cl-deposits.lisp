@@ -13,11 +13,8 @@
 (let* ((dir (uiop:ensure-directory-pathname (or (env "CLD_DIR") (error "set CLD_DIR"))))
        (keyfile (merge-pathnames "node.key" dir)))
   (ensure-directories-exist dir)
-  (unless (probe-file keyfile)
-    (with-open-file (s keyfile :direction :output)
-      (format s "~a~%" (cl-deposits.util:bytes->hex (cl-deposits.node::random-aux)))))
-  (let* ((priv (cl-deposits.util:be->int (cl-deposits.util:hex->bytes
-                                          (string-trim '(#\Newline #\Space) (uiop:read-file-string keyfile)))))
+  (unless (probe-file keyfile) (cl-deposits.wire:write-new-key-file keyfile))
+  (let* ((priv (cl-deposits.wire:read-key-file keyfile))   ; fixed; MAKE-NODE takes an even-Y copy
          (relays (uiop:split-string (env "CLD_RELAYS" "ws://127.0.0.1:7777") :separator ","))
          (bus (cl-deposits.nostr-bus:make-nostr-bus relays))
          (cli (env "CLD_BITCOIN_CLI"))
@@ -36,6 +33,7 @@
                 :ln (let ((hp (env "CLD_LN_CONTROL")))
                       (and hp (let ((i (position #\: hp)))
                                 (cl-deposits.lightning:make-clp-backend (subseq hp 0 i) (parse-integer hp :start (1+ i)))))))))
+    (gossamer:free priv)                      ; the node holds its own even-Y copy
     (when (cl-deposits.node:node-ln node)
       (cl-deposits.node:start-invoice-poller node)
       (format t "~&lightning rail: ~a~%" (env "CLD_LN_CONTROL")))

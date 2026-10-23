@@ -448,7 +448,7 @@
 
 (defun point-is-scalar-image (point scalar)
   (let ((s (be->int scalar)))
-    (and (< 0 s secp:*secp256k1-n*) (equalp (cl-deposits.update:compressed-pubkey s) point))))
+    (and (< 0 s secp:*secp256k1-n*) (equalp (cl-deposits.update:public-scalar-point s) point))))
 
 (defvar *budget*)
 (defun charge (n) (when *budget* (when (< (decf (car *budget*) n) 0) (fail "budget exhausted"))))

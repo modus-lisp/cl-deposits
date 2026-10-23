@@ -175,9 +175,9 @@
     (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
 
 (defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn pledge-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn feerate-fn)
-  (let* ((priv (w:even-y-privkey priv))
+  (let* ((priv (w:even-y-privkey priv))     ; a pooled copy this node owns
          (pub (up:compressed-pubkey priv))
-         (node (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
+         (node (gossamer:own (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
                            :chain-fn chain-fn :pledge-fn pledge-fn :spender-fn spender-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
@@ -187,7 +187,7 @@
                            ;; cosign request handled then found no record, took the ledger
                            ;; for a replica we had lost, and rebuilt it from the relay: 80k
                            ;; updates, racing the load, through every fork's updates too.
-                           :loading (and data-dir t))))
+                           :loading (and data-dir t)) priv)))
     ;; On a real relay, events arrive on the reader thread.  Responses are
     ;; consumed inline (they only wake a waiter); requests and updates go to a
     ;; worker, because handling a request may itself wait for responses.
@@ -2692,8 +2692,8 @@
 (defstruct (wallet (:constructor %make-wallet)) priv pubkey keypair bus (pending (make-hash-table :test #'equal)) (nonce 0))
 
 (defun make-wallet (&key priv bus)
-  (let* ((priv (w:even-y-privkey priv))
-         (wal (%make-wallet :priv priv :pubkey (up:compressed-pubkey priv) :keypair (w:nostr-keypair priv) :bus bus)))
+  (let* ((priv (w:even-y-privkey priv))     ; a pooled copy this wallet owns
+         (wal (gossamer:own (%make-wallet :priv priv :pubkey (up:compressed-pubkey priv) :keypair (w:nostr-keypair priv) :bus bus) priv)))
     (bus:bus-subscribe bus (flt:make-filter :kinds (list w:+kind-response+))
                        (lambda (event)
                          (let ((wt (gethash (w:event-request-id event) (wallet-pending wal))))
@@ -3098,7 +3098,13 @@
 (defun lottery-seed (node id-hex)
   "Our lottery seed for a dispute on ID-HEX, derived from the node key so a
    restarted node recovers the preimage it committed to."
-  (sha256 (cat (ascii->bytes "deposits/cl/lottery-seed/v1") (int->be (node-priv node) 32) (hex->bytes id-hex))))
+  (let ((out (make-array 32 :element-type '(unsigned-byte 8))))
+    (natrium:with-sha256 (c)
+      (natrium:sha256-update c (ascii->bytes "deposits/cl/lottery-seed/v1"))
+      (natrium:sha256-update c (node-priv node))          ; streamed: never concatenated
+      (natrium:sha256-update c (hex->bytes id-hex))
+      (natrium:sha256-final-into c out))
+    out))
 
 (defparameter *pledge-height-wait-seconds* 15)
 
@@ -4275,13 +4281,17 @@
    an offer or accept address commits a 32-byte root)."
   (let* ((xonly (up:x-only (node-pubkey node)))
          (n secp256k1-fast:*secp256k1-n*)
-         (d0 (if (= (aref (node-pubkey node) 0) 2) (node-priv node) (- n (node-priv node))))
-         (tweak (mod (be->int (tagged-hash "TapTweak" (cat xonly root))) n))
-         (d (mod (+ d0 tweak) n))
+         (tweak (mod (be->int (tagged-hash "TapTweak" (cat xonly root))) n))   ; public
          (sighash (cl-consensus.script:taproot-sighash tx in-index prevouts 0 :ext-flag 0)))
     (multiple-value-bind (spk parity) (lot:p2tr-spk xonly root)
       (declare (ignore spk))
-      (schnorr:schnorr-sign (if (= parity 1) (- secp256k1-fast:*secp256k1-n* d) d) sighash (random-aux)))))
+      ;; d = (d0 + t) mod n, negated when Q has odd Y; d0 = our key with even-Y P.
+      (gossamer:with-fixed-scratch ((d :octets 32) (tw :octets 32))
+        (secp256k1-fast:seckey-negate-into (node-priv node) d :negate (/= (aref (node-pubkey node) 0) 2))
+        (replace tw (int->be tweak 32))
+        (secp256k1-fast:seckey-tweak-add-into d tw d)
+        (secp256k1-fast:seckey-negate-into d d :negate (= parity 1))
+        (schnorr:schnorr-sign d sighash (random-aux))))))
 
 ;;; Fraud broadcasts (Kind 9101): verify, and if we are a member, dispute.
 

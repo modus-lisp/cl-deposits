@@ -3,7 +3,7 @@
 
 (in-package #:cl-deposits.test)
 
-(defun test-keys (n) (loop for i from 1 to n collect (+ 1000000007 (* i 987654321))))
+(defun test-keys (n) (loop for i from 1 to n collect (tk (+ 1000000007 (* i 987654321)))))
 
 (with-gate ("rotation: reserves spends validated by cl-consensus")
   (let* ((privs (test-keys 4))
@@ -317,7 +317,7 @@
                    (let ((w (words line)))
                      (if (string= (first w) "total")
                          (let ((m (op:decode-manifest (u:hex->bytes (gethash "manifest" kv)))))
-                           (setf (getf (lg:ledger-dormancy-notice l) :receiver) (up:compressed-pubkey 5)
+                           (setf (getf (lg:ledger-dormancy-notice l) :receiver) (up:compressed-pubkey (tk 5))
                                  (getf (lg:ledger-dormancy-notice l) :manifest) m
                                  (getf (lg:ledger-dormancy-notice l) :spk) (u:hex->bytes (gethash "receiver_spk" kv))
                                  (getf (lg:ledger-dormancy-notice l) :total) (parse-integer (second w))
@@ -593,18 +593,18 @@
 (with-gate ("DEP-06 vault spend: the anchor, answers and the two proof forms, against the shared vector")
   (when (uiop:getenv "CL_DEPOSITS_WRITE_VECTORS")
     (let* ((op-priv 424242) (m-privs '(515151 616161 717171)) (c-priv 818181)
-           (pa (up:compressed-pubkey op-priv)) (pms (mapcar #'up:compressed-pubkey m-privs)) (pc (up:compressed-pubkey c-priv))
+           (pa (up:compressed-pubkey (tk op-priv))) (pms (mapcar #'up:compressed-pubkey m-privs)) (pc (up:compressed-pubkey (tk c-priv)))
            (lid (u:sha256 (hx "1e"))) (cid (u:sha256 (hx "1c")))
            (zero (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
            (vault-txid (u:sha256 (u:ascii->bytes "vault")))
            (block (lambda (h) (u:sha256 (u:ascii->bytes (format nil "block ~a" h)))))
-           (sign (lambda (u priv) (up:sign-operator u priv) u))
+           (sign (lambda (u priv) (up:sign-operator u (tk priv)) u))
            (mk (lambda (priv pub ledger seq prev op &key (height (+ 100 seq)) cosigners)
                  (let ((u (up:make-signed-update :operator-id pub :ledger-id ledger :seq seq :prev-hash prev
                                                  :block-height height :block-hash (funcall block height)
                                                  :message (op:encode-operation op))))
                    (dolist (cp cosigners)
-                     (push (up:sign-cosignature u cp (up:compressed-pubkey cp) (u:sha256 (u:ascii->bytes "member tip"))) (up:update-cosignatures u)))
+                     (push (up:sign-cosignature u (tk cp) (up:compressed-pubkey (tk cp)) (u:sha256 (u:ascii->bytes "member tip"))) (up:update-cosignatures u)))
                    (funcall sign u priv))))
            (reserves (rs:build-reserves :operator pa :members pms :ledger-hash (u:sha256 (hx "aa")) :quorum-expiry 5000
                                         :ruleset "cltv-offset-v2" :network :signet))
@@ -625,7 +625,7 @@
                                             :outputs (loop for (spk . v) in outs collect (btx:make-txout :value v :script spk))
                                             :witnesses (list nil)))
                            (sigs (rot:sign-tier tx 0 prevouts reserves 0
-                                                (mapcar (lambda (p) (cons (up:x-only (up:compressed-pubkey p)) p)) m-privs))))
+                                                (mapcar (lambda (p) (cons (up:x-only (up:compressed-pubkey (tk p))) p)) m-privs))))
                       (rot:attach-tier-witness tx 0 reserves 0 sigs))))
            (next-spk (u:cat (hx "5120") (u:sha256 (u:ascii->bytes "next vault"))))
            (thief (u:cat (hx "5120") (u:sha256 (u:ascii->bytes "thief"))))
@@ -650,7 +650,7 @@
                                  (list :type :quorum-challenge :challenged-ledger-id lid :challenged-txid (btx:tx-txid tx) :challenged-anchor anchor)
                                  :height height)))
            (proof (lambda (signer tx &key challenge lapse)
-                    (fr:make-unauthorized-vault-spend-proof (up:compressed-pubkey signer) (u:sha256 (hx "a11ce")) lid 1 tx prevouts (funcall block 1000)
+                    (fr:make-unauthorized-vault-spend-proof (up:compressed-pubkey (tk signer)) (u:sha256 (hx "a11ce")) lid 1 tx prevouts (funcall block 1000)
                                                             :challenge-update challenge :lapse-block-hash (and lapse (funcall block lapse)))))
            (updates (list u3n u0 u3x u2 u3c u1 u3o u3p u3m u3t u3)))
       (with-open-file (o (vector-path "vault_spend_anchor.txt") :direction :output :if-exists :supersede)

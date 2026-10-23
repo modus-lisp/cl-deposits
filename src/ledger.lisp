@@ -420,7 +420,7 @@
                ((search "pointlock(" script)
                 (let ((s (be->int (first witness))))
                   (and (= 32 (length (first witness))) (< 0 s secp256k1-fast:*secp256k1-n*)
-                       (equalp (up:compressed-pubkey s) (hex->bytes arg)))))
+                       (equalp (up:public-scalar-point s) (hex->bytes arg)))))
                (t nil)))))
 
 (defun fees-due (d height)

@@ -93,7 +93,7 @@
           (when (<= amount fee) (error "amount too small to cover fees"))
           (when (> (- amount fee) (courier-balance c dest)) (error "insufficient courier liquidity on the destination ledger"))
           (let* ((t-scalar (and ptlc (nd::random-aux)))
-                 (point-t (and ptlc (up:compressed-pubkey (be->int t-scalar))))
+                 (point-t (and ptlc (up:scalar-point t-scalar)))
                  (point-b (and ptlc (point-add point-p point-t)))     ; P_b = P + T: what leg 1 locks to
                  (route (list :source source :dest dest :dest-deposit dest-deposit :amount amount :fee fee :forward (- amount fee)
                               :hash hash :point-p point-p :point-b point-b :blinding t-scalar)))
@@ -154,7 +154,7 @@
    Returns (values leg1-id s forward point-p)."
   (let* ((secret (or preimage (nd::random-aux)))
          (hash (and (not ptlc) (sha256 secret)))
-         (point-p (and ptlc (up:compressed-pubkey (be->int secret)))))
+         (point-p (and ptlc (up:scalar-point secret))))
     (multiple-value-bind (ok res err)
         (nd:wallet-request wal (make-string 64 :initial-element #\0) "request_route"
                            (apply #'w:json-object "source_ledger" source "dest_ledger" dest "dest_deposit_id" (bytes->hex dest-deposit)

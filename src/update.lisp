@@ -40,7 +40,7 @@
            #:content-hash #:chain-hash #:header-violation
            #:cosign-digest #:operator-digest
            #:verify-operator-signature #:verify-cosignature #:verify-cosignatures
-           #:x-only #:compressed-pubkey #:sign-cosignature #:sign-operator
+           #:x-only #:compressed-pubkey #:scalar-point #:public-scalar-point #:sign-cosignature #:sign-operator
            #:+cosign-tag+ #:+operator-tag+ #:encode-cosignatures-for-test))
 (in-package #:cl-deposits.update)
 
@@ -73,10 +73,21 @@
 
 (defun x-only (pubkey33) (subseq pubkey33 1 33))
 
-(defun compressed-pubkey (privkey-int)
-  "33-byte SEC compressed public key: 02/03 by y parity, then x."
+(defun compressed-pubkey (privkey)
+  "33-byte SEC compressed public key of PRIVKEY (a fixed 32-byte buffer)."
   (ec:secp-init)
-  (let ((pt (ec:secp-pubkey privkey-int)))
+  (secp256k1-fast:seckey-compressed-pubkey privkey))
+
+(defun scalar-point (scalar32)
+  "Compressed point s*G for a 32-byte scalar that is still SECRET (a PTLC secret or
+blinding before it is revealed), computed on the constant-time path via a pooled copy."
+  (let ((k (gossamer:pooled-copy scalar32)))
+    (unwind-protect (secp256k1-fast:seckey-compressed-pubkey k) (gossamer:free k))))
+
+(defun public-scalar-point (s)
+  "Compressed point s*G for an integer scalar that is PUBLIC (already revealed, e.g.
+when checking a disclosed PTLC secret against its point)."
+  (let ((pt (ec:secp-mul-point s (ec:secp-generator))))
     (cat (octets (if (evenp (ec:secp-y pt)) 2 3)) (int->be (ec:secp-x pt) 32))))
 
 (defun sorted-cosignatures (update)
@@ -214,16 +225,16 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Signing
 
-(defun sign-cosignature (u privkey-int pubkey33 member-ledger-hash &key aux)
+(defun sign-cosignature (u privkey pubkey33 member-ledger-hash &key aux)
   (make-cosignature :pubkey pubkey33
-                    :signature (secp:schnorr-sign privkey-int (cosign-digest u member-ledger-hash)
+                    :signature (secp:schnorr-sign privkey (cosign-digest u member-ledger-hash)
                                                   (or aux (make-array 32 :element-type '(unsigned-byte 8))))
                     :member-ledger-hash member-ledger-hash))
 
-(defun sign-operator (u privkey-int &key aux)
+(defun sign-operator (u privkey &key aux)
   "Sets and returns the operator signature over the update's cosignatures as they stand."
   (setf (update-operator-sig u)
-        (secp:schnorr-sign privkey-int (operator-digest u)
+        (secp:schnorr-sign privkey (operator-digest u)
                            (or aux (make-array 32 :element-type '(unsigned-byte 8))))))
 
 (defun header-violation (predecessor update)

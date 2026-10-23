@@ -68,11 +68,11 @@
           (check "dropping the optional fee arg breaks the signature (when present)"
                  (or (null (op:field o :fee)) (null (d17:verify-operation-witness m desc (op:field o :witness))))))))
     ;; Our own signing round-trips through the same verifier.
-    (let* ((priv 777777777777777777777) (pub (up:compressed-pubkey priv))
+    (let* ((priv 777777777777777777777) (pub (up:compressed-pubkey (tk priv)))
            (o (list :type :invoice-lock :deposit-id (op:deposit-id "x") :amount 5 :payment-id (u:sha256 (hx "01"))
                     :sequence-number 1 :nonce 9 :expiry 100 :witness '())))
       (check-equal "sign-operation verifies under pk(K)"
-                   (d17:verify-operation-witness o (format nil "pk(~a)" (u:bytes->hex pub)) (d17:sign-operation o priv))
+                   (d17:verify-operation-witness o (format nil "pk(~a)" (u:bytes->hex pub)) (d17:sign-operation o (tk priv)))
                    :ok))))
 
 

@@ -9,16 +9,15 @@
 (let* ((args (cdr (member "--" sb-ext:*posix-argv* :test #'string=)))
        (keyfile (or (first args) (error "usage: KEYFILE LEDGER ACTION ...")))
        (ledger (second args)) (action (third args)) (rest (cdddr args)))
-  (unless (probe-file keyfile)
-    (with-open-file (s keyfile :direction :output)
-      (format s "~a~%" (cl-deposits.util:bytes->hex (cl-deposits.node::random-aux)))))
-  (let* ((priv (cl-deposits.util:be->int (cl-deposits.util:hex->bytes (string-trim '(#\Newline #\Space) (uiop:read-file-string keyfile)))))
+  (unless (probe-file keyfile) (cl-deposits.wire:write-new-key-file keyfile))
+  (let* ((priv (cl-deposits.wire:read-key-file keyfile))
          (bus (and (not (string= action "pubkey"))
                    (cl-deposits.nostr-bus:make-nostr-bus (uiop:split-string (env "CLD_RELAYS" "ws://127.0.0.1:7777") :separator ","))))
          (wal (cl-deposits.node:make-wallet :priv priv :bus (or bus (cl-deposits.bus:make-mock-bus))))
          ;; One process per command: operation nonces must still climb across
          ;; invocations (an operator refuses a nonce it accepted within the expiry window).
-         (_ (setf (cl-deposits.node::wallet-nonce wal) (get-universal-time)))
+         (_ (progn (gossamer:free priv)       ; the wallet holds its own even-Y copy
+                   (setf (cl-deposits.node::wallet-nonce wal) (get-universal-time))))
          (hx #'cl-deposits.util:hex->bytes) (hex #'cl-deposits.util:bytes->hex)
          (*print-pretty* nil))
     (handler-case
