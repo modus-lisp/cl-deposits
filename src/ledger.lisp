@@ -28,7 +28,7 @@
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-last-fee-assessment #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
-           #:collateral-floor-bps #:collateral-meets-floor-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
+           #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
            #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
 (in-package #:cl-deposits.ledger)
@@ -461,6 +461,11 @@
            (fail :unknown-ruleset (format nil "QuorumBegin protocol_version ~s is not a known ruleset" (f :protocol-version))))
          ;; DEP-05 "Collateral floor": collateral is at least the strictest member's share of
          ;; the vault, never below 20%.  Collateral is a floor, not a cap on credits.
+         ;; DEP-05 "Quorum expiry": the operator may shorten a member's commitment, never extend it.
+         (let ((ceiling (quorum-expiry-ceiling promoted)))
+           (when (and ceiling (f :quorum-expiry) (> (f :quorum-expiry) ceiling))
+             (fail :quorum-expiry-exceeds-commitment
+                   (format nil "quorum_expiry ~a exceeds the shortest member commitment ~a" (f :quorum-expiry) ceiling))))
          (let ((floor (collateral-floor-bps promoted)))
            (unless (collateral-meets-floor-p (f :amount) (f :collateral-amount) floor)
              (fail :collateral-below-floor
@@ -862,6 +867,18 @@
 
 (defun collateral-meets-floor-p (reserves collateral floor-bps)
   (>= (* collateral 10000) (* floor-bps (+ reserves collateral))))
+
+(defun quorum-expiry-ceiling (members)
+  "DEP-05 \"Quorum expiry\": the latest quorum_expiry a QuorumBegin may carry, the shortest
+   membership_until among the members it seats.  Members that declared none impose none;
+   NIL when none did."
+  (let ((c (remove nil (mapcar #'member-membership-until members))))
+    (and c (reduce #'min c))))
+
+(defun planned-quorum-expiry (members current-block window-blocks)
+  "The quorum_expiry an operator proposes: its own window, shortened to the members' ceiling."
+  (let ((own (+ current-block window-blocks)) (c (quorum-expiry-ceiling members)))
+    (if c (min c own) own)))
 
 (defun lifecycle-tier (ledger height)
   (let ((expiry (ledger-quorum-expiry ledger)))

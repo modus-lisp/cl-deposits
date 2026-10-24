@@ -605,8 +605,7 @@
    it can be funded on chain first.  Returns the reserves."
   (let* ((staged (lg:ledger-next-quorum-members (record-ledger rec)))
          ;; DEP-05: quorum_expiry is the shortest member commitment.
-         (commitments (remove nil (mapcar #'lg:member-membership-until staged)))
-         (expiry (reduce #'min commitments :initial-value (+ (height node) expiry-blocks)))
+         (expiry (lg:planned-quorum-expiry staged (height node) expiry-blocks))
          (reserves (rs:build-reserves :operator (node-pubkey node) :members (mapcar #'lg:member-pubkey staged)
                                       :ledger-hash (up:chain-hash (tip rec)) :quorum-expiry expiry
                                       :ruleset ruleset :network (intern (string-upcase (node-network node)) :keyword))))

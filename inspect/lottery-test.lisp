@@ -273,6 +273,23 @@
                             (lg:collateral-meets-floor-p (gethash "reserves" case) (gethash "collateral" case) floor)
                             (gethash "ok" case))))))
 
+(with-gate ("ledger: the DEP-05 quorum expiry ceiling against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "quorum_expiry.json")))))
+    (loop for case across (gethash "cases" v)
+          for name = (gethash "name" case)
+          do (let* ((members (map 'list (lambda (c) (lg::make-quorum-member :membership-until (and (integerp c) c)))
+                                  (gethash "commitments" case)))
+                    (ceiling (lg:quorum-expiry-ceiling members))
+                    (want (gethash "ceiling" case)))
+               (check-equal (format nil "~a: ceiling" name) ceiling (and (integerp want) want))
+               (check-equal (format nil "~a: planned" name)
+                            (lg:planned-quorum-expiry members (gethash "current_block" case) (gethash "window_blocks" case))
+                            (gethash "planned" case))
+               (loop for chk across (gethash "checks" case)
+                     for e = (gethash "expiry" chk)
+                     do (check-equal (format nil "~a: expiry ~a" name e)
+                                     (or (null ceiling) (<= e ceiling)) (gethash "ok" chk)))))))
+
 ;;; inspect/vectors/armer_eligibility.json: the DEP-03 replacement-collateral cut,
 ;;; shared with deposits-rust (deposits-node/tests/vectors/armer_eligibility.json).
 (with-gate ("lottery: armer eligibility cut against the shared vector")
