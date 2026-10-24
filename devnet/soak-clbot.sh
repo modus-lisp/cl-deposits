@@ -46,9 +46,14 @@ while true; do
       T=$("$CLD_SRC/devnet/cld-wallet.sh" "$w" "$L" transfer "$D" "$dst" "$amt" "$H" "$fee")
     fi
     TID=$(sx1 "$T" ":TRANSFER"); PRE=$(sx1 "$T" ":PREIMAGE")
-    if [ -n "$TID" ] && "$CLD_SRC/devnet/cld-wallet.sh" "$w" "$L" complete "$TID" "$PRE" | grep -q ":STATUS :OK"; then
+    C=""; [ -n "$TID" ] && C=$("$CLD_SRC/devnet/cld-wallet.sh" "$w" "$L" complete "$TID" "$PRE")
+    if [[ "$C" == *":STATUS :OK"* ]]; then
       ok=$((ok+1)); echo "$(date +%FT%T) ok   $w $name ${D:0:8}->${dst:0:8} $amt msat fee $fee (balance was $bal)"
-    elif [[ "$T" == *"TIER0-POST-EXPIRY"* ]]; then
+    elif [ -n "$TID" ]; then
+      # The lock committed and the completion did not: log why, not the lock's answer.
+      fail=$((fail+1)); echo "$(date +%FT%T) FAIL $w $name ${D:0:8}->${dst:0:8} $amt msat fee $fee: locked ${TID:0:16}, complete: ${C:-no answer}"
+    elif [[ "$T" =~ not\ cosignable\ at\ TIER ]]; then
+      # Past quorum expiry, at any tier (TIER0-POST-EXPIRY, then TIER1.. after the grace).
       EXPIRED_UNTIL[$name]=$(( now + ${SOAK_CL_EXPIRED_BACKOFF:-600} ))
       echo "$(date +%FT%T) skip $w $name quorum expired; backing off"
     elif [[ "$T" == *"ledger disputed"* ]]; then

@@ -48,7 +48,16 @@ for r in rows:
     if r[0]==name: r[3]=txid; r[4]=vout
 open(p,'w').write(''.join('\t'.join(r)+'\n' for r in rows))
 PY
-  echo "$(date +%FT%T) $name rotated: $(cld_ctl "$op" "(:info)" | grep -oE "\(:ID \"$id\"[^)]*:MEMBERS [1-9][^)]*" | grep -oE ':SEQ [0-9]+|:EXPIRY [0-9]+' | tr '\n' ' ')"
+  # Rotated only if the expiry moved: begin-quorum also answers OK when it resumes a recorded
+  # QuorumBegin whose rungs still await signatures, and nothing is spent until they arrive.
+  local info new_exp
+  info=$(cld_ctl "$op" "(:info)" | grep -oE "\(:ID \"$id\"[^)]*:MEMBERS [1-9][^)]*" | head -1)
+  new_exp=$(grep -oE ':EXPIRY [0-9]+' <<<"$info" | cut -d' ' -f2)
+  if [ -n "$new_exp" ] && [ "$new_exp" = "${ROT_EXP_BEFORE:-}" ]; then
+    echo "$(date +%FT%T) $name: QuorumBegin recorded, rungs still await signatures (expiry ${new_exp}); retrying next pass"
+    return 1
+  fi
+  echo "$(date +%FT%T) $name rotated: $(grep -oE ':SEQ [0-9]+|:EXPIRY [0-9]+' <<<"$info" | tr '\n' ' ')"
 }
 declare -A STOOD_DOWN
 while true; do
@@ -66,7 +75,7 @@ while true; do
       [ -n "${STOOD_DOWN[$name]:-}" ] || echo "$(date +%FT%T) $name: $op stood down ($nd of $nm members disputed it; custody moved: $(grep -oE ':CUSTODY-MOVED [^ ]+' <<<"$row" | cut -d' ' -f2)); not rotating"
       STOOD_DOWN[$name]=1; continue
     fi
-    if [ $((exp - h)) -le "$MARGIN" ]; then rotate "$name" "$id" "$op" "$members" || echo "$(date +%FT%T) $name rotation FAILED (height $h, expiry $exp)"; fi
+    if [ $((exp - h)) -le "$MARGIN" ]; then ROT_EXP_BEFORE=$exp rotate "$name" "$id" "$op" "$members" || echo "$(date +%FT%T) $name rotation FAILED (height $h, expiry $exp)"; fi
   done
   sleep "$EVERY"
 done
