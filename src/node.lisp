@@ -5181,7 +5181,7 @@
     (flet ((load-one (f)
              (handler-case
                  (let* ((first (with-open-file (in f) (read-line in)))
-                        (u (up:decode-update (base64-decode (string-trim '(#\[ #\" #\, #\Space) first))))
+                        (u (up:decode-update (base64-decode (string-trim '(#\[ #\] #\" #\, #\Space #\Return) first))))   ; one update: ["…"]
                         (owned (equalp (up:update-operator-id u) (node-pubkey node)))
                         (fork-op (let ((i (search "_fork_" (file-namestring f)))) (and i (subseq (file-namestring f) (+ i 6) (+ i 22)))))
                         (rec (load-record node f :owned-p owned)))

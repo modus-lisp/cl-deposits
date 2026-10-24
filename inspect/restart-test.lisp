@@ -22,6 +22,17 @@
    normalizes its key to even-Y, so the original PRIVS name the dirs.)"
   (mapcar (lambda (n priv) (nd:stop-node n) (boot priv bus hf)) nodes privs))
 
+(with-gate ("restart: a ledger of one update (its file is one line, [\"...\"]) reloads")
+  ;; The startup scan read the first line for the owner and trimmed "[", quote and "," but not
+  ;; "]": a ledger holding only its LedgerOpen failed to load ("bad base64 char"), and a fresh
+  ;; member lost its own ledger at its first restart (regtest, 2026-10-24).
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*)) (p 77777777777777777777)
+         (n (boot p bus hf))
+         (id (nd:record-id-hex (nd:open-ledger n :reserves-id "genesis:one-update"))))
+    (let ((n2 (progn (nd:stop-node n) (boot p bus hf))))
+      (check "the one-update ledger reloads, owned" (let ((r (nd:find-record n2 id))) (and r (nd:record-owned-p r))))
+      (nd:stop-node n2))))
+
 (with-gate ("restart: quorum, deposits, transfer, and a dispute across node restarts")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (pa 11111111111111111111) (pb 22222222222222222222) (pc 33333333333333333333) (pd 44444444444444444444)
