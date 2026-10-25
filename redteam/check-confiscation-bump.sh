@@ -35,23 +35,23 @@ VAULT=$(cld_ctl $OP '(:vaults)' | tr '()' '\n\n' | grep -F "\"$W\"" -A1 | grep -
 [ -n "$VAULT" ] || fail "no vault for $W"
 VINTX=${VAULT%:*}; VINVOUT=${VAULT#*:}
 echo "== vault $VAULT"
-# The mempool transaction spending the vault, if any.
+# The mempool transaction spending the vault, if any (one RPC, so the check right before each
+# block leaves no window for the confiscation to be mined unseen).
 spending_vault() {
-  local t
-  for t in $(bcli getrawmempool | tr -d '[]", ' | grep -E '^[0-9a-f]{64}$'); do
-    bcli getrawtransaction "$t" true 2>/dev/null | python3 -c '
-import json,sys
-tx=json.load(sys.stdin)
-if any(i.get("txid")==sys.argv[1] and i.get("vout")==int(sys.argv[2]) for i in tx["vin"]): print(tx["txid"])' "$VINTX" "$VINVOUT"
-  done
+  bcli gettxspendingprevout "[{\"txid\":\"$VINTX\",\"vout\":$VINVOUT}]" 2>/dev/null \
+    | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r[0].get("spendingtxid",""))' 2>/dev/null
 }
 
 echo "== waiting for the confiscation's rung 0 (arm, cosign, broadcast); mining only while the vault is unspent"
 R0=""
 for i in $(seq 1 $((WAIT / 5))); do
-  R0=$(spending_vault | head -1)
+  R0=$(spending_vault)
   [ -n "$R0" ] && break
-  [ $((i % 6)) -eq 0 ] && mine 1 >/dev/null   # the arm window closes on height
+  if [ $((i % 6)) -eq 0 ]; then   # the arm window closes on height
+    R0=$(spending_vault); [ -n "$R0" ] && break
+    mine 1 >/dev/null
+  fi
+  [ -n "$(bcli gettxout "$VINTX" "$VINVOUT" false 2>/dev/null | head -1)" ] || fail "the vault was spent in a block before we saw it in the mempool"
   sleep 5
 done
 [ -n "$R0" ] || fail "no confiscation reached the mempool within ${WAIT}s"
