@@ -2318,8 +2318,10 @@
              (loop for respectful in '(t nil)
                    thereis (loop for ti below (length (rs:reserves-tiers (disputed-reserves node (find-record node id-hex))))
                                  for built = (ignore-errors (multiple-value-list (build-confiscation node id-hex :tier-index ti :respectful respectful :armers armers)))
-                                 when (and built (first built) (funcall (node-chain-fn node) (btx:tx-txid (first built)) 0))
-                                   return built))))
+                                 ;; DEP-03 §Confiscation ladder: the rung whose output 0 is on chain
+                                 for rung = (and built (find-if (lambda (r) (funcall (node-chain-fn node) (btx:tx-txid r) 0)) (sixth built)))
+                                 when rung
+                                   return (cons rung (rest built))))))
       ;; The eligibility cut first; then every other set of two or more armers, so
       ;; a confiscation built on a different view of the cut (or by an older node,
       ;; over every armer) is still recognised.
@@ -2555,6 +2557,9 @@
                             (note-dispute node id "re-armed: our pledge no longer counted; now pledging ~a:~a" (txid-hex (first p)) (second p)))
                      (note-dispute node id "our pledge no longer counts; waiting for collateral to re-arm"))))
               ((eq lstate :pending)
+               ;; DEP-03 §Confiscation ladder: until a rung confirms, push the one the schedule names.
+               (let ((i (bump-confiscation node id)))
+                 (when (and i (plusp i)) (note-dispute node id "confiscation unconfirmed; broadcast rung ~a" i)))
                (cond ((not (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
                       ;; ADVERSARY :withhold-reveal — an armer that never publishes its
                       ;; preimage: the lottery cannot be claimed, custody waits (red team:
@@ -2571,6 +2576,10 @@
                                         (release-pledges node id)
                                         (note-dispute node id "lottery: ~(~a~)" outcome))
                           (error (e) (note-dispute node id "waiting to claim: ~a" e))))))
+              ;; Our assembled confiscation fell out of the mempool: push the rung the schedule
+              ;; names again rather than gathering signatures anew.
+              ((let ((i (bump-confiscation node id)))
+                 (when i (note-dispute node id "confiscation not in the mempool; rebroadcast rung ~a" i) t)))
               (t
                (let* ((closes (dispute-arm-closes node base))
                       (armers (sort (mapcar #'first (armers-of node id)) #'bytes<))
@@ -3314,7 +3323,8 @@
     (+ (ceiling (* obligations ratio)) claim-fee)))
 
 (defun disputed-reserves (node rec)
-  "From the latest QuorumBegin: (values reserves-struct txid vout sats operator33)."
+  "From the latest QuorumBegin: (values reserves-struct txid vout sats operator33 collateral-msats
+   feerate), FEERATE its reference_feerate_sat_vb (2 when none): what its confiscation pays (DEP-03)."
   (let ((operator nil) (qb nil))
     (dolist (u (reverse (record-history rec)))
       (let ((o (op:decode-operation (up:update-message u))))
@@ -3327,7 +3337,8 @@
                                  :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
                                  :ruleset (or (op:field qb :protocol-version) "cltv-offset-v2")
                                  :network (intern (string-upcase (node-network node)) :keyword))
-              txid (op:field qb :new-outpoint-vout) sats operator))))
+              txid (op:field qb :new-outpoint-vout) sats operator (op:field qb :collateral-amount)
+              (let ((f (op:field qb :reference-feerate))) (if (and f (plusp f)) f lot:+confiscation-default-feerate+))))))
 
 (defvar *vault-rungs* (make-hash-table :test #'equalp :synchronized t)
   "rung-0 txid -> (txid sats): which rung of a fee ladder confirmed (DEP-03), once seen confirmed.")
@@ -3458,7 +3469,8 @@
    so every cosigner rebuilds the same one.  It spends the reserves through
    TIER-INDEX (default: the tier open at our height), its nLockTime that tier's
    CLTV.  Its lottery is over ARMERS, by default the DEP-03 eligibility cut
-   (lottery-armers).  Returns (values tx lottery prevouts reserves tier-index)."
+   (lottery-armers).  Returns (values tx lottery prevouts reserves tier-index rungs): TX is rung 0
+   of RUNGS, the fee ladder (DEP-03 §Confiscation ladder)."
   (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
          (armers (sort (copy-list (or armers (lottery-armers node id-hex))) #'bytes< :key #'first))
          (voters (recovery-voters base (dispute-last-valid-seq node id-hex)))
@@ -3466,20 +3478,22 @@
          (participants (loop for (pk c target) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target)))
          (lottery (progn (when (null participants) (fail "no armer is a lottery participant"))
                          (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword)))))
-    (multiple-value-bind (reserves txid vout sats operator) (disputed-reserves node base)
+    (multiple-value-bind (reserves txid vout sats operator collateral-msats feerate) (disputed-reserves node base)
       (multiple-value-bind (swept splice-outs residue)
           (confiscation-obligations node id-hex armers (or snapshot (nth-value 2 (lottery-armers node id-hex))))
         (let* ((tier-index (or tier-index (confiscation-tier reserves (height node))))
-               (tx (lot:confiscation-tx :vault (list txid vout sats) :swept swept :lottery-spk (lot:lottery-spk lottery)
-                                        :anchor (dispute-anchor node id-hex)
-                                        :voters (1+ (length voters)) :locktime (rs:tier-locktime (nth tier-index (rs:reserves-tiers reserves)))
-                                        :respectful respectful :fee fee
-                                        :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
-                                        :residue-sats residue :splice-outs splice-outs :operator-pubkey33 operator)))
+               (rungs (lot:confiscation-ladder :vault (list txid vout sats) :swept swept :lottery-spk (lot:lottery-spk lottery)
+                                               :anchor (dispute-anchor node id-hex)
+                                               :voters (1+ (length voters)) :locktime (rs:tier-locktime (nth tier-index (rs:reserves-tiers reserves)))
+                                               :respectful respectful :fee fee
+                                               :obligations-sats (floor (lg:total-obligations (record-ledger base)) 1000)
+                                               :residue-sats residue :splice-outs splice-outs :operator-pubkey33 operator
+                                               :collateral-msats collateral-msats :feerate feerate))
+               (tx (first rungs)))
           (values tx lottery (coerce (cons (cons sats (rs:reserves-spk reserves))
                                            (loop for (nil nil ss) in swept collect (cons ss (rs:reserves-spk reserves))))
                                      'vector)
-                  reserves tier-index))))))
+                  reserves tier-index rungs))))))
 
 (defun unsigned-tx-hex (tx)
   "An unsigned transaction as we send it to other signers: the legacy form.
@@ -3492,52 +3506,96 @@
 (defun confiscation-sighash (tx prevouts reserves &optional (tier-index 0))
   (rot:tier-sighash tx 0 prevouts (nth tier-index (rs:reserves-leaves reserves))))
 
+(defvar *confiscation-ladders* (make-hash-table :test #'equalp :synchronized t)
+  "(node pubkey . ledger id) -> (rungs h-c): the assembled rungs of a confiscation we proposed and
+   the height its broadcast schedule counts from (DEP-03 §Confiscation ladder).")
+
+(defun ladder-rung-due (n h-c height)
+  "DEP-03: the rung a holder broadcasts while none has confirmed, min(n - 1, (tip - h_c) / 6)."
+  (max 0 (min (1- n) (floor (- height h-c) 6))))
+
+(defun bump-confiscation (node id-hex)
+  "Broadcast the rung of our assembled confiscation of ID-HEX that the schedule names (a BIP-125
+   replacement of the one below), while no rung has confirmed.  Returns the rung index, or NIL."
+  (destructuring-bind (&optional rungs h-c) (gethash (cons (node-pubkey node) id-hex) *confiscation-ladders*)
+    (when (and rungs (node-chain-fn node)
+               (notany (lambda (r) (let ((info (funcall (node-chain-fn node) (btx:tx-txid r) 0)))
+                                     (and info (plusp (or (getf info :confirmations) 0)))))
+                       rungs))
+      (let ((i (ladder-rung-due (length rungs) h-c (height node))))
+        (broadcast node (nth i rungs))
+        i))))
+
 (defun confiscate (node id-hex &key respectful fee)
-  "Build the confiscation, gather the recovery quorum's tier-0 signatures over
-   the relay (confiscation_sign), assemble, and broadcast.  Returns (values tx lottery)."
-  (multiple-value-bind (tx lottery prevouts reserves tier-index) (build-confiscation node id-hex :respectful respectful :fee fee)
+  "Build the confiscation's fee ladder, gather the recovery quorum's signatures on every rung over
+   the relay (confiscation_sign), assemble each rung that reaches the tier's threshold, and
+   broadcast the one the schedule names (DEP-03 §Confiscation ladder).  Returns (values tx
+   lottery), TX rung 0."
+  (multiple-value-bind (tx lottery prevouts reserves tier-index rungs) (build-confiscation node id-hex :respectful respectful :fee fee)
     (setf fee (- (reduce #'+ prevouts :key #'car) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))
-    (let* ((sighash (confiscation-sighash tx prevouts reserves tier-index))
-           ;; DEP-06: swept migration outputs are spent through the same tier, one signature each
-           (sweep-hashes (loop for i from 1 below (length prevouts)
-                               collect (rot:tier-sighash tx i prevouts (nth tier-index (rs:reserves-leaves reserves)))))
-           (sweep-sigs (list (cons (up:x-only (node-pubkey node))
-                                   (mapcar (lambda (h) (schnorr:schnorr-sign (node-priv node) h (random-aux))) sweep-hashes))))
+    (let* ((leaf (nth tier-index (rs:reserves-leaves reserves)))
+           ;; per rung, one sighash per input (input 0 the vault, then the swept outputs, same tier)
+           (hashes (mapcar (lambda (r) (loop for i below (length prevouts) collect (rot:tier-sighash r i prevouts leaf))) rungs))
            (tier (nth tier-index (rs:reserves-tiers reserves)))
            (keys (rs:tier-keys tier))
-           (ours (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))
-           (sigs (list (cons (up:x-only (node-pubkey node)) ours)))
+           ;; signer x-only -> per rung, a list of per-input signatures (NIL for a rung it did not sign)
+           (sigs (list (cons (up:x-only (node-pubkey node))
+                             (mapcar (lambda (hs) (mapcar (lambda (h) (schnorr:schnorr-sign (node-priv node) h (random-aux))) hs)) hashes))))
            (responses (send-request node id-hex "confiscation_sign"
-                                    ;; The reference's field names: sighash, unsigned_tx, last_valid_sequence.
-                                    (w:json-object "sighash" (bytes->hex sighash) "respectful" (and respectful t) "fee_sats" fee
+                                    ;; The reference's field names: sighash, unsigned_tx, last_valid_sequence;
+                                    ;; unsigned_rungs / rung_signatures for the ladder.
+                                    (w:json-object "sighash" (bytes->hex (first (first hashes))) "respectful" (and respectful t) "fee_sats" fee
                                                    "tier_index" tier-index
-                                                   "sweep_sighashes" (and sweep-hashes (coerce (mapcar #'bytes->hex sweep-hashes) 'vector))
+                                                   "sweep_sighashes" (and (rest (first hashes)) (coerce (mapcar #'bytes->hex (rest (first hashes))) 'vector))
                                                    "unsigned_tx" (unsigned-tx-hex tx)
+                                                   "unsigned_rungs" (coerce (mapcar #'unsigned-tx-hex rungs) 'vector)
                                                    "last_valid_sequence" (lg:ledger-sequence (record-ledger (or (find-fork node id-hex (node-pubkey node)) (find-record node id-hex)))))
                                     :want (1- (rs:tier-threshold tier)) :timeout 20 :successes-only t)))
       (dolist (r responses)
         (let ((res (w:jget r "result")))
           (unless (w:jget r "success") (log! node "confiscation_sign refused: ~a" (w:jget r "error")))
           (when (and (w:jget r "success") res)
-            (let* ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature")))
-                   (ss (mapcar #'hex->bytes (coerce (or (w:jget res "sweep_signatures") #()) 'list))))
-              (when (and (member pk keys :test #'equalp) (schnorr:schnorr-verify pk sighash sig)
-                         (not (assoc pk sigs :test #'equalp))
-                         (= (length ss) (length sweep-hashes))
-                         (every (lambda (h s) (schnorr:schnorr-verify pk h s)) sweep-hashes ss))
-                (push (cons pk ss) sweep-sigs)
-                (push (cons pk sig) sigs))))))
-      (when (< (length sigs) (rs:tier-threshold tier)) (fail "only ~a of ~a confiscation signatures" (length sigs) (rs:tier-threshold tier)))
-      (let* ((ordered (mapcar (lambda (k) (cdr (assoc k sigs :test #'equalp))) keys))
-             (signed (rot:attach-tier-witness tx 0 reserves tier-index ordered)))
-        (loop for i from 1 below (length prevouts)
-              do (setf signed (rot:attach-tier-witness signed i reserves tier-index
-                                                       (mapcar (lambda (k) (nth (1- i) (cdr (assoc k sweep-sigs :test #'equalp)))) keys))))
-        (dotimes (i (length prevouts))
-          (unless (rot:verify-spend signed i prevouts) (fail "assembled confiscation input ~a does not verify" i)))
-        (broadcast node signed)
-        (dolist (fork (forks-of node id-hex)) (setf (record-lottery fork) lottery (record-confiscation fork) signed))
-        (values signed lottery)))))
+            (let* ((pk (up:x-only (hex->bytes (w:jget res "signer"))))
+                   (hexes (lambda (v) (mapcar #'hex->bytes (coerce (or v #()) 'list))))
+                   ;; per rung: input 0's signature then the swept inputs'.  A signer that predates
+                   ;; the ladder answers rung 0 alone (signature, sweep_signatures).
+                   (per-rung (let ((r0s (funcall hexes (w:jget res "rung_signatures")))
+                                   (rss (coerce (or (w:jget res "rung_sweep_signatures") #()) 'list)))
+                               (if r0s
+                                   (loop for s0 in r0s for i from 0
+                                         collect (cons s0 (funcall hexes (nth i rss))))
+                                   (list (cons (hex->bytes (w:jget res "signature")) (funcall hexes (w:jget res "sweep_signatures")))))))
+                   (verified (loop for ss in per-rung for hs in hashes
+                                   collect (and (= (length ss) (length hs))
+                                                (every (lambda (h s) (schnorr:schnorr-verify pk h s)) hs ss)
+                                                ss))))
+              (when (and (member pk keys :test #'equalp) (not (assoc pk sigs :test #'equalp)) (first verified))
+                (push (cons pk verified) sigs))))))
+      ;; Assemble the longest prefix of rungs that reach the threshold.
+      (let ((assembled
+              (loop for r in rungs for i from 0
+                    for signers = (remove-if-not (lambda (e) (nth i (cdr e))) sigs)
+                    while (>= (length signers) (rs:tier-threshold tier))
+                    collect (let ((signed r))
+                              (dotimes (in (length prevouts) signed)
+                                (setf signed (rot:attach-tier-witness signed in reserves tier-index
+                                                                      (mapcar (lambda (k) (let ((e (assoc k signers :test #'equalp)))
+                                                                                            (and e (nth in (nth i (cdr e))))))
+                                                                              keys))))))))
+        (unless assembled
+          (fail "only ~a of ~a confiscation signatures" (count-if (lambda (e) (first (cdr e))) sigs) (rs:tier-threshold tier)))
+        (dolist (signed assembled)
+          (dotimes (i (length prevouts))
+            (unless (rot:verify-spend signed i prevouts) (fail "assembled confiscation input ~a does not verify" i))))
+        (let ((h-c (max (btx:tx-locktime tx) (or (nth-value 2 (lottery-armers node id-hex)) 0))))
+          (setf (gethash (cons (node-pubkey node) id-hex) *confiscation-ladders*) (list assembled h-c))
+          (broadcast node (nth (ladder-rung-due (length assembled) h-c (height node)) assembled)))
+        ;; Every rung is a confiscation we hold: whichever confirms is found by its output 0.
+        (dolist (signed assembled)
+          (unless (find (btx:tx-txid signed) (gethash id-hex (node-signed-confiscations node)) :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
+            (push (cons signed lottery) (gethash id-hex (node-signed-confiscations node)))))
+        (dolist (fork (forks-of node id-hex)) (setf (record-lottery fork) lottery (record-confiscation fork) (first assembled)))
+        (values (first assembled) lottery)))))
 
 (defun broadcast (node tx)
   (push tx (node-broadcasts node))
@@ -3743,18 +3801,21 @@
       (let ((ours (ignore-errors (multiple-value-list
                                   (build-confiscation node id-hex :respectful respectful :tier-index ti)))))
         (when ours
-          (destructuring-bind (built lottery &rest _) ours
-            (declare (ignore _))
-            (cond ((equalp (unsigned-bytes built) (unsigned-bytes tx)) (values :ours lottery))
+          (destructuring-bind (built lottery prevouts reserves tier rungs &rest _) ours
+            (declare (ignore built prevouts reserves tier _))
+            ;; DEP-03 §Confiscation ladder: any rung of the rebuild
+            (cond ((find (unsigned-bytes tx) rungs :key #'unsigned-bytes :test #'equalp) (values :ours lottery))
                   (t (let ((l (ignore-errors (lottery-paid-by node id-hex (btx:txout-script (first (btx:tx-outputs tx)))))))
                        (when l
-                         (let ((swapped (btx:make-tx :version (btx:tx-version built) :locktime (btx:tx-locktime built) :segwit-p t
-                                                     :inputs (btx:tx-inputs built)
-                                                     :outputs (cons (btx:make-txout :value (btx:txout-value (first (btx:tx-outputs built)))
-                                                                                    :script (lot:lottery-spk l))
-                                                                    (rest (btx:tx-outputs built)))
-                                                     :witnesses (list nil))))
-                           (when (equalp (unsigned-bytes swapped) (unsigned-bytes tx)) (values :subset l)))))))))))))
+                         (loop for built in rungs
+                               for swapped = (btx:make-tx :version (btx:tx-version built) :locktime (btx:tx-locktime built) :segwit-p t
+                                                          :inputs (btx:tx-inputs built)
+                                                          :outputs (cons (btx:make-txout :value (btx:txout-value (first (btx:tx-outputs built)))
+                                                                                         :script (lot:lottery-spk l))
+                                                                         (rest (btx:tx-outputs built)))
+                                                          :witnesses (list nil))
+                               when (equalp (unsigned-bytes swapped) (unsigned-bytes tx))
+                                 do (return (values :subset l)))))))))))))
 
 ;;; DEP-06 "Authorised confiscation": a vault spend is a confiscation iff it is byte-identical to
 ;;; the one the rules build from public state (the ledger's history, the public DisputeArmed
@@ -3833,9 +3894,10 @@
                       (let ((key (mapcar #'first in)))
                         (when (and in (not (member key tried :test #'equalp)))
                           (push key tried)
-                          (let ((built (ignore-errors (build-confiscation view id-hex :tier-index ti :respectful respectful
-                                                                                      :armers in :snapshot snapshot))))
-                            (and built (equalp (unsigned-bytes built) want))))))))))
+                          (let ((rungs (ignore-errors (nth-value 5 (build-confiscation view id-hex :tier-index ti :respectful respectful
+                                                                                                   :armers in :snapshot snapshot)))))
+                            ;; DEP-06: byte-identical to any rung of the ladder (DEP-03 §Confiscation ladder)
+                            (find want rungs :key #'unsigned-bytes :test #'equalp)))))))))
 
 (defvar *rebuilt-confiscations* (make-hash-table :test #'equalp) "spend txid -> verdict, once judged")
 (defvar *rebuilt-confiscations-lock* (bt:make-lock "rebuilt-confiscations"))
@@ -3866,14 +3928,20 @@
                ;; DEP-03: the fee is the rule's and the shape our own dispute's reason, never the proposer's.
                (fee nil)
                (respectful (dispute-respectful-p node id))
-               (match (confiscation-match node id proposed)))
+               (match (confiscation-match node id proposed))
+               ;; DEP-03 §Confiscation ladder: every rung, rung 0 first (a proposer that predates the
+               ;; ladder sends rung 0 alone, as unsigned_tx)
+               (proposed-rungs (mapcar (lambda (h) (btx:parse-tx (bw:make-reader (hex->bytes h))))
+                                       (coerce (or (w:jget params "unsigned_rungs") #()) 'list))))
           (let ((r (w:jget params "respectful")))
             (when (and r (not (eq r :false)) (not respectful)) (fail "a respectful confiscation of a punitive dispute")))
           ;; A proposal over another subset of the armers is a real confiscation (it may land, and
           ;; we must recognise it), but not ours to sign until our views of late arms converge.
-          (when (and match (not (find (btx:tx-txid proposed) (gethash id (node-seen-confiscations node)) :key #'btx:tx-txid :test #'equalp)))
-            (push proposed (gethash id (node-seen-confiscations node))))
-          (multiple-value-bind (tx lottery prevouts reserves tier-index)
+          (when match
+            (dolist (r (cons proposed proposed-rungs))
+              (unless (find (btx:tx-txid r) (gethash id (node-seen-confiscations node)) :key #'btx:tx-txid :test #'equalp)
+                (push r (gethash id (node-seen-confiscations node))))))
+          (multiple-value-bind (tx lottery prevouts reserves tier-index rungs)
               ;; The proposer names its tier (the reference's `tier_index`; else the
               ;; one whose CLTV is the proposed nLockTime).  It must be open at our height.
               (let* ((reserves (disputed-reserves node (or (find-record node id) (fail "unknown ledger"))))
@@ -3891,15 +3959,23 @@
                     (if (eq match :subset) "a subset-lottery" "the proposed")
                     (car (aref prevouts 0)) (lg:ledger-sequence (record-ledger (find-record node id)))
                     (mapcar (lambda (o) (cons (btx:txout-value o) (subseq (bytes->hex (btx:txout-script o)) 0 12))) (btx:tx-outputs tx))))
-            (let ((expected (confiscation-sighash tx prevouts reserves tier-index)))
+            (when proposed-rungs
+              (unless (= (length proposed-rungs) (length rungs))
+                (fail "the proposal has ~a rungs; our ladder has ~a" (length proposed-rungs) (length rungs)))
+              (loop for p in proposed-rungs for r in rungs for i from 0
+                    unless (equalp (unsigned-bytes p) (unsigned-bytes r))
+                      do (fail "rung ~a is not our rebuild's" i)))
+            (let ((expected (confiscation-sighash tx prevouts reserves tier-index))
+                  (leaf (nth tier-index (rs:reserves-leaves reserves))))
               (unless (equalp expected (hex->bytes (w:jget params "sighash")))
                 (fail "the proposer's sighash is not our rebuild's"))
               ;; Its txid does not depend on the witness: keep it, the claim spends it.  Keep every
               ;; one we sign, too: a proposal from another proposer may be the one that lands.
               (dolist (fork (forks-of node id)) (setf (record-lottery fork) lottery (record-confiscation fork) proposed))
-              (unless (find (btx:tx-txid proposed) (gethash id (node-signed-confiscations node))
-                            :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
-                (push (cons proposed lottery) (gethash id (node-signed-confiscations node))))
+              (dolist (r (if proposed-rungs rungs (list proposed)))
+                (unless (find (btx:tx-txid r) (gethash id (node-signed-confiscations node))
+                              :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
+                  (push (cons r lottery) (gethash id (node-signed-confiscations node)))))
               (log! node "signed confiscation of ~a proposed by ~a (fee ~a sats)" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8)
                     (- (reduce #'+ prevouts :key #'car) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
@@ -3911,7 +3987,20 @@
                                                                                               (node-priv node)
                                                                                               (rot:tier-sighash tx i prevouts (nth tier-index (rs:reserves-leaves reserves)))
                                                                                               (random-aux))))
-                                                                   'vector))))))
+                                                                   'vector)
+                                                           ;; DEP-03 §Confiscation ladder: per rung, input 0 and the swept inputs
+                                                           "rung_signatures"
+                                                           (and proposed-rungs
+                                                                (coerce (loop for r in rungs
+                                                                              collect (bytes->hex (schnorr:schnorr-sign (node-priv node) (rot:tier-sighash r 0 prevouts leaf) (random-aux))))
+                                                                        'vector))
+                                                           "rung_sweep_signatures"
+                                                           (and proposed-rungs (> (length prevouts) 1)
+                                                                (coerce (loop for r in rungs
+                                                                              collect (coerce (loop for i from 1 below (length prevouts)
+                                                                                                    collect (bytes->hex (schnorr:schnorr-sign (node-priv node) (rot:tier-sighash r i prevouts leaf) (random-aux))))
+                                                                                              'vector))
+                                                                        'vector)))))))
       (error (e) (log! node "refused confiscation_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
 
 (defun publish-reveal (node id-hex)
@@ -4581,7 +4670,9 @@
                                             (and o (eq (op:operation-type o) :quorum-begin) (equalp (up:update-prev-hash u) anchor)
                                                  (member txid (fr:rotation-rungs o) :test #'equalp))))
                               (record-history rec)))
-             (fork (find-if (lambda (f) (and (record-confiscation f) (equalp (btx:tx-txid (record-confiscation f)) txid)))
+             (fork (find-if (lambda (f) (or (and (record-confiscation f) (equalp (btx:tx-txid (record-confiscation f)) txid))
+                                            ;; DEP-03 §Confiscation ladder: a rung of one we signed
+                                            (find txid (gethash id (node-signed-confiscations node)) :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)))
                             (forks-of node id))))
          (cond (answer
                 (log! node "answering the challenge of ~a's spend ~a: its rotation's QuorumBegin (seq ~a)"

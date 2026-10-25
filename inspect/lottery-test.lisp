@@ -262,6 +262,41 @@
                                      :witnesses nil)))
                (check-equal (format nil "~a confiscation tx" name) (u:bytes->hex (btx:serialize-tx tx)) (funcall vec name))))))
 
+(with-gate ("lottery: the DEP-03 confiscation ladder against the shared vector")
+  ;; inspect/vectors/confiscation_ladder.json, written by inspect/gen-confiscation-ladder.lisp and
+  ;; shared with deposits-rust (deposits-core/tests/vectors/confiscation_ladder.json).
+  (let* ((v (json-simple:parse (uiop:read-file-string (vector-path "confiscation_ladder.json"))))
+         (ladders (make-hash-table :test #'equal)))
+    (flet ((g (h k) (gethash k h))
+           (outpoint (h) (list (u:hex->bytes (gethash "txid" h)) (gethash "vout" h) (gethash "sats" h))))
+      (loop for c across (gethash "cases" v)
+            for name = (g c "name") for p = (g c "params")
+            for rungs = (lot:confiscation-ladder
+                         :vault (outpoint (g p "vault")) :swept (map 'list #'outpoint (g p "swept"))
+                         :lottery-spk (u:hex->bytes (g p "lottery_spk")) :voters (g p "voters") :locktime (g p "lock_time")
+                         :respectful (g p "respectful") :obligations-sats (g p "obligations_sats") :residue-sats (g p "residue_sats")
+                         :splice-outs (map 'list (lambda (o) (cons (u:hex->bytes (g o "spk")) (g o "sats"))) (g p "splice_outs"))
+                         :operator-pubkey33 (u:hex->bytes (g p "operator")) :anchor (u:hex->bytes (g p "anchor"))
+                         :feerate (g p "feerate") :collateral-msats (g p "collateral_msats"))
+            for inputs = (+ (g (g p "vault") "sats") (reduce #'+ (g p "swept") :key (lambda (o) (g o "sats"))))
+            do (setf (gethash name ladders) rungs)
+               (check-equal (format nil "~a: rung count" name) (length rungs) (length (g c "rungs")))
+               (loop for r in rungs for want across (g c "rungs") for fee across (g c "fees") for i from 0
+                     do (check-equal (format nil "~a: rung ~a" name i) (u:bytes->hex (btx:serialize-tx r :witness nil)) want)
+                        (check-equal (format nil "~a: rung ~a fee" name i)
+                                     (- inputs (reduce #'+ (btx:tx-outputs r) :key #'btx:txout-value)) fee)))
+      (loop for d across (gethash "decoys" v)
+            do (check (format nil "decoy (~a): ~a" (g d "case") (g d "why"))
+                      (notany (lambda (r) (string= (u:bytes->hex (btx:serialize-tx r :witness nil)) (g d "tx")))
+                              (gethash (g d "case") ladders))))
+      (let* ((cl (gethash "claim" v))
+             (r (nth (g cl "rung") (gethash (g cl "case") ladders)))
+             (tx (lot:claim-tx (btx:tx-txid r) 0 (btx:txout-value (first (btx:tx-outputs r)))
+                               (outpoint (g cl "collateral")) (u:hex->bytes (g cl "destination_spk"))
+                               :fee (g cl "fee") :subset (g cl "subset"))))
+        (check-equal "the claim of a higher rung spends its output 0 at its value"
+                     (u:bytes->hex (btx:serialize-tx tx :witness nil)) (g cl "tx"))))))
+
 (with-gate ("ledger: the DEP-05 collateral floor against the shared vector")
   (let ((v (json-simple:parse (uiop:read-file-string (vector-path "collateral_floor.json")))))
     (loop for case across (gethash "cases" v)

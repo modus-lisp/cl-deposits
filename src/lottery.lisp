@@ -26,7 +26,7 @@
            #:armer-share-leaves #:armer-share-control-block #:forfeit-sweep-outputs
            #:confiscation-outputs #:confiscation-tx #:revealers-from-witness #:tapbuilder-tree #:p2tr-spk #:key-path-spk
            #:+reveal-csv+ #:+armer-sweep-csv+ #:+max-disputants+ #:+timeout-recovery-csv+
-           #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+ #:claim-tx #:+claim-fee-floor+))
+           #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+ #:confiscation-ladder #:+confiscation-rungs+ #:claim-tx #:+claim-fee-floor+))
 (in-package #:cl-deposits.lottery)
 
 (defconstant +max-disputants+ 7 "MAX_LOTTERY_PARTICIPANTS: the subset tree has 2^k - 1 claim leaves.")
@@ -323,6 +323,34 @@
                     :outputs (append (loop for (spk . val) in outs collect (btx:make-txout :value val :script spk))
                                      (list (btx:make-txout :value 0 :script (cl-deposits.rotation:anchor-script anchor))))
                     :witnesses (make-list (1+ (length swept)))))))))
+
+(defconstant +confiscation-rungs+ 4 "DEP-03 §Confiscation ladder: k.")
+
+(defun confiscation-ladder (&rest args &key collateral-msats (fee nil fee-p) (feerate +confiscation-default-feerate+)
+                                         voters swept &allow-other-keys)
+  "DEP-03 §Confiscation ladder: the rungs of a confiscation, rung 0 first, each CONFISCATION-TX
+   at 2^i x rung 0's fee.  Rung i > 0 keeps rung 0's outputs (same scripts, so the shape never
+   collapses mid-ladder) with only the output that pays for it lower: the lottery (punitive) or
+   the operator's change (respectful).  It exists only while that output stays at its floor (330
+   or 294 sats) and its extra fee is at most COLLATERAL-MSATS / 1000: the ladder stops at the
+   first rung that fails."
+  (let* ((args (loop for (k v) on args by #'cddr unless (member k '(:collateral-msats :fee)) append (list k v)))
+         (fee0 (if (and fee-p fee) fee (* feerate (+ 163 (* 30 voters) (* (length swept) (+ 41 (* 30 voters)))))))
+         (r0 (apply #'confiscation-tx :fee fee0 args))
+         (outs0 (btx:tx-outputs r0))
+         ;; the output whose value differs between rungs: the change when respectful survived, else the lottery
+         (pay (if (and (getf args :respectful) (> (length outs0) (+ 2 (length (getf args :splice-outs)))))
+                  1 0))
+         (floor (if (= pay 1) +p2wpkh-dust+ +p2wsh-dust+)))
+    (cons r0 (loop for i from 1 below +confiscation-rungs+
+                   for delta = (* fee0 (1- (expt 2 i)))
+                   for r = (apply #'confiscation-tx :fee (* fee0 (expt 2 i)) args)
+                   for outs = (btx:tx-outputs r)
+                   while (and (= (length outs) (length outs0))
+                              (every (lambda (a b) (equalp (btx:txout-script a) (btx:txout-script b))) outs outs0)
+                              (>= (btx:txout-value (nth pay outs)) floor)
+                              (<= (* 1000 delta) (or collateral-msats 0)))
+                   collect r))))
 
 (defun confiscation-outputs (lottery-spk reserves-sats fee-sats &key respectful obligations-sats operator-pubkey33)
   "A list of (spk . sats).  Punitive: everything to the lottery output.
