@@ -130,7 +130,9 @@ in_landed=""; [ -n "$landed" ] && [[ " $landed " == *" ${VCPK:2:14} "* ]] && in_
 # A veto test only if the spend confirmed at or before a snapshot E the members cut at; otherwise
 # the adversary was rightly a participant and the run says nothing about the veto: INVALID, retried.
 spend_tx=$(grep -oE ' in [0-9a-f]{64}' <<<"$spent" | grep -oE '[0-9a-f]{64}')
-spend_h=""; [ -n "$spend_tx" ] && spend_h=$(bcli getrawtransaction "$spend_tx" true 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("blockhash",""))' | xargs -r bcli getblockheader 2>/dev/null | grep -oE '"height": [0-9]+' | grep -oE '[0-9]+')
+# bcli is a shell function, so no xargs: the block's header from its hash, directly.
+spend_bh=""; [ -n "$spend_tx" ] && spend_bh=$(bcli getrawtransaction "$spend_tx" true 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("blockhash",""))' 2>/dev/null)
+spend_h=""; [ -n "$spend_bh" ] && spend_h=$(bcli getblockheader "$spend_bh" 2>/dev/null | grep -oE '"height": [0-9]+' | grep -oE '[0-9]+')
 cut_e=$(echo "$sets" | grep -oE "snapshot [0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1)
 excluded_at=$(echo "$sets" | grep -E "excluded: \[[^]]*${VCPK:0:16}" | grep -oE 'snapshot [0-9]+' | grep -oE '[0-9]+' | sort -n | head -1)
 echo "   spend confirmed at ${spend_h:-?}; snapshots evaluated up to ${cut_e:-?}; adversary excluded at ${excluded_at:-never}"
