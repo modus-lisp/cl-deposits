@@ -46,6 +46,9 @@
             :note "a watcher whose replica lags behind the QuorumBegin does not take the rotation for a theft")
    (make-sc :name "rotation-bump" :script "check-rotation-bump.sh" :ledger-var "REDTEAM_BUMP" :timeout 1800
             :note "DEP-03 fee ladder: a stuck rung 0 is replaced by a higher rung, and the next rotation spends it")
+   (make-sc :name "confiscation-bump" :script "check-confiscation-bump.sh" :ledger-var "REDTEAM_CB"
+            :env '("REFS=" "WAIT=900") :timeout 2400 :tags '(:contagion)
+            :note "DEP-03 confiscation ladder: a stuck rung 0 is replaced by a higher rung, and its lottery is claimed")
    (make-sc :name "exit" :script "check-exit.sh" :ledger-var "REDTEAM_EXIT" :timeout 1200
             :note "DEP-20 exits settle at the rotation (mixed quorum); dust carried; cancel releases")
    (make-sc :name "splice" :script "check-splice.sh" :ledger-var "REDTEAM_SPLICE" :timeout 2400

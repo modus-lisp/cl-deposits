@@ -3508,7 +3508,7 @@
 
 (defvar *confiscation-ladders* (make-hash-table :test #'equalp :synchronized t)
   "(node pubkey . ledger id) -> (rungs h-c): the assembled rungs of a confiscation we proposed and
-   the height its broadcast schedule counts from (DEP-03 §Confiscation ladder).")
+   the height we first broadcast it, which its schedule counts from (DEP-03 §Confiscation ladder).")
 
 (defun ladder-rung-due (n h-c height)
   "DEP-03: the rung a holder broadcasts while none has confirmed, min(n - 1, (tip - h_c) / 6)."
@@ -3587,8 +3587,14 @@
         (dolist (signed assembled)
           (dotimes (i (length prevouts))
             (unless (rot:verify-spend signed i prevouts) (fail "assembled confiscation input ~a does not verify" i))))
-        (let ((h-c (max (btx:tx-locktime tx) (or (nth-value 2 (lottery-armers node id-hex)) 0))))
-          (setf (gethash (cons (node-pubkey node) id-hex) *confiscation-ladders*) (list assembled h-c))
+        ;; DEP-03: the schedule counts from our first broadcast of this confiscation (a re-proposal
+        ;; of the same ladder keeps the first one's count).
+        (let* ((key (cons (node-pubkey node) id-hex))
+               (prior (gethash key *confiscation-ladders*))
+               (h-c (if (and prior (equalp (btx:tx-txid (first (first prior))) (btx:tx-txid (first assembled))))
+                        (second prior)
+                        (height node))))
+          (setf (gethash key *confiscation-ladders*) (list assembled h-c))
           (broadcast node (nth (ladder-rung-due (length assembled) h-c (height node)) assembled)))
         ;; Every rung is a confiscation we hold: whichever confirms is found by its output 0.
         (dolist (signed assembled)
