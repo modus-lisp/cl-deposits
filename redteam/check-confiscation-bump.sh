@@ -11,10 +11,10 @@
 # check and sign every rung too.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-900}
 source "$(dirname "$0")/_lib.sh"
-pick OP C2 C3 C4 H
+pick OP C2 C3 C4 H H2   # five members: Q must be 3, 5 or 7
 REFS=${REFS-}
 ROW=${REDTEAM_CB:-CB$RANDOM}
-W=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" $C2 $C3 $C4 $H $REFS) || exit 1; echo "== ledger $W"
+W=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" $C2 $C3 $C4 $H $H2 $REFS) || exit 1; echo "== ledger $W"
 FROM=$(fresh_deposits "$ROW" $OP "$W" 1 | head -1); [ -n "$FROM" ] || fail "no deposit on the ledger"
 
 # The block ticker would mine rung 0 before we can stall it: pause it for the run.
@@ -57,7 +57,7 @@ done
 [ -n "$R0" ] || fail "no confiscation reached the mempool within ${WAIT}s"
 bcli prioritisetransaction "$R0" 0 -100000000 >/dev/null
 echo "== rung 0 $R0 made unmineable; mining 7 blocks"
-proposed=$(for n in $C2 $C3 $C4 $H $OP; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}: proposed confiscation" | tail -1; done | head -1)
+proposed=$(for n in $C2 $C3 $C4 $H $H2 $OP; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}: proposed confiscation" | tail -1; done | head -1)
 echo "   $proposed"
 for i in $(seq 1 7); do mine 1 >/dev/null; sleep 8; done
 sleep 90; mine 1 >/dev/null; sleep 10   # a drive-disputes pass (once a minute) pushes the due rung
@@ -68,7 +68,7 @@ import json,sys
 b=json.load(sys.stdin); t,v=sys.argv[1],int(sys.argv[2])
 for tx in b["tx"]:
     for vin in tx.get("vin",[]):
-        if vin.get("txid")==t and vin.get("vout")==v: print(tx["txid"]); sys.exit()' "$VINTX" "$VINVOUT")
+        if vin.get("txid")==t and vin.get("vout")==v: print(tx["txid"]); sys.exit()' "$VINTX" "$VINVOUT" 2>/dev/null)
 if [ -z "$conf" ]; then
   tip=$(bcli getblockcount)
   for h in $(seq "$tip" -1 $((tip - 12))); do
@@ -84,7 +84,7 @@ fi
 [ -n "$conf" ] || fail "no rung of the confiscation confirmed after the bump window (rung 0 $R0)"
 [ "$conf" != "$R0" ] || fail "rung 0 confirmed despite its prioritisation (the test proves nothing)"
 echo "== confirmed: $conf (a higher rung)"
-for n in $C2 $C3 $C4 $H; do
+for n in $C2 $C3 $C4 $H $H2; do
   cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}:" | grep -E "broadcast rung|rebroadcast rung" | tail -1
 done
 
@@ -108,10 +108,11 @@ for tx in b["tx"]:
   sleep 5
 done
 [ -n "$claim" ] || fail "the lottery output of the confirmed rung ($conf:0) was not claimed within ${WAIT}s"
-acq=0; for n in $C2 $C3 $C4 $H $REFS; do case $n in cld*) acq=$((acq + $(cld_ctl $n "(:forks :ledger \"$W\")" 2>/dev/null | grep -c "DISPUTE-ACQUIRE")));; esac; done
-echo "== claimed by $claim; $acq DisputeAcquire(s) seen on the cl forks"
+won=$(for n in $C2 $C3 $C4 $H $H2; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}: lottery: won" | head -1 | sed "s/^/$n: /"; done)
+echo "== claimed by $claim; winner: ${won:-none among the cl members}"
+[ "$(printf '%s\n' "$won" | grep -c 'lottery: won')" -le 1 ] || fail "more than one member won the lottery"
 # No node took the bumped rung for a theft.
-for n in $C2 $C3 $C4 $H $OP; do
+for n in $C2 $C3 $C4 $H $H2 $OP; do
   if cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND|unauthori[sz]ed spend" | grep -qi "${conf:0:16}\|${W:0:8}"; then
     fail "$n took the confiscation's rung for a theft"
   fi
