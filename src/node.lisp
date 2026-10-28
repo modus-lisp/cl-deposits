@@ -1582,7 +1582,13 @@
     (unless (own-ledger node) (return-from handle-consent (respond node event nil :error "no ledger of our own")))
     (handler-case
         (let* ((genesis-operator (if history (up:update-operator-id (first history)) operator))
-               (forked (not (equalp genesis-operator operator)))
+               (known (find-record node their-id))
+               ;; Forked when the requester is not the operator of our replica: a custodian
+               ;; after DisputeAcquire, whose history (a prefix from genesis, or none for a
+               ;; long ledger) need not show its fork at all.
+               (forked (if known
+                           (not (equalp (lg:ledger-operator-key (record-ledger known)) operator))
+                           (not (equalp genesis-operator operator))))
                (div (and forked (position-if (lambda (u) (equalp (up:update-operator-id u) operator)) history)))
                (base (or (find-record node their-id)
                          ;; No replica yet: build it from the history's base prefix,
