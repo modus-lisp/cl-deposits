@@ -325,6 +325,25 @@
                      do (check-equal (format nil "~a: expiry ~a" name e)
                                      (or (null ceiling) (<= e ceiling)) (gethash "ok" chk)))))))
 
+;;; inspect/vectors/expiry_dispute_ends.json, shared with deposits-rust
+;;; (deposits-protocol/tests/vectors/expiry_dispute_ends.json).
+(with-gate ("dispute: when a quorum_expired dispute ends, against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "expiry_dispute_ends.json")))))
+    (loop for c across (gethash "ended" v)
+          do (check-equal (gethash "name" c)
+                          (and (cl-deposits.node::expiry-dispute-ended-p
+                                (gethash "last_valid_sequence" c) (gethash "latest_quorum_begin_sequence" c)
+                                (gethash "confiscation_confirmed" c))
+                               t)
+                          (gethash "ended" c)))
+    (loop for c across (gethash "arm" v)
+          do (check-equal (gethash "name" c)
+                          (and (cl-deposits.node::arm-on-expiry-dispute-p
+                                (gethash "anchor_block_height" c) (gethash "governing_quorum_expiry" c)
+                                (gethash "last_valid_sequence" c) (gethash "latest_quorum_begin_sequence" c))
+                               t)
+                          (gethash "arm" c)))))
+
 ;;; inspect/vectors/armer_eligibility.json: the DEP-03 replacement-collateral cut,
 ;;; shared with deposits-rust (deposits-node/tests/vectors/armer_eligibility.json).
 (with-gate ("lottery: armer eligibility cut against the shared vector")

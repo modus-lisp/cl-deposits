@@ -2501,6 +2501,19 @@
           (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) tx (record-lottery f) l)))
         (values tx l state)))))
 
+(defun expiry-dispute-ended-p (last-valid-seq latest-quorum-begin-seq confiscation-confirmed)
+  "DEP-05 §\"When a quorum_expired dispute ends\": a QuorumBegin after the dispute's fork point
+   (re-establishment) ends it, unless its confiscation already confirmed.  Vector:
+   expiry_dispute_ends.json."
+  (and (not confiscation-confirmed) (integerp last-valid-seq) (> latest-quorum-begin-seq last-valid-seq)))
+
+(defun arm-on-expiry-dispute-p (anchor-height governing-expiry last-valid-seq latest-quorum-begin-seq)
+  "DEP-05: a quorum_expired DisputeEnter is armed on only while its ground stands: its anchor is
+   past the expiry of the QuorumBegin governing at its fork point, and no QuorumBegin since has
+   re-established the quorum."
+  (and (integerp anchor-height) (integerp governing-expiry) (> anchor-height governing-expiry)
+       (not (expiry-dispute-ended-p last-valid-seq latest-quorum-begin-seq nil))))
+
 (defun drive-dispute (node fork)
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (h (height node)))
     (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
@@ -2515,11 +2528,18 @@
           (when (loop for v being the hash-values of (node-pledges node) thereis (equal v id)) (release-pledges node id))
           (return-from drive-dispute (note-dispute node id "concluded")))
         (multiple-value-bind (conf lottery lstate) (fork-lottery node id)
-          ;; A quorum_expired dispute whose operator has since re-established the
-          ;; quorum (or that we opened on a stale replica): stand down, unless it
-          ;; is already confiscated.
-          (let ((expiry (lg:ledger-quorum-expiry (record-ledger base))))
-            (when (and (expiry-reason-p (op:field enter-op :reason)) expiry (<= h (+ expiry *expiry-grace-blocks*)) (null conf))
+          ;; DEP-05 §"When a quorum_expired dispute ends": a QuorumBegin after the dispute's
+          ;; fork point answers its ground, unless its confiscation already confirmed.  Judged
+          ;; from the ledger, not the tip: the re-established quorum may itself have expired
+          ;; since, and that is a new ground for a new dispute (signet soak, 2026-10-27: members
+          ;; kept disputes from before their operators re-established and never opened new
+          ;; ones).  A dispute opened on a stale replica, its quorum live now, ends too.
+          (let ((expiry (lg:ledger-quorum-expiry (record-ledger base)))
+                (confirmed (or (assoc (node-pubkey node) (reveals-of node id) :test #'equalp)
+                               (and conf (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid conf) 0)))))
+            (when (and (expiry-reason-p (op:field enter-op :reason)) (not confirmed)
+                       (or (expiry-dispute-ended-p (op:field enter-op :last-valid-sequence) (latest-quorum-begin-seq base) nil)
+                           (and expiry (<= h (+ expiry *expiry-grace-blocks*)))))
               (conclude "quorum re-established (expiry ~a); yielded" expiry)))
           (let ((reserves-spent (multiple-value-bind (r txid vout) (disputed-reserves node base)
                                   (declare (ignore r))
@@ -2940,11 +2960,22 @@
   (loop for rec being the hash-values of (node-ledgers node)
         when (and (record-fork-p rec) (string= (record-fork-of rec) id-hex)) collect rec))
 
+(defvar *latest-qb-memo* (make-hash-table :test #'eq :weakness :key :synchronized t)
+  "record -> (tip-seq . latest QuorumBegin seq): the walk back to the last QuorumBegin decodes
+   every update since, ~60k on a soaked ledger whose rotations stalled, and fork-live-p asks
+   for it on every dispute decision.")
+
 (defun latest-quorum-begin-seq (rec)
-  (or (loop for u in (record-history rec)
-            when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
-              return (up:update-seq u))
-      0))
+  (let* ((tip (let ((u (first (record-history rec)))) (and u (up:update-seq u))))
+         (hit (gethash rec *latest-qb-memo*)))
+    (if (and hit tip (eql (car hit) tip))
+        (cdr hit)
+        (let ((v (or (loop for u in (record-history rec)
+                           when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
+                             return (up:update-seq u))
+                     0)))
+          (when tip (setf (gethash rec *latest-qb-memo*) (cons tip v)))
+          v))))
 
 (defun fork-live-p (node fork)
   "FORK still speaks for its ledger's current dispute: it has custody (DisputeAcquire: the
@@ -3085,10 +3116,24 @@
   "N disputants = the DEP-06 recovery voters."
   (length (recovery-voters rec fork-point)))
 
+(defvar *recovery-voters-memo* (make-hash-table :test #'eq :weakness :key :synchronized t)
+  "record -> ((fork-point . tip-seq) . voters): the walk decodes the whole chain (~180k updates on
+   a soaked ledger) and every lottery and confiscation decision asks for it.")
+
 (defun recovery-voters (rec &optional fork-point)
   "DEP-06 recovery voters: x-only keys, other than the original operator's (the author of
    sequence 0), of the members of the latest QuorumBegin the original operator authored at a
    sequence <= FORK-POINT (the dispute's lowest last_valid_sequence; NIL = every sequence)."
+  (let* ((tip (let ((u (first (record-history rec)))) (and u (up:update-seq u))))
+         (k (cons fork-point tip))
+         (hit (gethash rec *recovery-voters-memo*)))
+    (if (and hit tip (equal (car hit) k))
+        (cdr hit)
+        (let ((v (%recovery-voters rec fork-point)))
+          (when tip (setf (gethash rec *recovery-voters-memo*) (cons k v)))
+          v))))
+
+(defun %recovery-voters (rec fork-point)
   (let ((operator nil) (members '()))
     (dolist (u (reverse (record-history rec)))
       (when (zerop (up:update-seq u)) (setf operator (up:update-operator-id u)))
@@ -3202,9 +3247,13 @@
 (defun %all-arms (node id-hex)
   "Every DisputeArmed on every fork of the ledger, newest first within each fork."
   (loop for fork in (forks-of node id-hex)
+        ;; A fork's arms are its operator's own updates; the prefix it inherited from the base
+        ;; (~180k updates on a soaked ledger) is the base operator's, and decoding it on every
+        ;; lottery and confiscation decision saturated the node (signet soak, 2026-10-27).
         append (loop for u in (record-history fork)
-                     for o = (op:decode-operation (up:update-message u))
-                     when (eq (op:operation-type o) :dispute-armed)
+                     for o = (and (equalp (up:update-operator-id u) (record-fork-operator fork))
+                                  (op:decode-operation (up:update-message u)))
+                     when (and o (eq (op:operation-type o) :dispute-armed))
                        collect (list (up:update-operator-id u) (op:field o :commitment-hash) (op:field o :target-reserves)
                                      (and (op:field o :replacement-collateral-txid)
                                           (list (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)
@@ -3397,6 +3446,18 @@
               (setf (gethash key *obligations-memo*) v))
             (values-list v))))))
 
+(defvar *fork-point-memo* (make-hash-table :test #'equal :synchronized t)
+  "(id-hex seq hash) -> the ledger replayed to a dispute's fork point.  It never changes, and a
+   replay of a soaked ledger (~180k updates) took seconds on every confiscation_sign request.")
+
+(defun fork-point-ledger (base id-hex lvs)
+  (let* ((at (find lvs (record-history base) :key #'up:update-seq))
+         (key (list id-hex lvs (and at (bytes->hex (up:content-hash at))))))
+    (or (gethash key *fork-point-memo*)
+        (let ((l (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base))))))
+          (when (> (hash-table-count *fork-point-memo*) 256) (clrhash *fork-point-memo*))
+          (setf (gethash key *fork-point-memo*) l)))))
+
 (defun %confiscation-obligations (node id-hex participants snapshot)
   "DEP-06 §Confiscation obligations: (values swept splice-outs residue-sats) for the confiscation of
    ID-HEX.  SWEPT ((txid vout sats) ...) ascending; SPLICE-OUTS ((spk . sats) ...) ascending by
@@ -3404,7 +3465,7 @@
    point and the ObligationRecords on PARTICIPANTS' forks below their DisputeArmed."
   (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
          (lvs (dispute-last-valid-seq node id-hex))
-         (l (if lvs (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base)))) (record-ledger base)))
+         (l (if lvs (fork-point-ledger base id-hex lvs) (record-ledger base)))
          (a (lg:ledger-dormancy-accept l))
          (swept '()) (outs '()) (residue 0))
     (when a
