@@ -4506,6 +4506,18 @@
          (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
          (not (live-fork node (record-id-hex rec) (node-pubkey node))))))
 
+(defun expiry-disputed-p (node rec)
+  "We already disputed REC's current quorum for expiry and that dispute concluded (yielded: its
+   lottery claimed by the winner, or the quorum re-established).  The same expiry is not grounds
+   for another: DEP-05 asks for a new DisputeEnter only for a later expiry, which only a later
+   QuorumBegin can bring.  Re-disputing every minute had a member append a DisputeEnter and a
+   DisputeYield to a dead chain each pass (signet soak, 2026-10-28, ledger G)."
+  (let ((f (find-fork node (record-id-hex rec) (node-pubkey node))))
+    (and f (fork-op f :dispute-yield)
+         (multiple-value-bind (enter eo) (fork-op f :dispute-enter)
+           (and enter (expiry-reason-p (op:field eo :reason))
+                (>= (or (op:field eo :last-valid-sequence) -1) (latest-quorum-begin-seq rec)))))))
+
 (defun check-expired-quorums (node &key anchor-block-hash (grace 0) skip)
   "For every ledger we cosign whose quorum_expiry is more than GRACE blocks behind
    the chain tip (and whose id is not in SKIP), publish a QuorumExpired proof and
@@ -4513,7 +4525,8 @@
   (let ((h (height node)) (disputed '()))
     (loop for rec being the hash-values of (node-ledgers node)
           for ledger = (record-ledger rec)
-          when (and (expired-quorum-p node rec h grace) (not (member (record-id-hex rec) skip :test #'equal)))
+          when (and (expired-quorum-p node rec h grace) (not (member (record-id-hex rec) skip :test #'equal))
+                    (not (expiry-disputed-p node rec)))
             do (let ((proof (fr:make-quorum-expired-proof (lg:ledger-operator-key ledger) (hex->bytes (record-id-hex rec))
                                                           (or anchor-block-hash (make-array 32 :element-type '(unsigned-byte 8)))
                                                           (lg:ledger-quorum-expiry ledger))))
