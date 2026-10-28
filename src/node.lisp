@@ -922,6 +922,10 @@
                   (prepare-quorum node rec :ruleset ruleset :expiry-blocks expiry-blocks)))
          (expiry (cdr (record-pinned rec))))
     (multiple-value-bind (cur txid vout sats) (disputed-reserves node rec)
+      ;; The vault a confiscation (or another rotation) already spent cannot be rotated: every
+      ;; member refuses its rungs ("vault outpoint is spent") and the attempt repeats for good.
+      (when (vault-spent-p node txid vout)
+        (fail "the vault ~a:~a is already spent (confiscated or rotated); not rotating" (bytes->hex txid) vout))
       (let* ((tier-index (rotation-tier-index cur (height node)))
              (tier (nth tier-index (rs:reserves-tiers cur)))
              (cutoff (height node))
@@ -1783,6 +1787,18 @@
      (when i
        (note-rotation-rungs node (first rungs) (loop for k from 0 to i collect (and (= k i) bytes)) (up:update-block-height qu))))))
 
+(defun vault-spent-p (node txid vout)
+  "TXID:VOUT (internal-order bytes), a vault the ledger names, is not unspent in our chain view
+   (mempool included).  NIL without a chain view: never judged blind."
+  (and (node-chain-fn node) (null (ignore-errors (funcall (node-chain-fn node) txid vout)))))
+
+(defun rotation-rung-confirmed-p (node qu)
+  "Some rung of the rotation QuorumBegin QU has its new vault (output 0) in our chain view."
+  (let ((o (op:decode-operation (up:update-message qu))))
+    (and (node-chain-fn node)
+         (some (lambda (txid) (ignore-errors (funcall (node-chain-fn node) txid 0))) (fr:rotation-rungs o))
+         t)))
+
 (defun drive-rotation-rebroadcast (node)
   "DEP-03: rebroadcast every recorded rotation we hold until a rung confirms, moving to rung i
    once its QuorumBegin is 6·i blocks old.  Also resumes the signing of a rotation of ours that
@@ -1792,10 +1808,21 @@
           do (let ((r (pending-rotation node rec)))
                (when (and r (getf r :qb-seq))
                  (let ((qu (record-update-at rec (getf r :qb-seq))))
-                   (if qu
+                   (cond
+                     ((null qu) (clear-rotation node rec))
+                     ;; Its vault is gone (a confiscation confirmed first): nothing to sign or
+                     ;; broadcast, and asking the members again only collects refusals.
+                     ((let ((plan (getf r :plan)))
+                        (and plan (getf plan :vault-txid)
+                             (vault-spent-p node (hex->bytes (getf plan :vault-txid)) (getf plan :vault-vout))
+                             (not (rotation-rung-confirmed-p node qu))))
+                      (log! node "rotation of ~a: its vault ~a:~a was spent by another transaction; abandoned"
+                            (subseq (record-id-hex rec) 0 8) (subseq (getf (getf r :plan) :vault-txid) 0 16)
+                            (getf (getf r :plan) :vault-vout))
+                      (clear-rotation node rec))
+                     (t
                        (handler-case (sign-rotation-rungs node rec qu :timeout 30)
-                         (error (c) (log! node "rotation of ~a still awaits its rung signatures: ~a" (subseq (record-id-hex rec) 0 8) c)))
-                       (clear-rotation node rec))))))
+                         (error (c) (log! node "rotation of ~a still awaits its rung signatures: ~a" (subseq (record-id-hex rec) 0 8) c)))))))))
   (when (and (node-broadcast-fn node) (node-chain-fn node))
     (loop for rung0 being the hash-keys of (node-inflight-rotations node) using (hash-value e)
           do (let* ((rungs (getf e :rungs))
