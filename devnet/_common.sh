@@ -91,7 +91,7 @@ else
   REF_NODES=("ref2:8766" "ref3:8767" "ref4:8768" "ref5:8769" "ref6:8770" "ref7:8771")
 fi
 # regtest runs its own build (a rebuild for the signet devnet never pulls the binary from under it)
-DEPOSITS_RUST="${DEPOSITS_RUST:-$([ "$CLD_CHAIN" = regtest ] && echo /mnt/lisp/cargo-target/regtest-net/release || echo "$HOME/workspace/deposits-rust/target/release")}"
+DEPOSITS_RUST="${DEPOSITS_RUST:-$([ "$CLD_CHAIN" = regtest ] && echo /mnt/lisp/cargo-target/regtest-net/release || echo /mnt/lisp/cargo-target/signet/release)}"   # out-of-tree builds; the soak runs these
 REF_NODE_BIN="$DEPOSITS_RUST/deposits-node"; REF_WALLET_BIN="$DEPOSITS_RUST/deposits-wallet"
 ref_names() { for e in "${REF_NODES[@]}"; do echo "${e%%:*}"; done; }
 ref_port()  { for e in "${REF_NODES[@]}"; do [ "${e%%:*}" = "$1" ] && echo "${e##*:}" && return; done; return 1; }
@@ -129,7 +129,8 @@ start_ref() {
   ( cd "$dir" && setsid -f nohup env $(ref_env) "$REF_NODE_BIN" run --network "$CLD_CHAIN" --relay "$RELAY_URL" --esplora "$ESPLORA_URL" \
       --data-dir "$dir" --seed-file "$dir/seed.hex" --name "$n" --admin-bind "127.0.0.1:$(ref_port "$n")" >>"$dir/node.log" 2>&1 </dev/null
     sleep 1; pgrep -nf "deposits-node run .*--data-dir $dir " >"$dir/ref.pid" )
-  for i in $(seq 1 120); do tail -c +"$from" "$dir/node.log" 2>/dev/null | grep -q 'Wallet synced' && { echo "$n up (admin $(ref_port "$n"))"; return 0; }; ref_running "$n" || break; sleep 1; done
+  # A soaked node loads ~180k updates per ledger before it syncs its wallet: minutes, not seconds.
+  for i in $(seq 1 "${REF_START_WAIT:-600}"); do tail -c +"$from" "$dir/node.log" 2>/dev/null | grep -q 'Wallet synced' && { echo "$n up (admin $(ref_port "$n"))"; return 0; }; ref_running "$n" || break; sleep 1; done
   echo "$n did not come up; see $dir/node.log" >&2; return 1
 }
 # ref_begin_quorum NAME LEDGER [ratio] — fund the ledger's reserves address, then drive `quorum begin`
@@ -202,7 +203,8 @@ start_cld() {
       # (~1 KB per update; the soak's ledgers passed 80k updates overnight) and the old
       # loader held an 84 MB file as a 4-byte-per-char string.  Three nodes died "Heap
       # exhausted, game over" on the first night.
-  for i in $(seq 1 120); do (echo >/dev/tcp/127.0.0.1/$(cld_port "$n")) 2>/dev/null && { echo "$n up (control $(cld_port "$n"))"; return 0; }; sleep 0.5; done
+  # Loading a soaked node's ledgers (~180k updates each) takes minutes before the control port opens.
+  for i in $(seq 1 "${CLD_START_WAIT:-600}"); do (echo >/dev/tcp/127.0.0.1/$(cld_port "$n")) 2>/dev/null && { echo "$n up (control $(cld_port "$n"))"; return 0; }; sleep 1; done
   echo "$n did not come up; see $dir/cld.log" >&2; return 1
 }
 stop_relay() { local p; p=$(cat "$CLD_ROOT/relay.pid" 2>/dev/null) && [ -n "$p" ] && kill "$p" 2>/dev/null; rm -f "$CLD_ROOT/relay.pid"; }
