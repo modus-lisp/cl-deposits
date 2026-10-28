@@ -79,6 +79,7 @@
   ;; updates and read the rest through FORK-BASE up to FORK-SEQ.
   (count 0)                                    ; (length history), without walking it
   (index (make-hash-table :test #'eq))         ; operation type -> this record's own updates of it, newest first
+  (by-hash (make-hash-table :test #'equalp))   ; chain hash -> this record's own update's sequence
   (by-seq (make-hash-table))                   ; sequence -> this record's own update
   fork-base fork-seq                           ; a fork or view: the record it inherits from, through which sequence
   (checkpoints '())                            ; ((seq . ledger snapshot) ...) newest first, for LEDGER-AT
@@ -325,7 +326,9 @@
 (defun verify-record-indexes (rec)
   (incf *index-verifications*)
   (flet ((bad (fmt &rest args) (push (apply #'format nil fmt args) *index-mismatches*)))
-    (let* ((hist (record-history rec)) (types (remove-duplicates (mapcar #'op:update-type hist))))
+    (let* ((hist (record-history rec))
+           (types (let ((h (make-hash-table))) (dolist (u hist) (setf (gethash (op:update-type u) h) t))
+                    (loop for k being the hash-keys of h collect k))))
       (unless (= (record-count rec) (length hist))
         (bad "~a: count ~a, history ~a" (subseq (record-id-hex rec) 0 8) (record-count rec) (length hist)))
       (dolist (ty (union types '(:quorum-begin :dispute-enter :dispute-armed :dispute-acquire :obligation-record)))
@@ -336,6 +339,13 @@
       (dolist (u hist)
         (unless (eq (record-update-at rec (up:update-seq u)) (find (up:update-seq u) hist :key #'up:update-seq))
           (bad "~a: update-at ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq u))))
+      ;; chain hash -> sequence, for a record whose ledger follows its history (not a scratch fork)
+      (when (and hist (= (lg:ledger-sequence (record-ledger rec)) (up:update-seq (first hist))))
+        (dolist (u (if (record-fork-base rec)
+                       (loop for u in hist while (> (up:update-seq u) (record-fork-seq rec)) collect u)
+                       hist))
+          (unless (eql (record-seq-of-hash rec (up:chain-hash u)) (up:update-seq u))
+            (bad "~a: seq-of-hash ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq u)))))
       ;; LEDGER-AT against a replay of the prefix, for a base record (a fork's own state starts from
       ;; its fork point with the quorum cleared, which a replay from genesis does not do)
       (when (and hist (not (record-fork-base rec)) (not (record-fork-p rec)) (zerop (up:update-seq (car (last hist)))))
@@ -360,7 +370,9 @@
   (incf (record-count rec))
   (push u (gethash (op:update-type u) (record-index rec)))
   (setf (gethash (up:update-seq u) (record-by-seq rec)) u)
-  (let ((seq (up:update-seq u)))
+  (let ((seq (up:update-seq u)) (l (record-ledger rec)))
+    ;; the chain hash is the ledger's tip once U is applied (a scratch fork with no state: none)
+    (when (= seq (lg:ledger-sequence l)) (setf (gethash (lg:ledger-chain-tip l) (record-by-hash rec)) seq))
     (when (and (zerop (mod seq *checkpoint-every*)) (= seq (lg:ledger-sequence (record-ledger rec))))
       (push (cons seq (lg:copy-ledger (record-ledger rec))) (record-checkpoints rec))
       (prune-checkpoints rec seq)))
@@ -372,10 +384,11 @@
   (let ((own (if (record-fork-base rec)
                  (loop for u in (record-history rec) while (> (up:update-seq u) (record-fork-seq rec)) collect u)
                  (record-history rec))))
-    (clrhash (record-index rec)) (clrhash (record-by-seq rec))
+    (clrhash (record-index rec)) (clrhash (record-by-seq rec)) (clrhash (record-by-hash rec))
     (dolist (u (reverse own))
       (push u (gethash (op:update-type u) (record-index rec)))
-      (setf (gethash (up:update-seq u) (record-by-seq rec)) u))
+      (setf (gethash (up:update-seq u) (record-by-seq rec)) u)
+      (setf (gethash (up:chain-hash u) (record-by-hash rec)) (up:update-seq u)))
     (setf (record-count rec) (length (record-history rec))))
   rec)
 
@@ -390,6 +403,12 @@
   (or (gethash seq (record-by-seq rec))
       (and (record-fork-base rec) (<= seq (record-fork-seq rec))
            (record-update-at (record-fork-base rec) seq))))
+
+(defun record-seq-of-hash (rec hash)
+  "The sequence of REC's update whose chain hash is HASH, or NIL."
+  (or (gethash hash (record-by-hash rec))
+      (and (record-fork-base rec)
+           (let ((s (record-seq-of-hash (record-fork-base rec) hash))) (and s (<= s (record-fork-seq rec)) s)))))
 
 (defun record-updates-of (rec type)
   "REC's updates of operation TYPE, newest first: its own, then (a fork or view) its base's
@@ -4043,44 +4062,54 @@
   "A scratch node holding ID-HEX's ledger and its dispute forks as UPDATES (the relay's, every
    operator's) give them: the original operator's chain, and for each member that entered a
    dispute, the base to its DisputeEnter's fork point then its own updates.  It shares NODE's
-   chain functions, so the eligibility cut and obligations are judged on the same chain."
+   chain functions, so the eligibility cut and obligations are judged on the same chain.
+   Linear in UPDATES: the chain is walked by a sequence table (a search of every operator update
+   per link was quadratic, 38% of a soaked node's CPU), and when our own replica holds the same
+   chain its state is taken from a checkpoint instead of replayed."
   (let* ((sorted (sort (copy-list updates) #'< :key #'up:update-seq))
          (open (or (find-if (lambda (u) (and (zerop (up:update-seq u)) (fr:update-opens-ledger-p u (hex->bytes id-hex)))) sorted)
                    (fail "no LedgerOpen for ~a" (subseq id-hex 0 8))))
          (origin (up:update-operator-id open))
-         ;; The operator's chain by its hash links, from LedgerOpen until it forks (an
-         ;; equivocation): every dispute forks before its fault, so that prefix is the one
-         ;; the forks share.
-         (base (let* ((mine (remove-if-not (lambda (u) (equalp (up:update-operator-id u) origin)) sorted))
-                      (chain (list open)))
-                 (loop for next = (let ((tip (first chain)))
-                                    (remove-duplicates
-                                     (remove-if-not (lambda (u) (and (= (up:update-seq u) (1+ (up:update-seq tip)))
-                                                                     (equalp (up:update-prev-hash u) (up:chain-hash tip))))
-                                                    mine)
-                                     :test #'equalp :key #'up:chain-hash))
-                       while (= (length next) 1)
-                       do (push (first next) chain))
-                 (reverse chain)))
-         (s (%make-node :pubkey (let ((k (make-array 33 :element-type '(unsigned-byte 8))))
-                                  (setf (aref k 0) 2) (loop for i from 1 below 33 do (setf (aref k i) (random 256))) k)
-                        :network (node-network node) :height-fn (node-height-fn node) :chain-fn (node-chain-fn node)
-                        :pledge-fn (node-pledge-fn node) :spender-fn (node-spender-fn node) :feerate-fn (node-feerate-fn node)
-                        :height-of-block (node-height-of-block node) :block-hash-fn (node-block-hash-fn node))))
-    (setf (gethash id-hex (node-ledgers s)) (index-record (make-record :id-hex id-hex :ledger (lg:replay base) :history (reverse base))))
-    (dolist (op (remove-duplicates (loop for u in sorted unless (equalp (up:update-operator-id u) origin) collect (up:update-operator-id u))
-                                   :test #'equalp))
-      (let* ((mine (remove-if-not (lambda (u) (equalp (up:update-operator-id u) op)) sorted))
-             (enter (find :dispute-enter mine :key (lambda (u) (op:update-type u)))))
-        (when enter
-          (let ((lvs (op:field (op:decode-operation (up:update-message enter)) :last-valid-sequence)))
-            (setf (gethash (fork-key id-hex op) (node-ledgers s))
-                  (index-record
-                   (make-record :id-hex id-hex :ledger (lg:make-ledger) :fork-p t :fork-of id-hex :fork-operator op
-                                :history (reverse (append (remove-if (lambda (u) (> (up:update-seq u) lvs)) base)
-                                                          (remove-if (lambda (u) (<= (up:update-seq u) lvs)) mine))))))))))
-    (when confiscated-at (setf (gethash id-hex (node-confiscation-heights s)) confiscated-at))
-    s))
+         (by-operator (make-hash-table :test #'equalp))   ; operator -> its updates, ascending
+         (base nil))
+    (dolist (u (reverse sorted)) (push u (gethash (up:update-operator-id u) by-operator)))
+    ;; The operator's chain by its hash links, from LedgerOpen until it forks (an equivocation):
+    ;; every dispute forks before its fault, so that prefix is the one the forks share.
+    (let ((at-seq (make-hash-table)) (chain (list open)))
+      (dolist (u (gethash origin by-operator)) (push u (gethash (up:update-seq u) at-seq)))
+      (loop for tip = (first chain)
+            for link = (up:chain-hash tip)
+            for next = (remove-duplicates (remove-if-not (lambda (u) (equalp (up:update-prev-hash u) link))
+                                                         (gethash (1+ (up:update-seq tip)) at-seq))
+                                          :test #'equalp :key #'up:chain-hash)
+            while (= (length next) 1)
+            do (push (first next) chain))
+      (setf base chain))                                  ; newest first
+    (let* ((s (%make-node :pubkey (let ((k (make-array 33 :element-type '(unsigned-byte 8))))
+                                    (setf (aref k 0) 2) (loop for i from 1 below 33 do (setf (aref k i) (random 256))) k)
+                          :network (node-network node) :height-fn (node-height-fn node) :chain-fn (node-chain-fn node)
+                          :pledge-fn (node-pledge-fn node) :spender-fn (node-spender-fn node) :feerate-fn (node-feerate-fn node)
+                          :height-of-block (node-height-of-block node) :block-hash-fn (node-block-hash-fn node)))
+           (top (first base))
+           (ours (find-record node id-hex))
+           (same (and ours (not (record-fork-p ours))
+                      (let ((u (record-update-at ours (up:update-seq top))))
+                        (and u (equalp (up:chain-hash u) (up:chain-hash top))))))
+           (brec (if same
+                     (make-view ours (up:update-seq top))   ; the same chain: shared, state from a checkpoint
+                     (index-record (make-record :id-hex id-hex :ledger (lg:replay (reverse base)) :history base)))))
+      (setf (gethash id-hex (node-ledgers s)) brec)
+      (loop for op being the hash-keys of by-operator using (hash-value mine)
+            unless (equalp op origin)
+              do (let ((enter (find :dispute-enter mine :key #'op:update-type)))
+                   (when enter
+                     (let* ((lvs (op:field (op:update-op enter) :last-valid-sequence))
+                            (fork (make-view brec (min lvs (up:update-seq top)) :fork-p t :fork-operator op :ledger (lg:make-ledger))))
+                       (dolist (u mine)                     ; ascending
+                         (when (> (up:update-seq u) lvs) (record-push fork u)))
+                       (setf (gethash (fork-key id-hex op) (node-ledgers s)) fork)))))
+      (when confiscated-at (setf (gethash id-hex (node-confiscation-heights s)) confiscated-at))
+      s)))
 
 (defun view-respectful-p (view id-hex)
   "DEP-06: a confiscation is respectful iff every DisputeEnter of the dispute is for a lapsed
@@ -4119,18 +4148,39 @@
 (defvar *rebuilt-confiscations* (make-hash-table :test #'equalp) "spend txid -> verdict, once judged")
 (defvar *rebuilt-confiscations-lock* (bt:make-lock "rebuilt-confiscations"))
 
-(defun rebuilt-confiscation-p (node id-hex tx &key spend-height updates)
+(defvar *rebuilt-misses* (make-hash-table :test #'equalp :synchronized t)
+  "txid -> (update-count dispute-update-count universal-time): a rebuild that did not match, what
+   it was built from, and when.")
+(defparameter *rebuilt-miss-seconds* 60
+  "A rebuild that missed is not tried again (nor the ledger fetched from the relay again) for this long.")
+
+(defun rebuilt-confiscation-p (node id-hex tx &key spend-height updates updates-fn)
   "DEP-06: TX (a spend of ID-HEX's vault, confirmed at SPEND-HEIGHT) is the confiscation the
-   rules build from public state.  UPDATES default to the relay's.  Cached by txid."
+   rules build from public state.  UPDATES (or what UPDATES-FN returns, called only when needed)
+   default to the relay's.  A match is cached by txid; a miss is remembered with how many
+   dispute updates it saw, and not rebuilt again until more arrive (a relay that had not yet
+   delivered every arm)."
   (let ((txid (btx:tx-txid tx)))
     (multiple-value-bind (hit found) (bt:with-lock-held (*rebuilt-confiscations-lock*) (gethash txid *rebuilt-confiscations*))
       (when found (return-from rebuilt-confiscation-p hit)))
-    (let* ((updates (or updates (ledger-updates-from-relays node id-hex)))
-           (view (and updates (ignore-errors (dispute-view node id-hex updates :confiscated-at spend-height))))
-           (verdict (and view (forks-of view id-hex) (ignore-errors (rebuild-matches-p view id-hex tx)))))
-      ;; Only a match is final; a miss may be a relay that has not delivered every arm yet.
-      (when verdict (bt:with-lock-held (*rebuilt-confiscations-lock*) (setf (gethash txid *rebuilt-confiscations*) t)))
-      verdict)))
+    (let ((miss (gethash txid *rebuilt-misses*)))
+      (when (and miss (< (- (get-universal-time) (third miss)) *rebuilt-miss-seconds*))
+        (return-from rebuilt-confiscation-p nil)))
+    (let* ((updates (or updates (and updates-fn (funcall updates-fn)) (ledger-updates-from-relays node id-hex)))
+           (disputes (count-if (lambda (u) (member (ignore-errors (op:update-type u)) '(:dispute-enter :dispute-armed :obligation-record)))
+                               updates))
+           (miss (gethash txid *rebuilt-misses*)))
+      (when (and miss (= (first miss) (length updates)) (= (second miss) disputes))
+        (setf (third miss) (get-universal-time))
+        (return-from rebuilt-confiscation-p nil))
+      (let* ((view (and updates (ignore-errors (dispute-view node id-hex updates :confiscated-at spend-height))))
+             (verdict (and view (forks-of view id-hex) (ignore-errors (rebuild-matches-p view id-hex tx)))))
+        ;; Only a match is final; a miss may be a relay that has not delivered every arm yet.
+        (if verdict
+            (progn (bt:with-lock-held (*rebuilt-confiscations-lock*) (setf (gethash txid *rebuilt-confiscations*) t))
+                   (remhash txid *rebuilt-misses*))
+            (setf (gethash txid *rebuilt-misses*) (list (length updates) disputes (get-universal-time))))
+        verdict))))
 
 (defun handle-confiscation-sign (node event params)
   "A recovery-quorum member: rebuild the confiscation from public state and sign
@@ -4822,17 +4872,28 @@
         for got = (ledger-updates-from-relays node id-hex :from lo :to (+ lo page -1))
         while got append got))
 
-(defun spend-answer-updates (node id-hex gseq)
-  "Everything we can find of ID-HEX past its QuorumBegin at GSEQ: our replica, the relay's copies
-   past it (signals when the relay holds nothing at all of the ledger, so the caller judges later),
-   and the answers published to challenges of it."
+(defun spend-answer-updates (node id-hex gseq &optional anchor)
+  "Everything we can find of ID-HEX past its QuorumBegin at GSEQ that could answer a spend anchored
+   at ANCHOR: our replica, the relay's copies (signals when the relay holds nothing at all of the
+   ledger, so the caller judges later), and the answers published to challenges of it.  When our
+   replica holds the update ANCHOR names, only the sequence after it is read (an answer is that
+   update's child); otherwise the relay is read past our own tip, since anything at or below it we
+   hold.  Reading every update past an old QuorumBegin, page by page, was hundreds of relay round
+   trips per judgement on a soaked ledger."
   (let* ((rec (find-record node id-hex))
-         (history (and rec (not (record-fork-p rec)) (record-history rec)))
+         (base (and rec (not (record-fork-p rec)) rec))
+         (k (and base anchor (record-seq-of-hash base anchor)))
+         (history (cond ((null base) nil)
+                        (k (let ((u (record-update-at base (1+ k)))) (and u (list u))))
+                        (t (loop for u in (record-history base) while (> (up:update-seq u) gseq) collect u))))
          ;; FAULT :blind-relay (a ledger id prefix): we read none of that ledger's updates on the
          ;; relay, only our replica and published answers (redteam/check-rotation-lag.sh)
          (blind (let ((p (getf (node-adversary node) :blind-relay)))
                   (and (stringp p) (>= (length id-hex) (length p)) (string-equal p (subseq id-hex 0 (length p))))))
-         (relay (and (not blind) (relay-updates-past node id-hex (1+ gseq)))))
+         (relay (and (not blind)
+                     (if k
+                         (ledger-updates-from-relays node id-hex :from (1+ k) :to (1+ k))
+                         (relay-updates-past node id-hex (1+ (max gseq (if base (lg:ledger-sequence (record-ledger base)) gseq))))))))
     (unless (or blind relay (ledger-updates-from-relays node id-hex :from gseq :to gseq))
       (error "the relay holds nothing of ~a at ~a" (subseq id-hex 0 8) gseq))
     (append history relay (gethash id-hex (node-spend-answers node)))))
@@ -4844,12 +4905,13 @@
    public state.  NIL for an unanchored spend.  Signals when we cannot read the relay."
   (let ((anchor (rot:anchor-of tx)))
     (when anchor
-      (let ((updates (spend-answer-updates node id-hex gseq)))
+      (let ((updates (spend-answer-updates node id-hex gseq anchor)))
         (or (fr:rotation-answer updates anchor (btx:tx-txid tx) reserves tier-index)
             (rebuilt-confiscation-p node id-hex tx :spend-height spend-height
-                                                   :updates (append (unless (getf (node-adversary node) :blind-relay)
-                                                                      (ledger-updates-from-relays node id-hex))
-                                                                    updates)))))))
+                                                   :updates-fn (lambda ()
+                                                                 (append (unless (getf (node-adversary node) :blind-relay)
+                                                                           (ledger-updates-from-relays node id-hex))
+                                                                         updates))))))))
 
 (defun authorised-spend-p (node rec tx &key spend-height)
   "DEP-06 §Spend challenge: TX's spend of one of REC's vaults is answered (a rotation naming it,
