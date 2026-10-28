@@ -482,13 +482,22 @@
 (defparameter *height-ttl-seconds* 3 "How stale a cached chain height may be.")
 
 (defun bitcoin-cli-height-fn (cli)
-  (let ((lock (bt:make-lock "height")) (value 0) (at 0))
+  "The lock guards the cached value only, never the call to bitcoind: one caller refreshes a
+   stale height while every other gets the cached one at once.  Holding it across the call put
+   the worker and the cosigner behind a dispute drive's bitcoind round trips (signet soak,
+   2026-10-28)."
+  (let ((lock (bt:make-lock "height")) (value 0) (at 0) (refreshing nil))
     (lambda ()
-      (bt:with-lock-held (lock)
-        (when (> (- (get-universal-time) at) *height-ttl-seconds*)
-          (let ((h (ignore-errors (parse-integer (run-cli cli "getblockcount")))))
-            (when h (setf value h at (get-universal-time)))))
-        value))))
+      (let ((mine nil))
+        (bt:with-lock-held (lock)
+          (when (and (> (- (get-universal-time) at) *height-ttl-seconds*) (not refreshing))
+            (setf refreshing t mine t)))
+        (when mine
+          (unwind-protect
+               (let ((h (ignore-errors (parse-integer (run-cli cli "getblockcount")))))
+                 (when h (bt:with-lock-held (lock) (setf value h at (get-universal-time)))))
+            (bt:with-lock-held (lock) (setf refreshing nil))))
+        (bt:with-lock-held (lock) value)))))
 
 (defun bitcoin-cli-chain-fn (cli)
   "gettxout -> (:value-sats n :confirmations n), or NIL when spent/unknown."
@@ -517,17 +526,18 @@
    the reverse of the reference's, and of our own height-of-block's."
   (let ((lock (bt:make-lock "block-hash")) (cache (make-hash-table)))   ; height -> (hash . fetched-at)
     (lambda (height)
-      (bt:with-lock-held (lock)
-        (let ((hit (gethash height cache)))
-          ;; A cached hash is re-read after a minute, so a reorg of a recent block heals.
-          (if (and hit (< (- (get-universal-time) (cdr hit)) 60))
-              (car hit)
-              (let* ((out (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string height))))
-                     (h (and (= (length out) 64) (txid-bytes out))))
-                (when h
+      (let ((hit (bt:with-lock-held (lock) (gethash height cache))))
+        ;; A cached hash is re-read after a minute, so a reorg of a recent block heals.
+        (if (and hit (< (- (get-universal-time) (cdr hit)) 60))
+            (car hit)
+            ;; bitcoind is asked outside the lock (see BITCOIN-CLI-HEIGHT-FN)
+            (let* ((out (string-trim '(#\Newline #\Space) (run-cli cli "getblockhash" (princ-to-string height))))
+                   (h (and (= (length out) 64) (txid-bytes out))))
+              (when h
+                (bt:with-lock-held (lock)
                   (when (> (hash-table-count cache) 4096) (clrhash cache))
-                  (setf (gethash height cache) (cons h (get-universal-time))))
-                h)))))))
+                  (setf (gethash height cache) (cons h (get-universal-time)))))
+              h))))))
 
 (defun bitcoin-cli-utxos-fn (cli &key (retries 5))
   "Address -> its confirmed UTXOs, via scantxoutset (no bitcoind wallet needed):

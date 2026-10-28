@@ -33,7 +33,7 @@
   (:export #:signed-update #:make-signed-update #:signed-update-p
            #:update-operator-id #:update-ledger-id #:update-seq #:update-prev-hash
            #:update-message #:update-block-height #:update-block-hash
-           #:update-operator-sig #:update-cosignatures
+           #:update-operator-sig #:update-cosignatures #:update-%type #:update-%op
            #:cosignature #:make-cosignature #:cosig-pubkey #:cosig-signature
            #:cosig-member-ledger-hash
            #:decode-update #:encode-update #:sorted-cosignatures
@@ -69,7 +69,10 @@
   operator-id ledger-id (seq 0) prev-hash message
   (block-height 0) block-hash
   operator-sig
-  (cosignatures '()))
+  (cosignatures '())
+  ;; Caches, filled on first use (CL-DEPOSITS.OPERATION:UPDATE-TYPE / UPDATE-OP).  The message
+  ;; never changes once built, so neither do these.  Not part of the wire form.
+  (%type nil) (%op nil))
 
 (defun x-only (pubkey33) (subseq pubkey33 1 33))
 

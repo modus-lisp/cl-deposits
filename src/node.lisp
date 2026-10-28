@@ -72,7 +72,17 @@
   (append-lock (bt:make-lock "append"))        ; one append at a time per owned ledger, cosign wait included
   preimage lottery confiscation                ; our lottery secret; the built lottery; the confiscation tx
   rotation                                     ; broadcast rotation awaiting its QuorumBegin (plist; persisted)
-  (offers (make-hash-table :test #'equalp)))   ; DEP-10 funding offers we made: offer id -> plist
+  (offers (make-hash-table :test #'equalp))    ; DEP-10 funding offers we made: offer id -> plist
+  ;; Kept current by RECORD-PUSH, so steady-state questions cost what changed, not the chain's
+  ;; length (a soaked ledger is ~200k updates).  A fork's history is its own updates consed onto
+  ;; its base's history at the fork point (shared, never copied); its indexes hold its own
+  ;; updates and read the rest through FORK-BASE up to FORK-SEQ.
+  (count 0)                                    ; (length history), without walking it
+  (index (make-hash-table :test #'eq))         ; operation type -> this record's own updates of it, newest first
+  (by-seq (make-hash-table))                   ; sequence -> this record's own update
+  fork-base fork-seq                           ; a fork or view: the record it inherits from, through which sequence
+  (checkpoints '())                            ; ((seq . ledger snapshot) ...) newest first, for LEDGER-AT
+  (file-base 0))                               ; history entries not in this record's file (a fork's inherited prefix)
 
 (defstruct (node (:constructor %make-node))
   priv pubkey pubkey-hex keypair bus network
@@ -289,6 +299,126 @@
 (defun find-record (node id-hex) (gethash id-hex (node-ledgers node)))
 (defun own-ledger (node) (and (node-member-ledger-hex node) (find-record node (node-member-ledger-hex node))))
 (defun tip (rec) (car (record-history rec)))
+
+;;; ---------------------------------------------------------------------------
+;;; Record indexes.  Every update a record gains goes through RECORD-PUSH, which keeps the
+;;; counts, the per-type index, the by-sequence table and the ledger checkpoints.  A full walk
+;;; of a history is for startup and recovery only, and LEDGER-AT logs one when it has to.
+
+(defparameter *checkpoint-every* 1024 "Snapshot the ledger state every this many updates.")
+(defparameter *checkpoint-recent* 8192 "Keep every snapshot this close to the tip ...")
+(defparameter *checkpoint-sparse* 32768 "... and, further back, one per this many updates.")
+
+(defun prune-checkpoints (rec tip-seq)
+  (setf (record-checkpoints rec)
+        (remove-if-not (lambda (c) (or (<= (- tip-seq (car c)) *checkpoint-recent*)
+                                       (zerop (mod (car c) *checkpoint-sparse*))))
+                       (record-checkpoints rec))))
+
+(defun record-push (rec u)
+  "Append U (already applied to REC's ledger) to REC's history and indexes."
+  (ensure-indexed rec)
+  (push u (record-history rec))
+  (incf (record-count rec))
+  (push u (gethash (op:update-type u) (record-index rec)))
+  (setf (gethash (up:update-seq u) (record-by-seq rec)) u)
+  (let ((seq (up:update-seq u)))
+    (when (and (zerop (mod seq *checkpoint-every*)) (= seq (lg:ledger-sequence (record-ledger rec))))
+      (push (cons seq (lg:copy-ledger (record-ledger rec))) (record-checkpoints rec))
+      (prune-checkpoints rec seq)))
+  u)
+
+(defun index-record (rec)
+  "Rebuild REC's indexes from its history (a record built from a list, not pushed).  O(length)."
+  (let ((own (if (record-fork-base rec)
+                 (loop for u in (record-history rec) while (> (up:update-seq u) (record-fork-seq rec)) collect u)
+                 (record-history rec))))
+    (clrhash (record-index rec)) (clrhash (record-by-seq rec))
+    (dolist (u (reverse own))
+      (push u (gethash (op:update-type u) (record-index rec)))
+      (setf (gethash (up:update-seq u) (record-by-seq rec)) u))
+    (setf (record-count rec) (length (record-history rec))))
+  rec)
+
+(defun ensure-indexed (rec)
+  "A record built from a list rather than pushed (tests, scratch views) is indexed on first use."
+  (when (and (zerop (record-count rec)) (record-history rec)) (index-record rec))
+  rec)
+
+(defun record-update-at (rec seq)
+  "REC's update at sequence SEQ, or NIL."
+  (ensure-indexed rec)
+  (or (gethash seq (record-by-seq rec))
+      (and (record-fork-base rec) (<= seq (record-fork-seq rec))
+           (record-update-at (record-fork-base rec) seq))))
+
+(defun record-updates-of (rec type)
+  "REC's updates of operation TYPE, newest first: its own, then (a fork or view) its base's
+   through the fork point.  Shared structure: do not modify."
+  (ensure-indexed rec)
+  (let ((own (gethash type (record-index rec))) (base (record-fork-base rec)))
+    (if base
+        (let ((inherited (member-if (lambda (u) (<= (up:update-seq u) (record-fork-seq rec)))
+                                    (record-updates-of base type))))
+          (if own (append own inherited) inherited))
+        own)))
+
+(defun record-latest (rec type &key (below most-positive-fixnum) test)
+  "REC's newest update of TYPE with sequence below BELOW (and satisfying TEST), or NIL."
+  (find-if (lambda (u) (and (< (up:update-seq u) below) (or (null test) (funcall test u))))
+           (record-updates-of rec type)))
+
+(defvar *rescan-log* nil "(lambda (fmt &rest args)) told about every full rescan LEDGER-AT makes.")
+
+(defun ledger-at (rec seq)
+  "A fresh copy of REC's ledger as it stood after sequence SEQ: from the nearest checkpoint at or
+   below SEQ, replaying only what follows it.  Callers may modify the result."
+  (let ((tip (lg:ledger-sequence (record-ledger rec))))
+    (cond ((= seq tip) (lg:copy-ledger (record-ledger rec)))
+          ((> seq tip) (fail "ledger ~a is at ~a, not ~a" (subseq (record-id-hex rec) 0 8) tip seq))
+          ((and (record-fork-base rec) (<= seq (record-fork-seq rec))) (ledger-at (record-fork-base rec) seq))
+          (t (let* ((cp (find-if (lambda (c) (<= (car c) seq)) (record-checkpoints rec)))
+                    (l (if cp (lg:copy-ledger (cdr cp)) (lg:make-ledger)))
+                    (from (if cp (1+ (car cp)) 0)))
+               (when (and *rescan-log* (> (- seq from) *checkpoint-sparse*))
+                 (funcall *rescan-log* "rescan: ~a replayed from ~a to ~a (no checkpoint)" (subseq (record-id-hex rec) 0 8) from seq))
+               (loop for s from from to seq
+                     do (lg:apply-update l (or (record-update-at rec s) (fail "ledger ~a has no update ~a" (subseq (record-id-hex rec) 0 8) s))))
+               l)))))
+
+(defun fork-own-segment (fork)
+  "FORK's own updates (after its fork point), newest first; all of a scratch fork's."
+  (if (record-fork-base fork)
+      (loop for u in (record-history fork) while (> (up:update-seq u) (record-fork-seq fork)) collect u)
+      (record-history fork)))
+
+(defun fork-own-updates (fork type)
+  "FORK's own updates of TYPE (after its fork point; a view or scratch fork with no base: all of
+   them), newest first."
+  (if (record-fork-base fork) (gethash type (record-index (ensure-indexed fork))) (record-updates-of fork type)))
+
+(defun spent-vault-updates (rec &optional seq)
+  "What FR:SPENT-VAULT reads of REC: its LedgerOpen and QuorumBegins (all of them when SEQ is
+   NIL, else the one at SEQ), not the whole chain."
+  (remove nil (cons (record-update-at rec 0)
+                    (if seq (list (record-update-at rec seq)) (record-updates-of rec :quorum-begin)))))
+
+(defun make-view (rec seq &key fork-p fork-operator owned-p ledger)
+  "A record that inherits REC's history through SEQ (shared, not copied), with LEDGER (default:
+   REC's ledger as it stood after SEQ) and empty own indexes."
+  (let* ((skipped 0)
+         (history (loop for tail on (record-history rec)
+                        while (> (up:update-seq (car tail)) seq) do (incf skipped)
+                        finally (return tail)))
+         (v (make-record :id-hex (record-id-hex rec) :owned-p owned-p
+                         :ledger (or ledger (ledger-at rec seq))
+                         :history history
+                         :fork-p fork-p :fork-of (and fork-p (record-id-hex rec)) :fork-operator fork-operator
+                         :fork-base rec :fork-seq seq)))
+    (setf (record-count v) (- (record-count rec) skipped)
+          (record-file-base v) (record-count v)
+          (record-checkpoints v) (list (cons seq (lg:copy-ledger (record-ledger v)))))
+    v))
 (defun x-hex (pubkey33) (bytes->hex (up:x-only pubkey33)))
 
 ;;; ---------------------------------------------------------------------------
@@ -369,7 +499,7 @@
             (up:update-seq update) (subseq (record-id-hex rec) 0 8) e)
       (setf (lg:ledger-sequence (record-ledger rec)) (up:update-seq update)
             (lg:ledger-chain-tip (record-ledger rec)) (up:chain-hash update))))
-  (push update (record-history rec))
+  (record-push rec update)
   (setf (record-last-event-id rec) (ev:event-id (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) update))))
   (save-record node rec)
   (run-hooks node rec update)
@@ -448,7 +578,7 @@
                                 ;; DEP-03 Rotation ordering: cosigners rebuild every rung, unsigned.
                                 "rotation_rungs_tx" (let ((r (record-rotation rec)))
                                                       (and r (getf r :rungs) (not (getf r :qb-seq))
-                                                           (eq (op:operation-type (op:decode-operation (up:update-message update))) :quorum-begin)
+                                                           (eq (op:update-type update) :quorum-begin)
                                                            (coerce (getf r :rungs) 'vector)))
                                 *extra-cosign-params*))
          (signer-xs (mapcar (lambda (m) (x-hex (lg:member-pubkey m))) signers))
@@ -560,9 +690,8 @@
          ;; ledger id from it) and gap-fills the rest itself; ours catches up
          ;; from the relay to `ledger_sequence`.
          (params (w:json-object "operator_pubkey" (node-pubkey-hex node) "operator_ledger_id" (record-id-hex rec)
-                                "ledger_history" (coerce (let ((h (reverse (record-history rec))))
-                                                           (mapcar (lambda (u) (base64-encode (up:encode-update u)))
-                                                                   (subseq h 0 (min (length h) +consent-history-limit+))))
+                                "ledger_history" (coerce (let ((h (reverse (last (record-history rec) +consent-history-limit+))))
+                                                           (mapcar (lambda (u) (base64-encode (up:encode-update u))) h))
                                                          'vector)
                                 "ledger_sequence" (lg:ledger-sequence (record-ledger rec))
                                 "chosen_ruleset" ruleset "min_fee_bps" min-fee-bps "min_fee_fixed" min-fee-fixed
@@ -644,10 +773,8 @@
 (defun has-quorum-begin-p (rec)
   "REC holds a vault its next QuorumBegin must rotate: a QuorumBegin with no DisputeAcquire
    after it (an acquisition's first QuorumBegin is funded by the lottery claim instead)."
-  (loop for u in (record-history rec)                 ; newest first
-        for type = (op:operation-type (op:decode-operation (up:update-message u)))
-        when (eq type :dispute-acquire) return nil
-        when (eq type :quorum-begin) return t))
+  (let ((qb (record-latest rec :quorum-begin)) (acq (record-latest rec :dispute-acquire)))
+    (and qb (or (null acq) (> (up:update-seq qb) (up:update-seq acq))))))
 
 (defun rotation-tier-index (reserves height)
   "The highest-numbered tier whose CLTV is satisfied at HEIGHT (Tier 0 before expiry)."
@@ -803,7 +930,7 @@
   (let* ((r (or (pending-rotation node rec) (fail "no pending rotation")))
          (plan (getf r :plan))
          (rungs (mapcar (lambda (h) (btx:parse-tx (bw:make-reader (hex->bytes h)))) (getf r :rungs)))
-         (cur (or (fr:spent-vault (record-history rec) (getf plan :governing-seq)) (fail "the spent vault's QuorumBegin is gone")))
+         (cur (or (fr:spent-vault (spent-vault-updates rec) (getf plan :governing-seq)) (fail "the spent vault's QuorumBegin is gone")))
          (tier-index (getf plan :tier-index))
          (tier (nth tier-index (rs:reserves-tiers cur)))
          (leaf (nth tier-index (rs:reserves-leaves cur)))
@@ -882,7 +1009,7 @@
                            (fail "a rotation must spend the old vault: rotate-vault first")))))
     (when (and rotation (getf rotation :qb-seq))
       ;; recorded already; only its signatures are missing
-      (let ((qu (find (getf rotation :qb-seq) (record-history rec) :key #'up:update-seq)))
+      (let ((qu (record-update-at rec (getf rotation :qb-seq))))
         (return-from begin-quorum
           (values qu (record-reserves rec) (ignore-errors (sign-rotation-rungs node rec qu))))))
     (when rotation
@@ -1100,7 +1227,7 @@
       (fail "fork update not signed by the fork's operator"))
     (when (<= (up:update-seq update) (lg:ledger-sequence ledger))
       ;; Same sequence, different content, validly signed by the operator: equivocation.
-      (let ((ours (find (up:update-seq update) (record-history rec) :key #'up:update-seq)))
+      (let ((ours (record-update-at rec (up:update-seq update))))
         (when (and ours (not (record-fork-p rec))
                    (equalp (up:update-operator-id ours) (up:update-operator-id update))   ; a fork's is not the operator's
                    (not (equalp (up:content-hash ours) (up:content-hash update)))
@@ -1131,7 +1258,7 @@
         ;; and the rules reject it.  That is provable fraud, not a glitch to retry.
         (report-non-conforming node rec update e)
         (error e)))
-    (push update (record-history rec))
+    (record-push rec update)
     (save-record node rec)
     (run-hooks node rec update)
     :applied))
@@ -1563,7 +1690,7 @@
           (rec (find-record node (w:jget c "ledger_id")))
           (bytes (hex->bytes (w:jget c "tx")))
           (txid (btx:tx-txid (btx:parse-tx (bw:make-reader bytes))))
-          (qu (and rec (find (w:jget c "sequence") (record-history rec) :key #'up:update-seq)))
+          (qu (and rec (record-update-at rec (w:jget c "sequence"))))
           (o (and qu (op:decode-operation (up:update-message qu))))
           (rungs (and o (eq (op:operation-type o) :quorum-begin) (fr:rotation-rungs o)))
           (i (and rungs (position txid rungs :test #'equalp))))
@@ -1578,7 +1705,7 @@
         when (and (record-owned-p rec) (not (record-fork-p rec)))
           do (let ((r (pending-rotation node rec)))
                (when (and r (getf r :qb-seq))
-                 (let ((qu (find (getf r :qb-seq) (record-history rec) :key #'up:update-seq)))
+                 (let ((qu (record-update-at rec (getf r :qb-seq))))
                    (if qu
                        (handler-case (sign-rotation-rungs node rec qu :timeout 30)
                          (error (c) (log! node "rotation of ~a still awaits its rung signatures: ~a" (subseq (record-id-hex rec) 0 8) c)))
@@ -1743,7 +1870,7 @@
   (let ((qb nil))
     (dolist (u (receiver-history node (bytes->hex (up:update-ledger-id accept-update))))
       (when (and (< (up:update-seq u) (up:update-seq accept-update))
-                 (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :quorum-begin))
+                 (eq (ignore-errors (op:update-type u)) :quorum-begin))
         (setf qb u)))
     (or qb (fail "the receiver's ledger has no QuorumBegin before the accept"))))
 
@@ -1758,7 +1885,7 @@
          (ours (find (up:update-seq au) hist :key #'up:update-seq))
          (latest-qb (let ((q nil))
                       (dolist (u hist q)
-                        (when (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :quorum-begin)
+                        (when (eq (ignore-errors (op:update-type u)) :quorum-begin)
                           (setf q u))))))
     (unless (and ours (equalp (up:chain-hash ours) (up:chain-hash au)))
       (fail "the accept is not in the receiver's history"))
@@ -1996,7 +2123,9 @@
          (sighash (cf:signed-sighash o)) (accepted '()) (hit nil))
     (when (plusp live)
       (loop for u in (record-history rec)
-            for a = (ignore-errors (op:decode-operation (up:update-message u)))
+            for a = (and (member (ignore-errors (op:update-type u))
+                                 '(:invoice-lock :onchain-lock :transfer-lock :deposit-key-rotate :exit-request :exit-cancel))
+                         (ignore-errors (op:decode-operation (up:update-message u))))
             when (and a (eql (ignore-errors (op:field a :nonce)) nonce)
                       (equalp (cf:operation-deposit-id a) (cf:operation-deposit-id o))
                       (cf:signed-sighash a))
@@ -2016,9 +2145,9 @@
       (:accept nil))))
 
 (defun invoice-fulfill-preimage (rec payment-id)
-  (loop for u in (record-history rec)
-        for a = (ignore-errors (op:decode-operation (up:update-message u)))
-        when (and a (eq (op:operation-type a) :invoice-fulfill) (equalp (op:field a :payment-id) payment-id))
+  (loop for u in (record-updates-of rec :invoice-fulfill)
+        for a = (ignore-errors (op:update-op u))
+        when (and a (equalp (op:field a :payment-id) payment-id))
           return (op:field a :preimage)))
 
 (defun handle-pay-invoice (node rec event params)
@@ -2284,10 +2413,11 @@
   "FORK's most recent update of operation TYPE its own operator signed, and its decoded operation.
    (A dispute of a ledger after a custody change forks the winner's chain, whose DisputeEnter and
    DisputeAcquire are the winner's, not this fork's.)"
-  (let ((u (find-if (lambda (u) (and (equalp (up:update-operator-id u) (record-fork-operator fork))
-                                     (eq (op:operation-type (op:decode-operation (up:update-message u))) type)))
-                    (record-history fork))))
-    (and u (values u (op:decode-operation (up:update-message u))))))
+  (let ((u (find-if (lambda (u) (equalp (up:update-operator-id u) (record-fork-operator fork)))
+                    (if (record-fork-base fork)
+                        (gethash type (record-index fork))      ; its own updates: after the fork point
+                        (record-updates-of fork type)))))
+    (and u (values u (op:update-op u)))))
 
 (defun dispute-arm-closes (node base)
   "The block the arm window closes: the earliest DisputeEnter on any fork of
@@ -2960,22 +3090,9 @@
   (loop for rec being the hash-values of (node-ledgers node)
         when (and (record-fork-p rec) (string= (record-fork-of rec) id-hex)) collect rec))
 
-(defvar *latest-qb-memo* (make-hash-table :test #'eq :weakness :key :synchronized t)
-  "record -> (tip-seq . latest QuorumBegin seq): the walk back to the last QuorumBegin decodes
-   every update since, ~60k on a soaked ledger whose rotations stalled, and fork-live-p asks
-   for it on every dispute decision.")
-
 (defun latest-quorum-begin-seq (rec)
-  (let* ((tip (let ((u (first (record-history rec)))) (and u (up:update-seq u))))
-         (hit (gethash rec *latest-qb-memo*)))
-    (if (and hit tip (eql (car hit) tip))
-        (cdr hit)
-        (let ((v (or (loop for u in (record-history rec)
-                           when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
-                             return (up:update-seq u))
-                     0)))
-          (when tip (setf (gethash rec *latest-qb-memo*) (cons tip v)))
-          v))))
+  "The sequence of REC's latest QuorumBegin, or 0."
+  (let ((u (record-latest rec :quorum-begin))) (if u (up:update-seq u) 0)))
 
 (defun fork-live-p (node fork)
   "FORK still speaks for its ledger's current dispute: it has custody (DisputeAcquire: the
@@ -3016,9 +3133,7 @@
   "Pubkeys of REC's current quorum members that have disputed it since the quorum
    began: a fork whose DisputeEnter (other than for a lapsed quorum) is at or after
    the latest QuorumBegin, whether still open, armed, yielded or acquired."
-  (let* ((qb-seq (or (loop for u in (record-history rec)
-                           when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
-                             return (up:update-seq u))
+  (let* ((qb-seq (or (let ((u (record-latest rec :quorum-begin))) (and u (up:update-seq u)))
                      0))
          (members (mapcar #'lg:member-pubkey (lg:ledger-quorum-members (record-ledger rec)))))
     (loop for f in (forks-of node (record-id-hex rec))
@@ -3070,9 +3185,7 @@
   "A member refuses to extend REC's base chain once its operator is deposed (DEP-05):
    custody moved by a DisputeAcquire, or we, or a majority of the quorum, disputed it
    at or after the latest QuorumBegin other than for expiry."
-  (let* ((qb-seq (or (loop for u in (record-history rec)
-                           when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
-                             return (up:update-seq u))
+  (let* ((qb-seq (or (let ((u (record-latest rec :quorum-begin))) (and u (up:update-seq u)))
                      0))
          (disputes (loop for f in (forks-of node (record-id-hex rec))
                          for o = (nth-value 1 (fork-op f :dispute-enter))
@@ -3089,15 +3202,16 @@
   "A fork of REC's ledger from LAST-VALID-SEQ, operated by OPERATOR33: the
    truncated history replayed, quorum cleared (the reference does the same,
    so fork operations need no cosignatures)."
-  (let* ((history (remove-if (lambda (u) (> (up:update-seq u) last-valid-seq)) (reverse (record-history rec))))
-         (ledger (lg:replay history))
-         (fork (make-record :id-hex (record-id-hex rec) :ledger ledger :history (reverse history)
-                            :owned-p (equalp operator33 (node-pubkey node))
-                            :fork-p t :fork-of (record-id-hex rec) :fork-operator operator33)))
+  ;; The base's history is shared from the fork point (not copied), and its state comes from the
+  ;; nearest checkpoint: replaying the whole chain per fork was seconds of CPU and a second copy
+  ;; of every update list in memory (signet soak, 2026-10-28: 7 forks of a 190k-update ledger).
+  (let* ((ledger (ledger-at rec last-valid-seq)))
     (setf (lg:ledger-quorum-at-fork ledger) (lg:ledger-quorum-members ledger)
           (lg:ledger-quorum-members ledger) '() (lg:ledger-next-quorum-members ledger) '())
+    (let ((fork (make-view rec last-valid-seq :fork-p t :fork-operator operator33
+                                              :owned-p (equalp operator33 (node-pubkey node)) :ledger ledger)))
     (setf (gethash (fork-key (record-id-hex rec) operator33) (node-ledgers node)) fork)
-    fork))
+    fork)))
 
 (defun enter-dispute (node rec last-valid-seq &key (reason "fraud") anchor-block-hash anchor-block-height fraud-proof-hash)
   "We are a quorum member of REC's ledger and have grounds: fork it and publish DisputeEnter."
@@ -3134,14 +3248,13 @@
           v))))
 
 (defun %recovery-voters (rec fork-point)
-  (let ((operator nil) (members '()))
-    (dolist (u (reverse (record-history rec)))
-      (when (zerop (up:update-seq u)) (setf operator (up:update-operator-id u)))
-      (when (and operator (equalp (up:update-operator-id u) operator)
-                 (or (null fork-point) (<= (up:update-seq u) fork-point)))
-        (let ((o (op:decode-operation (up:update-message u))))
-          (when (eq (op:operation-type o) :quorum-begin)
-            (setf members (op:field o :quorum-members))))))
+  (let* ((genesis (record-update-at rec 0))
+         (operator (and genesis (up:update-operator-id genesis)))
+         (qb (and operator
+                  (find-if (lambda (u) (and (equalp (up:update-operator-id u) operator)
+                                            (or (null fork-point) (<= (up:update-seq u) fork-point))))
+                           (record-updates-of rec :quorum-begin))))
+         (members (and qb (op:field (op:update-op qb) :quorum-members))))
     (remove-duplicates (mapcar #'up:x-only (remove operator members :test #'equalp)) :test #'equalp)))
 
 (defun our-target-address (node)
@@ -3183,7 +3296,7 @@
   "DEP-06: if the disputed ledger had an unresolved DormancyAccept at the fork point and its source
    consumed the notice, append an ObligationRecord (the source's notice and QuorumBegin) to FORK."
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (lvs (dispute-last-valid-seq node id))
-         (l (and base lvs (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base))))))
+         (l (and base lvs (ledger-at base lvs)))
          (a (and l (lg:ledger-dormancy-accept l))))
     (when (and a (not (getf a :resolved)) (getf a :source))
       (multiple-value-bind (nu qu) (migration-source-updates node a (bytes->hex (getf a :source)))
@@ -3250,10 +3363,10 @@
         ;; A fork's arms are its operator's own updates; the prefix it inherited from the base
         ;; (~180k updates on a soaked ledger) is the base operator's, and decoding it on every
         ;; lottery and confiscation decision saturated the node (signet soak, 2026-10-27).
-        append (loop for u in (record-history fork)
+        append (loop for u in (if (record-fork-base fork) (gethash :dispute-armed (record-index fork)) (record-updates-of fork :dispute-armed))
                      for o = (and (equalp (up:update-operator-id u) (record-fork-operator fork))
-                                  (op:decode-operation (up:update-message u)))
-                     when (and o (eq (op:operation-type o) :dispute-armed))
+                                  (op:update-op u))
+                     when o
                        collect (list (up:update-operator-id u) (op:field o :commitment-hash) (op:field o :target-reserves)
                                      (and (op:field o :replacement-collateral-txid)
                                           (list (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)
@@ -3288,7 +3401,7 @@
   (let ((lvs (dispute-last-valid-seq node id-hex)))
     (unless lvs (fail "no fork point for ~a's confiscation anchor" (subseq id-hex 0 8)))
     (let ((u (or (loop for r in (cons (find-record node id-hex) (forks-of node id-hex))
-                       thereis (and r (find lvs (record-history r) :key #'up:update-seq)))
+                       thereis (and r (record-update-at r lvs)))
                  (fail "no update at ~a's fork point ~a" (subseq id-hex 0 8) lvs))))
       (fork-point-anchor u))))
 
@@ -3298,7 +3411,7 @@
   (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
          (lvs (dispute-last-valid-seq node id-hex))
          (l (if lvs
-                (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base))))
+                (ledger-at base lvs)
                 (record-ledger base)))
          (reserves (lg:ledger-reserves-amount l)))
     (unless (plusp reserves) (fail "QuorumBegin reserves were zero"))
@@ -3374,12 +3487,10 @@
 (defun disputed-reserves (node rec)
   "From the latest QuorumBegin: (values reserves-struct txid vout sats operator33 collateral-msats
    feerate), FEERATE its reference_feerate_sat_vb (2 when none): what its confiscation pays (DEP-03)."
-  (let ((operator nil) (qb nil))
-    (dolist (u (reverse (record-history rec)))
-      (let ((o (op:decode-operation (up:update-message u))))
-        (case (op:operation-type o)
-          (:ledger-open (setf operator (op:field o :operator-id)))
-          (:quorum-begin (setf qb o)))))
+  (let* ((open (record-latest rec :ledger-open))
+         (operator (and open (op:field (op:update-op open) :operator-id)))
+         (qbu (record-latest rec :quorum-begin))
+         (qb (and qbu (op:update-op qbu))))
     (unless qb (fail "no QuorumBegin"))
     (multiple-value-bind (txid sats) (vault-rung node qb)
       (values (rs:build-reserves :operator operator :members (op:field qb :quorum-members)
@@ -3451,10 +3562,10 @@
    replay of a soaked ledger (~180k updates) took seconds on every confiscation_sign request.")
 
 (defun fork-point-ledger (base id-hex lvs)
-  (let* ((at (find lvs (record-history base) :key #'up:update-seq))
+  (let* ((at (record-update-at base lvs))
          (key (list id-hex lvs (and at (bytes->hex (up:content-hash at))))))
     (or (gethash key *fork-point-memo*)
-        (let ((l (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base))))))
+        (let ((l (ledger-at base lvs)))
           (when (> (hash-table-count *fork-point-memo*) 256) (clrhash *fork-point-memo*))
           (setf (gethash key *fork-point-memo*) l)))))
 
@@ -3478,9 +3589,9 @@
         (let ((seen '()))
           (dolist (p participants)
             (let ((fork (find-fork node id-hex (first p))))
-              (dolist (u (and fork (reverse (record-history fork))))
-                (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-                  (when (and o (eq (op:operation-type o) :obligation-record) (< (up:update-seq u) (sixth p)))
+              (dolist (u (and fork (reverse (fork-own-updates fork :obligation-record))))
+                (let ((o (ignore-errors (op:update-op u))))
+                  (when (and o (< (up:update-seq u) (sixth p)))
                     (multiple-value-bind (notice qb qu to-us)
                         (ignore-errors (lg:migration-evidence l (op:field o :source-notice-update) (op:field o :source-qb-update)))
                       (when (and qb to-us
@@ -3499,14 +3610,15 @@
                                     (incf residue (floor (getf e :amount) 1000)))))))))))))))))
     ;; DEP-06: proven-uncredited offer payments recorded on the participants' forks are owed too
     ;; (paid from the vault: the payment itself sits at the operator's offer address).
-    (let ((hist (reverse (record-history base))) (paid '())
+    (let ((hist nil) (paid '())
           (hob (or (node-height-of-block node) (lambda (b) (declare (ignore b)) nil))))
       (dolist (p participants)
         (let ((fork (find-fork node id-hex (first p))))
-          (dolist (u (and fork (reverse (record-history fork))))
-            (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-              (when (and o (eq (op:operation-type o) :obligation-record) (op:field o :uncredited-proof)
+          (dolist (u (and fork (reverse (fork-own-updates fork :obligation-record))))
+            (let ((o (ignore-errors (op:update-op u))))
+              (when (and o (op:field o :uncredited-proof)
                          (< (up:update-seq u) (sixth p)))
+                (unless hist (setf hist (reverse (record-history base))))   ; only when a proof needs judging
                 (let* ((proof (ignore-errors (fr:json->proof (w:parse-json (bytes->ascii (op:field o :uncredited-proof))))))
                        (txid (and proof (ignore-errors (hex->bytes (fr::e proof :txid)))))
                        (vout (and proof (fr::e proof :vout))))
@@ -3778,9 +3890,7 @@
   "REC as it stood before sequence SEQ: a scratch record whose history and ledger stop at SEQ - 1."
   (if (< (lg:ledger-sequence (record-ledger rec)) seq)
       rec
-      (let ((hist (remove-if (lambda (u) (>= (up:update-seq u) seq)) (record-history rec))))
-        (make-record :id-hex (record-id-hex rec) :owned-p (record-owned-p rec) :history hist
-                     :ledger (lg:replay (reverse hist))))))
+      (make-view rec (1- seq) :owned-p (record-owned-p rec))))
 
 (defun handle-rotation-sign (node event params)
   "DEP-03 Rotation ordering, step 3: sign the rungs a FINAL QuorumBegin names, never a vault
@@ -3918,17 +4028,18 @@
                         :network (node-network node) :height-fn (node-height-fn node) :chain-fn (node-chain-fn node)
                         :pledge-fn (node-pledge-fn node) :spender-fn (node-spender-fn node) :feerate-fn (node-feerate-fn node)
                         :height-of-block (node-height-of-block node) :block-hash-fn (node-block-hash-fn node))))
-    (setf (gethash id-hex (node-ledgers s)) (make-record :id-hex id-hex :ledger (lg:replay base) :history (reverse base)))
+    (setf (gethash id-hex (node-ledgers s)) (index-record (make-record :id-hex id-hex :ledger (lg:replay base) :history (reverse base))))
     (dolist (op (remove-duplicates (loop for u in sorted unless (equalp (up:update-operator-id u) origin) collect (up:update-operator-id u))
                                    :test #'equalp))
       (let* ((mine (remove-if-not (lambda (u) (equalp (up:update-operator-id u) op)) sorted))
-             (enter (find :dispute-enter mine :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u)))))))
+             (enter (find :dispute-enter mine :key (lambda (u) (op:update-type u)))))
         (when enter
           (let ((lvs (op:field (op:decode-operation (up:update-message enter)) :last-valid-sequence)))
             (setf (gethash (fork-key id-hex op) (node-ledgers s))
-                  (make-record :id-hex id-hex :ledger (lg:make-ledger) :fork-p t :fork-of id-hex :fork-operator op
-                               :history (reverse (append (remove-if (lambda (u) (> (up:update-seq u) lvs)) base)
-                                                         (remove-if (lambda (u) (<= (up:update-seq u) lvs)) mine)))))))))
+                  (index-record
+                   (make-record :id-hex id-hex :ledger (lg:make-ledger) :fork-p t :fork-of id-hex :fork-operator op
+                                :history (reverse (append (remove-if (lambda (u) (> (up:update-seq u) lvs)) base)
+                                                          (remove-if (lambda (u) (<= (up:update-seq u) lvs)) mine))))))))))
     (when confiscated-at (setf (gethash id-hex (node-confiscation-heights s)) confiscated-at))
     s))
 
@@ -4211,7 +4322,7 @@
    proven uncredited (recorded on a fork, or verified by us): its deposit opened if need be, then
    an OnchainCredit of its outpoint.  Returns how many credits were appended."
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (lvs (dispute-last-valid-seq node id))
-         (l (and base lvs (lg:replay (remove-if (lambda (u) (> (up:update-seq u) lvs)) (reverse (record-history base))))))
+         (l (and base lvs (ledger-at base lvs)))
          (a (and l (lg:ledger-dormancy-accept l)))
          (n 0))
     (when (and a (not (getf a :resolved)) (getf a :source))
@@ -4226,9 +4337,9 @@
     (let ((jsons (remove-duplicates
                   (append (gethash id (node-obligation-proofs node))
                           (loop for f in (forks-of node id)
-                                append (loop for u in (record-history f)
-                                             for o = (ignore-errors (op:decode-operation (up:update-message u)))
-                                             when (and o (eq (op:operation-type o) :obligation-record) (op:field o :uncredited-proof))
+                                append (loop for u in (fork-own-updates f :obligation-record)
+                                             for o = (ignore-errors (op:update-op u))
+                                             when (and o (op:field o :uncredited-proof))
                                                collect (bytes->ascii (op:field o :uncredited-proof)))))
                   :test #'string=)))
       (dolist (json jsons)
@@ -4399,9 +4510,9 @@
            ;; made by hand on the control socket, or before pledges were kept).
            (declared (loop for r being the hash-values of (node-ledgers node)
                            when (and (record-fork-p r) (record-owned-p r))
-                             append (loop for u in (record-history r)
-                                          for o = (op:decode-operation (up:update-message u))
-                                          when (and (eq (op:operation-type o) :dispute-armed) (op:field o :replacement-collateral-txid))
+                             append (loop for u in (fork-own-updates r :dispute-armed)
+                                          for o = (op:update-op u)
+                                          when (op:field o :replacement-collateral-txid)
                                             collect (outpoint-key (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)))))
            (free (remove-if (lambda (u) (let ((k (outpoint-key (getf u :txid) (getf u :vout))))
                                           (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
@@ -4498,9 +4609,7 @@
     (values ids ok)))
 
 (defun governing-quorum-begin-seq (rec seq)
-  (let ((qb (find-if (lambda (u) (and (<= (up:update-seq u) seq)
-                                      (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)))
-                     (record-history rec))))            ; newest first: the latest at or before SEQ
+  (let ((qb (record-latest rec :quorum-begin :below (1+ seq))))   ; the latest at or before SEQ
     (and qb (up:update-seq qb))))
 
 (defun broadcast-cosigner-contagion (node rec update)
@@ -4555,22 +4664,24 @@
    what the relays have."
   (let ((rec (find-record node id-hex)))
     (if (and rec (not (record-fork-p rec)))
-        (append (record-history rec) (loop for f in (forks-of node id-hex) append (record-history f)))
+        ;; A fork shares its base's history up to its fork point: add only its own updates.
+        (append (record-history rec)
+                (loop for f in (forks-of node id-hex)
+                      append (if (record-fork-base f)
+                                 (loop for u in (record-history f) while (> (up:update-seq u) (record-fork-seq f)) collect u)
+                                 (record-history f))))
         (ledger-updates-from-relays node id-hex))))
 
 (defun watch-derelicts (node id-hex proof fork)
   "DEP-19 §6: we disputed ID-HEX on PROOF with FORK's DisputeEnter, which cites the proof and
    anchors it.  Watch the co-members who do not."
-  (let ((enter (and fork (find-if (lambda (u) (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :dispute-enter))
-                                  (record-history fork)))))
+  (let ((enter (and fork (first (fork-own-updates fork :dispute-enter)))))
     (when enter
       (setf (gethash id-hex (node-derelict-watch node)) (list :proof proof :disclosure enter)))))
 
 (defun governing-quorum-begin (rec seq)
   "REC's latest QuorumBegin at or before SEQ."
-  (find-if (lambda (u) (and (<= (up:update-seq u) seq)
-                            (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :quorum-begin)))
-           (record-history rec)))
+  (record-latest rec :quorum-begin :below (1+ seq)))
 
 (defun report-derelict-members (node rec watch)
   "DEP-19 §6 / DEP-11.  We disputed REC on (getf WATCH :proof) with the DisputeEnter (getf WATCH
@@ -4582,15 +4693,24 @@
          (anchor (up:update-block-height disc))
          (lvs (op:field (op:decode-operation (up:update-message disc)) :last-valid-sequence))
          (qb (governing-quorum-begin rec lvs))
-         (all (updates-of-ledger node id)))
+         (all nil)
+         ;; Who acted is read from the disputes alone, not from every transfer on the chain.
+         (acts (append (loop for type in '(:dispute-enter :dispute-armed) append (record-updates-of rec type))
+                       (loop for f in (forks-of node id)
+                             append (loop for type in '(:dispute-enter :dispute-armed) append (fork-own-updates f type))))))
     (when qb
       (dolist (mk (op:field (op:decode-operation (up:update-message qb)) :quorum-members))
         (let* ((vis (and (not (equalp mk (node-pubkey node)))
-                         (find-if (lambda (u) (and (>= (up:update-block-height u) anchor)
-                                                   (find mk (up:update-cosignatures u) :key #'up:cosig-pubkey :test #'equalp)))
-                                  (reverse (record-history rec)))))
-               (required (and vis (fr::member-response-blocks (reverse (record-history rec)) mk (up:update-seq qb)))))
-          (when (and vis (notany (lambda (u) (fr::acted-on-p u mk (hex->bytes id))) all))
+                         ;; the earliest at or above ANCHOR: heights never fall along the chain, so walk
+                         ;; back from the tip only as far as ANCHOR
+                         (let ((hit nil))
+                           (loop for u in (record-history rec)
+                                 while (>= (up:update-block-height u) anchor)
+                                 when (find mk (up:update-cosignatures u) :key #'up:cosig-pubkey :test #'equalp)
+                                   do (setf hit u))
+                           hit)))
+               (required (and vis (fr::member-response-blocks (reverse (record-updates-of rec :quorum-add-member)) mk (up:update-seq qb)))))
+          (when (and vis (notany (lambda (u) (fr::acted-on-p u mk (hex->bytes id))) acts))
             (dolist (target (ledgers-operated-by node mk))
               (let* ((mrec (find-record node target))
                      (key (format nil "~a:~a:~a" target (bytes->hex mk) id))
@@ -4604,7 +4724,7 @@
                     (multiple-value-bind (ok why)
                         (fr:verify-dispute-dereliction d (reverse (record-history mrec))
                                                        (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
-                                                       :defrauded-updates all)
+                                                       :defrauded-updates (or all (setf all (updates-of-ledger node id))))
                       (if (not ok)
                           (log! node "not reporting ~a on ~a: our own dereliction proof does not verify: ~a"
                                 (subseq (bytes->hex mk) 0 8) (subseq target 0 8) why)
@@ -4696,10 +4816,8 @@
   "DEP-06 §Spend challenge: TX's spend of one of REC's vaults is answered (a rotation naming it,
    or the confiscation the rules rebuild from public state).  The tier is read from TX's witness
    leaf (0 when unsigned)."
-  (loop for u in (record-history rec)
-        for o = (ignore-errors (op:decode-operation (up:update-message u)))
-        thereis (and o (eq (op:operation-type o) :quorum-begin)
-                     (multiple-value-bind (reserves rungs vout) (fr:spent-vault (record-history rec) (up:update-seq u))
+  (loop for u in (record-updates-of rec :quorum-begin)
+        thereis (and (multiple-value-bind (reserves rungs vout) (fr:spent-vault (spent-vault-updates rec) (up:update-seq u))
                        (let ((i (and reserves (position-if (lambda (in) (and (member (btx:txin-prev-hash in) rungs :test #'equalp)
                                                                              (= (btx:txin-prev-index in) vout)))
                                                            (btx:tx-inputs tx)))))
@@ -4733,10 +4851,10 @@
           (txid (hex->bytes (w:jget c "txid"))) (anchor (hex->bytes (w:jget c "anchor")))
           (rec (find-record node id)))
      (when (and rec (not (record-fork-p rec)))
-       (let ((answer (find-if (lambda (u) (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-                                            (and o (eq (op:operation-type o) :quorum-begin) (equalp (up:update-prev-hash u) anchor)
+       (let ((answer (find-if (lambda (u) (let ((o (ignore-errors (op:update-op u))))
+                                            (and o (equalp (up:update-prev-hash u) anchor)
                                                  (member txid (fr:rotation-rungs o) :test #'equalp))))
-                              (record-history rec)))
+                              (record-updates-of rec :quorum-begin)))
              (fork (find-if (lambda (f) (or (and (record-confiscation f) (equalp (btx:tx-txid (record-confiscation f)) txid))
                                             ;; DEP-03 §Confiscation ladder: a rung of one we signed
                                             (find txid (gethash id (node-signed-confiscations node)) :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)))
@@ -4752,7 +4870,7 @@
                                                                            (mapcar (lambda (u) (base64-encode (up:encode-update u)))
                                                                                    (remove-if (lambda (u) (equalp (up:update-operator-id u)
                                                                                                                   (lg:ledger-operator-key (record-ledger rec))))
-                                                                                              (record-history fork))))))))))))
+                                                                                              (fork-own-segment fork))))))))))))
 
 (defun handle-challenge-answer (node event)
   "Kind 9112: keep the updates answering a challenge, for every later judgement of that ledger's spends."
@@ -4807,12 +4925,10 @@
     (loop for rec being the hash-values of (node-ledgers node)
           unless (record-fork-p rec)
             do (ignore-errors
-                (let ((qbs (loop for u in (record-history rec)
-                                 when (eq (op:operation-type (op:decode-operation (up:update-message u))) :quorum-begin)
-                                   collect (up:update-seq u))))
+                (let ((qbs (mapcar #'up:update-seq (record-updates-of rec :quorum-begin))))
                   (dolist (seq (subseq qbs 0 (min 2 (length qbs))))
                     ;; DEP-03 §Fee ladder: output 0 of every rung (only one can confirm)
-                    (multiple-value-bind (reserves rungs vout) (fr:spent-vault (record-history rec) seq)
+                    (multiple-value-bind (reserves rungs vout) (fr:spent-vault (spent-vault-updates rec) seq)
                       (when reserves (dolist (txid rungs) (push (list rec seq txid vout) out))))))))
     out))
 
@@ -4859,9 +4975,8 @@
         for l = (and rec (record-ledger rec))
         when (and l (lg:ledger-confiscation-txid l))
           do (handler-case
-                 (let* ((history (reverse (record-history rec)))
-                        (au (find :dispute-acquire history :from-end t
-                                  :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u))))))
+                 (let* ((history nil)   ; the whole chain, built only when a candidate needs a proof
+                        (au (record-latest rec :dispute-acquire))
                         (conf (find (lg:ledger-confiscation-txid l)
                                     (loop for f in (forks-of node (record-id-hex rec)) when (record-confiscation f) collect (record-confiscation f))
                                     :key #'btx:tx-txid :test #'equalp))
@@ -4871,9 +4986,9 @@
                      (when (and a (not (getf a :resolved)) (getf a :source))
                        (multiple-value-bind (nu qu) (migration-source-updates node a (bytes->hex (getf a :source)))
                          (when qu (push (list (format nil "obligation:~a:migration" (record-id-hex rec)) :notice-update nu :qb-update qu) candidates))))
-                     (dolist (u history)
-                       (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-                         (when (and o (eq (op:operation-type o) :obligation-record) (op:field o :uncredited-proof)
+                     (dolist (u (reverse (record-updates-of rec :obligation-record)))
+                       (let ((o (ignore-errors (op:update-op u))))
+                         (when (and o (op:field o :uncredited-proof)
                                     (< (up:update-seq u) (up:update-seq au)))
                            (push (list (format nil "obligation:~a:~a" (record-id-hex rec) (bytes->hex (sha256 (op:field o :uncredited-proof))))
                                        :uncredited-proof (bytes->ascii (op:field o :uncredited-proof)))
@@ -4881,6 +4996,7 @@
                      (dolist (c candidates)
                        (destructuring-bind (key &rest args) c
                          (unless (gethash key (node-migrations-watched node))
+                           (unless history (setf history (reverse (record-history rec))))
                            (let ((proof (apply #'fr:unhonoured-obligation-proof history au conf args)))
                              (when proof
                                (multiple-value-bind (ok why)
@@ -4902,7 +5018,8 @@
    broadcast the UncreditedOnchainPayment proof against it."
   (loop for rec being the hash-values of (node-ledgers node)
         unless (record-fork-p rec)
-          do (let ((source (reverse (record-history rec))))
+          do (let ((source (sort (append (record-updates-of rec :quorum-begin) (record-updates-of rec :dormancy-notice))
+                                 #'< :key #'up:update-seq)))   ; what LATEST-MIGRATION reads; the full chain only for a proof
                (multiple-value-bind (qu nu qb) (fr:latest-migration source)
                  (let* ((key (and qu (format nil "~a:~a" (record-id-hex rec) (up:update-seq qu))))
                         (seen (and key (gethash key (node-migrations-watched node)))))
@@ -4920,7 +5037,7 @@
                                     (rid (bytes->hex (up:update-ledger-id au)))
                                     (rrec (find-record node rid))
                                     (rhist (if (and rrec (not (record-fork-p rrec))) (reverse (record-history rrec)) (ledger-updates-from-relays node rid)))
-                                    (proof (fr:uncredited-migration-proof source rhist (getf conf :hash) (getf conf :height))))
+                                    (proof (fr:uncredited-migration-proof (reverse (record-history rec)) rhist (getf conf :hash) (getf conf :height))))
                                (cond (proof
                                       (multiple-value-bind (ok why)
                                           (fr:verify-proof proof :history rhist
@@ -4953,7 +5070,7 @@
       (let* ((qb (or qb-seq (governing-quorum-begin-seq rec (lg:ledger-sequence (record-ledger rec)))))
              (probe (fr:make-unauthorized-vault-spend-proof (node-pubkey node) (hex->bytes id) (hex->bytes id) qb tx
                                                            (getf spend :prevouts) (getf spend :block-hash))))
-        (multiple-value-bind (reserves rungs vvout) (fr:spent-vault (record-history rec) qb)
+        (multiple-value-bind (reserves rungs vvout) (fr:spent-vault (spent-vault-updates rec) qb)
           (multiple-value-bind (signers idx tier-index)
               (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves rungs vvout)
             (declare (ignore idx))
@@ -4991,7 +5108,10 @@
     (if (null cu)
         (values nil nil opened)
         (let* ((rec (find-record node (getf e :id)))
-               (w (fr:spend-window (if rec (record-history rec) (ledger-updates-from-relays node (getf e :id))) (getf e :qb)))
+               (w (fr:spend-window (if rec
+                                       (append (record-updates-of rec :quorum-add-member) (record-updates-of rec :quorum-begin))
+                                       (ledger-updates-from-relays node (getf e :id)))
+                                   (getf e :qb)))
                (end (+ (max (up:update-block-height cu) (or (getf e :height) 0)) w))
                (hash (and (>= (height node) end) (node-block-hash-fn node) (funcall (node-block-hash-fn node) end))))
           (values (and hash cu) hash opened)))))
@@ -5022,7 +5142,7 @@
                        (multiple-value-bind (c l opened) (lapsed-challenge node e)
                          (setf cu c lapse l)
                          (when opened (setf (getf e :challenge) opened changed t)))
-                       (multiple-value-bind (reserves) (fr:spent-vault (let ((r (find-record node (getf e :id)))) (if r (record-history r) '())) (getf e :qb))
+                       (multiple-value-bind (reserves) (fr:spent-vault (let ((r (find-record node (getf e :id)))) (if r (spent-vault-updates r) '())) (getf e :qb))
                          (when (and reserves (ignore-errors (spend-answered-p node (getf e :id) tx (getf e :qb) reserves (getf e :tier)
                                                                               :spend-height (getf e :height))))
                            (log! node "the challenge of ~a's spend ~a is answered; nothing to prove" (subseq (getf e :id) 0 8)
@@ -5151,7 +5271,7 @@
           ;; already disputing it: our fork holds the custody change
           ((let ((own (find-fork node id us)))
              (and own (not (eq own chain))
-                  (some (lambda (u) (eq (op:operation-type (op:decode-operation (up:update-message u))) :dispute-acquire))
+                  (some (lambda (u) (eq (op:update-type u) :dispute-acquire))
                         (record-history own))))
            nil)
           (t
@@ -5225,7 +5345,8 @@
       (format nil "ledger_~a.json" (subseq (record-id-hex rec) 0 16))))
 
 (defun save-record (node rec)
-  "Persist the history as a JSON array of base64 updates, one per line.  The
+  "Persist the history as a JSON array of base64 updates, one per line (a fork: only the
+   updates after its fork point; LOAD-RECORD takes the rest from the base).  The
    common case — one new update on a file we wrote — APPENDS inside the closing
    bracket; rewriting the whole file per update was O(sequence) and at seq 1800
    (a 5.7 MB file, six updates a second across the ledgers a node replicates)
@@ -5235,7 +5356,7 @@
   (when (and (node-data-dir node) (not *deferred-saves*))
     (ensure-directories-exist (node-data-dir node))
     (let* ((path (merge-pathnames (record-file-name rec) (node-data-dir node)))
-           (n (length (record-history rec)))
+           (n (- (record-count rec) (record-file-base rec)))   ; entries the file should hold
            (appendable (and (plusp (record-persisted rec)) (= n (1+ (record-persisted rec))) (probe-file path)
                             (with-open-file (in path :external-format :latin-1)
                               (and (> (file-length in) 2)
@@ -5250,7 +5371,9 @@
           ;; an error inside FORMAT) aborts it: that is how replicas vanished.
           (let ((tmp (make-pathname :type "tmp" :defaults path)))
             (with-open-file (out tmp :direction :output :if-exists :supersede :external-format :latin-1)
-              (format out "[~{~s~^,~%~}]~%" (mapcar (lambda (u) (base64-encode (up:encode-update u))) (reverse (record-history rec)))))
+              ;; A fork's file holds its own updates only; its base's file holds the rest.
+              (format out "[~{~s~^,~%~}]~%" (mapcar (lambda (u) (base64-encode (up:encode-update u)))
+                                                    (reverse (subseq (record-history rec) 0 n)))))
             (uiop:rename-file-overwriting-target tmp path)))
       (setf (record-persisted rec) n))))
 
@@ -5276,11 +5399,17 @@
          (first (first updates))
          (id-hex (bytes->hex (up:update-ledger-id first)))
          (fork-p (search "_fork_" (file-namestring path)))
+         (inherited-in-file nil)
          (rec (if fork-p
                   (let* ((base (or (find-record node id-hex) (fail "fork file before its base ledger")))
-                         (divergence (or (position-if (lambda (u) (not (equalp (up:update-operator-id u) (lg:ledger-operator-key (record-ledger base))))) updates)
-                                         (fail "fork file with no fork updates")))
+                         ;; Current files start at the fork's first own update; older ones repeat the
+                         ;; base's history from genesis first.
+                         (divergence (if (plusp (up:update-seq first))
+                                         0
+                                         (or (position-if (lambda (u) (not (equalp (up:update-operator-id u) (lg:ledger-operator-key (record-ledger base))))) updates)
+                                             (fail "fork file with no fork updates"))))
                          (operator (up:update-operator-id (nth divergence updates))))
+                    (setf inherited-in-file divergence)
                     (make-fork node base (1- (up:update-seq (nth divergence updates))) operator))
                   (make-record :id-hex id-hex :ledger (lg:make-ledger) :owned-p owned-p))))
     ;; An entry that does not chain (a gap or a bad update mid-file, from a
@@ -5299,23 +5428,31 @@
       (when (> (up:update-seq u) (lg:ledger-sequence (record-ledger rec)))   ; a fork file's inherited prefix: skipped
         (handler-case
             (cond ((and (record-owned-p rec) (not fork-p))
-                   (lg:apply-update (record-ledger rec) u) (push u (record-history rec)))
+                   (lg:apply-update (record-ledger rec) u) (record-push rec u))
                   (*verify-on-load* (accept-update node rec u))
                   (t (when (and fork-p (not (equalp (up:update-operator-id u) (record-fork-operator rec))))
                        (fail "fork update not signed by the fork's operator"))
-                     (lg:apply-update (record-ledger rec) u) (push u (record-history rec))))
+                     (lg:apply-update (record-ledger rec) u) (record-push rec u)))
           (error (e)
             (log! node "~a: entry at seq ~a does not apply (~a); keeping ~a entries"
-                  (file-namestring path) (up:update-seq u) e (length (record-history rec)))
+                  (file-namestring path) (up:update-seq u) e (record-count rec))
             (setf clean nil) (return))))))
     (unless fork-p (setf (gethash (record-id-hex rec) (node-ledgers node)) rec))
-    (setf (record-persisted rec) (if clean (length (record-history rec)) 0))   ; a damaged file is rewritten whole on the next save
+    ;; A damaged file is rewritten whole on the next save; so is a fork file in the old format,
+    ;; which repeated its base's whole history before the fork's own updates.
+    (setf (record-persisted rec) (if (and clean (or (not fork-p) (null inherited-in-file) (zerop inherited-in-file)))
+                                     (- (record-count rec) (record-file-base rec))
+                                     0))
     (unless clean (log! node "~a: damaged after seq ~a; will rewrite, catch-up refills the rest" (file-namestring path) (lg:ledger-sequence (record-ledger rec))))
+    (when (and clean fork-p inherited-in-file (plusp inherited-in-file))
+      (save-record node rec)
+      (log! node "~a: rewritten with the fork's own ~a updates (was ~a with its base's history)"
+            (file-namestring path) (record-persisted rec) (+ inherited-in-file (record-persisted rec))))
     (when (and owned-p (not fork-p) (null (node-member-ledger-hex node)))
       (setf (node-member-ledger-hex node) (record-id-hex rec)))
     ;; Our own fork, armed before the restart: the preimage is re-derivable.
     (when (and fork-p (record-owned-p rec))
-      (let ((armed (find :dispute-armed (record-history rec) :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u)))))))
+      (let ((armed (first (fork-own-updates rec :dispute-armed))))   ; the latest arm
         (when armed
           (let ((preimage (lot:derive-preimage (lottery-seed node id-hex))))
             (if (equalp (lot:commitment-of preimage) (op:field (op:decode-operation (up:update-message armed)) :commitment-hash))

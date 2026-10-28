@@ -14,8 +14,8 @@
 
 (defpackage #:cl-deposits.operation
   (:use #:cl #:cl-deposits.util)
-  (:local-nicknames (#:tlv #:cl-deposits.tlv))
-  (:export #:decode-operation #:encode-operation #:operation-type #:field
+  (:local-nicknames (#:tlv #:cl-deposits.tlv) (#:up #:cl-deposits.update))
+  (:export #:message-type #:update-type #:update-op #:decode-operation #:encode-operation #:operation-type #:field
            #:op-error #:discriminant #:type-of-discriminant
            #:deposit-id #:compute-ledger-id #:*operations*
            #:fees #:transfer-fees #:make-fees #:make-transfer-fees
@@ -310,19 +310,43 @@
                       (error 'op-error :detail (format nil "unknown discriminant ~a" (aref d 0)))))
            (op (list :type (second entry)))
            (known (list 0)))
-      (loop for (name tag kind . flags) in (cddr entry)
-            do (push tag known)
-               (let ((v (tlv:field a tag)))
-                 (cond (v (setf op (append op (list name (decode-kind kind v name)))))
-                       ((member :optional flags))
-                       (t (error 'op-error :detail (format nil "~a: missing ~a (tag ~a)" (second entry) name tag))))))
-      ;; Unknown odd tags are permitted (forward compatibility); unknown even tags are not.
-      (dolist (rec a)
-        (unless (member (car rec) known)
-          (when (evenp (car rec))
-            (error 'op-error :detail (format nil "~a: unknown even tag ~a" (second entry) (car rec))))
-          (setf op (append op (list (car rec) (cdr rec))))))
+      ;; Collected in order (APPEND per field was quadratic in the field count).
+      (let ((tail op))
+        (flet ((add (k v) (setf (cdr tail) (list k v) tail (cddr tail))))
+          (setf tail (cdr op))
+          (loop for (name tag kind . flags) in (cddr entry)
+                do (push tag known)
+                   (let ((v (tlv:field a tag)))
+                     (cond (v (add name (decode-kind kind v name)))
+                           ((member :optional flags))
+                           (t (error 'op-error :detail (format nil "~a: missing ~a (tag ~a)" (second entry) name tag))))))
+          ;; Unknown odd tags are permitted (forward compatibility); unknown even tags are not.
+          (dolist (rec a)
+            (unless (member (car rec) known)
+              (when (evenp (car rec))
+                (error 'op-error :detail (format nil "~a: unknown even tag ~a" (second entry) (car rec))))
+              (add (car rec) (cdr rec))))))
       op)))
+
+(defun message-type (bytes)
+  "The operation type of encoded operation BYTES, from its discriminant alone.  TLV records are
+   in ascending type order, so a canonical message starts 00 01 <discriminant>; anything else is
+   decoded in full (and errors as DECODE-OPERATION does)."
+  (if (and (>= (length bytes) 3) (zerop (aref bytes 0)) (= (aref bytes 1) 1))
+      (let ((entry (assoc (aref bytes 2) *operations*)))
+        (if entry (second entry) (operation-type (decode-operation bytes))))
+      (operation-type (decode-operation bytes))))
+
+(defun update-type (u)
+  "U's operation type, cached on U.  Scans of a long history ask for the type of every update:
+   decoding each one in full was most of a soaked node's CPU."
+  (or (up:update-%type u) (setf (up:update-%type u) (message-type (up:update-message u)))))
+
+(defun update-op (u)
+  "U's decoded operation, cached on U.  Callers must not modify it."
+  (or (up:update-%op u)
+      (let ((o (decode-operation (up:update-message u))))
+        (setf (up:update-%type u) (operation-type o) (up:update-%op u) o))))
 
 (defun encode-operation (op)
   (let* ((type (operation-type op))

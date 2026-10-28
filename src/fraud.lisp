@@ -337,17 +337,18 @@
   "MEMBER's own dispute_response_blocks: from its latest QuorumAddMember at or before QB-SEQ."
   (let ((found nil))
     (dolist (u chain)
-      (when (<= (up:update-seq u) qb-seq)
-        (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-          (when (and o (eq (op:operation-type o) :quorum-add-member) (equalp (op:field o :quorum-member) member33))
+      (when (and (<= (up:update-seq u) qb-seq) (eq (ignore-errors (op:update-type u)) :quorum-add-member))
+        (let ((o (ignore-errors (op:update-op u))))
+          (when (and o (equalp (op:field o :quorum-member) member33))
             (setf found (op:field o :dispute-response-blocks))))))
     (or found +default-dispute-response-blocks+)))
 
 (defun acted-on-p (u member33 ledger-id)
   "U is MEMBER's own signed DisputeEnter (not an expiry) or DisputeArmed on LEDGER-ID."
   (and (equalp (up:update-operator-id u) member33) (equalp (up:update-ledger-id u) ledger-id)
+       (member (ignore-errors (op:update-type u)) '(:dispute-armed :dispute-enter))
        (up:verify-operator-signature u)
-       (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+       (let ((o (ignore-errors (op:update-op u))))
          (and o (or (eq (op:operation-type o) :dispute-armed)
                     (and (eq (op:operation-type o) :dispute-enter)
                          (not (equal (substitute #\_ #\- (or (op:field o :reason) "")) "quorum_expired"))))))))
@@ -391,7 +392,7 @@
                        (find-if (lambda (u) (equalp (up:encode-update u) (up:encode-update qb))) chain)
                        (<= (up:update-seq qb) (op:field disc-op :last-valid-sequence))
                        (notany (lambda (u) (and (< (up:update-seq qb) (up:update-seq u) (1+ (op:field disc-op :last-valid-sequence)))
-                                                (eq (ignore-errors (op:operation-type (op:decode-operation (up:update-message u)))) :quorum-begin)))
+                                                (eq (ignore-errors (op:update-type u)) :quorum-begin)))
                                chain)))
              (values nil "the QuorumBegin is not the one governing the defrauded ledger at the fault"))
             ((not (member mk (op:field qb-op :quorum-members) :test #'equalp))
@@ -438,12 +439,13 @@
    (the spent ledger's chain, any order), or NIL.  The vault is output VOUT of whichever rung
    confirmed (DEP-03 §Fee ladder)."
   (let ((operator nil) (qb nil))
-    (dolist (u (sort (copy-list history) #'< :key #'up:update-seq))
-      (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-        (when o
-          (case (op:operation-type o)
-            (:ledger-open (when (zerop (up:update-seq u)) (setf operator (op:field o :operator-id))))
-            (:quorum-begin (when (= (up:update-seq u) governing-seq) (setf qb o)))))))
+    ;; One pass, decoding only the two updates it needs (the type is cached on each update).
+    (dolist (u history)
+      (case (ignore-errors (op:update-type u))
+        (:ledger-open (when (and (null operator) (zerop (up:update-seq u)))
+                        (setf operator (op:field (op:update-op u) :operator-id))))
+        (:quorum-begin (when (and (null qb) (eql (up:update-seq u) governing-seq))
+                         (setf qb (op:update-op u))))))
     (when (and qb operator)
       (values (rs:build-reserves :operator operator :members (op:field qb :quorum-members)
                                  :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
@@ -573,7 +575,8 @@
    DormancyNotice before it carrying the accept: (values qb-update notice-update qb-op), or NIL."
   (let ((qb nil) (notice nil))
     (dolist (u (reverse source-history))
-      (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+      (let ((o (and (member (ignore-errors (op:update-type u)) '(:quorum-begin :dormancy-notice))
+                    (ignore-errors (op:update-op u)))))
         (cond ((and (null qb) o (eq (op:operation-type o) :quorum-begin) (op:field o :migration-manifest))
                (setf qb u))
               ((and qb o (eq (op:operation-type o) :dormancy-notice) (op:field o :dormancy-accept))
@@ -589,8 +592,9 @@
    Never a value carried by a proof."
   (let ((declared (make-hash-table :test #'equalp)) (members '()))
     (dolist (u history)
-      (when (<= (up:update-seq u) at-seq)
-        (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+      (when (and (<= (up:update-seq u) at-seq)
+                 (member (ignore-errors (op:update-type u)) '(:quorum-add-member :quorum-begin)))
+        (let ((o (ignore-errors (op:update-op u))))
           (case (and o (op:operation-type o))
             (:quorum-add-member
              (when (op:field o :service-response-blocks)
@@ -881,7 +885,7 @@
                       (equalp (op:field ao :confiscation-txid) (btx:tx-txid tx))))
             (values nil "acquire_update is not the accused's custody change naming this confiscation")
             (multiple-value-bind (entries credited-p prefix) (obligation-owed history au ev height-of-block)
-              (let* ((vault-qb (find :quorum-begin (reverse prefix) :key (lambda (u) (op:operation-type (op:decode-operation (up:update-message u))))))
+              (let* ((vault-qb (find :quorum-begin (reverse prefix) :key (lambda (u) (op:update-type u))))
                      (vo (and vault-qb (op:decode-operation (up:update-message vault-qb))))
                      (in0 (first (btx:tx-inputs tx)))
                      (ah (up:update-block-height au))        ; DEP-02: dated by signed heights
