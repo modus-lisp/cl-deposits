@@ -1454,9 +1454,15 @@
                 (member (node-pubkey node) (lg:ledger-next-quorum-members l) :key #'lg:member-pubkey :test #'equalp))
             (progn (log! node "rebuilt our replica of ~a from the relay (seq ~a)" (subseq id-hex 0 8) (lg:ledger-sequence l))
                    (remhash id-hex (node-not-ours node)) (save-record node rec) rec)
-            (progn (remhash id-hex (node-ledgers node))
-                   (let ((f (merge-pathnames (record-file-name rec) (node-data-dir node)))) (when (probe-file f) (delete-file f)))
-                   nil)))
+            ;; Not in its quorum any more, but a fork of it we hold is built on this replica:
+            ;; dropping the file lost every such fork at the next restart ("fork file before its
+            ;; base ledger"), and with them the custodian's chain we were asked to consent to
+            ;; (signet soak, 2026-10-28, ledger E after custody moved).
+            (if (forks-of node id-hex)
+                (progn (save-record node rec) rec)
+                (progn (remhash id-hex (node-ledgers node))
+                       (let ((f (merge-pathnames (record-file-name rec) (node-data-dir node)))) (when (probe-file f) (delete-file f)))
+                       nil))))
     (error (e) (log! node "cannot follow ~a: ~a" (subseq id-hex 0 8) e) nil)))
 
 (defun follow-ledger (node id-hex)
