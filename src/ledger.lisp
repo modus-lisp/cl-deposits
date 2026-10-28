@@ -28,7 +28,7 @@
            #:deposit #:deposit-id #:deposit-descriptor #:deposit-balance #:deposit-locked-balance
            #:deposit-fees #:deposit-last-fee-assessment #:deposit-transfer-fees #:deposit-available-balance #:deposit-seen-nonces
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
-           #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
+           #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:quorum-expiry-ok-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
            #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
 (in-package #:cl-deposits.ledger)
@@ -466,6 +466,10 @@
            (when (and ceiling (f :quorum-expiry) (> (f :quorum-expiry) ceiling))
              (fail :quorum-expiry-exceeds-commitment
                    (format nil "quorum_expiry ~a exceeds the shortest member commitment ~a" (f :quorum-expiry) ceiling))))
+         ;; DEP-05 "Born expired": a quorum past expiry from its first update buys nothing.
+         (when (and (f :quorum-expiry) (plusp *block-height*) (<= (f :quorum-expiry) *block-height*))
+           (fail :quorum-expiry-not-after-block
+                 (format nil "quorum_expiry ~a is not after the QuorumBegin's block_height ~a" (f :quorum-expiry) *block-height*)))
          (let ((floor (collateral-floor-bps promoted)))
            (unless (collateral-meets-floor-p (f :amount) (f :collateral-amount) floor)
              (fail :collateral-below-floor
@@ -879,6 +883,12 @@
   "The quorum_expiry an operator proposes: its own window, shortened to the members' ceiling."
   (let ((own (+ current-block window-blocks)) (c (quorum-expiry-ceiling members)))
     (if c (min c own) own)))
+
+(defun quorum-expiry-ok-p (members expiry block-height)
+  "DEP-05: EXPIRY is a valid quorum_expiry for a QuorumBegin seating MEMBERS at BLOCK-HEIGHT: within
+   the shortest commitment, and after the block (a quorum is never born expired)."
+  (let ((c (quorum-expiry-ceiling members)))
+    (and (or (null c) (<= expiry c)) (> expiry block-height))))
 
 (defun lifecycle-tier (ledger height)
   (let ((expiry (ledger-quorum-expiry ledger)))

@@ -320,10 +320,15 @@
                (check-equal (format nil "~a: planned" name)
                             (lg:planned-quorum-expiry members (gethash "current_block" case) (gethash "window_blocks" case))
                             (gethash "planned" case))
+               ;; DEP-05 "Born expired": the operator rotates only to an expiry after the block.
+               (check-equal (format nil "~a: rotatable" name)
+                            (> (lg:planned-quorum-expiry members (gethash "current_block" case) (gethash "window_blocks" case))
+                               (gethash "current_block" case))
+                            (gethash "rotatable" case))
                (loop for chk across (gethash "checks" case)
                      for e = (gethash "expiry" chk)
                      do (check-equal (format nil "~a: expiry ~a" name e)
-                                     (or (null ceiling) (<= e ceiling)) (gethash "ok" chk)))))))
+                                     (lg:quorum-expiry-ok-p members e (gethash "current_block" case)) (gethash "ok" chk)))))))
 
 ;;; inspect/vectors/expiry_dispute_ends.json, shared with deposits-rust
 ;;; (deposits-protocol/tests/vectors/expiry_dispute_ends.json).

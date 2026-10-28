@@ -315,6 +315,44 @@
                                        (zerop (mod (car c) *checkpoint-sparse*))))
                        (record-checkpoints rec))))
 
+(defvar *verify-indexes* nil
+  "Gates: after every Nth push, check the record's indexes against a from-scratch scan of its
+   history (and LEDGER-AT against a replay).  Mismatches are collected in *INDEX-MISMATCHES*.")
+(defvar *verify-every* 7)
+(defvar *index-verifications* 0)
+(defvar *index-mismatches* '())
+
+(defun verify-record-indexes (rec)
+  (incf *index-verifications*)
+  (flet ((bad (fmt &rest args) (push (apply #'format nil fmt args) *index-mismatches*)))
+    (let* ((hist (record-history rec)) (types (remove-duplicates (mapcar #'op:update-type hist))))
+      (unless (= (record-count rec) (length hist))
+        (bad "~a: count ~a, history ~a" (subseq (record-id-hex rec) 0 8) (record-count rec) (length hist)))
+      (dolist (ty (union types '(:quorum-begin :dispute-enter :dispute-armed :dispute-acquire :obligation-record)))
+        (let ((want (remove-if-not (lambda (u) (eq (op:update-type u) ty)) hist))
+              (got (record-updates-of rec ty)))
+          (unless (and (= (length want) (length got)) (every #'eq want got))
+            (bad "~a: index of ~a holds ~a, the history ~a" (subseq (record-id-hex rec) 0 8) ty (length got) (length want)))))
+      (dolist (u hist)
+        (unless (eq (record-update-at rec (up:update-seq u)) (find (up:update-seq u) hist :key #'up:update-seq))
+          (bad "~a: update-at ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq u))))
+      ;; LEDGER-AT against a replay of the prefix, for a base record (a fork's own state starts from
+      ;; its fork point with the quorum cleared, which a replay from genesis does not do)
+      (when (and hist (not (record-fork-base rec)) (not (record-fork-p rec)) (zerop (up:update-seq (car (last hist)))))
+        (let* ((seq (up:update-seq (nth (random (length hist)) hist)))
+               (a (ignore-errors (ledger-at rec seq)))
+               (b (ignore-errors (lg:replay (reverse (remove-if (lambda (u) (> (up:update-seq u) seq)) hist))))))
+          (when (and b (not (and a (= (lg:ledger-sequence a) (lg:ledger-sequence b))
+                                 (equalp (lg:ledger-chain-tip a) (lg:ledger-chain-tip b))
+                                 (equalp (lg:ledger-quorum-members a) (lg:ledger-quorum-members b))
+                                 (= (lg:ledger-reserves-amount a) (lg:ledger-reserves-amount b))
+                                 (= (hash-table-count (lg:ledger-deposits a)) (hash-table-count (lg:ledger-deposits b)))
+                                 (loop for k being the hash-keys of (lg:ledger-deposits b) using (hash-value d)
+                                       always (let ((e (gethash k (lg:ledger-deposits a))))
+                                                (and e (= (lg:deposit-balance e) (lg:deposit-balance d))
+                                                     (= (lg:deposit-locked-balance e) (lg:deposit-locked-balance d))))))))
+            (bad "~a: ledger-at ~a differs from a replay" (subseq (record-id-hex rec) 0 8) seq)))))))
+
 (defun record-push (rec u)
   "Append U (already applied to REC's ledger) to REC's history and indexes."
   (ensure-indexed rec)
@@ -326,6 +364,7 @@
     (when (and (zerop (mod seq *checkpoint-every*)) (= seq (lg:ledger-sequence (record-ledger rec))))
       (push (cons seq (lg:copy-ledger (record-ledger rec))) (record-checkpoints rec))
       (prune-checkpoints rec seq)))
+  (when (and *verify-indexes* (zerop (mod (record-count rec) *verify-every*))) (verify-record-indexes rec))
   u)
 
 (defun index-record (rec)
