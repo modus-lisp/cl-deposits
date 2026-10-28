@@ -4077,10 +4077,16 @@
     (dolist (u (reverse sorted)) (push u (gethash (up:update-operator-id u) by-operator)))
     ;; The operator's chain by its hash links, from LedgerOpen until it forks (an equivocation):
     ;; every dispute forks before its fault, so that prefix is the one the forks share.
-    (let ((at-seq (make-hash-table)) (chain (list open)))
+    (let ((at-seq (make-hash-table)) (chain (list open))
+          (ours (let ((r (find-record node id-hex))) (and r (not (record-fork-p r)) r))))
       (dolist (u (gethash origin by-operator)) (push u (gethash (up:update-seq u) at-seq)))
       (loop for tip = (first chain)
-            for link = (up:chain-hash tip)
+            ;; TIP's chain hash, without hashing when our replica holds the same update (the
+            ;; operator's signature commits to its content): our next update's previous_hash
+            for link = (let* ((mine (and ours (record-update-at ours (up:update-seq tip))))
+                              (after (and mine (equalp (up:update-operator-sig mine) (up:update-operator-sig tip))
+                                          (record-update-at ours (1+ (up:update-seq tip))))))
+                         (if after (up:update-prev-hash after) (up:chain-hash tip)))
             for next = (remove-duplicates (remove-if-not (lambda (u) (equalp (up:update-prev-hash u) link))
                                                          (gethash (1+ (up:update-seq tip)) at-seq))
                                           :test #'equalp :key #'up:chain-hash)
