@@ -1406,6 +1406,10 @@
                   (subseq (bytes->hex (record-fork-operator fork)) 0 8) (up:update-seq u) e)
             (return n)))))))
 
+(defun catch-up-to (node rec seq)
+  "Bring REC to SEQ from the relays: the operator's chain, or a fork's by its operator."
+  (if (record-fork-p rec) (catch-up-fork node rec seq) (catch-up node rec)))
+
 (defun catch-up-all (node)
   "At startup: every replica we cosign, before the first cosign request arrives."
   (loop for id being the hash-keys of (node-ledgers node) using (hash-value rec)
@@ -1525,8 +1529,8 @@
                      (fail "block_height ~a is more than ~a above our tip ~a" block-height *cosign-height-tolerance* ours))
                    (when (> (- ours block-height) *cosign-height-tolerance*)
                      (fail "block_height ~a is more than ~a below our tip ~a" block-height *cosign-height-tolerance* ours))))
-               (when (and (> seq (1+ (lg:ledger-sequence ledger))) (not (record-fork-p rec)))
-                 (catch-up node rec))
+               (when (> seq (1+ (lg:ledger-sequence ledger)))
+                 (catch-up-to node rec (1- seq)))
                (unless (= seq (1+ (lg:ledger-sequence ledger)))
                  (fail "expected seq ~a" (1+ (lg:ledger-sequence ledger))))
                (unless (equalp prev (lg:ledger-chain-tip ledger)) (fail "chain mismatch: not our tip"))
@@ -1589,20 +1593,30 @@
                                (setf (gethash their-id (node-ledgers node)) b)
                                b)
                              (follow-ledger node their-id))))
-               (rec (if (not forked)
-                        base
-                        ;; A dispute winner re-establishing on its fork: find or build the fork.
-                        (or (find-fork node their-id operator)
-                            (progn (unless div (fail "history has no fork by this operator"))
-                                   (make-fork node base (1- (up:update-seq (nth div history))) operator))))))
+               (rec (cond ((not forked) base)
+                          ;; A dispute winner re-establishing on its fork: find or build the fork.
+                          ((find-fork node their-id operator))
+                          ;; Our replica already follows the winner's chain.
+                          ((equalp (lg:ledger-operator-key (record-ledger base)) operator) base)
+                          ;; The history is a prefix that ends before the fork (the operator
+                          ;; sends at most a few dozen updates): nothing to build the fork from.
+                          ((not div) (fail "not yet: no replica of ~a's fork of ~a; retry once it reaches us"
+                                           (subseq (bytes->hex operator) 0 8) (subseq their-id 0 8)))
+                          (t (make-fork node base (1- (up:update-seq (nth div history))) operator)))))
           ;; Catch up from the piggybacked history, or from the relay when none came.
           (dolist (u history)
             (when (> (up:update-seq u) (lg:ledger-sequence (record-ledger rec)))
               (accept-update node rec u)))
+          ;; A fork lags like any replica (a winner's chain after DisputeAcquire is one): judging
+          ;; the operator from a stale copy refused every consent the custodian asked for.
           (let ((want (w:jget params "ledger_sequence")))
-            (when (and (integerp want) (> want (lg:ledger-sequence (record-ledger rec))) (not (record-fork-p rec)))
-              (catch-up node rec)))
-          (unless (equalp (lg:ledger-operator-key (record-ledger rec)) operator) (fail "history is not this operator's"))
+            (when (and (integerp want) (> want (lg:ledger-sequence (record-ledger rec))))
+              (catch-up-to node rec want))
+            (unless (equalp (lg:ledger-operator-key (record-ledger rec)) operator)
+              (if (and (integerp want) (< (lg:ledger-sequence (record-ledger rec)) want))
+                  (fail "not yet: our replica of ~a is at seq ~a, behind the operator's ~a; retry"
+                        (subseq their-id 0 8) (lg:ledger-sequence (record-ledger rec)) want)
+                  (fail "history is not this operator's"))))
           (unless (record-fork-p rec) (setf (gethash their-id (node-ledgers node)) rec))
           (let* ((until (let ((u (w:jget params "membership_until"))) (if (integerp u) u (+ (height node) 4320))))
                  (consent (schnorr:schnorr-sign (node-priv node)
@@ -2669,6 +2683,29 @@
   "A DisputeEnter for a lapsed quorum, in either spelling we ever wrote."
   (and (stringp reason) (string= (substitute #\_ #\- reason) "quorum_expired")))
 
+(defparameter *punitive-dispute-reasons*
+  '("uncredited_onchain_payment" "uncredited_lightning_payment" "stale_cosignature" "dispute_dereliction"
+    "non_conforming_update" "winner_collateral_deviation" "equivocation" "non_conforming_cosignature"
+    "unauthorized_vault_spend" "unhonoured_obligation")
+  "DisputeEnter reasons that name a freezing ground: the DEP-06 proof types, snake_case.")
+
+(defun dispute-ground-expiry-p (reason has-anchor cites-proof enter-height governing-expiry)
+  "DEP-05 \"The ground of a dispute\": whether a DisputeEnter is a quorum_expired dispute.  Its
+   reason decides when it names a ground; a generic one (auto_dispute, fraud: records written
+   before reasons named grounds) is read from the record: an expiry anchor, or no fraud proof
+   cited and entered past the quorum_expiry governing at its fork point.  Vector
+   inspect/vectors/dispute_ground.json, shared with deposits-rust."
+  (let ((r (and (stringp reason) (substitute #\_ #\- reason))))
+    (cond ((equal r "quorum_expired") t)
+          ((member r *punitive-dispute-reasons* :test #'equal) nil)
+          (t (or (and has-anchor t)
+                 (and (not cites-proof) governing-expiry (> enter-height governing-expiry) t))))))
+
+(defun dispute-enter-expiry-p (update op governing-expiry)
+  "The DisputeEnter UPDATE (decoded OP) judged by its ground, GOVERNING-EXPIRY the base's."
+  (dispute-ground-expiry-p (op:field op :reason) (op:field op :anchor-block-height) (op:field op :fraud-proof-hash)
+                           (up:update-block-height update) governing-expiry))
+
 (defun fork-lottery (node id-hex)
   "(values confiscation lottery :pending) for ID-HEX while its lottery output is
    unspent, or NIL.  Found once by rebuilding (CONFISCATED-LOTTERY), then kept on
@@ -2727,7 +2764,7 @@
           (let ((expiry (lg:ledger-quorum-expiry (record-ledger base)))
                 (confirmed (or (assoc (node-pubkey node) (reveals-of node id) :test #'equalp)
                                (and conf (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid conf) 0)))))
-            (when (and (expiry-reason-p (op:field enter-op :reason)) (not confirmed)
+            (when (and (dispute-enter-expiry-p enter enter-op expiry) (not confirmed)
                        (or (expiry-dispute-ended-p (op:field enter-op :last-valid-sequence) (latest-quorum-begin-seq base) nil)
                            (and expiry (<= h (+ expiry *expiry-grace-blocks*)))))
               (conclude "quorum re-established (expiry ~a); yielded" expiry)))
@@ -3196,13 +3233,14 @@
   (let* ((qb-seq (or (let ((u (record-latest rec :quorum-begin))) (and u (up:update-seq u)))
                      0))
          (members (mapcar #'lg:member-pubkey (lg:ledger-quorum-members (record-ledger rec)))))
-    (loop for f in (forks-of node (record-id-hex rec))
-          for o = (nth-value 1 (fork-op f :dispute-enter))
+    (loop with expiry = (lg:ledger-quorum-expiry (record-ledger rec))
+          for f in (forks-of node (record-id-hex rec))
+          for (u o) = (multiple-value-list (fork-op f :dispute-enter))
           when (and o (member (record-fork-operator f) members :test #'equalp)
                     (>= (or (op:field o :last-valid-sequence) -1) qb-seq)
                     ;; respectful: the operator re-establishes.  Any other dispute counts in
                     ;; every state: a loser yields only once the vault is confiscated.
-                    (not (expiry-reason-p (op:field o :reason))))
+                    (not (dispute-enter-expiry-p u o expiry)))
             collect (record-fork-operator f) into keys
           finally (return (remove-duplicates keys :test #'equalp)))))
 
@@ -3247,11 +3285,14 @@
    at or after the latest QuorumBegin other than for expiry."
   (let* ((qb-seq (or (let ((u (record-latest rec :quorum-begin))) (and u (up:update-seq u)))
                      0))
+         (expiry (lg:ledger-quorum-expiry (record-ledger rec)))
          (disputes (loop for f in (forks-of node (record-id-hex rec))
-                         for o = (nth-value 1 (fork-op f :dispute-enter))
+                         for (u o) = (multiple-value-list (fork-op f :dispute-enter))
                          when o collect (list :by (record-fork-operator f)
                                               :last-valid (or (op:field o :last-valid-sequence) -1)
-                                              :reason (op:field o :reason)
+                                              ;; by its ground: a legacy generic label on an expiry
+                                              ;; dispute stops freezing co-signing (DEP-05)
+                                              :reason (if (dispute-enter-expiry-p u o expiry) "quorum_expired" (op:field o :reason))
                                               :acquired (and (fork-op f :dispute-acquire) t))))
          (why (cosign-refusal (node-pubkey node)
                               (mapcar #'lg:member-pubkey (lg:ledger-quorum-members (record-ledger rec)))

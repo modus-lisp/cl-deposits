@@ -349,6 +349,18 @@
                                t)
                           (gethash "arm" c)))))
 
+;;; inspect/vectors/dispute_ground.json, shared with deposits-rust
+;;; (deposits-protocol/tests/vectors/dispute_ground.json).
+(with-gate ("dispute: the ground of a DisputeEnter against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "dispute_ground.json")))))
+    (loop for c across (gethash "cases" v)
+          for e = (gethash "governing_quorum_expiry" c)
+          do (check-equal (gethash "name" c)
+                          (cl-deposits.node::dispute-ground-expiry-p
+                           (gethash "reason" c) (eq (gethash "has_anchor" c) t) (eq (gethash "cites_proof" c) t)
+                           (gethash "enter_block_height" c) (and (integerp e) e))
+                          (eq (gethash "expiry" c) t)))))
+
 ;;; inspect/vectors/armer_eligibility.json: the DEP-03 replacement-collateral cut,
 ;;; shared with deposits-rust (deposits-node/tests/vectors/armer_eligibility.json).
 (with-gate ("lottery: armer eligibility cut against the shared vector")
