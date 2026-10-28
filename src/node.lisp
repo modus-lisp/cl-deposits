@@ -1293,7 +1293,9 @@
           ;; ...and only if it follows this ledger's chain.  ledger_id is unsigned and
           ;; the operator signs its other ledgers with the same key: one of their
           ;; updates, relabelled with this ledger's id, is not an equivocation.
-          (if (fr:update-binds-to-ledger-p update (up:update-ledger-id ours) (fr:bound-hashes (record-history rec)))
+          (if (fr:update-binds-to-ledger-p update (up:update-ledger-id ours)
+                                          ;; our chain-hash index is exactly BOUND-HASHES of the history
+                                          (if (record-fork-base rec) (fr:bound-hashes (record-history rec)) (record-by-hash (ensure-indexed rec))))
               (progn (log! node "EQUIVOCATION on ~a at seq ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq update))
                      (broadcast-fraud node (fr:make-equivocation-proof (up:update-operator-id update) (up:update-ledger-id update) ours update)))
               (log! node "ignored an update on ~a at seq ~a that is not on its chain (another ledger's, relabelled?)"
