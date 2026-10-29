@@ -9,7 +9,9 @@
 set -u
 CLD_CHAIN="${CLD_CHAIN:-${DEVNET:-signet}}"
 SIGNET_ROOT="${SIGNET_ROOT:-/mnt/lisp/signet}"
-CLD_SRC="${CLD_SRC:-$HOME/cl-deposits}"
+# The source tree the nodes run: by default the checkout this script is in, never a fixed path
+# (a stale ~/cl-deposits once ran in place of the worktree under test).
+CLD_SRC="${CLD_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}"
 # ASDF registry for every cl process the devnet starts: the source tree, then Quicklisp's
 # software, then whatever the user's config inherits.  The inherited config here is
 # (:tree ~/), so any other project's same-named system under ~ competed with Quicklisp's
