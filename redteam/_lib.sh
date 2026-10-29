@@ -55,7 +55,7 @@ consent() {         # consent LEDGER OPERATOR MEMBER... — a reference member's
 form_ledger() {
   local row="$S/redteam-$1" op=$2 rs=$3 l prep addr txid vout coll=${COLLATERAL_SATS:-25000000}; shift 3   # DEP-05 floor: >= 20%
   if [ -f "$row" ]; then cat "$row"; return; fi
-  l=$(sx "$(cld_ctl "$op" "(:open-ledger :reserves-id \"genesis:$op:redteam-$(basename "$row"):$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER")
+  l=$(sx "$(cld_ctl "$op" "(:open-ledger :reserves-id \"genesis:$op:redteam-$(basename "$row"):$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000${OPEN_RULESET:+ :ruleset \"$OPEN_RULESET\"})")" ":LEDGER")
   [ -n "$l" ] || fail "open ledger $(basename "$row")"
   consent "$l" "$op" "$@" >&2
   prep=$(cld_ctl "$op" "(:prepare-quorum :ledger \"$l\" :expiry-blocks ${FORM_EXPIRY:-4320}${rs:+ :ruleset \"$rs\"})"); expect "$prep" "prepare-quorum"; addr=$(sx "$prep" ":ADDRESS")

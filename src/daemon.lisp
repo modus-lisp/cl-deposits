@@ -1,7 +1,7 @@
 ;;;; src/daemon.lisp — the control socket: one s-expression per line on localhost.
 ;;;;
 ;;;;   (:info)                                   (:log)
-;;;;   (:open-ledger :reserves-id "s" :reserves-msat N :collateral-msat M)
+;;;;   (:open-ledger :reserves-id "s" :reserves-msat N :collateral-msat M [:ruleset "name"|"none"])
 ;;;;   (:add-member :ledger "hex" :member "pubkey hex" [:membership-blocks N] [:dispute-response-blocks N])
 ;;;;   (:prepare-quorum :ledger "hex" [:expiry-blocks N] [:ruleset "s"])  -> :address to fund
 ;;;;   (:begin-quorum :ledger "hex" :txid "hex" :vout N :sats N :collateral-sats M)   ; a rotation's: -> :txid its rung 0
@@ -41,7 +41,8 @@
           :disputed (if (and (nd:record-owned-p rec) (not (nd:record-fork-p rec)))
                         (length (nd::disputing-members node rec)) 0)
           :custody-moved (let ((c (and (nd:record-owned-p rec) (not (nd:record-fork-p rec)) (nd::custody-moved-to node rec))))
-                           (and c (subseq (bytes->hex c) 0 16))))))
+                           (and c (subseq (bytes->hex c) 0 16)))
+          :ruleset (lg:ledger-active-ruleset l))))
 
 (defun handle-command (node form)
   (handler-case
@@ -104,7 +105,10 @@
                               (sb-thread:list-all-threads))))
         (:open-ledger
          (let ((rec (nd:open-ledger node :reserves-id (arg form :reserves-id) :reserves (arg form :reserves-msat 0)
-                                         :collateral (arg form :collateral-msat 0))))
+                                         :collateral (arg form :collateral-msat 0)
+                                         ;; DEP-18: the ruleset its LedgerOpen names; "none" for none
+                                         :ruleset (let ((r (arg form :ruleset lg:+current-ruleset+)))
+                                                    (if (equal r "none") nil r)))))
            (ok :ledger (nd:record-id-hex rec))))
         (:add-member
          (let ((rec (rec! node form)))
