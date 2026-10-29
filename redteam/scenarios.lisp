@@ -75,6 +75,9 @@
    (make-sc :name "ruleset-prior" :script "check-ruleset-prior.sh"
             :timeout 1800 :tags '(:contagion)
             :note "DEP-18: a cltv-offset-v2 vault's unanchored spend is never proven; a rotation moves the ledger to anchor-ladder-v5")
+   (make-sc :name "ruleset-undeclared" :script "check-ruleset-undeclared.sh"
+            :timeout 1800 :tags '(:safe)
+            :note "DEP-18: a QuorumBegin naming a ruleset a seated member did not declare is refused by cl and reference operators")
    (make-sc :name "vault-recovery-tier" :script "attack-vault-recovery-tier.sh" :ledger-var "REDTEAM_RT"
             :timeout 1800 :tags '(:contagion :disruptive :slow) :note "mines past expiry + 720")
    (make-sc :name "vault-rotate-late" :script "attack-vault-rotate-grace.sh" :args '("late")

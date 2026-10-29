@@ -819,3 +819,26 @@
                                                                                  (fr:rotation-answer updates anchor txid reserves tier)))
                               t)
                          (string= verdict "1"))))))))
+
+;;; inspect/vectors/ruleset_naming.txt: DEP-18, shared with deposits-rust.  Rulesets are named,
+;;; not ordered.  seat and upgrade verdicts are consensus; plan is the reference operator policy.
+(with-gate ("DEP-18 ruleset naming: the shared ruleset_naming vector")
+  (flet ((rs (s) (if (string= s "-") nil s))
+         (decls (s) (mapcar (lambda (m) (if (string= m "-") '() (uiop:split-string m :separator ",")))
+                            (uiop:split-string s :separator ";")))
+         (v (k) (string-downcase (symbol-name k))))
+    (let ((n 0))
+      (with-open-file (in (vector-path "ruleset_naming.txt"))
+        (loop for line = (read-line in nil) while line
+              unless (or (zerop (length line)) (char= (char line 0) #\#))
+                do (let ((w (uiop:split-string line :separator " ")))
+                     (incf n)
+                     (cond
+                       ((string= (first w) "seat")
+                        (check-equal line (v (lg:seat-verdict (second w) (decls (third w)))) (fourth w)))
+                       ((string= (first w) "upgrade")
+                        (check-equal line (v (lg:upgrade-verdict (rs (second w)) (third w) (decls (fourth w)))) (fifth w)))
+                       ((string= (first w) "plan")
+                        (check-equal line (lg:planned-ruleset (rs (second w)) (decls (third w))) (fourth w)))
+                       (t (check (format nil "unknown case ~a" line) nil))))))
+      (check-equal "ruleset_naming cases" n 21))))

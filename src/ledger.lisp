@@ -30,7 +30,7 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:quorum-expiry-ok-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:newest-shared-ruleset #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
+           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
 (in-package #:cl-deposits.ledger)
 
 (define-condition ledger-error (error)
@@ -91,12 +91,35 @@
                      (incf i (1+ n)))))
         (nreverse out)))))
 
-(defun newest-shared-ruleset (members)
-  "DEP-18 negotiation: the newest ruleset this node supports that every member declared;
-   cltv-offset-v2 when none is shared beyond it (or MEMBERS declare nothing)."
-  (or (find-if (lambda (r) (every (lambda (m) (member r (member-supported-rulesets m) :test #'string=)) members))
-               (reverse +supported-rulesets+))
-      "cltv-offset-v2"))
+(defun every-declares-p (ruleset declarations)
+  "DEP-18: did every member, by its list of declared ruleset names, declare RULESET?"
+  (every (lambda (d) (member ruleset d :test #'string=)) declarations))
+
+(defun seat-verdict (ruleset declarations)
+  "DEP-18 (consensus): a QuorumBegin naming RULESET that seats members with DECLARATIONS.
+   :ok, :unknown (not in the registry) or :unsupported (a member did not declare it).
+   Rulesets are named, not ordered: nothing here compares names."
+  (cond ((not (member ruleset +rulesets+ :test #'equal)) :unknown)
+        ((not (every-declares-p ruleset declarations)) :unsupported)
+        (t :ok)))
+
+(defun upgrade-verdict (from to declarations)
+  "DEP-18 (consensus): a QuorumUpgrade from FROM (NIL for none) to TO, with the current quorum's
+   DECLARATIONS.  :ok, :unknown, :family (a different reserves-cascade family, which only a
+   QuorumBegin may cross) or :unsupported."
+  (cond ((not (member to +rulesets+ :test #'equal)) :unknown)
+        ((not (equal (reserves-family to) (reserves-family from))) :family)
+        ((not (every-declares-p to declarations)) :unsupported)
+        (t :ok)))
+
+(defun planned-ruleset (current declarations)
+  "DEP-18 §operator policy, not consensus: the ruleset an operator names at its next QuorumBegin.
+   A balance-commit-v4 ledger keeps it (anchor-ladder-v5 lacks MissingBalanceCommitment); otherwise
+   +current-ruleset+ when every member declares it, else the current ruleset, else cltv-offset-v2."
+  (cond ((equal current "balance-commit-v4") current)
+        ((every-declares-p +current-ruleset+ declarations) +current-ruleset+)
+        (current current)
+        (t "cltv-offset-v2")))
 
 (defparameter +valid-quorum-sizes+ '(3 5 7)
   "DEP-03 §Pre-release policy cap: odd for clean majorities, >= 3 for redundancy, <= 7.")
@@ -515,6 +538,10 @@
            (fail :quorum-size-invalid (format nil "Q=~a not in ~a" (length declared) +valid-quorum-sizes+)))
          (unless (member (f :protocol-version) +rulesets+ :test #'equal)
            (fail :unknown-ruleset (format nil "QuorumBegin protocol_version ~s is not a known ruleset" (f :protocol-version))))
+         ;; DEP-18: every member seated declared the ruleset this QuorumBegin names.
+         (when (eq (seat-verdict (f :protocol-version) (mapcar #'member-supported-rulesets promoted)) :unsupported)
+           (fail :ruleset-unsupported-by-member
+                 (format nil "QuorumBegin names ~a, which a seated member did not declare" (f :protocol-version))))
          ;; DEP-05 "Collateral floor": collateral is at least the strictest member's share of
          ;; the vault, never below 20%.  Collateral is a floor, not a cap on credits.
          ;; DEP-05 "Quorum expiry": the operator may shorten a member's commitment, never extend it.
@@ -710,7 +737,15 @@
       (:quorum-remove-member
        (setf (ledger-next-quorum-members ledger)
              (remove (f :quorum-member) (ledger-next-quorum-members ledger) :key #'member-pubkey :test #'equalp)))
-      (:quorum-upgrade (setf (ledger-active-ruleset ledger) (f :new-protocol-version)))
+      (:quorum-upgrade
+       ;; DEP-18: a known ruleset, in the current one's reserves family, that every member declared.
+       (let ((v (upgrade-verdict (ledger-active-ruleset ledger) (f :new-protocol-version)
+                                 (mapcar #'member-supported-rulesets (ledger-quorum-members ledger)))))
+         (unless (eq v :ok)
+           (fail (ecase v (:unknown :unknown-ruleset) (:family :ruleset-family-mismatch)
+                   (:unsupported :ruleset-unsupported-by-member))
+                 (format nil "QuorumUpgrade from ~a to ~a: ~(~a~)" (ledger-active-ruleset ledger) (f :new-protocol-version) v))))
+       (setf (ledger-active-ruleset ledger) (f :new-protocol-version)))
       (:quorum-join
        (let ((existing (find-if (lambda (j) (and (equalp (getf j :operator-id) (f :operator-id))
                                                  (string= (getf j :ledger-id) (f :ledger-id))))

@@ -791,10 +791,10 @@
 
 (defun prepare-quorum (node rec &key ruleset (expiry-blocks 4320))
   "Build (and pin) the reserves output the next QuorumBegin will point at, so
-   it can be funded on chain first.  Returns the reserves.  RULESET defaults to the newest
-   every staged member declared (DEP-18)."
+   it can be funded on chain first.  Returns the reserves.  RULESET defaults to the reference
+   operator policy (DEP-18 §operator policy, LG:PLANNED-RULESET)."
   (let* ((staged (lg:ledger-next-quorum-members (record-ledger rec)))
-         (ruleset (or ruleset (lg:newest-shared-ruleset staged)))
+         (ruleset (or ruleset (lg:planned-ruleset (lg:ledger-active-ruleset (record-ledger rec)) (mapcar #'lg:member-supported-rulesets staged))))
          ;; DEP-05: quorum_expiry is the shortest member commitment.
          (expiry (lg:planned-quorum-expiry staged (height node) expiry-blocks))
          (reserves (rs:build-reserves :operator (node-pubkey node) :members (mapcar #'lg:member-pubkey staged)
@@ -1534,6 +1534,11 @@
          (handler-case
              (progn
                (unless (equalp ledger-id (hex->bytes (record-id-hex rec))) (fail "ledger_id mismatch"))
+               ;; DEP-18 "advertising is a promise": we never cosign under a ruleset whose rules we
+               ;; do not enforce (balance-commit-v4's MissingBalanceCommitment), even if seated.
+               (let ((r (lg:ledger-active-ruleset ledger)))
+                 (when (and r (not (member r lg:+supported-rulesets+ :test #'string=)))
+                   (fail "the ledger's ruleset ~a is not one we enforce" r)))
                (unless (record-fork-p rec) (check-not-deposed node rec))
                ;; DEP-02: our tip is only a bound.  A height a little above it we wait for (the
                ;; operator saw a block before we did); the hash is never judged against our chain.
