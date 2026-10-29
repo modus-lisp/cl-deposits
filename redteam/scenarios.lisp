@@ -74,7 +74,10 @@
             :note "DEP-06 §Spend challenge: a theft with a forged anchor is challenged, then proven once the challenge lapses")
    (make-sc :name "ruleset-prior" :script "check-ruleset-prior.sh"
             :timeout 1800 :tags '(:contagion)
-            :note "DEP-18: a cltv-offset-v2 vault's unanchored spend is never proven; a rotation moves the ledger to anchor-ladder-v5")
+            :note "DEP-18: a cltv-offset-v2 vault's unanchored spend is never proven; a rotation moves the ledger to balance-anchor-v6")
+   (make-sc :name "ruleset-v6" :script "check-ruleset-v6.sh"
+            :timeout 2400 :tags '(:safe)
+            :note "DEP-18 balance-anchor-v6: a mixed v5 quorum rotates to v6 and refuses a missing commitment; a reference-only v4 ledger upgrades to v6")
    (make-sc :name "ruleset-undeclared" :script "check-ruleset-undeclared.sh"
             :timeout 1800 :tags '(:safe)
             :note "DEP-18: a QuorumBegin naming a ruleset a seated member did not declare is refused by cl and reference operators")

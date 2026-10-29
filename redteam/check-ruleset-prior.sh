@@ -7,8 +7,8 @@
 # that is theft on its face, but proof 10 is a rule of anchor-ladder-v5 and P's vault was created
 # under cltv-offset-v2: the honest members (a cl node and two reference nodes) must not prove it,
 # challenge it or dispute anyone.  Part 2: ledger Q is seated under cltv-offset-v2 too, then its
-# operator rotates it after fresh consents, which now declare anchor-ladder-v5: the new
-# QuorumBegin names anchor-ladder-v5 and every member's replica moves with it.
+# operator rotates it after fresh consents, which now declare balance-anchor-v6: the new
+# QuorumBegin names balance-anchor-v6 (the reference policy) and every member's replica moves with it.
 # PASS = both.  (attack-vault-spend.sh is the same theft of an anchor-ladder-v5 vault: proven.)
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-150}
 source "$(dirname "$0")/_lib.sh"
@@ -37,7 +37,7 @@ forks=0; for l in "$L1" "$L2" "$L3" "$L4" "$L5"; do
 echo "   $HON proof or challenge lines: $hits; reference lines: $rh; signer ledgers disputed: $forks"
 [ "$hits" -eq 0 ] && [ "$rh" -eq 0 ] || fail "a spend of a cltv-offset-v2 vault was proven or challenged"
 
-echo "== part 2: a rotation moves a cltv-offset-v2 ledger to anchor-ladder-v5"
+echo "== part 2: a rotation moves a cltv-offset-v2 ledger to balance-anchor-v6"
 pick C1 C2 C3 C4
 Q=$(OPEN_RULESET=cltv-offset-v2 form_ledger "PRIORQ$RANDOM" $C1 cltv-offset-v2 $C2 $C3 $C4 $R1 $R2) || exit 1
 rq=$(ruleset_of $C2 "$Q"); echo "   $Q before: $rq"
@@ -52,6 +52,6 @@ expect "$r" "begin-quorum"
 mine 3 >/dev/null; sleep 20
 for n in $C1 $C2 $C3 $C4; do
   ra=$(ruleset_of $n "$Q"); echo "   $Q on $n after: $ra"
-  [ "$ra" = ':RULESET "anchor-ladder-v5"' ] || fail "$n did not move $Q to anchor-ladder-v5: $ra"
+  [ "$ra" = ':RULESET "balance-anchor-v6"' ] || fail "$n did not move $Q to balance-anchor-v6: $ra"
 done
-echo "PASS: the cltv-offset-v2 vault's unanchored spend was never proven ($TXID), and the rotation moved $Q to anchor-ladder-v5"
+echo "PASS: the cltv-offset-v2 vault's unanchored spend was never proven ($TXID), and the rotation moved $Q to balance-anchor-v6"

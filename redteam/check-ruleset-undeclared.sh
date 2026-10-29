@@ -2,10 +2,12 @@
 # redteam/check-ruleset-undeclared.sh — DEP-18: rulesets are named, not ordered.  A QuorumBegin
 # that names a ruleset one seated member did not declare is refused, by either implementation.
 #
-# Part 1: a cl operator names balance-commit-v4 (which cl members do not declare) for a quorum of
-# cl and reference members: begin-quorum is refused, and no member applies a QuorumBegin.
+# Both implementations declare every registered ruleset, so the cl members here withhold
+# balance-commit-v4 from their declarations (the :withhold-rulesets red-team switch).
+# Part 1: a cl operator names balance-commit-v4 for a quorum of cl and reference members:
+# begin-quorum is refused, and no member applies a QuorumBegin.
 # Part 2: a reference operator names balance-commit-v4 for a quorum with cl members: refused.  The
-# same ledger then rotates with no name given; the reference policy names anchor-ladder-v5, which
+# same ledger then rotates with no name given; the reference policy names balance-anchor-v6, which
 # every member declares, and the cl members' replicas record it.
 # PASS = both refusals, and the policy-named QuorumBegin.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"
@@ -52,6 +54,6 @@ case "$out" in *rror*) fail "the policy-named quorum begin failed: $out";; esac
 await_active "$RL" $C1 $C2
 for n in $C1 $C2; do
   ra=$(ruleset_of $n "$RL"); echo "   $RL on $n: $ra"
-  [ "$ra" = ':RULESET "anchor-ladder-v5"' ] || fail "$n records $ra, not anchor-ladder-v5"
+  [ "$ra" = ':RULESET "balance-anchor-v6"' ] || fail "$n records $ra, not balance-anchor-v6"
 done
-echo "PASS: both implementations refused a QuorumBegin naming a ruleset a seated member did not declare; the policy named anchor-ladder-v5"
+echo "PASS: both implementations refused a QuorumBegin naming a ruleset a seated member did not declare; the policy named balance-anchor-v6"

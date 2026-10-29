@@ -691,12 +691,15 @@
   (bt:with-lock-held ((record-append-lock rec))
     (when op-fn (setf op (funcall op-fn (up:chain-hash (tip rec)))))
     ;; DEP-02 §Balance Commitments: declare the post-update balances of what OP touches.
-    (let ((height (max height (if (tip rec) (up:update-block-height (tip rec)) 0))))
-      (setf op (lg:fill-balance-commitments (record-ledger rec) op height (1+ (lg:ledger-sequence (record-ledger rec))))))
+    ;; ADVERSARY :omit-commitments — an operator that declares none (red team: DEP-18's
+    ;; MissingBalanceCommitment under balance-commit-v4 and balance-anchor-v6).
+    (unless (getf (node-adversary node) :omit-commitments)
+     (let ((height (max height (if (tip rec) (up:update-block-height (tip rec)) 0))))
+      (setf op (lg:fill-balance-commitments (record-ledger rec) op height (1+ (lg:ledger-sequence (record-ledger rec)))))))
     ;; Would it apply?  Check on a copy before asking anyone to cosign it.
     ;; ADVERSARY :sign-invalid — an operator that asks its quorum to cosign an
     ;; operation its own validator rejects (red team #1).
-    (unless (getf (node-adversary node) :sign-invalid)
+    (unless (or (getf (node-adversary node) :sign-invalid) (getf (node-adversary node) :omit-commitments))
       (lg:speculate (record-ledger rec) op (max height (if (tip rec) (up:update-block-height (tip rec)) 0))
                     (1+ (lg:ledger-sequence (record-ledger rec)))))
     (let ((update (new-update node rec op :height height)))
@@ -1871,8 +1874,11 @@
            (list (cons 1 (int->be 1 2)) (cons 2 (node-pubkey node)) (cons 3 operator)
                  (cons 4 (ascii->bytes their-id)) (cons 5 (ascii->bytes (or ruleset "cltv-offset-v2")))
                  (cons 6 (ascii->bytes (node-member-ledger-hex node)))
+                 ;; ADVERSARY :withhold-rulesets — a member that declares fewer rulesets (red team:
+                 ;; DEP-18's refusal of a ruleset a seated member did not declare).
                  (cons 7 (apply #'cat (mapcar (lambda (s) (cat (octets (length s)) (ascii->bytes s)))
-                                              lg:+supported-rulesets+)))
+                                              (set-difference lg:+supported-rulesets+ (getf (node-adversary node) :withhold-rulesets)
+                                                              :test #'string=))))
                  (let ((v (w:jget params "min_fee_bps"))) (and v (cons 10 (int->be v 2))))
                  (let ((v (w:jget params "min_fee_fixed"))) (and v (cons 11 (int->be v 8))))
                  (let ((v (w:jget params "max_fee_period"))) (and v (cons 12 (int->be v 4))))
