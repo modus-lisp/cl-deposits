@@ -30,7 +30,7 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:quorum-expiry-ok-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
+           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:newest-shared-ruleset #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
 (in-package #:cl-deposits.ledger)
 
 (define-condition ledger-error (error)
@@ -40,11 +40,63 @@
 
 (defun fail (kind &optional detail) (error 'ledger-error :kind kind :detail detail))
 
-;; The registered rulesets.  All share the cltv-offset-v2 reserves cascade (tier-1
-;; minority ceil(n/2) - 1); fee-cap-v3 and balance-commit-v4 add off-chain op rules
-;; this implementation does not enforce, so it advertises only cltv-offset-v2.
-(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4"))
-(defparameter +supported-rulesets+ '("cltv-offset-v2"))
+;; DEP-18 §the registry: append-only, all of the cltv-offset-v2 reserves cascade (tier-1
+;; minority ceil(n/2) - 1).  balance-commit-v4 requires balance commitments, which this
+;; implementation does not emit, so it advertises the others only; fee-cap-v3's fee cap is
+;; intrinsic (DEP-07).  A ruleset's rules are frozen once registered: a change is a new name.
+(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5"))
+(defparameter +supported-rulesets+ '("cltv-offset-v2" "anchor-ladder-v5"))
+(defparameter +current-ruleset+ "anchor-ladder-v5"
+  "What a new ledger's LedgerOpen names, and what a quorum moves to when every member declares it.")
+
+(defparameter +ruleset-rules+
+  '(("anchor-ladder-v5" :signed-header :born-expired :collateral-floor :vault-spend-proofs))
+  "DEP-18: the gated rules each ruleset adds to the intrinsic ones.")
+
+(defun ruleset-rule-p (ruleset rule)
+  "Does RULESET (a name, or NIL for none) enforce the gated RULE?  NIL is dormant: a ledger
+   with no active ruleset yet, or a QuorumBegin that names none, is never judged by a gated rule."
+  (and ruleset (member rule (cdr (assoc ruleset +ruleset-rules+ :test #'string=))) t))
+
+(defun reserves-family (ruleset)
+  (when (member ruleset +rulesets+ :test #'equal) "cltv-offset-v2"))
+
+(defun born-expired-p (ruleset quorum-expiry block-height)
+  "DEP-05 born expired, a rule of anchor-ladder-v5: under RULESET (the one the QuorumBegin names),
+   is a quorum_expiry at or below the QuorumBegin's block_height?"
+  (and (ruleset-rule-p ruleset :born-expired) quorum-expiry (plusp block-height) (<= quorum-expiry block-height)))
+
+(defun collateral-below-floor-p (ruleset reserves collateral floor-bps)
+  "DEP-05 collateral floor, a rule of anchor-ladder-v5 (judged under the ruleset the QuorumBegin names)."
+  (and (ruleset-rule-p ruleset :collateral-floor) (not (collateral-meets-floor-p reserves collateral floor-bps))))
+
+(defun signed-header-applies-p (ledger update)
+  "DEP-18: does the signed-header rule judge UPDATE?  Under LEDGER's active ruleset before it;
+   a LedgerOpen (sequence 0) under the ruleset it names itself."
+  (ruleset-rule-p (if (zerop (up:update-seq update))
+                      (ignore-errors (op:field (op:update-op update) :protocol-version))
+                      (ledger-active-ruleset ledger))
+                  :signed-header))
+
+(defun member-supported-rulesets (m)
+  "The rulesets M declared in its signed QuorumMemberResponse (TLV 7: length-prefixed names);
+   NIL without one."
+  (let ((blob (member-member-response m)))
+    (when blob
+      (let ((v (cdr (assoc 7 (ignore-errors (cl-deposits.tlv:decode blob))))) (out '()))
+        (when v
+          (loop with i = 0 while (< i (length v))
+                do (let ((n (aref v i)))
+                     (push (map 'string #'code-char (subseq v (1+ i) (min (length v) (+ 1 i n)))) out)
+                     (incf i (1+ n)))))
+        (nreverse out)))))
+
+(defun newest-shared-ruleset (members)
+  "DEP-18 negotiation: the newest ruleset this node supports that every member declared;
+   cltv-offset-v2 when none is shared beyond it (or MEMBERS declare nothing)."
+  (or (find-if (lambda (r) (every (lambda (m) (member r (member-supported-rulesets m) :test #'string=)) members))
+               (reverse +supported-rulesets+))
+      "cltv-offset-v2"))
 
 (defparameter +valid-quorum-sizes+ '(3 5 7)
   "DEP-03 §Pre-release policy cap: odd for clean majorities, >= 3 for redundancy, <= 7.")
@@ -444,6 +496,10 @@
   (flet ((f (name) (op:field o name)))
     (ecase (op:operation-type o)
       (:ledger-open
+       ;; DEP-18: a LedgerOpen may name the ruleset in force before its first QuorumBegin.
+       (when (and (f :protocol-version) (not (member (f :protocol-version) +rulesets+ :test #'equal)))
+         (fail :unknown-ruleset (format nil "LedgerOpen protocol_version ~s is not a known ruleset" (f :protocol-version))))
+       (setf (ledger-active-ruleset ledger) (f :protocol-version))
        (setf (ledger-operator-key ledger) (f :operator-id)
              (ledger-reserves-key ledger) (f :reserves-id)
              (ledger-genesis-block ledger) (f :genesis-block)
@@ -467,11 +523,12 @@
              (fail :quorum-expiry-exceeds-commitment
                    (format nil "quorum_expiry ~a exceeds the shortest member commitment ~a" (f :quorum-expiry) ceiling))))
          ;; DEP-05 "Born expired": a quorum past expiry from its first update buys nothing.
-         (when (and (f :quorum-expiry) (plusp *block-height*) (<= (f :quorum-expiry) *block-height*))
+         ;; Gated (DEP-18): judged under the ruleset this QuorumBegin names.
+         (when (born-expired-p (f :protocol-version) (f :quorum-expiry) *block-height*)
            (fail :quorum-expiry-not-after-block
                  (format nil "quorum_expiry ~a is not after the QuorumBegin's block_height ~a" (f :quorum-expiry) *block-height*)))
          (let ((floor (collateral-floor-bps promoted)))
-           (unless (collateral-meets-floor-p (f :amount) (f :collateral-amount) floor)
+           (when (collateral-below-floor-p (f :protocol-version) (f :amount) (f :collateral-amount) floor)
              (fail :collateral-below-floor
                    (format nil "collateral ~a is below ~a bps of the vault (reserves ~a)" (f :collateral-amount) floor (f :amount)))))
          (let* ((cutoff (or (op:field o :exit-cutoff-height) (- *block-height* +exit-cutoff-margin+)))

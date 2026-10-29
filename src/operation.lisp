@@ -39,7 +39,7 @@
 (defparameter *operations*
   '((1 :ledger-open
      (:operator-id 56 :pubkey) (:reserves-id 58 :string) (:genesis-block 96 :u32)
-     (:reserves-amount 62 :u64) (:collateral-amount 88 :u64))
+     (:reserves-amount 62 :u64) (:collateral-amount 88 :u64) (:protocol-version 286 :string :optional))
     (12 :quorum-begin
      (:reserves-id 58 :string) (:spending-txid 90 :bytes32) (:new-outpoint-txid 84 :bytes32)
      (:new-outpoint-vout 92 :u32) (:amount 2 :u64) (:quorum-expiry 86 :u32)

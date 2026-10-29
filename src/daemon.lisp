@@ -115,7 +115,7 @@
            (ok :staged (length (lg:ledger-next-quorum-members (nd:record-ledger rec))))))
         (:prepare-quorum
          (let* ((rec (rec! node form))
-                (r (nd:prepare-quorum node rec :expiry-blocks (arg form :expiry-blocks 4320) :ruleset (arg form :ruleset "cltv-offset-v2"))))
+                (r (nd:prepare-quorum node rec :expiry-blocks (arg form :expiry-blocks 4320) :ruleset (arg form :ruleset nil))))
            (ok :address (rs:reserves-address r) :expiry (cdr (nd:record-pinned rec))
                :ledger-hash (bytes->hex (rs:reserves-ledger-hash r)))))
         (:vaults

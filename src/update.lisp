@@ -240,13 +240,15 @@ when checking a disclosed PTLC secret against its point)."
         (secp:schnorr-sign privkey (operator-digest u)
                            (or aux (make-array 32 :element-type '(unsigned-byte 8))))))
 
-(defun header-violation (predecessor update)
+(defun header-violation (predecessor update enforce-p)
   "DEP-02 §Block height and hash: NIL when UPDATE's header conforms after PREDECESSOR (NIL at
    sequence 0), else the broken rule.  Heights never decrease along a chain (equal is fine), and
    every update names a block.  The hash is never judged against any chain: a reorganised-out
-   block is not a fault."
+   block is not a fault.  A rule of anchor-ladder-v5 (DEP-18): ENFORCE-P is whether the ledger's
+   active ruleset before UPDATE carries it; NIL is always conforming."
   (let ((h (update-block-hash update)))
-    (cond ((or (null h) (/= (length h) 32) (zero-bytes-p h))
+    (cond ((not enforce-p) nil)
+          ((or (null h) (/= (length h) 32) (zero-bytes-p h))
            (format nil "MissingBlockHash: seq ~a names no block" (update-seq update)))
           ((and predecessor (< (update-block-height update) (update-block-height predecessor)))
            (format nil "HeightDecreases: seq ~a at height ~a follows height ~a"

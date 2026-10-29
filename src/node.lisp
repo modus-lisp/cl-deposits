@@ -714,7 +714,8 @@
           (solicit-cosignatures node rec update signers required)))
       (commit-update node rec update))))
 
-(defun open-ledger (node &key reserves-id (genesis-block (height node)) (reserves 0) (collateral 0))
+(defun open-ledger (node &key reserves-id (genesis-block (height node)) (reserves 0) (collateral 0)
+                         (ruleset lg:+current-ruleset+))
   "Genesis: LedgerOpen at sequence 0.  Returns the record."
   (let* ((id (op:compute-ledger-id (node-pubkey node) reserves-id genesis-block))
          (rec (make-record :id-hex (bytes->hex id) :ledger (lg:make-ledger) :owned-p t)))
@@ -722,7 +723,8 @@
     (unless (node-member-ledger-hex node) (setf (node-member-ledger-hex node) (record-id-hex rec)))
     (commit-update node rec (new-update node rec (list :type :ledger-open :operator-id (node-pubkey node)
                                                        :reserves-id reserves-id :genesis-block genesis-block
-                                                       :reserves-amount reserves :collateral-amount collateral)))
+                                                       :reserves-amount reserves :collateral-amount collateral
+                                                       :protocol-version ruleset)))
     rec))
 
 ;;; ---------------------------------------------------------------------------
@@ -737,7 +739,7 @@
   "How much of the history a consent request carries: the reference's nostr client drops any
    event over 70 KB (~70 updates), and it needs LedgerOpen; the rest is gap-filled from the relay.")
 
-(defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) (ruleset "cltv-offset-v2") (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016) dispute-response-blocks dormancy-blocks dormancy-notice-blocks)
+(defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) (ruleset lg:+current-ruleset+) (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016) dispute-response-blocks dormancy-blocks dormancy-notice-blocks)
   "Ask MEMBER-PUBKEY to join REC's quorum; on consent, stage them with QuorumAddMember.
    The request is addressed (tag l) to MEMBER-LEDGER-ID — the member's own ledger —
    as the reference does; its nodes only answer requests for ledgers they operate."
@@ -787,10 +789,12 @@
 (defun %strip-nil-fields (plist)
   (loop for (k v) on plist by #'cddr when v append (list k v)))
 
-(defun prepare-quorum (node rec &key (ruleset "cltv-offset-v2") (expiry-blocks 4320))
+(defun prepare-quorum (node rec &key ruleset (expiry-blocks 4320))
   "Build (and pin) the reserves output the next QuorumBegin will point at, so
-   it can be funded on chain first.  Returns the reserves."
+   it can be funded on chain first.  Returns the reserves.  RULESET defaults to the newest
+   every staged member declared (DEP-18)."
   (let* ((staged (lg:ledger-next-quorum-members (record-ledger rec)))
+         (ruleset (or ruleset (lg:newest-shared-ruleset staged)))
          ;; DEP-05: quorum_expiry is the shortest member commitment.
          (expiry (lg:planned-quorum-expiry staged (height node) expiry-blocks))
          (reserves (rs:build-reserves :operator (node-pubkey node) :members (mapcar #'lg:member-pubkey staged)
@@ -901,7 +905,7 @@
   (let ((old (+ (lg:ledger-reserves-amount ledger) (lg:ledger-collateral-amount ledger))))
     (if (plusp old) (floor (* (lg:ledger-collateral-amount ledger) (- vault-sats fee-sats) 1000) old) 0)))
 
-(defun rotate-vault (node rec &key (ruleset "cltv-offset-v2") (expiry-blocks 4320) (timeout 90) splice)
+(defun rotate-vault (node rec &key ruleset (expiry-blocks 4320) (timeout 90) splice)
   "DEP-03 rotation, first step: plan the spend of the current vault into the reserves of the
    staged quorum with the shared builder (rot:build-ladder).  Nothing is signed yet: BEGIN-QUORUM
    records the QuorumBegin naming every rung, then gathers the members' signatures on the rungs
@@ -1058,7 +1062,7 @@
           (btx:tx-txid (first signed)))))))
 
 (defun begin-quorum (node rec &key funding-txid funding-vout amount-msats collateral-msats splice-collateral-msats
-                                   (ruleset "cltv-offset-v2") (expiry-blocks 4320) (spending-txid funding-txid))
+                                   ruleset (expiry-blocks 4320) (spending-txid funding-txid))
   "Promote the staged members: chain a QuorumBegin.  The first one points at the
    outpoint funding the reserves output prepared by PREPARE-QUORUM (or built now);
    every later one names the rungs of the rotation ROTATE-VAULT planned (DEP-03): built on
@@ -1313,7 +1317,8 @@
         (multiple-value-bind (ok why)
             (up:verify-cosignatures update :quorum (mapcar #'lg:member-pubkey signers) :threshold required)
           (unless ok (fail "seq ~a: ~a" (up:update-seq update) why)))))
-    (handler-case (let ((v (or (up:header-violation (first (record-history rec)) update)
+    (handler-case (let ((v (or (up:header-violation (first (record-history rec)) update
+                                                    (lg:signed-header-applies-p ledger update))
                                (cf:violation ledger op (up:update-block-height update)))))
                     (when v (lg::fail :non-conforming v))
                     (lg:apply-update ledger update))
@@ -1544,7 +1549,8 @@
                (unless (= seq (1+ (lg:ledger-sequence ledger)))
                  (fail "expected seq ~a" (1+ (lg:ledger-sequence ledger))))
                (unless (equalp prev (lg:ledger-chain-tip ledger)) (fail "chain mismatch: not our tip"))
-               (let ((v (up:header-violation (first (record-history rec)) candidate)))
+               (let ((v (up:header-violation (first (record-history rec)) candidate
+                                                 (lg:signed-header-applies-p ledger candidate))))
                  (when v (fail "~a" v)))
                (let ((o (op:decode-operation message)))
                  ;; Speculative apply on a fresh replica: the op must be valid on our state.
@@ -5272,10 +5278,14 @@
       (let* ((qb (or qb-seq (governing-quorum-begin-seq rec (lg:ledger-sequence (record-ledger rec)))))
              (probe (fr:make-unauthorized-vault-spend-proof (node-pubkey node) (hex->bytes id) (hex->bytes id) qb tx
                                                            (getf spend :prevouts) (getf spend :block-hash))))
-        (multiple-value-bind (reserves rungs vvout) (fr:spent-vault (spent-vault-updates rec) qb)
+        (multiple-value-bind (reserves rungs vvout operator ruleset) (fr:spent-vault (spent-vault-updates rec) qb)
+          (declare (ignore operator))
           (multiple-value-bind (signers idx tier-index)
               (fr:vault-spend-signers tx (fr::parse-prevouts (getf (getf probe :evidence) :prevouts)) reserves rungs vvout)
             (declare (ignore idx))
+            ;; DEP-18: a vault created under a ruleset without vault-spend proofs is never
+            ;; proven against and opens no challenge (dormant: it can only excuse).
+            (unless (lg:ruleset-rule-p ruleset :vault-spend-proofs) (setf signers nil))
             (when signers
               (let ((anchor (rot:anchor-of tx)))
                 (cond ((spend-answered-p node id tx qb reserves tier-index :spend-height (getf spend :height))

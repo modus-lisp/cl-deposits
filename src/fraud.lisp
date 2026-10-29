@@ -244,7 +244,11 @@
              (seq (up:update-seq fault))
              (id (up:update-ledger-id fault))
              (bound (bound-hashes history))
-             (prefix (sort (remove-if-not (lambda (u) (< (up:update-seq u) seq)) (copy-list history)) #'< :key #'up:update-seq)))
+             (prefix (sort (remove-if-not (lambda (u) (< (up:update-seq u) seq)) (copy-list history)) #'< :key #'up:update-seq))
+             (prefix-ledger nil))
+       (flet ((prefix-enforces-p (rule)
+                (declare (ignore rule))
+                (lg:signed-header-applies-p (or prefix-ledger (setf prefix-ledger (lg:replay prefix))) fault)))
         (cond ((not (string= (bytes->hex (up:update-operator-id fault)) (getf proof :accused)))
                (values nil "accused is not the signer"))
               ((not (string= (bytes->hex id) (getf proof :ledger-id))) (values nil "ledger id mismatch"))
@@ -263,9 +267,10 @@
               ((and (plusp seq) (/= (gethash (up:update-prev-hash fault) bound) (1- seq)))
                (values t (format nil "fault at seq ~a follows seq ~a" seq (gethash (up:update-prev-hash fault) bound))))
               ((/= (length prefix) seq) (values nil "history does not reach the fault's predecessor"))
-              ((up:header-violation (car (last prefix)) fault)
+              ((up:header-violation (car (last prefix)) fault (prefix-enforces-p :signed-header))
                ;; DEP-02 §Block height and hash: a height below its predecessor's, or no block
-               (values t (up:header-violation (car (last prefix)) fault)))
+               ;; (anchor-ladder-v5, judged under the ruleset in force before the fault).
+               (values t (up:header-violation (car (last prefix)) fault t)))
               (t
                ;; It chains onto its predecessor, so it must break a rule: the fold's,
                ;; or the depositor's (authorization, nonce window, expiry).
@@ -274,7 +279,7 @@
                  (if v
                      (values t v)
                      (handler-case (progn (lg:apply-update l fault) (values nil "fault update applies cleanly: conforming"))
-                       (lg:ledger-error (c) (values t (princ-to-string c)))))))))
+                       (lg:ledger-error (c) (values t (princ-to-string c))))))))))
     (error (c) (values nil (princ-to-string c)))))
 
 (defun verify-non-conforming-cosignature (proof fault-history)
@@ -435,9 +440,10 @@
         (list (op:field o :new-outpoint-txid)))))
 
 (defun spent-vault (history governing-seq)
-  "(values reserves rung-txids vout operator33) for the QuorumBegin at GOVERNING-SEQ in HISTORY
-   (the spent ledger's chain, any order), or NIL.  The vault is output VOUT of whichever rung
-   confirmed (DEP-03 §Fee ladder)."
+  "(values reserves rung-txids vout operator33 ruleset) for the QuorumBegin at GOVERNING-SEQ in
+   HISTORY (the spent ledger's chain, any order), or NIL.  The vault is output VOUT of whichever
+   rung confirmed (DEP-03 §Fee ladder); RULESET is the one that QuorumBegin names, which judges
+   spends of its vault (DEP-18)."
   (let ((operator nil) (qb nil))
     ;; One pass, decoding only the two updates it needs (the type is cached on each update).
     (dolist (u history)
@@ -450,7 +456,7 @@
       (values (rs:build-reserves :operator operator :members (op:field qb :quorum-members)
                                  :ledger-hash (op:field qb :ledger-hash) :quorum-expiry (op:field qb :quorum-expiry)
                                  :ruleset (or (op:field qb :protocol-version) "cltv-offset-v2"))
-              (rotation-rungs qb) (op:field qb :new-outpoint-vout) operator))))
+              (rotation-rungs qb) (op:field qb :new-outpoint-vout) operator (op:field qb :protocol-version)))))
 
 ;;; DEP-06 §Spend challenge.  An anchored spend names, by its anchor H, the one place in the
 ;;; ledger that must answer for it: a rotation is the QuorumBegin whose previous_hash is H and
@@ -536,8 +542,12 @@
              (anchor (rot:anchor-of tx))
              (prevouts (parse-prevouts (getf ev :prevouts)))
              (spend-height (funcall height-of-block (getf ev :spend-block-hash))))
-        (multiple-value-bind (reserves rungs vvout) (spent-vault spent-history (getf ev :governing-quorumbegin-seq))
+        (multiple-value-bind (reserves rungs vvout operator ruleset) (spent-vault spent-history (getf ev :governing-quorumbegin-seq))
+          (declare (ignore operator))
           (cond ((null reserves) (values nil "no such QuorumBegin on the spent ledger"))
+                ;; DEP-18: proof 10 is a rule of anchor-ladder-v5, judged under the vault's ruleset.
+                ((not (lg:ruleset-rule-p ruleset :vault-spend-proofs))
+                 (values nil (format nil "the vault's ruleset (~a) has no UnauthorizedVaultSpend" (or ruleset "none"))))
                 ((/= (length prevouts) (length (btx:tx-inputs tx))) (values nil "prevouts do not match the inputs"))
                 ((null spend-height) (values nil "spend block not in our chain"))
                 (t
