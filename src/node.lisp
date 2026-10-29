@@ -690,12 +690,15 @@
   ;; when value-moving operations were being refused and nothing competed.
   (bt:with-lock-held ((record-append-lock rec))
     (when op-fn (setf op (funcall op-fn (up:chain-hash (tip rec)))))
+    ;; DEP-02 §Balance Commitments: declare the post-update balances of what OP touches.
+    (let ((height (max height (if (tip rec) (up:update-block-height (tip rec)) 0))))
+      (setf op (lg:fill-balance-commitments (record-ledger rec) op height (1+ (lg:ledger-sequence (record-ledger rec))))))
     ;; Would it apply?  Check on a copy before asking anyone to cosign it.
     ;; ADVERSARY :sign-invalid — an operator that asks its quorum to cosign an
     ;; operation its own validator rejects (red team #1).
     (unless (getf (node-adversary node) :sign-invalid)
-      (let ((lg:*block-height* height) (lg:*update-seq* (1+ (lg:ledger-sequence (record-ledger rec)))))
-        (lg:apply-operation (lg:copy-ledger (record-ledger rec)) op)))
+      (lg:speculate (record-ledger rec) op (max height (if (tip rec) (up:update-block-height (tip rec)) 0))
+                    (1+ (lg:ledger-sequence (record-ledger rec)))))
     (let ((update (new-update node rec op :height height)))
       (multiple-value-bind (required signers tier operator-alone allowed)
           (lg:cosign-requirement (record-ledger rec) op height)
@@ -1535,7 +1538,7 @@
              (progn
                (unless (equalp ledger-id (hex->bytes (record-id-hex rec))) (fail "ledger_id mismatch"))
                ;; DEP-18 "advertising is a promise": we never cosign under a ruleset whose rules we
-               ;; do not enforce (balance-commit-v4's MissingBalanceCommitment), even if seated.
+               ;; do not enforce, even if seated.
                (let ((r (lg:ledger-active-ruleset ledger)))
                  (when (and r (not (member r lg:+supported-rulesets+ :test #'string=)))
                    (fail "the ledger's ruleset ~a is not one we enforce" r)))
@@ -1563,8 +1566,7 @@
                  (unless (getf (node-adversary node) :cosign-blind)
                    ;; Depositor authorization, nonce window, expiry: at the height we sign.
                    (let ((v (cf:violation (record-ledger rec) o block-height))) (when v (fail "~a" v)))
-                   (let ((lg:*block-height* block-height) (lg:*update-seq* seq))
-                     (lg:apply-operation (lg:copy-ledger (record-ledger rec)) o)))
+                   (lg:speculate (record-ledger rec) o block-height seq))
                  (multiple-value-bind (required signers tier operator-alone allowed)
                      (lg:cosign-requirement ledger o block-height)
                    (declare (ignore required signers tier operator-alone))

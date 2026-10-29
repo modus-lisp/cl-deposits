@@ -1059,5 +1059,7 @@
           (cond ((null state) "the operator's chain up to the deadline does not replay")
                 ((cf:violation state o height)
                  (format nil "the request was not servable at the deadline: ~a" (cf:violation state o height)))
-                ((handler-case (let ((lg:*block-height* height)) (lg:apply-operation (lg:copy-ledger state) o) nil)
+                ;; Served as the operator would serve it: with its balance commitments (DEP-02).
+                ((handler-case (let ((seq (up:update-seq breach)))
+                                 (lg:speculate state (lg:fill-balance-commitments state o height seq) height seq) nil)
                    (lg:ledger-error (e) (format nil "the request was not servable at the deadline: ~a" e)))))))))

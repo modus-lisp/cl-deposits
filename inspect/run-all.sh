@@ -22,7 +22,7 @@ lisp_gate () {  # name, then test files
   run_gate "$name" "$SBCL" "${args[@]}"
 }
 echo "== cl-deposits offline gate suite =="
-lisp_gate vectors inspect/update-test.lisp inspect/operation-test.lisp inspect/dep17-test.lisp inspect/dep16-test.lisp inspect/reserves-test.lisp inspect/rotation-test.lisp inspect/lottery-test.lisp
+lisp_gate vectors inspect/update-test.lisp inspect/operation-test.lisp inspect/dep17-test.lisp inspect/dep16-test.lisp inspect/reserves-test.lisp inspect/rotation-test.lisp inspect/commitment-test.lisp inspect/lottery-test.lisp
 lisp_gate nodes   inspect/update-test.lisp inspect/operation-test.lisp inspect/index-test.lisp inspect/node-test.lisp
 lisp_gate property inspect/update-test.lisp inspect/operation-test.lisp inspect/property-test.lisp
 lisp_gate chaos    inspect/chaos-test.lisp

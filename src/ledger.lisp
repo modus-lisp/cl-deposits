@@ -30,7 +30,8 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:quorum-expiry-ok-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger))
+           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger
+           #:speculate #:fill-balance-commitments #:commitment-targets))
 (in-package #:cl-deposits.ledger)
 
 (define-condition ledger-error (error)
@@ -41,16 +42,20 @@
 (defun fail (kind &optional detail) (error 'ledger-error :kind kind :detail detail))
 
 ;; DEP-18 §the registry: append-only, all of the cltv-offset-v2 reserves cascade (tier-1
-;; minority ceil(n/2) - 1).  balance-commit-v4 requires balance commitments, which this
-;; implementation does not emit, so it advertises the others only; fee-cap-v3's fee cap is
-;; intrinsic (DEP-07).  A ruleset's rules are frozen once registered: a change is a new name.
-(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5"))
-(defparameter +supported-rulesets+ '("cltv-offset-v2" "anchor-ladder-v5"))
-(defparameter +current-ruleset+ "anchor-ladder-v5"
+;; minority ceil(n/2) - 1).  fee-cap-v3's fee cap is intrinsic (DEP-07), so fee-cap-v3 adds
+;; nothing; balance-commit-v4 adds MissingBalanceCommitment (DEP-02 §Balance Commitments), and
+;; balance-anchor-v6 is anchor-ladder-v5's rules plus that one.  We enforce every rule of every
+;; registered ruleset, so we declare them all.  A ruleset's rules are frozen once registered: a
+;; change is a new name.
+(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6"))
+(defparameter +supported-rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6"))
+(defparameter +current-ruleset+ "balance-anchor-v6"
   "What a new ledger's LedgerOpen names, and what a quorum moves to when every member declares it.")
 
 (defparameter +ruleset-rules+
-  '(("anchor-ladder-v5" :signed-header :born-expired :collateral-floor :vault-spend-proofs))
+  '(("balance-commit-v4" :missing-balance-commitment)
+    ("anchor-ladder-v5" :signed-header :born-expired :collateral-floor :vault-spend-proofs)
+    ("balance-anchor-v6" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment))
   "DEP-18: the gated rules each ruleset adds to the intrinsic ones.")
 
 (defun ruleset-rule-p (ruleset rule)
@@ -114,10 +119,13 @@
 
 (defun planned-ruleset (current declarations)
   "DEP-18 §operator policy, not consensus: the ruleset an operator names at its next QuorumBegin.
-   A balance-commit-v4 ledger keeps it (anchor-ladder-v5 lacks MissingBalanceCommitment); otherwise
-   +current-ruleset+ when every member declares it, else the current ruleset, else cltv-offset-v2."
-  (cond ((equal current "balance-commit-v4") current)
-        ((every-declares-p +current-ruleset+ declarations) +current-ruleset+)
+   balance-anchor-v6 (+current-ruleset+) when every member declares it; otherwise a
+   balance-commit-v4 ledger keeps it (anchor-ladder-v5 lacks MissingBalanceCommitment), any other
+   moves to anchor-ladder-v5 when every member declares it; else the current ruleset, else
+   cltv-offset-v2."
+  (cond ((every-declares-p +current-ruleset+ declarations) +current-ruleset+)
+        ((equal current "balance-commit-v4") current)
+        ((every-declares-p "anchor-ladder-v5" declarations) "anchor-ladder-v5")
         (current current)
         (t "cltv-offset-v2")))
 
@@ -510,10 +518,88 @@
           (+ (floor (* (op:fees-annualized-msats fees) b) 52560)
              (floor (* (deposit-balance d) (op:fees-annualized-bps fees) b) (* 52560 10000)))))))
 
+;;; DEP-02 §Balance Commitments.  The operator declares, on every balance-touching operation, the
+;;; (balance, locked_balance) its deposit(s) hold after the update; cosigners recompute and compare.
+;;; A declaration present must be right under every ruleset; one missing is MissingBalanceCommitment
+;;; under a ruleset that has that rule (DEP-18).
+
+(defvar *check-balance-commitments* t "Bound to NIL while the operator computes the declarations.")
+
+(defun commitment-targets (ledger o)
+  "The deposits O must declare, as ((deposit-id balance-field locked-field) ...), judged on LEDGER
+   before O (DEP-02 §Semantics; a transfer's source and destination come from its pending lock)."
+  (flet ((f (name) (op:field o name))
+         (one (id) (list (list id :balance-after :locked-after))))
+    (case (op:operation-type o)
+      ((:deposit-open :deposit-close :fee-collect :invoice-credit :invoice-lock :invoice-fail :invoice-fulfill
+        :onchain-credit :onchain-lock :onchain-fail :onchain-fulfill)
+       (one (f :deposit-id)))
+      (:transfer-lock (one (f :source-deposit-id)))
+      (:transfer-fail (let ((p (gethash (f :transfer-id) (ledger-pending-transfers ledger))))
+                        (when p (one (getf p :source)))))
+      (:transfer-complete (let ((p (gethash (f :transfer-id) (ledger-pending-transfers ledger))))
+                            (when p (list (list (getf p :source) :balance-after :locked-after)
+                                          (list (getf p :destination) :dest-balance-after :dest-locked-after))))))))
+
+(defun deposit-pair (ledger id)
+  "(values balance locked) of deposit ID in LEDGER; (0 0) for one that is gone (a close)."
+  (let ((d (gethash id (ledger-deposits ledger))))
+    (if d (values (deposit-balance d) (deposit-locked-balance d)) (values 0 0))))
+
+(defun check-balance-commitments (ledger o targets required)
+  "LEDGER is the state after O.  Signal BALANCE-COMMITMENT-MISMATCH for a declaration that is not it,
+   and MISSING-BALANCE-COMMITMENT for none when REQUIRED."
+  (loop for (id bk lk) in targets
+        do (let ((b (op:field o bk)) (l (op:field o lk)))
+             (multiple-value-bind (bal lock) (deposit-pair ledger id)
+               (cond ((and (null b) (null l))
+                      (when required
+                        (fail :missing-balance-commitment
+                              (format nil "~a: no balance commitment for deposit ~a" (op:operation-type o) (bytes->hex id)))))
+                     ((not (and (eql b bal) (eql l lock)))
+                      (fail :balance-commitment-mismatch
+                            (format nil "~a: deposit ~a declared (~a, ~a), holds (~a, ~a)"
+                                    (op:operation-type o) (bytes->hex id) b l bal lock))))))))
+
 (defun apply-operation (ledger o)
   "Fold one operation into LEDGER, or signal LEDGER-ERROR leaving it untouched
    in the ways that matter (callers replaying a chain treat any error as fatal)."
-  (prog1 (%apply-operation ledger o) (%touch ledger o)))
+  (let ((targets (and *check-balance-commitments* (commitment-targets ledger o)))
+        (required (ruleset-rule-p (ledger-active-ruleset ledger) :missing-balance-commitment)))
+    (prog1 (%apply-operation ledger o)
+      (%touch ledger o)
+      (when targets (check-balance-commitments ledger o targets required)))))
+
+(defun speculate (ledger o height seq)
+  "A copy of LEDGER after O as the update at HEIGHT and SEQ would leave it: the exit requests that
+   expired by HEIGHT released first (DEP-20 §3), as APPLY-UPDATE does."
+  (let ((l (copy-ledger ledger)) (*block-height* height) (*update-seq* seq))
+    (unless (eq (op:operation-type o) :quorum-begin) (%release-expired-exits l height))
+    (apply-operation l o)
+    l))
+
+(defun op-with (o name value)
+  "O with field NAME set to VALUE."
+  (let ((o (copy-list o)))
+    (if (member name (cddr o))
+        (progn (setf (getf (cddr o) name) value) o)
+        (append o (list name value)))))
+
+(defun fill-balance-commitments (ledger o height seq)
+  "The operator's half of DEP-02 §Balance Commitments: O with the post-update (balance, locked)
+   of each deposit it touches declared.  Correct under every ruleset, so always emitted.  An O
+   that would not apply is returned as it is; the caller's own check reports why."
+  (let ((targets (commitment-targets ledger o)))
+    (if (null targets)
+        o
+        (let ((next (handler-case (let ((*check-balance-commitments* nil)) (speculate ledger o height seq))
+                      (ledger-error () nil))))
+          (if (null next)
+              o
+              (loop for (id bk lk) in targets
+                    do (multiple-value-bind (b l) (deposit-pair next id)
+                         (setf o (op-with (op-with o bk b) lk l)))
+                    finally (return o)))))))
 
 (defun %apply-operation (ledger o)
   (flet ((f (name) (op:field o name)))

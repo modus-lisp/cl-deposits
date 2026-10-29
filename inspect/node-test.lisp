@@ -185,8 +185,12 @@
                                                    :prev-hash (lg:ledger-chain-tip (nd:record-ledger la))
                                                    ;; DEP-02: at the chain's height, naming a block
                                                    :block-height *height* :block-hash (u:sha256 (u:ascii->bytes "block"))
-                                                   :message (op:encode-operation (list :type :onchain-credit :txid (u:sha256 (hx "ee")) :vout 0
-                                                                                       :deposit-id d1 :amount amount :funding-address "x")))))
+                                                   :message (op:encode-operation
+                                                             (lg:fill-balance-commitments
+                                                              (nd:record-ledger la)
+                                                              (list :type :onchain-credit :txid (u:sha256 (hx "ee")) :vout 0
+                                                                    :deposit-id d1 :amount amount :funding-address "x")
+                                                              *height* seq)))))
                      (up:sign-operator u (nd::node-priv a)) u)))
              (u1 (funcall mk 1)) (u2 (funcall mk 2))
              (proof (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) u1 u2)))

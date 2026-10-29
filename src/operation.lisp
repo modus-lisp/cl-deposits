@@ -141,8 +141,7 @@
     (90 :batch (:ops 298 :bytes))
     (100 :exit-request
      (:deposit-id 200 :deposit-id) (:amount 2 :u64) (:exit-address 300 :bytes)
-     (:expires-at-height 302 :u32 :optional) (:nonce 288 :u64) (:expiry 290 :u32) (:witness 204 :witness)
-     (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))
+     (:expires-at-height 302 :u32 :optional) (:nonce 288 :u64) (:expiry 290 :u32) (:witness 204 :witness))
     (102 :dormancy-notice (:rotation-height 306 :u32) (:migration-receiver 288 :pubkey :optional)
      (:manifest-hash 308 :bytes32 :optional) (:migration-manifest 316 :manifest :optional)
      (:dormancy-accept 338 :bytes :optional) (:premium 340 :u64 :optional)
@@ -158,7 +157,7 @@
      (:uncredited-proof 356 :bytes :optional))
     (101 :exit-cancel
      (:deposit-id 200 :deposit-id) (:exit-request-id 304 :bytes32) (:nonce 288 :u64) (:expiry 290 :u32)
-     (:witness 204 :witness) (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))))
+     (:witness 204 :witness))))
 
 (defun discriminant (type)
   (or (first (find type *operations* :key #'second))
@@ -320,6 +319,10 @@
                      (cond (v (add name (decode-kind kind v name)))
                            ((member :optional flags))
                            (t (error 'op-error :detail (format nil "~a: missing ~a (tag ~a)" (second entry) name tag))))))
+          ;; DEP-02 §Balance Commitments: a pair is both tags or neither.
+          (loop for (b l) in '((223 225) (227 229))
+                when (and (member b known) (not (eq (null (tlv:field a b)) (null (tlv:field a l)))))
+                  do (error 'op-error :detail (format nil "~a: half-present balance commitment (tags ~a/~a)" (second entry) b l)))
           ;; Unknown odd tags are permitted (forward compatibility); unknown even tags are not.
           (dolist (rec a)
             (unless (member (car rec) known)
