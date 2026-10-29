@@ -38,15 +38,19 @@ echo "   $HON proof or challenge lines: $hits; reference lines: $rh; signer ledg
 [ "$hits" -eq 0 ] && [ "$rh" -eq 0 ] || fail "a spend of a cltv-offset-v2 vault was proven or challenged"
 
 echo "== part 2: a rotation moves a cltv-offset-v2 ledger to anchor-ladder-v5"
-pick C1 C2 C3
-Q=$(OPEN_RULESET=cltv-offset-v2 form_ledger "PRIORQ$RANDOM" $C1 cltv-offset-v2 $C2 $C3 $R1 $R2) || exit 1
+pick C1 C2 C3 C4
+Q=$(OPEN_RULESET=cltv-offset-v2 form_ledger "PRIORQ$RANDOM" $C1 cltv-offset-v2 $C2 $C3 $C4 $R1 $R2) || exit 1
 rq=$(ruleset_of $C2 "$Q"); echo "   $Q before: $rq"
 [ "$rq" = ':RULESET "cltv-offset-v2"' ] || fail "Q is not under cltv-offset-v2: $rq"
-consent "$Q" $C1 $C2 $C3 $R1 $R2
+consent "$Q" $C1 $C2 $C3 $C4 $R1 $R2
 r=$(printf '%s\n' "(:rotate-vault :ledger \"$Q\" :expiry-blocks 4320)" | timeout 300 bash -c "exec 3<>/dev/tcp/127.0.0.1/$(cld_port $C1); cat >&3; head -n1 <&3")
 expect "$r" "rotate-vault"
-mine 3; sleep 20
-for n in $C1 $C2 $C3; do
+mine 3 >/dev/null; sleep 20
+for i in 1 2 3; do r=$(printf '%s\n' "(:begin-quorum :ledger \"$Q\")" | timeout 300 bash -c "exec 3<>/dev/tcp/127.0.0.1/$(cld_port $C1); cat >&3; head -n1 <&3")
+  case "$r" in *":STATUS :OK"*) break;; esac; echo "   begin-quorum retry $i: $r"; mine 1 >/dev/null; sleep 15; done
+expect "$r" "begin-quorum"
+mine 3 >/dev/null; sleep 20
+for n in $C1 $C2 $C3 $C4; do
   ra=$(ruleset_of $n "$Q"); echo "   $Q on $n after: $ra"
   [ "$ra" = ':RULESET "anchor-ladder-v5"' ] || fail "$n did not move $Q to anchor-ladder-v5: $ra"
 done
