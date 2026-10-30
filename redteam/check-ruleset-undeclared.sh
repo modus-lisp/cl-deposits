@@ -16,6 +16,8 @@ pick OP T2 T3 C1 C2
 R1=${R1:-ref6}; R2=${R2:-ref7}
 ruleset_of() { cld_ctl "$1" "(:info)" | grep -oE "\(:ID \"$2\"[^)]*" | grep -oE ':RULESET "[^"]*"|:RULESET NIL' | head -1; }
 
+for n in $T2 $T3 $C1 $C2; do expect "$(cld_ctl $n '(:adversary :set :withhold-rulesets ("balance-commit-v4"))')" "withhold on $n"; done
+trap 'for n in $T2 $T3 $C1 $C2; do cld_ctl $n "(:adversary :set :withhold-rulesets nil)" >/dev/null 2>&1; done' EXIT
 echo "== part 1: a cl operator names a ruleset its cl members did not declare"
 L=$(sx "$(cld_ctl $OP "(:open-ledger :reserves-id \"genesis:$OP:undeclared:$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000)")" ":LEDGER")
 [ -n "$L" ] || fail "open ledger"
