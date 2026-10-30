@@ -132,9 +132,16 @@
 (defparameter +valid-quorum-sizes+ '(3 5 7)
   "DEP-03 §Pre-release policy cap: odd for clean majorities, >= 3 for redundancy, <= 7.")
 
+(defun default-transfer-fees ()
+  "DEP-07 §Transfer Fees: the schedule of a deposit whose DepositOpen names none, fixed_msats 2,
+   rate_bps 20.  cl took it as zero while the reference took this, so a TransferFail charged the
+   fixed portion on one replica and not the other; the signet soak's first balance commitments
+   from a cl operator were 2 msat off at every Rust member (2026-10-30)."
+  (op:make-transfer-fees :fixed-msats 2 :rate-bps 20))
+
 (defstruct deposit
   id descriptor (balance 0) (locked-balance 0)
-  (fees (op:make-fees)) (transfer-fees (op:make-transfer-fees))
+  (fees (op:make-fees)) (transfer-fees (default-transfer-fees))
   (receive-requires-sig nil) fee-change-after-blocks fee-change-notice-blocks fee-change-limit-bps
   (opened-at-block 0) pending-fee-change (last-fee-assessment 0)
   (last-activity-block 0) (last-received-block 0)

@@ -34,6 +34,7 @@
   "(height operation) for the shared vector, as first written (no commitments)."
   (let* ((pa (up:compressed-pubkey (tk 717171)))
          (a (commitment-did "pk(commit-a)")) (b (commitment-did "pk(commit-b)")) (c (commitment-did "pk(commit-c)"))
+         (d (commitment-did "pk(commit-d)"))
          (h (lambda (s) (u:sha256 (u:ascii->bytes s))))
          (pre1 (funcall h "pre1")) (pre2 (funcall h "pre2")) (pre3 (funcall h "pre3"))
          (spk (u:cat (u:hex->bytes "0014") (subseq (funcall h "exit") 0 20))))
@@ -76,6 +77,14 @@
      (list 160 (list :type :invoice-credit :payment-hash (funcall h "p2") :deposit-id a :amount 10000 :invoice-id "inv-a" :sequence-number 6))
      (list 161 (list :type :deposit-open :deposit-id c :descriptor "pk(commit-c)"))
      (list 161 (list :type :deposit-close :deposit-id c))
+     ;; A deposit opened with no transfer_fees takes DEP-07's default schedule (2 msat + 20 bps):
+     ;; its failed transfer keeps the fixed 2 msat (DEP-07 §Fee on Failure).
+     (list 161 (list :type :deposit-open :deposit-id d :descriptor "pk(commit-d)"))
+     (list 161 (list :type :onchain-credit :txid (funcall h "t3") :vout 0 :deposit-id d :amount 200000 :funding-address "bcrt1qd"))
+     (list 161 (list :type :transfer-lock :transfer-nonce (funcall h "n4") :source-deposit-id d :destination-deposit-id a
+                     :amount 50000 :fee 102 :completion-script "sha256(00)"
+                     :timeout-height 161 :transfer-id (funcall h "x4") :nonce 9 :expiry 1000 :witness '()))
+     (list 161 (list :type :transfer-fail :transfer-id (funcall h "x4") :block-hash (funcall h "block 161") :reason 0))
      (list 162 (list :type :transfer-lock :transfer-nonce (funcall h "n3") :source-deposit-id a :destination-deposit-id b
                      :amount 100000 :fee 0 :completion-script (format nil "sha256(~a)" (u:bytes->hex (u:sha256 pre3)))
                      :timeout-height 400 :transfer-id (funcall h "x3") :nonce 8 :expiry 1000 :witness '())))))
@@ -156,4 +165,6 @@
                       (check-equal (format nil "judge ~a ~a" (second w) (subseq (fourth w) 0 16))
                                    (commitment-verdict l (second w) (fourth w) (parse-integer (third w)) seq)
                                    (fifth w)))))))
-    (check-equal "balance_commitments: steps, filled, judges" (list steps filled judges) (list 23 21 29))))
+    (check-equal "balance_commitments: steps, filled, judges" (list steps filled judges) (list 27 25 29))
+    (check-equal "a deposit opened without transfer_fees keeps the default fixed 2 msat on a TransferFail"
+                 (lg:deposit-balance (lg:find-deposit l (commitment-did "pk(commit-d)"))) 199998)))
