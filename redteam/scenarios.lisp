@@ -81,6 +81,12 @@
    (make-sc :name "ruleset-undeclared" :script "check-ruleset-undeclared.sh"
             :timeout 1800 :tags '(:safe)
             :note "DEP-18: a QuorumBegin naming a ruleset a seated member did not declare is refused by cl and reference operators")
+   (make-sc :name "descriptor-validity-honest" :script "check-descriptor-validity.sh" :args '("honest")
+            :ledger-var "REDTEAM_DV" :timeout 900
+            :note "DEP-16 §descriptor validity: cl and reference cosigners refuse an invalid descriptor")
+   (make-sc :name "descriptor-validity-collude" :script "check-descriptor-validity.sh" :args '("collude")
+            :ledger-var "REDTEAM_DV" :timeout 900 :tags '(:contagion)
+            :note "DEP-16 §descriptor validity: a committed invalid descriptor is fraud on neither side")
    (make-sc :name "vault-recovery-tier" :script "attack-vault-recovery-tier.sh" :ledger-var "REDTEAM_RT"
             :timeout 1800 :tags '(:contagion :disruptive :slow) :note "mines past expiry + 720")
    (make-sc :name "vault-rotate-late" :script "attack-vault-rotate-grace.sh" :args '("late")
