@@ -19,7 +19,8 @@
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:op #:cl-deposits.operation) (#:lg #:cl-deposits.ledger)
                     (#:d16 #:cl-deposits.dep16) (#:d17 #:cl-deposits.dep17))
-  (:export #:violation #:authorized-p #:nonce-verdict #:operation-deposit-id #:signed-sighash))
+  (:export #:violation #:authorized-p #:nonce-verdict #:operation-deposit-id #:signed-sighash
+           #:descriptor-refusal))
 (in-package #:cl-deposits.conformance)
 
 (defun field (o name) (ignore-errors (op:field o name)))
@@ -38,7 +39,9 @@
         (eq :ok (d17:verify-operation-witness o desc witness))
         (multiple-value-bind (id type args nonce expiry) (d17:operation->dep16 o)
           (and id
-               (let ((descriptor (d16:parse-descriptor desc))
+               (let ((descriptor (handler-case (d16:parse-descriptor desc)
+                                   ;; an unparseable descriptor authorizes nothing (as in the reference)
+                                   (d16:eval-error () (return-from authorized-p nil))))
                      (op (d16:make-operation :deposit-id id :op-type type :args args :nonce nonce :expiry expiry)))
                  (handler-case (d16:evaluate descriptor op (snapshot d height) (d16:witness-from-stack witness descriptor op))
                    (d16:eval-error () nil))))))))
@@ -74,6 +77,26 @@
                               (lg:deposit-seen-nonces d)))
              (format nil "NonceReplay: nonce ~a" nonce))
             ((not (authorized-p o d height)) "Unauthorized: the depositor's witness does not authorize this operation")))))
+
+;;; DEP-16 §Descriptor validity.  Grounds for a member to refuse a cosignature and for an operator
+;;; not to propose, never to convict: the descriptor is the depositor's own, and cl admitted
+;;; invalid ones before the shared vector existed (inspect/vectors/descriptor_validity.json).
+;;; The reference is deposits-protocol ledger_state check_conformance (UnparseableDescriptor,
+;;; DescriptorTooLarge), which proves_non_conformance excludes.
+
+(defun descriptor-refusal (ledger o)
+  "NIL, or why a DepositOpen or DepositKeyRotate O may not be cosigned on LEDGER: its descriptor
+   is invalid, or longer than the smallest max_descriptor_bytes a quorum member declared."
+  (let ((text (case (op:operation-type o)
+                (:deposit-open (field o :descriptor))
+                (:deposit-key-rotate (field o :new-descriptor)))))
+    (when text
+      (or (let ((v (d16:descriptor-violation text)))
+            (when v (format nil "UnparseableDescriptor: ~a" v)))
+          (let ((caps (remove nil (mapcar #'lg::member-max-descriptor-bytes (lg:ledger-quorum-members ledger))))
+                (len (length (sb-ext:string-to-octets text :external-format :utf-8))))
+            (when (and caps (> len (reduce #'min caps)))
+              (format nil "DescriptorTooLarge: ~a bytes, at most ~a" len (reduce #'min caps))))))))
 
 ;;; DEP-17 §duplicate delivery: what an operator does with a request whose operation reuses
 ;;; a nonce.  Pinned by inspect/vectors/nonce_delivery.json, shared with deposits-rust.

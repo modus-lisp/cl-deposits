@@ -21,7 +21,7 @@
   (:export #:parse-descriptor #:encode-descriptor #:decode-descriptor #:descriptor-id
            #:encode-term #:decode-value #:decode-witness #:encode-witness #:decode-snapshot #:encode-snapshot
            #:decode-operation #:evaluate #:eval-error #:make-witness #:make-snapshot #:make-operation
-           #:witness-from-stack #:descriptor-keys))
+           #:witness-from-stack #:descriptor-keys #:descriptor-violation))
 (in-package #:cl-deposits.dep16)
 
 (define-condition eval-error (error) ((detail :initarg :detail :reader detail))
@@ -51,24 +51,48 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Text -> AST
 
+;;; The lexer and parser follow deposits-rust's (rust-miniscript calculus/parse.rs) token for
+;;; token, so the two give the same verdict on every text: DEP-16 §Descriptor validity, pinned by
+;;; inspect/vectors/descriptor_validity.json.
+
+(defconstant +max-depth+ 128 "DEP-16 parse nesting limit (rust-miniscript calculus MAX_DEPTH).")
+(defparameter +int-min+ (- (expt 2 127)))
+(defparameter +int-max+ (1- (expt 2 127)))
+
+(defun ws-char-p (c) (member (char-code c) '(9 10 11 12 13 32)))
+(defun ascii-digit-p (c) (char<= #\0 c #\9))
+(defun word-char-p (c) (or (char= c #\_) (ascii-digit-p c) (char<= #\a c #\z) (char<= #\A c #\Z)))
+(defun hex-char-p (c) (or (ascii-digit-p c) (char<= #\a c #\f) (char<= #\A c #\F)))
+
+(defun lex-integer (text)
+  (let ((n (parse-integer text)))
+    (unless (<= +int-min+ n +int-max+) (fail "bad integer `~a`" text))
+    n))
+
 (defun lex (s)
   (let ((i 0) (n (length s)) (out '()))
     (loop while (< i n)
           do (let ((c (char s i)))
-               (cond ((member c '(#\Space #\Tab #\Newline)) (incf i))
+               (cond ((ws-char-p c) (incf i))
                      ((find c "()[],=:") (push (cdr (assoc c '((#\( . :lp) (#\) . :rp) (#\[ . :lb) (#\] . :rb) (#\, . :comma) (#\= . :eq) (#\: . :colon)))) out) (incf i))
-                     ((char= c #\<) (if (and (< (1+ i) n) (char= (char s (1+ i)) #\=)) (progn (push :le out) (incf i 2)) (progn (push :lt out) (incf i))))
-                     ((char= c #\>) (if (and (< (1+ i) n) (char= (char s (1+ i)) #\=)) (progn (push :ge out) (incf i 2)) (progn (push :gt out) (incf i))))
-                     ((or (char= c #\_) (alphanumericp c) (and (char= c #\-) (< (1+ i) n) (digit-char-p (char s (1+ i)))))
+                     ((char= c #\-)
+                      ;; a sign: only before a digit, and the literal is the digits after it
+                      (unless (and (< (1+ i) n) (ascii-digit-p (char s (1+ i)))) (fail "unexpected character `-`"))
                       (let ((start i))
                         (incf i)
-                        (loop while (and (< i n) (or (char= (char s i) #\_) (alphanumericp (char s i)))) do (incf i))
+                        (loop while (and (< i n) (ascii-digit-p (char s i))) do (incf i))
+                        (push (lex-integer (subseq s start i)) out)))
+                     ((char= c #\<) (if (and (< (1+ i) n) (char= (char s (1+ i)) #\=)) (progn (push :le out) (incf i 2)) (progn (push :lt out) (incf i))))
+                     ((char= c #\>) (if (and (< (1+ i) n) (char= (char s (1+ i)) #\=)) (progn (push :ge out) (incf i 2)) (progn (push :gt out) (incf i))))
+                     ((word-char-p c)
+                      (let ((start i))
+                        (loop while (and (< i n) (word-char-p (char s i))) do (incf i))
                         (let ((w (subseq s start i)))
-                          (push (if (every (lambda (ch) (or (digit-char-p ch) (char= ch #\-))) w) (parse-integer w) w) out))))
+                          (push (if (every #'ascii-digit-p w) (lex-integer w) w) out))))
                      (t (fail "unexpected character ~s" c)))))
     (nreverse out)))
 
-(defvar *toks*) (defvar *pos*) (defvar *bound*)
+(defvar *toks*) (defvar *pos*) (defvar *bound*) (defvar *depth* 0) (defvar *duplicate-name* nil)
 (defun peek () (nth *pos* *toks*))
 (defun next () (prog1 (or (peek) (fail "unexpected end")) (incf *pos*)))
 (defun expect (tok) (let ((got (next))) (unless (equal got tok) (fail "expected ~s, found ~s" tok got))))
@@ -76,16 +100,35 @@
 (defun hashfn-p (w) (member w '("sha256" "hash256" "ripemd160" "hash160") :test #'string=))
 (defun hashfn-kw (w) (intern (string-upcase w) :keyword))
 
+(defun decode-hex (h)
+  "Strict hex: an even number of hex digits."
+  (unless (evenp (length h)) (fail "hex literal has an odd number of digits"))
+  (unless (every #'hex-char-p h) (fail "invalid hex in `~a`" h))
+  (hex->bytes h))
+
 (defun try-key (w)
-  "A 33-byte compressed key (66 hex) or a 32-byte x-only key (64 hex); else NIL."
-  (and (member (length w) '(64 66)) (every (lambda (ch) (digit-char-p ch 16)) w) (hex->bytes w)))
+  "A v1 key literal: 66 hex digits naming a compressed secp256k1 point; else NIL."
+  (and (= (length w) 66) (every #'hex-char-p w)
+       (let ((b (hex->bytes w))) (and (ignore-errors (d17::parse-pubkey b)) b))))
 
 (defun hash-literal (fnname hexword)
-  (let ((d (hex->bytes hexword)))
+  (unless (stringp hexword) (fail "expected a digest"))
+  (let ((d (decode-hex (if (and (>= (length hexword) 2) (string= "0x" (subseq hexword 0 2))) (subseq hexword 2) hexword))))
     (unless (= (length d) (if (member fnname '("sha256" "hash256") :test #'string=) 32 20)) (fail "bad digest length"))
     (list :hash (hashfn-kw fnname) d)))
 
-(defun parse-literal ()
+(defun hex-prefixed-p (tok) (and (stringp tok) (>= (length tok) 2) (string= "0x" (subseq tok 0 2))))
+(defun bytes-literal (tok)
+  (let ((h (subseq tok 2)))
+    (when (zerop (length h)) (fail "empty hex literal `0x`"))
+    (list :bytes (decode-hex h))))
+
+(defmacro with-depth (&body body)
+  `(progn (when (>= *depth* +max-depth+) (fail "nesting too deep (> ~a)" +max-depth+))
+          (let ((*depth* (1+ *depth*))) ,@body)))
+
+(defun parse-literal () (with-depth (parse-literal-inner)))
+(defun parse-literal-inner ()
   (let ((tok (peek)))
     (cond ((eq tok :lb) (next)
            (let ((items '()))
@@ -97,18 +140,19 @@
           ((stringp tok) (next)
            (cond ((and (hashfn-p tok) (eq (peek) :lp)) (next) (let ((h (hash-literal tok (word)))) (expect :rp) h))
                  ((and (hashfn-p tok) (eq (peek) :colon)) (next) (hash-literal tok (word)))
-                 ((and (> (length tok) 2) (string= "0x" (subseq tok 0 2))) (list :bytes (hex->bytes (subseq tok 2))))
+                 ((hex-prefixed-p tok) (bytes-literal tok))
                  ((try-key tok) (list :key (try-key tok)))
                  (t (list :bytes (ascii->bytes tok)))))
           (t (fail "expected a literal, found ~s" tok)))))
 
-(defun parse-vterm ()
+(defun parse-vterm () (with-depth (parse-vterm-inner)))
+(defun parse-vterm-inner ()
   (let ((tok (peek)))
     (cond ((integerp tok) (next) (list :lit (list :int tok)))
           ((eq tok :lb) (list :lit (parse-literal)))
           ((stringp tok)
-           (cond ((and (hashfn-p tok) (member (nth (1+ *pos*) *toks*) '(:lp :colon))) (list :lit (parse-literal)))
-                 ((and (> (length tok) 2) (string= "0x" (subseq tok 0 2))) (next) (list :lit (list :bytes (hex->bytes (subseq tok 2)))))
+           (cond ((and (hashfn-p tok) (member (nth (1+ *pos*) *toks*) '(:lp :colon))) (list :lit (parse-literal-inner)))
+                 ((hex-prefixed-p tok) (next) (list :lit (bytes-literal tok)))
                  ((eq (nth (1+ *pos*) *toks*) :lp)
                   (next) (next)
                   (unless (member tok +value-fns+ :test #'string=) (fail "unknown value function ~a" tok))
@@ -130,6 +174,7 @@
 
 (defun parse-bterm-list ()
   (let ((out '()))
+    (when (eq (peek) :rp) (next) (return-from parse-bterm-list '()))
     (loop (push (parse-bterm) out)
           (let ((sep (next))) (cond ((eq sep :comma)) ((eq sep :rp) (return)) (t (fail "expected , or )")))))
     (nreverse out)))
@@ -137,7 +182,9 @@
 (defun parse-cmpop ()
   (let ((tok (next)))
     (case tok (:eq :eq) (:lt :lt) (:le :le) (:gt :gt) (:ge :ge)
-      (t (if (and (stringp tok) (member tok '("eq" "lt" "le" "gt" "ge") :test #'string=)) (intern (string-upcase tok) :keyword) (fail "expected a comparison"))))))
+      (t (fail "expected a comparison operator")))))
+
+(defun num () (let ((n (next))) (unless (integerp n) (fail "expected an integer, found ~s" n)) n))
 
 (defun parse-obligation-body (name)
   (flet ((v () (parse-vterm)))
@@ -145,25 +192,26 @@
           ((string= name "pk_h") (prog1 (list :pk-h (v)) (expect :rp)))
           ((string= name "pk_any") (prog1 (list :pk-any (v)) (expect :rp)))
           ((member name '("multi" "pk_threshold") :test #'string=)
-           (let ((k (next))) (expect :comma) (prog1 (list :multi k (v)) (expect :rp))))
+           (let ((k (num))) (expect :comma) (prog1 (list :multi k (v)) (expect :rp))))
           ((string= name "hashlock") (prog1 (list :hashlock (v)) (expect :rp)))
           ((string= name "pointlock") (prog1 (list :pointlock (v)) (expect :rp)))
           ((string= name "attest")
            (let ((key (v))) (expect :comma)
-             (let ((schema (let ((w (word))) (expect :lp) (let ((n (next))) (expect :rp) (unless (string= w "price_within_bps") (fail "unknown schema ~a" w)) (list :price-within-bps n)))))
+             (let ((schema (let ((w (word))) (expect :lp) (unless (string= w "price_schema") (fail "unknown schema ~a" w)) (let ((n (num))) (expect :rp) (list :price-within-bps n)))))
                (expect :rp) (list :attest key schema))))
           (t (fail "unknown obligation ~a" name)))))
 
 (defun obligation-name-p (w) (member w '("pk" "pk_h" "pk_any" "multi" "pk_threshold" "hashlock" "pointlock" "attest") :test #'string=))
 
-(defun parse-bterm ()
+(defun parse-bterm () (with-depth (parse-bterm-inner)))
+(defun parse-bterm-inner ()
   (let ((name (word)))
     (cond ((string= name "true") (list :const t))
           ((string= name "false") (list :const nil))
           (t (expect :lp)
              (cond ((string= name "and") (list :and (parse-bterm-list)))
                    ((string= name "or") (list :or (parse-bterm-list)))
-                   ((string= name "thresh") (let ((k (next))) (expect :comma) (list :thresh k (parse-bterm-list))))
+                   ((string= name "thresh") (let ((k (num))) (expect :comma) (list :thresh k (parse-bterm-list))))
                    ((string= name "not") (let ((b (parse-bterm))) (expect :rp) (list :not b)))
                    ((string= name "if") (let ((c (parse-bterm))) (expect :comma) (let ((th (parse-bterm))) (expect :comma) (let ((el (parse-bterm))) (expect :rp) (list :if c th el)))))
                    ((string= name "match") (parse-match))
@@ -193,14 +241,31 @@
       (progn (next) (expect :lp)
              (let ((constants '()))
                (loop (when (and (stringp (peek)) (string= (peek) "in")) (next) (return))
-                     (let ((name (word))) (expect :eq) (let ((v (parse-literal))) (push (cons name v) constants)) (expect :comma)))
+                     (let ((name (word)))
+                       (unless (canonical-name-p name) (fail "invalid constant name `~a`" name))
+                       (expect :eq)
+                       (let ((v (parse-literal)))
+                         ;; the reference keeps the last binding of a name (a BTreeMap); validity refuses it
+                         (when (assoc name constants :test #'string=)
+                           (setf *duplicate-name* name constants (remove name constants :key #'car :test #'string=)))
+                         (push (cons name v) constants))
+                       (expect :comma)))
                (setf *bound* (mapcar #'car constants))
                (let ((body (parse-bterm))) (expect :rp) (values (nreverse constants) body))))
       (values '() (parse-bterm))))
 
+(defun canonical-name-p (name)
+  (and (plusp (length name))
+       (let ((c (char name 0))) (or (char= c #\_) (char<= #\a c #\z)))
+       (every (lambda (c) (or (char= c #\_) (char<= #\a c #\z) (ascii-digit-p c))) name)))
+
 (defun parse-descriptor (text)
   "Descriptor text -> (:scheme :wsh|:tr :internal-key k :constants alist :body term)."
-  (let ((*toks* (lex text)) (*pos* 0) (*bound* '()))
+  (let ((*toks* (lex text)) (*pos* 0) (*bound* '()) (*depth* 0))
+    (prog1 (parse-descriptor-tokens)
+      (when (< *pos* (length *toks*)) (fail "trailing tokens after descriptor at position ~a" *pos*)))))
+
+(defun parse-descriptor-tokens ()
     (cond ((equal (peek) "wsh") (next) (expect :lp)
            (multiple-value-bind (constants body) (parse-with-or-bare) (expect :rp)
              (list :scheme :wsh :constants constants :body body)))
@@ -211,7 +276,92 @@
                                  (list :scheme :tr :internal-key key :constants constants :body body)))
                  (progn (expect :rp) (list :scheme :tr :internal-key key :constants '() :body nil)))))
           (t (multiple-value-bind (constants body) (parse-with-or-bare)
-               (list :scheme :wsh :constants constants :body body))))))
+               (list :scheme :wsh :constants constants :body body)))))
+
+;;; ---------------------------------------------------------------------------
+;;; DEP-16 §Descriptor validity: may this text enter a ledger (DepositOpen, DepositKeyRotate)?
+;;; The reference is deposits-core dep16/validity.rs; inspect/vectors/descriptor_validity.json
+;;; pins both.
+
+(defun descriptor-char-ok-p (c)
+  (let ((n (char-code c))) (or (<= 9 n 13) (<= 32 n 126))))
+
+(defun key-word-violation (w)
+  (let ((hex (every #'hex-char-p w)))
+    (cond ((and hex (= (length w) 130)) (format nil "`~a…` is an uncompressed key" (subseq w 0 8)))
+          ((and hex (= (length w) 66) (not (try-key w))) (format nil "`~a…` is not a compressed secp256k1 key" (subseq w 0 8))))))
+
+(defun polarity-violation (term positive)
+  (ecase (first term)
+    (:prove (unless positive "a proof obligation is in negative position"))
+    (:not (polarity-violation (second term) nil))
+    (:if (or (polarity-violation (second term) nil) (polarity-violation (third term) positive) (polarity-violation (fourth term) positive)))
+    ((:and :or) (some (lambda (b) (polarity-violation b positive)) (second term)))
+    (:thresh (some (lambda (b) (polarity-violation b positive)) (third term)))
+    (:match (or (some (lambda (arm) (polarity-violation (cdr arm) positive)) (third term)) (polarity-violation (fourth term) positive)))
+    ((:const :cmp :state) nil)))
+
+(defun vterm-unresolved (vt names)
+  (ecase (first vt)
+    (:lit nil)
+    (:var (unless (member (second vt) names :test #'string=) (second vt)))
+    (:op (some (lambda (a) (vterm-unresolved a names)) (third vt)))))
+
+(defun obligation-unresolved (o names)
+  (ecase (first o)
+    ((:pk :pk-h :pk-any :hashlock :pointlock) (vterm-unresolved (second o) names))
+    (:multi (vterm-unresolved (third o) names))
+    (:attest (vterm-unresolved (second o) names))))
+
+(defun term-unresolved (term names)
+  (ecase (first term)
+    (:const nil)
+    ((:and :or) (some (lambda (b) (term-unresolved b names)) (second term)))
+    (:thresh (some (lambda (b) (term-unresolved b names)) (third term)))
+    (:not (term-unresolved (second term) names))
+    (:if (or (term-unresolved (second term) names) (term-unresolved (third term) names) (term-unresolved (fourth term) names)))
+    (:match (or (vterm-unresolved (second term) names)
+                (some (lambda (arm) (term-unresolved (cdr arm) names)) (third term))
+                (term-unresolved (fourth term) names)))
+    (:cmp (or (vterm-unresolved (third term) names) (vterm-unresolved (fourth term) names)))
+    (:state (some (lambda (a) (vterm-unresolved a names)) (third term)))
+    (:prove (obligation-unresolved (second term) names))))
+
+(defun thresh-violation (term)
+  (when (and (eq (first term) :thresh) (not (<= 1 (second term) (length (third term)))))
+    (return-from thresh-violation (format nil "thresh needs 1 <= k <= ~a" (length (third term)))))
+  (some #'thresh-violation
+        (case (first term)
+          ((:and :or) (second term))
+          (:thresh (third term))
+          (:not (list (second term)))
+          (:if (list (second term) (third term) (fourth term)))
+          (:match (append (mapcar #'cdr (third term)) (list (fourth term)))))))
+
+(defun descriptor-violation (text)
+  "NIL if TEXT is a valid descriptor (DEP-16 §Descriptor validity), else the reason it is not."
+  (let ((bad (find-if-not #'descriptor-char-ok-p text)))
+    (when bad (return-from descriptor-violation
+                (format nil "character ~s is outside the descriptor character set" bad))))
+  ;; Words: a 66-hex-digit word is a compressed key, none is 130 (uncompressed).
+  (let ((i 0) (n (length text)))
+    (loop while (< i n)
+          do (if (word-char-p (char text i))
+                 (let ((start i))
+                   (loop while (and (< i n) (word-char-p (char text i))) do (incf i))
+                   (let ((v (key-word-violation (subseq text start i))))
+                     (when v (return-from descriptor-violation v))))
+                 (incf i))))
+  (handler-case
+      (let* ((*duplicate-name* nil) (d (parse-descriptor text)) (body (getf d :body))
+             (names (mapcar #'car (getf d :constants))))
+        (if *duplicate-name*
+            (format nil "name `~a` is bound twice" *duplicate-name*)
+            (when body
+              (or (polarity-violation body t)
+                  (let ((u (term-unresolved body names))) (when u (format nil "name `~a` does not resolve" u)))
+                  (thresh-violation body)))))
+    (eval-error (e) (detail e))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Canonical bytes (DEP-17)

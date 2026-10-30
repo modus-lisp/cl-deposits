@@ -700,6 +700,7 @@
     ;; ADVERSARY :sign-invalid — an operator that asks its quorum to cosign an
     ;; operation its own validator rejects (red team #1).
     (unless (or (getf (node-adversary node) :sign-invalid) (getf (node-adversary node) :omit-commitments))
+      (let ((why (cf:descriptor-refusal (record-ledger rec) op))) (when why (fail "~a" why)))
       (lg:speculate (record-ledger rec) op (max height (if (tip rec) (up:update-block-height (tip rec)) 0))
                     (1+ (lg:ledger-sequence (record-ledger rec)))))
     (let ((update (new-update node rec op :height height)))
@@ -1568,7 +1569,9 @@
                  ;; ADVERSARY :cosign-blind — a member that signs whatever chains (red team #1).
                  (unless (getf (node-adversary node) :cosign-blind)
                    ;; Depositor authorization, nonce window, expiry: at the height we sign.
-                   (let ((v (cf:violation (record-ledger rec) o block-height))) (when v (fail "~a" v)))
+                   (let ((v (or (cf:violation (record-ledger rec) o block-height)
+                                (cf:descriptor-refusal (record-ledger rec) o))))
+                     (when v (fail "~a" v)))
                    (lg:speculate (record-ledger rec) o block-height seq))
                  (multiple-value-bind (required signers tier operator-alone allowed)
                      (lg:cosign-requirement ledger o block-height)

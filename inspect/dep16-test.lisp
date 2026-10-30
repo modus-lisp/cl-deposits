@@ -36,7 +36,7 @@
 
 (with-gate ("dep16: parser and evaluator beyond the vectors")
   (let* ((priv 123456789) (pub (up:compressed-pubkey (tk priv)))
-         (d (d16:parse-descriptor (format nil "wsh(with(K = ~a, cap = 1000, in and(pk(K), amount_at_most(cap), older(10))))" (u:bytes->hex pub))))
+         (d (d16:parse-descriptor (format nil "wsh(with(k = ~a, cap = 1000, in and(pk(k), amount_at_most(cap), older(10))))" (u:bytes->hex pub))))
          (op (d16:make-operation :deposit-id (make-array 32 :element-type '(unsigned-byte 8)) :op-type "spend"
                                  :args '(("amount" . (:int 500)) ("kind" . (:symbol "invoice")))))
          (st (d16:make-snapshot :balance 10000 :blocks-since-activity 12 :height 500))
