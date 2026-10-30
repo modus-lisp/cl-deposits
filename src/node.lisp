@@ -745,11 +745,15 @@
   "How much of the history a consent request carries: the reference's nostr client drops any
    event over 70 KB (~70 updates), and it needs LedgerOpen; the rest is gap-filled from the relay.")
 
-(defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) (ruleset lg:+current-ruleset+) (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016) dispute-response-blocks dormancy-blocks dormancy-notice-blocks)
+(defun add-member (node rec member-pubkey &key member-ledger-id (membership-blocks 4320) ruleset (min-fee-bps 0) (min-fee-fixed 0) (max-fee-period 2016) dispute-response-blocks dormancy-blocks dormancy-notice-blocks)
   "Ask MEMBER-PUBKEY to join REC's quorum; on consent, stage them with QuorumAddMember.
    The request is addressed (tag l) to MEMBER-LEDGER-ID — the member's own ledger —
    as the reference does; its nodes only answer requests for ledgers they operate."
   (let* ((until (+ (height node) membership-blocks))
+         (ruleset (or ruleset (let ((l (record-ledger rec)))   ; DEP-18 §operator policy, LG:PROPOSED-RULESET
+                                (lg:proposed-ruleset (or (lg:ledger-active-ruleset l)
+                                                         (and (null (lg:ledger-quorum-members l)) lg:+current-ruleset+))
+                                                     (lg:member-declaration l member-pubkey)))))
          ;; Only a PREFIX of the history rides along.  At 46k updates the whole
          ;; of it is ~60 MB of base64 in one event — no relay carries that.  The
          ;; reference member insists on seeing LedgerOpen (it validates the

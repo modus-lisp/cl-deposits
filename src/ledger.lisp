@@ -30,7 +30,7 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:quorum-expiry-ok-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger
+           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:proposed-ruleset #:member-declaration #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger
            #:speculate #:fill-balance-commitments #:commitment-targets))
 (in-package #:cl-deposits.ledger)
 
@@ -116,6 +116,28 @@
         ((not (equal (reserves-family to) (reserves-family from))) :family)
         ((not (every-declares-p to declarations)) :unsupported)
         (t :ok)))
+
+(defun proposed-ruleset (current declaration)
+  "DEP-18 §operator policy: the ruleset a consent request proposes to one member.  A proposal is
+   not the QuorumBegin's choice (that is PLANNED-RULESET over every member's fresh declaration),
+   and a member may refuse a proposal it does not support, as releases before
+   balance-anchor-v6 do.  So the operator proposes only what the member is known to support:
+   the policy target for that member when its last signed DECLARATION (a list of names, NIL if
+   none is known) lists it, otherwise the ledger's CURRENT ruleset, else cltv-offset-v2.  Without
+   this, an upgraded operator proposed balance-anchor-v6 to members still on an older release,
+   which refused, and its rotation failed for as long as the versions were mixed (signet soak,
+   2026-10-30, ledgers G and I)."
+  (let ((target (and declaration (planned-ruleset current (list declaration)))))
+    (cond ((and target (member target declaration :test #'equal)) target)
+          (current current)
+          (t "cltv-offset-v2"))))
+
+(defun member-declaration (ledger pubkey)
+  "The rulesets PUBKEY last declared to LEDGER (a staged member's response, else a seated one's);
+   NIL when none is known."
+  (let ((m (or (find pubkey (ledger-next-quorum-members ledger) :key #'member-pubkey :test #'equalp)
+               (find pubkey (ledger-quorum-members ledger) :key #'member-pubkey :test #'equalp))))
+    (and m (member-supported-rulesets m))))
 
 (defun planned-ruleset (current declarations)
   "DEP-18 §operator policy, not consensus: the ruleset an operator names at its next QuorumBegin.

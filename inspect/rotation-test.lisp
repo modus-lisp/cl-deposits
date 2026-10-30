@@ -840,5 +840,7 @@
                         (check-equal line (v (lg:upgrade-verdict (rs (second w)) (third w) (decls (fourth w)))) (fifth w)))
                        ((string= (first w) "plan")
                         (check-equal line (lg:planned-ruleset (rs (second w)) (decls (third w))) (fourth w)))
+                       ((string= (first w) "propose")
+                        (check-equal line (lg:proposed-ruleset (rs (second w)) (first (decls (third w)))) (fourth w)))
                        (t (check (format nil "unknown case ~a" line) nil))))))
-      (check-equal "ruleset_naming cases" n 31))))
+      (check-equal "ruleset_naming cases" n 41))))
