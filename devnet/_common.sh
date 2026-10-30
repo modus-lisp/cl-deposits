@@ -186,7 +186,9 @@ stop_ref() {   # and wait for it to exit: a start while the old daemon still shu
 # deploy never restart the same node at once.
 restart_node() {
   local n=$1; ( flock -w 1800 9 || { echo "$n: restart lock busy" >&2; exit 1; }
-    case "$n" in cld*) stop_cld "$n"; sleep 5; start_cld "$n";; ref*) stop_ref "$n"; sleep 5; start_ref "$n";; esac ) 9>"$(node_dir "$n")/restart.lock"
+    # 9>&-: the daemon start_* spawns must not inherit the lock, or it holds it for life and the
+    # node's next restart waits forever (every switched node did, 2026-10-30).
+    case "$n" in cld*) stop_cld "$n" 9>&-; sleep 5; start_cld "$n" 9>&-;; ref*) stop_ref "$n" 9>&-; sleep 5; start_ref "$n" 9>&-;; esac ) 9>"$(node_dir "$n")/restart.lock"
 }
 
 ESPLORA_PORT="${ESPLORA_PORT:-$([ "$CLD_CHAIN" = regtest ] && echo 3012 || echo 3002)}"
