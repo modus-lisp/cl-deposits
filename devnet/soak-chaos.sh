@@ -8,6 +8,6 @@ while true; do
   sleep "$EVERY"
   n=${NODES[$((ci % ${#NODES[@]}))]}; ci=$((ci+1)); t0=$(date +%s)
   echo "$(date +%FT%T) restarting $n"
-  case "$n" in cld*) stop_cld "$n"; sleep 5; start_cld "$n";; ref*) stop_ref "$n"; sleep 5; start_ref "$n";; esac
-  echo "$(date +%FT%T) $n back after $(( $(date +%s) - t0 ))s"
+  restart_node "$n"   # under the node's restart lock (a deploy may be switching it), onto the version it runs
+  echo "$(date +%FT%T) $n back after $(( $(date +%s) - t0 ))s  $(node_version "$n")"
 done

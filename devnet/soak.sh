@@ -207,6 +207,8 @@ stop() { for f in "$SOAK"/pids/*; do [ -f "$f" ] || continue; p=$(cat "$f"); kil
 status() {
   for f in "$SOAK"/pids/*; do [ -f "$f" ] && printf '%-9s %s\n' "$(basename "$f")" "$(alive "$(basename "$f")" && echo running || echo STOPPED)"; done
   echo; [ -f "$SOAK/status.txt" ] && cat "$SOAK/status.txt"
+  echo; echo "versions (version file / running):"; versions_report
+  [ -f "$SOAK/deploy/plan.tsv" ] && { echo; "$(dirname "$0")/soak-deploy.sh" --status; }
 }
 case "${1:-}" in
   setup) setup;; fund-cl) fund_cl_collateral;; start) start;; stop) stop;; status) status;;

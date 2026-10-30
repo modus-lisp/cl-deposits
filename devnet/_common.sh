@@ -95,6 +95,35 @@ fi
 # regtest runs its own build (a rebuild for the signet devnet never pulls the binary from under it)
 DEPOSITS_RUST="${DEPOSITS_RUST:-$([ "$CLD_CHAIN" = regtest ] && echo /mnt/lisp/cargo-target/regtest-net/release || echo /mnt/lisp/cargo-target/signet/release)}"   # out-of-tree builds; the soak runs these
 REF_NODE_BIN="$DEPOSITS_RUST/deposits-node"; REF_WALLET_BIN="$DEPOSITS_RUST/deposits-wallet"
+# Versioned builds (devnet/soak-deploy.sh).  A node whose data dir holds a `version` file runs the
+# build that file names, immutable and side by side with every other: cl from the worktree
+# $CL_BUILDS/cl-$CLD_CHAIN-<sha>, the reference from $RUST_BUILDS/<sha>/.  Without the file a node
+# runs the defaults above ($CLD_SRC, $DEPOSITS_RUST).  start_cld/start_ref read it on every start,
+# so a chaos restart keeps a node on the version it was deployed to.
+CL_BUILDS="${CL_BUILDS:-/mnt/lisp/wt}"
+RUST_BUILDS="${RUST_BUILDS:-/mnt/lisp/cargo-target/$CLD_CHAIN-bin}"
+node_dir()     { case "$1" in cld*) echo "$CLD_ROOT/$1";; ref*) echo "$CLD_ROOT/$1";; esac; }
+node_version() { cat "$(node_dir "$1")/version" 2>/dev/null; }
+cl_build()     { echo "$CL_BUILDS/cl-$CLD_CHAIN-$1"; }
+rust_build()   { echo "$RUST_BUILDS/$1"; }
+cld_src_of()   { local v; v=$(node_version "$1"); if [ -n "$v" ]; then cl_build "$v"; else echo "$CLD_SRC"; fi; }
+ref_bin_of()   { local v; v=$(node_version "$1"); if [ -n "$v" ]; then echo "$(rust_build "$v")/deposits-node"; else echo "$REF_NODE_BIN"; fi; }
+live_build()   {   # what a running node actually runs: its cl worktree (the daemon's cwd) or its reference binary's dir
+  local p; case "$1" in cld*) p=$(cld_pid "$1");; ref*) p=$(ref_pid "$1");; esac; [ -n "$p" ] && kill -0 "$p" 2>/dev/null || return 1
+  case "$1" in cld*) readlink "/proc/$p/cwd";; ref*) dirname "$(readlink "/proc/$p/exe" | sed 's/ (deleted)$//')";; esac
+}
+live_version() {   # the version (build sha) a running node runs, "down", or default(<path>) for an unversioned build
+  local b; b=$(live_build "$1") || { echo down; return; }
+  case "$b" in "$CL_BUILDS/cl-$CLD_CHAIN-"*) echo "${b##*-}";; "$RUST_BUILDS/"*) basename "$b";; *) echo "default($b)";; esac
+}
+versions_report() {   # one line per node (version file / what runs), then the mix
+  local n v l; declare -A mix=()
+  for n in $(cld_names) $(ref_names); do v=$(node_version "$n"); l=$(live_version "$n")
+    printf '  %-6s %-10s %s%s\n' "$n" "${v:-(none)}" "$l" "$([ -n "$v" ] && [ "$v" != "$l" ] && echo '   <- differs')"
+    mix["${n%%[0-9]*}:$l"]=$(( ${mix["${n%%[0-9]*}:$l"]:-0} + 1 ))
+  done
+  printf '  mix:'; for k in "${!mix[@]}"; do printf ' %s=%s' "$k" "${mix[$k]}"; done; echo
+}
 ref_names() { for e in "${REF_NODES[@]}"; do echo "${e%%:*}"; done; }
 ref_port()  { for e in "${REF_NODES[@]}"; do [ "${e%%:*}" = "$1" ] && echo "${e##*:}" && return; done; return 1; }
 ref_dir()   { echo "$CLD_ROOT/$1"; }
@@ -102,7 +131,7 @@ ref_pid()   { pgrep -nf "deposits-node run .*--data-dir $(ref_dir "$1") " 2>/dev
 ref_running(){ local p; p=$(ref_pid "$1") && [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
 ref_env()   { echo "LIGHTNING_BACKEND=none CHAIN_BACKEND=bitcoind BITCOIND_RPC_URL=http://127.0.0.1:${BITCOIN_RPC_PORT:-38332} BITCOIND_COOKIE_FILE=$BITCOIN_DATADIR/$CLD_CHAIN/.cookie DEPOSITS_STACK_DUMP=1"; }   # SIGUSR2 dumps a stack (a stalled node)
 # ref_cli NAME CMD ARGS...  — the reference CLI against NAME's data dir (the daemon may be running; the CLI reaches it over the relay)
-ref_cli()   { local n=$1; shift; env $(ref_env) RUST_LOG=error "$REF_NODE_BIN" "$@" --network "$CLD_CHAIN" --esplora "$ESPLORA_URL" --relay "$RELAY_URL" --data-dir "$(ref_dir "$n")" 2>&1 | grep -vE '^\S*\[[0-9]m|^\[2m' ; }
+ref_cli()   { local n=$1; shift; env $(ref_env) RUST_LOG=error "$(ref_bin_of "$n")" "$@" --network "$CLD_CHAIN" --esplora "$ESPLORA_URL" --relay "$RELAY_URL" --data-dir "$(ref_dir "$n")" 2>&1 | grep -vE '^\S*\[[0-9]m|^\[2m' ; }
 # The protocol identity (operator/cosigner key) is NOT the Nostr key: it is what `quorum show-identity` prints.
 ref_pubkey(){ ref_cli "$1" quorum show-identity | sed -nE 's/^ *pubkey: *([0-9a-f]{66}).*/\1/p' | head -1; }
 ref_ledger(){ ref_cli "$1" quorum show-identity | sed -nE 's/^ *([0-9a-f]{66}):([0-9a-f]{64}).*/\2/p' | head -1; }   # its first own ledger
@@ -128,7 +157,8 @@ start_ref() {
   ref_running "$n" && { echo "$n already running"; return 0; }
   [ -f "$dir/seed.hex" ] || head -c 32 /dev/urandom | xxd -p -c 64 >"$dir/seed.hex"
   local from=$(( $(stat -c %s "$dir/node.log" 2>/dev/null || echo 0) + 1 ))   # the log is ~1 GB: grep only this run's part
-  ( cd "$dir" && setsid -f nohup env $(ref_env) "$REF_NODE_BIN" run --network "$CLD_CHAIN" --relay "$RELAY_URL" --esplora "$ESPLORA_URL" \
+  local bin; bin=$(ref_bin_of "$n"); [ -x "$bin" ] || { echo "$n: no build at $bin (version $(node_version "$n"))" >&2; return 1; }
+  ( cd "$dir" && setsid -f nohup env $(ref_env) "$bin" run --network "$CLD_CHAIN" --relay "$RELAY_URL" --esplora "$ESPLORA_URL" \
       --data-dir "$dir" --seed-file "$dir/seed.hex" --name "$n" --admin-bind "127.0.0.1:$(ref_port "$n")" >>"$dir/node.log" 2>&1 </dev/null
     sleep 1; pgrep -nf "deposits-node run .*--data-dir $dir " >"$dir/ref.pid" )
   # A soaked node loads ~180k updates per ledger before it syncs its wallet: minutes, not seconds.
@@ -142,13 +172,22 @@ ref_begin_quorum() {
   addr=$(ref_cli "$n" ledger address "$l" | grep -oE '(tb1|bcrt1)[0-9a-z]+' | head -1) || return 1
   wcli sendtoaddress "$addr" 0.5 >/dev/null && mine 3 && sleep 45     # the reference wallet syncs through the shim on a timer
   for i in 1 2 3 4 5 6; do
-    out=$(timeout 120 "$REF_NODE_BIN" quorum begin "$l" --collateral-ratio "$ratio" --network "$CLD_CHAIN" --esplora "$ESPLORA_URL" --relay "$RELAY_URL" --data-dir "$(ref_dir "$n")" 2>&1 | grep -vE '^\S*\[[0-9]m|^\[2m')
+    out=$(timeout 120 "$(ref_bin_of "$n")" quorum begin "$l" --collateral-ratio "$ratio" --network "$CLD_CHAIN" --esplora "$ESPLORA_URL" --relay "$RELAY_URL" --data-dir "$(ref_dir "$n")" 2>&1 | grep -vE '^\S*\[[0-9]m|^\[2m')
     echo "$out" | grep -qi 'No response' || { echo "$out" | tail -1; return 0; }
     mine 1; sleep 15
   done
   echo "quorum begin on $l did not complete" >&2; return 1
 }
-stop_ref() { local p; p=$(ref_pid "$1") || return 0; [ -n "$p" ] && kill "$p" 2>/dev/null && echo "$1 stopped"; rm -f "$(ref_dir "$1")/ref.pid"; }
+stop_ref() {   # and wait for it to exit: a start while the old daemon still shuts down saw it "already running"
+  local p i; p=$(ref_pid "$1") || return 0; [ -n "$p" ] && kill "$p" 2>/dev/null && echo "$1 stopped"; rm -f "$(ref_dir "$1")/ref.pid"
+  [ -n "$p" ] && for i in $(seq 1 60); do kill -0 "$p" 2>/dev/null || return 0; sleep 1; done; [ -n "$p" ] && kill -9 "$p" 2>/dev/null; return 0
+}
+# restart_node NAME — stop and start one node under its restart lock, so the chaos loop and a
+# deploy never restart the same node at once.
+restart_node() {
+  local n=$1; ( flock -w 1800 9 || { echo "$n: restart lock busy" >&2; exit 1; }
+    case "$n" in cld*) stop_cld "$n"; sleep 5; start_cld "$n";; ref*) stop_ref "$n"; sleep 5; start_ref "$n";; esac ) 9>"$(node_dir "$n")/restart.lock"
+}
 
 ESPLORA_PORT="${ESPLORA_PORT:-$([ "$CLD_CHAIN" = regtest ] && echo 3012 || echo 3002)}"
 ESPLORA_URL="http://127.0.0.1:$ESPLORA_PORT"
@@ -189,9 +228,10 @@ start_cld() {
   cld_running "$n" && { echo "$n already running"; return 0; }
   (echo >/dev/tcp/127.0.0.1/$(cld_port "$n")) 2>/dev/null && { echo "$n: control port $(cld_port "$n") already bound by another process; stop_cld first" >&2; return 1; }
   local lnenv=(); [ "$n" = cld1 ] && lnenv=("CLD_LN_CONTROL=$CLD_LN_CONTROL")
-  ( cd "$CLD_SRC" && exec setsid -f nohup env CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=$CLD_CHAIN \
+  local src; src=$(cld_src_of "$n"); [ -f "$src/bin/cl-deposits.lisp" ] || { echo "$n: no build at $src (version $(node_version "$n"))" >&2; return 1; }
+  ( cd "$src" && exec setsid -f nohup env CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=$CLD_CHAIN \
       CLD_BITCOIN_CLI="$BCLI" CLD_MIN_CONFS=1 "${lnenv[@]}" \
-      CL_SOURCE_REGISTRY="$(cld_registry)" \
+      CL_SOURCE_REGISTRY="$(cld_registry "$src")" \
       "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --dynamic-space-size "${CLD_HEAP_MB:-32768}" --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 ) </dev/null >/dev/null 2>&1
       # setsid -f: the node is its own session leader, reparented to init, and no wrapper
       # shell survives as its parent.  A surviving wrapper carried its caller's argv, so
