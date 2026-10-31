@@ -73,6 +73,15 @@ Status: next.
 | Dust exits and policy exits designed to cost the operator fees | idea | DEP-20 / DEP-21: exits pay their own fees |
 | Mass dormancy or migration storms | idea | |
 
+## Proofs from replayed state (DEP-22 draft)
+
+| Attack | Status | Notes |
+|---|---|---|
+| A judge with corrupted state (double apply, gap, wrong baseline) publishing a proof that looks real | have (incidents) | Oct 30 23:33Z on F, Oct 31 fee baseline. Inject with a switch that perturbs one replica's state; expect refusals, never proofs |
+| An operator whose item pointer skips an update (to hide a debit) | idea | DEP-22 item fork proof |
+| An operator committing a wrong snapshot root when moving to v7 | idea | The last replay-judged conviction under DEP-22 |
+| An operator pointing an item at an update on another branch | idea | Should surface as Equivocation |
+
 ## Infrastructure attacks
 
 | Attack | Status | Notes |
