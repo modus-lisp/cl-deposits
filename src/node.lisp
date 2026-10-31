@@ -70,6 +70,11 @@
   last-event-id                                ; Nostr id of the last update we published
   (persisted 0)                                ; how many history entries the file on disk holds (append-only save)
   (append-lock (bt:make-lock "append"))        ; one append at a time per owned ledger, cosign wait included
+  ;; One writer at a time on a replica: the replica lane, a cosign or consent request and a
+  ;; rotation check each caught up the same record from their own threads, applied the same
+  ;; update twice, and the doubled balance read as a cl operator's BalanceCommitmentMismatch
+  ;; (signet soak, 2026-10-30).  Recursive: catch-up applies through ACCEPT-UPDATE.
+  (apply-lock (sb-thread:make-mutex :name "replica apply"))
   preimage lottery confiscation                ; our lottery secret; the built lottery; the confiscation tx
   rotation                                     ; broadcast rotation awaiting its QuorumBegin (plist; persisted)
   (offers (make-hash-table :test #'equalp))    ; DEP-10 funding offers we made: offer id -> plist
@@ -1296,7 +1301,11 @@
                     (log! node "fork of ~a by ~a at seq ~a" (subseq id 0 8) (subseq (bytes->hex signer) 0 8) (op:field o :last-valid-sequence)))))))))))
 
 (defun accept-update (node rec update)
-  "Validate an operator's update against our replica and apply it."
+  "Validate an operator's update against our replica and apply it, one writer at a time."
+  (sb-thread:with-recursive-lock ((record-apply-lock rec))
+    (%accept-update node rec update)))
+
+(defun %accept-update (node rec update)
   (let ((ledger (record-ledger rec)) (op (op:decode-operation (up:update-message update))))
     (unless (up:verify-operator-signature update) (fail "bad operator signature at seq ~a" (up:update-seq update)))
     (when (and (record-fork-p rec) (not (equalp (up:update-operator-id update) (record-fork-operator rec))))
@@ -1318,7 +1327,7 @@
                      (broadcast-fraud node (fr:make-equivocation-proof (up:update-operator-id update) (up:update-ledger-id update) ours update)))
               (log! node "ignored an update on ~a at seq ~a that is not on its chain (another ledger's, relabelled?)"
                     (subseq (record-id-hex rec) 0 8) (up:update-seq update)))))
-      (return-from accept-update :echo))
+      (return-from %accept-update :echo))
     (multiple-value-bind (required signers tier operator-alone allowed)
         (lg:cosign-requirement ledger op (up:update-block-height update))
       (declare (ignore tier operator-alone))
@@ -1377,13 +1386,16 @@
   "A replica that missed an update (a restart, a relay that dropped us) can never
    apply another: every later one fails 'expected seq N'.  Fetch the operator's
    chain past our sequence and apply it in order.  Returns how many applied."
+  (sb-thread:with-recursive-lock ((record-apply-lock rec)) (%catch-up node rec)))
+
+(defun %catch-up (node rec)
   (let ((ledger (record-ledger rec)) (n 0) (from (lg:ledger-sequence (record-ledger rec))) (window 200))
     ;; The operator's next update was already refused by the rules (reported and
     ;; disputed then): nothing past it can chain onto our tip.  Every later update
     ;; showed a gap and sent us back into the same refusal, logged each time.
     (when (or (eql (gethash (record-id-hex rec) (node-refused node)) (1+ (lg:ledger-sequence ledger)))
               (lagging-p node (record-id-hex rec)))
-      (return-from catch-up 0))
+      (return-from %catch-up 0))
     ;; Windows of WINDOW sequences past our tip, until a window adds nothing.
     (loop
       (let* ((lo (1+ (lg:ledger-sequence ledger))) (hi (+ lo window -1)) (applied 0)
@@ -1412,6 +1424,9 @@
   "Another member's dispute fork past whose tip an update arrived (or, at startup, any it
    published while we were down): apply that operator's updates from the relays, in order,
    to UPTO (default 200 past our tip).  Returns how many applied."
+  (sb-thread:with-recursive-lock ((record-apply-lock fork)) (%catch-up-fork node fork upto)))
+
+(defun %catch-up-fork (node fork upto)
   (let* ((ledger (record-ledger fork)) (lo (1+ (lg:ledger-sequence ledger))) (n 0))
     (dolist (u (handler-case (ledger-updates-from-relays node (record-id-hex fork) :from lo :to (or upto (+ lo 199)))
                  (error (e) (log! node "fork catch-up on ~a: fetch failed: ~a" (subseq (record-id-hex fork) 0 8) e) '()))
@@ -4774,6 +4789,25 @@
 
 ;;; Fraud broadcasts (Kind 9101): verify, and if we are a member, dispute.
 
+(defun repair-replica (node rec)
+  "Rebuild REC's state from its history, one update per sequence along the chain, and forget
+   the refusal, so catch-up resumes.  For a replica whose state disagrees with a replay."
+  (sb-thread:with-recursive-lock ((record-apply-lock rec))
+    (let* ((seen (make-hash-table)) (chain '()))
+      (dolist (u (reverse (record-history rec)))
+        (unless (gethash (up:update-seq u) seen)
+          (setf (gethash (up:update-seq u) seen) t) (push u chain)))
+      (let ((chron (reverse chain)))
+        (setf (record-ledger rec) (lg:replay chron)
+              (record-history rec) chain
+              (record-checkpoints rec) '()
+              (record-persisted rec) 0)        ; the next save rewrites the file
+        (index-record rec))
+      (remhash (record-id-hex rec) (node-refused node))
+      (save-record node rec)
+      (log! node "repaired ~a: replayed ~a updates to seq ~a" (subseq (record-id-hex rec) 0 8)
+            (length chain) (lg:ledger-sequence (record-ledger rec))))))
+
 (defun report-non-conforming (node rec update condition)
   ;; ADVERSARY :ignore-fraud — a passive derelict member: it refuses the bad update
   ;; (never applies it) but takes no dispute action, self-detected or received.
@@ -4791,6 +4825,16 @@
                (not (live-fork node id (node-pubkey node))))
       (log! node "NON-CONFORMING cosigned update on ~a at seq ~a: ~a" (subseq id 0 8) (up:update-seq update) condition)
       (let ((proof (fr:make-non-conforming-update-proof (up:update-operator-id update) (up:update-ledger-id update) update)))
+        ;; A proof is what every verifier will judge, so judge it first as they will: from a
+        ;; replay of the history, not from the replica that refused the update.  A replica can be
+        ;; wrong (an update applied twice); a replay that accepts the update means the fault is
+        ;; ours.  Repair the replica and accuse no one.
+        (multiple-value-bind (ok why) (ignore-errors (fr:verify-proof proof :history (reverse (record-history rec))))
+          (unless ok
+            (log! node "NOT REPORTED: our replica of ~a refused seq ~a (~a) but a replay of its history accepts it (~a): repairing the replica"
+                  (subseq id 0 8) (up:update-seq update) condition why)
+            (repair-replica node rec)
+            (return-from report-non-conforming nil)))
         (broadcast-fraud node proof)
         (broadcast-cosigner-contagion node rec update)
         (when (and (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
