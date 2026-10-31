@@ -176,20 +176,20 @@
       (update-opens-ledger-p u ledger-id)
       (nth-value 1 (gethash (up:update-prev-hash u) bound))))
 
-(defun operator-at (history seq)
+(defun operator-at (history seq &optional (prefix-ledger-fn #'lg:replay))
   "The key that operates the ledger at sequence SEQ: the fold of HISTORY's
    updates before SEQ (custody can change hands), or NIL when HISTORY does not
    reach SEQ.  For SEQ 0, whoever the genesis LedgerOpen names."
   (let ((prefix (sort (remove-if-not (lambda (u) (< (up:update-seq u) seq)) (copy-list history)) #'< :key #'up:update-seq)))
     (cond ((zerop seq) :genesis)
           ((/= (length prefix) seq) nil)
-          (t (ignore-errors (lg:ledger-operator-key (lg:replay prefix)))))))
+          (t (ignore-errors (lg:ledger-operator-key (funcall prefix-ledger-fn prefix)))))))
 
-(defun accused-operates-p (accused-hex history seq)
+(defun accused-operates-p (accused-hex history seq &optional (prefix-ledger-fn #'lg:replay))
   "Only the ledger's operator's equivocation or non-conforming update is fraud on
    the ledger.  A quorum member can sign anything under the ledger's id, chained
    onto its tip; accusing itself, it froze an honest operator's ledger."
-  (let ((key (operator-at history seq)))
+  (let ((key (operator-at history seq prefix-ledger-fn)))
     (or (eq key :genesis) (and key (string= (bytes->hex key) accused-hex)))))
 
 (defun verify-equivocation (proof history)
@@ -232,13 +232,15 @@
           ((/= claimed actual) (values nil "claimed expiry does not match the ledger's QuorumBegin"))
           (t (values t nil)))))
 
-(defun verify-non-conforming-update (proof history)
+(defun verify-non-conforming-update (proof history &key (prefix-ledger-fn #'lg:replay))
   "HISTORY is the ledger's canonical chain.  The fault update must be signed by
    the accused and bound to this ledger (it opens it, or its previous_hash names
    one of its updates), and then either follow an update other than its
    predecessor (a rewind or a skip) or chain onto the predecessor and fail to
    apply.  A previous_hash that names nothing here is not proof: it may be an
-   honest update of another ledger the same key operates, relabelled."
+   honest update of another ledger the same key operates, relabelled.
+   PREFIX-LEDGER-FN builds the ledger after the fault's predecessor from the prefix of HISTORY
+   (default: a replay from genesis; a node passes one that starts from its replayed checkpoints)."
   (handler-case
       (let* ((fault (up:decode-update (hex->bytes (e proof :fault-update-hex))))
              (seq (up:update-seq fault))
@@ -248,7 +250,7 @@
              (prefix-ledger nil))
        (flet ((prefix-enforces-p (rule)
                 (declare (ignore rule))
-                (lg:signed-header-applies-p (or prefix-ledger (setf prefix-ledger (lg:replay prefix))) fault)))
+                (lg:signed-header-applies-p (or prefix-ledger (setf prefix-ledger (funcall prefix-ledger-fn prefix))) fault)))
         (cond ((not (string= (bytes->hex (up:update-operator-id fault)) (getf proof :accused)))
                (values nil "accused is not the signer"))
               ((not (string= (bytes->hex id) (getf proof :ledger-id))) (values nil "ledger id mismatch"))
@@ -257,7 +259,8 @@
               ;; (a skip claims a later sequence than any the verifier holds).
               ((not (accused-operates-p (getf proof :accused) history
                                         (let ((pred (and (plusp seq) (gethash (up:update-prev-hash fault) bound))))
-                                          (if pred (1+ pred) seq))))
+                                          (if pred (1+ pred) seq))
+                                        prefix-ledger-fn))
                (values nil "the accused does not operate the ledger at that sequence"))
               ((/= seq (e proof :fault-sequence)) (values nil "sequence mismatch"))
               ((not (update-binds-to-ledger-p fault id bound))
@@ -274,7 +277,7 @@
               (t
                ;; It chains onto its predecessor, so it must break a rule: the fold's,
                ;; or the depositor's (authorization, nonce window, expiry).
-               (let* ((l (lg:replay prefix))
+               (let* ((l (funcall prefix-ledger-fn prefix))
                       (v (cf:violation l (op:decode-operation (up:update-message fault)) (up:update-block-height fault))))
                  (if v
                      (values t v)
@@ -282,7 +285,7 @@
                        (lg:ledger-error (c) (values t (princ-to-string c))))))))))
     (error (c) (values nil (princ-to-string c)))))
 
-(defun verify-non-conforming-cosignature (proof fault-history)
+(defun verify-non-conforming-cosignature (proof fault-history &key (prefix-ledger-fn #'lg:replay))
   "FAULT-HISTORY is the fault ledger's chain before the fault.  The accused signed
    the fault update: as its operator (DEP-19 §5: the accused 'MUST appear on the
    update as operator_id or in cosignatures'; operator contagion), or with a valid
@@ -304,7 +307,7 @@
               ;; NonConformingUpdate judgement below).
               (operator-p (verify-non-conforming-update
                            (make-non-conforming-update-proof (up:update-operator-id fault) (up:update-ledger-id fault) fault)
-                           fault-history))
+                           fault-history :prefix-ledger-fn prefix-ledger-fn))
               ((null cosig) (values nil "the accused did not cosign the fault"))
               ((not (up:verify-cosignature fault cosig)) (values nil "the accused's cosignature does not verify"))
               ((not (and qb-op (eq (op:operation-type qb-op) :quorum-begin) (<= qb-seq seq)))
@@ -313,7 +316,7 @@
                (values nil "the governing QuorumBegin does not name the accused"))
               (t (verify-non-conforming-update
                   (make-non-conforming-update-proof (up:update-operator-id fault) (up:update-ledger-id fault) fault)
-                  fault-history))))
+                  fault-history :prefix-ledger-fn prefix-ledger-fn))))
     (error (c) (values nil (princ-to-string c)))))
 
 ;;; DEP-19 §6 dereliction.  The proof binds to a real fraud (the original proof is carried and
@@ -914,11 +917,11 @@
                   (t (values t nil)))))))
     (error (c) (values nil (princ-to-string c)))))
 
-(defun verify-proof (proof &key history height-of-block)
+(defun verify-proof (proof &key history height-of-block (prefix-ledger-fn #'lg:replay))
   (case (getf proof :type)
     (:equivocation (verify-equivocation proof history))
     (:quorum-expired (verify-quorum-expired proof history height-of-block))
-    (:non-conforming-update (verify-non-conforming-update proof history))
+    (:non-conforming-update (verify-non-conforming-update proof history :prefix-ledger-fn prefix-ledger-fn))
     (:dispute-dereliction (values nil "dereliction needs the defrauded ledger: verify-dispute-dereliction"))
     (:unhonoured-obligation (verify-unhonoured-obligation proof history height-of-block))
     (:uncredited-onchain-payment

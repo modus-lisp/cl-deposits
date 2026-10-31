@@ -30,7 +30,7 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:quorum-expiry-ok-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:proposed-ruleset #:member-declaration #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger
+           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:proposed-ruleset #:member-declaration #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger #:encode-state #:decode-state #:state-digest
            #:speculate #:fill-balance-commitments #:commitment-targets))
 (in-package #:cl-deposits.ledger)
 
@@ -1151,6 +1151,79 @@
                           (let ((n (sb-mop:slot-definition-name slot)))
                             (setf (slot-value c n) (deep-copy (slot-value c n)))))))
     (t x)))
+
+(defun encode-state (x)
+  "A canonical text for X (a ledger or anything inside one): hash tables sorted by their
+   encoded keys, so two ledgers in the same state encode to the same string whatever order
+   they were built in.  DECODE-STATE reads it back.  Used to compare a ledger kept up to date
+   update by update against one replayed from a checkpoint, and to persist checkpoints."
+  (with-output-to-string (out) (%encode-state x out)))
+
+(defun %encode-state (x out)
+  (typecase x
+    (null (write-string "()" out))                       ; read under the KEYWORD package, "NIL" would be :NIL
+    ((eql t) (write-string "(:Y \"COMMON-LISP\" \"T\")" out))
+    (keyword (prin1 x out))
+    (symbol (format out "(:Y ~s ~s)" (package-name (symbol-package x)) (symbol-name x)))
+    ((or integer ratio float) (prin1 x out))
+    (string (prin1 (coerce x 'simple-string) out))
+    ((array (unsigned-byte 8) (*)) (format out "(:B ~s)" (bytes->hex x)))
+    (cons (write-string "(:L" out)
+          (loop for tail = x then (cdr tail)
+                do (write-char #\Space out) (%encode-state (car tail) out)
+                while (consp (cdr tail))
+                finally (when (cdr tail) (write-string " :DOT " out) (%encode-state (cdr tail) out)))
+          (write-char #\) out))
+    (hash-table
+     (format out "(:H ~s" (symbol-name (hash-table-test x)))
+     (dolist (e (sort (loop for k being the hash-keys of x using (hash-value v)
+                            collect (cons (encode-state k) (encode-state v)))
+                      #'string< :key #'car))
+       (format out " ~a ~a" (car e) (cdr e)))
+     (write-char #\) out))
+    (vector (write-string "(:V" out)
+            (loop for e across x do (write-char #\Space out) (%encode-state e out))
+            (write-char #\) out))
+    (structure-object
+     (let ((class (class-of x)))
+       (format out "(:S ~s ~s" (package-name (symbol-package (class-name class))) (symbol-name (class-name class)))
+       (dolist (slot (sb-mop:class-slots class))
+         (let ((n (sb-mop:slot-definition-name slot)))
+           (write-char #\Space out) (prin1 (symbol-name n) out)
+           (write-char #\Space out) (%encode-state (slot-value x n) out)))
+       (write-char #\) out)))
+    (t (error "encode-state: cannot encode ~s" (type-of x)))))
+
+(defun decode-state (string)
+  "The value ENCODE-STATE encoded as STRING."
+  (labels ((sym (pkg name) (or (find-symbol name (or (find-package pkg) (error "no package ~a" pkg)))
+                               (error "no symbol ~a::~a" pkg name)))
+           (dec (f)
+             (if (atom f) f
+                 (ecase (car f)
+                   (:y (sym (second f) (third f)))
+                   (:b (hex->bytes (second f)))
+                   (:l (let ((items (cdr f)) (acc '()))
+                         (loop while items
+                               do (if (eq (car items) :dot)
+                                      (return-from dec (let ((tail (dec (second items)))) (nreconc acc tail)))
+                                      (push (dec (pop items)) acc)))
+                         (nreverse acc)))
+                   (:h (let ((h (make-hash-table :test (sym "COMMON-LISP" (second f)))))
+                         (loop for (k v) on (cddr f) by #'cddr do (setf (gethash (dec k) h) (dec v)))
+                         h))
+                   (:v (coerce (mapcar #'dec (cdr f)) 'simple-vector))
+                   (:s (let ((o (allocate-instance (find-class (sym (second f) (third f))))))
+                         (loop for (n v) on (cdddr f) by #'cddr
+                               do (setf (slot-value o (sym (second f) n)) (dec v)))
+                         o))))))
+    (with-standard-io-syntax
+      (let ((*read-eval* nil) (*package* (find-package :keyword)))
+        (dec (read-from-string string))))))
+
+(defun state-digest (ledger)
+  "SHA-256 of LEDGER's canonical encoding, hex."
+  (bytes->hex (sha256 (sb-ext:string-to-octets (encode-state ledger) :external-format :utf-8))))
 
 (defun copy-ledger (ledger)
   "A private copy to try an operation on.  Replaying the history from genesis

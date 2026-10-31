@@ -225,6 +225,57 @@
           (check-equal "and the replica is repaired from its history"
                        (lg:deposit-balance (lg:find-deposit (nd:record-ledger rec) d1)) right)
           (check "with no dispute fork" (not (nd::live-fork a id (nd:node-pubkey a)))))
+        ;; --- Checkpoints are made by replay, never copied from the live state.  A live state that
+        ;; went wrong (here: a balance bumped, as a double apply would) is caught at the next
+        ;; checkpoint, replaced by the replay, counted, and no one is accused.  Proofs are judged
+        ;; from the replayed checkpoints, and a genuine fault is still proven from them.
+        (let* ((hist (nd:record-history la))
+               (rec (nd::index-record (nd::make-record :id-hex id :ledger (lg:replay (reverse hist)) :history '())))
+               (chron (reverse hist)))
+          ;; rebuild REC by pushing every update, with a checkpoint at every push past the first few
+          (setf (nd:record-ledger rec) (lg:make-ledger) (nd::record-count rec) 0)
+          (let ((nd::*checkpoint-every* 1000000))
+            (dolist (u (butlast chron 2)) (lg:apply-update (nd:record-ledger rec) u) (nd::record-push rec u)))
+          (let ((nd::*checkpoint-every* 1))
+            ;; a clean checkpoint first
+            (let ((u (car (last chron 2)))) (lg:apply-update (nd:record-ledger rec) u) (nd::record-push rec u))
+            (check-equal "a clean checkpoint finds no mismatch" (nd::record-ckpt-mismatches rec) 0)
+            (let ((u (car (last chron))))
+              (lg:apply-update (nd:record-ledger rec) u)
+              (incf (lg:deposit-balance (lg:find-deposit (nd:record-ledger rec) d1)) 7)   ; as a double apply would
+              (nd::record-push rec u)))
+          (check-equal "a corrupted live state is caught at the next checkpoint" (nd::record-ckpt-mismatches rec) 1)
+          (check-equal "and replaced by the replay"
+                       (lg:deposit-balance (lg:find-deposit (nd:record-ledger rec) d1))
+                       (lg:deposit-balance (lg:find-deposit (nd:record-ledger la) d1)))
+          (check "and logged, accusing no one"
+                 (some (lambda (m) (search "CHECKPOINT MISMATCH" m)) (nd::record-ckpt-events rec)))
+          (check-equal "the live state now encodes as the replayed checkpoint"
+                       (lg:encode-state (nd:record-ledger rec)) (lg:encode-state (cdr (first (nd::record-checkpoints rec)))))
+          (check-equal "the state encoding round-trips"
+                       (lg:encode-state (lg:decode-state (lg:encode-state (nd:record-ledger la)))) (lg:encode-state (nd:record-ledger la)))
+          (let ((bad (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id) :seq seq
+                                                     :prev-hash (lg:ledger-chain-tip (nd:record-ledger la))
+                                                     :message (op:encode-operation (list :type :deposit-close :deposit-id d1)))))
+                       (up:sign-operator u (nd::node-priv a)) u)))
+            (check "a genuine fault is still proven from the replayed checkpoints"
+                   (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) bad)
+                                                    (reverse (nd:record-history rec)) :prefix-ledger-fn (nd::prefix-ledger-fn rec)))
+            (check "and a conforming update is not"
+                   (not (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) u1)
+                                                         (reverse (nd:record-history rec)) :prefix-ledger-fn (nd::prefix-ledger-fn rec)))))
+          ;; persisted and read back
+          (let ((dir (format nil "/tmp/cl-deposits-ckpt-~a/" (random 1000000))) (dd (nd::node-data-dir a)))
+            (ensure-directories-exist dir)
+            (setf (nd::node-data-dir a) dir)
+            (unwind-protect
+                 (progn (nd::persist-checkpoint a rec)
+                        (multiple-value-bind (cseq chash cl) (nd::read-checkpoint (nd::checkpoint-path a rec))
+                          (check-equal "a persisted checkpoint reads back at its sequence" cseq (car (first (nd::record-checkpoints rec))))
+                          (check "with its update's chain hash" (string= chash (u:bytes->hex (up:chain-hash (nd::record-update-at rec cseq)))))
+                          (check-equal "and the same state" (lg:encode-state cl) (lg:encode-state (cdr (first (nd::record-checkpoints rec)))))))
+              (setf (nd::node-data-dir a) dd)
+              (uiop:delete-directory-tree (pathname dir) :validate t :if-does-not-exist :ignore))))
         ;; --- Relabelling (red team, the reference's bedabe0/f581dba): ledger_id is signed by
         ;; no one and A signs its other ledger with the same key, so any of that ledger's
         ;; updates carries a valid signature under this ledger's id.  None of them is proof.

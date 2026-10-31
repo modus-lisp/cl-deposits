@@ -87,8 +87,11 @@
   (by-hash (make-hash-table :test #'equalp))   ; chain hash -> this record's own update's sequence
   (by-seq (make-hash-table))                   ; sequence -> this record's own update
   fork-base fork-seq                           ; a fork or view: the record it inherits from, through which sequence
-  (checkpoints '())                            ; ((seq . ledger snapshot) ...) newest first, for LEDGER-AT
-  (file-base 0))                               ; history entries not in this record's file (a fork's inherited prefix)
+  (checkpoints '())                            ; ((seq . ledger snapshot) ...) newest first, for LEDGER-AT; each made by replay
+  (file-base 0)                                ; history entries not in this record's file (a fork's inherited prefix)
+  (ckpt-mismatches 0)                          ; checkpoints whose replay disagreed with the live state (a bug of ours)
+  (ckpt-events '())                            ; messages for the node's log, drained by SAVE-RECORD
+  (ckpt-persisted -1))                         ; the sequence of the checkpoint last written to disk                               ; history entries not in this record's file (a fork's inherited prefix)
 
 (defstruct (node (:constructor %make-node))
   priv pubkey pubkey-hex keypair bus network
@@ -315,6 +318,77 @@
 (defparameter *checkpoint-recent* 8192 "Keep every snapshot this close to the tip ...")
 (defparameter *checkpoint-sparse* 32768 "... and, further back, one per this many updates.")
 
+;;; A checkpoint is made by replay, never copied from the live state.  The live state is kept
+;;; up to date update by update, through code that has had bugs a replay does not share: on
+;;; 2026-10-30 a replica caught up from three threads, applied a transfer twice, and published a
+;;; false proof from the doubled balance.  So every *CHECKPOINT-EVERY* updates the segment since
+;;; the previous checkpoint is replayed from that checkpoint and compared with the live state.  A
+;;; difference is our own fault: the live state is replaced by the replay, the event is logged and
+;;; counted, and no one is accused.  Verifying a proof before publishing it starts from these
+;;; checkpoints (VERIFIED-LEDGER-AT), never from the live state.  Cost: one replay of
+;;; *CHECKPOINT-EVERY* updates and two encodings per checkpoint.
+
+(defvar *replaying* nil
+  "True while a record is being rebuilt from its file in order (LOAD-RECORD): the live state is
+   itself a replay then, so a checkpoint is taken from it without replaying the segment again.")
+
+(defun replay-to-checkpoint (rec seq)
+  "REC's ledger after SEQ, replayed from its newest checkpoint below SEQ (from genesis when it has
+   none).  NIL when an update in between is missing."
+  (let* ((cp (find-if (lambda (c) (< (car c) seq)) (record-checkpoints rec)))
+         (l (if cp (lg:copy-ledger (cdr cp)) (lg:make-ledger))))
+    (loop for s from (if cp (1+ (car cp)) 0) to seq
+          for u = (record-update-at rec s)
+          do (if u (lg:apply-update l u) (return-from replay-to-checkpoint nil)))
+    l))
+
+(defun take-checkpoint (rec seq)
+  "Replay REC to SEQ from its previous checkpoint, compare with the live state, keep the replay."
+  (let ((live (record-ledger rec)))
+    (if (or *replaying* (record-fork-p rec) (record-fork-base rec))
+        ;; A load is a replay already.  A fork's state starts from its fork point with the quorum
+        ;; cleared, which a replay of its history does not reproduce: its checkpoints stay copies.
+        (push (cons seq (lg:copy-ledger live)) (record-checkpoints rec))
+        (let ((r (handler-case (replay-to-checkpoint rec seq)
+                   (error (e) (push (format nil "checkpoint ~a at ~a: the replay failed (~a); none taken"
+                                            (subseq (record-id-hex rec) 0 8) seq e)
+                                    (record-ckpt-events rec))
+                     nil))))
+          (when r
+            (unless (string= (lg:encode-state r) (lg:encode-state live))
+              (incf (record-ckpt-mismatches rec))
+              (push (format nil "CHECKPOINT MISMATCH on ~a at seq ~a: the live state differs from a replay; replacing it with the replay (our fault, no one accused)"
+                            (subseq (record-id-hex rec) 0 8) seq)
+                    (record-ckpt-events rec))
+              (setf (record-ledger rec) (lg:copy-ledger r)))
+            (push (cons seq r) (record-checkpoints rec)))))
+    (prune-checkpoints rec seq)))
+
+(defun verified-ledger-at (rec seq)
+  "A fresh copy of REC's ledger after SEQ, replayed from its newest checkpoint at or below SEQ:
+   never the live state.  For judging a proof before we publish it."
+  (cond ((and (record-fork-base rec) (<= seq (record-fork-seq rec))) (verified-ledger-at (record-fork-base rec) seq))
+        (t (let* ((cp (find-if (lambda (c) (<= (car c) seq)) (record-checkpoints rec)))
+                  (l (if cp (lg:copy-ledger (cdr cp)) (lg:make-ledger))))
+             (unless cp
+               (push (format nil "verify: ~a replayed from genesis to ~a (no checkpoint)" (subseq (record-id-hex rec) 0 8) seq)
+                     (record-ckpt-events rec)))
+             (loop for s from (if cp (1+ (car cp)) 0) to seq
+                   do (lg:apply-update l (or (record-update-at rec s) (fail "ledger ~a has no update ~a" (subseq (record-id-hex rec) 0 8) s))))
+             l))))
+
+(defun prefix-ledger-fn (rec)
+  "For FR:VERIFY-PROOF: the ledger after PREFIX (oldest first), from REC's checkpoints when
+   PREFIX ends in the very update REC holds at that sequence; otherwise (another branch, or no
+   record) a replay of PREFIX from genesis."
+  (lambda (prefix)
+    (let* ((last-u (car (last prefix)))
+           (ours (and last-u rec (not (record-fork-p rec)) (record-update-at rec (up:update-seq last-u)))))
+      (cond ((null prefix) (lg:make-ledger))
+            ((and ours (equalp (up:chain-hash ours) (up:chain-hash last-u)))
+             (verified-ledger-at rec (up:update-seq last-u)))
+            (t (lg:replay prefix))))))
+
 (defun prune-checkpoints (rec tip-seq)
   (setf (record-checkpoints rec)
         (remove-if-not (lambda (c) (or (<= (- tip-seq (car c)) *checkpoint-recent*)
@@ -379,8 +453,7 @@
     ;; the chain hash is the ledger's tip once U is applied (a scratch fork with no state: none)
     (when (= seq (lg:ledger-sequence l)) (setf (gethash (lg:ledger-chain-tip l) (record-by-hash rec)) seq))
     (when (and (zerop (mod seq *checkpoint-every*)) (= seq (lg:ledger-sequence (record-ledger rec))))
-      (push (cons seq (lg:copy-ledger (record-ledger rec))) (record-checkpoints rec))
-      (prune-checkpoints rec seq)))
+      (take-checkpoint rec seq)))
   (when (and *verify-indexes* (zerop (mod (record-count rec) *verify-every*))) (verify-record-indexes rec))
   u)
 
@@ -4803,7 +4876,8 @@
       (let ((chron (reverse chain)))
         (setf (record-ledger rec) (lg:replay chron)
               (record-history rec) chain
-              (record-checkpoints rec) '()
+              ;; the replay just made is a checkpoint at the tip
+              (record-checkpoints rec) (list (cons (lg:ledger-sequence (record-ledger rec)) (lg:copy-ledger (record-ledger rec))))
               (record-persisted rec) 0)        ; the next save rewrites the file
         (index-record rec))
       (remhash (record-id-hex rec) (node-refused node))
@@ -4832,7 +4906,8 @@
         ;; replay of the history, not from the replica that refused the update.  A replica can be
         ;; wrong (an update applied twice); a replay that accepts the update means the fault is
         ;; ours.  Repair the replica and accuse no one.
-        (multiple-value-bind (ok why) (ignore-errors (fr:verify-proof proof :history (reverse (record-history rec))))
+        (multiple-value-bind (ok why) (ignore-errors (fr:verify-proof proof :history (reverse (record-history rec))
+                                                                             :prefix-ledger-fn (prefix-ledger-fn rec)))
           (unless ok
             (log! node "NOT REPORTED: our replica of ~a refused seq ~a (~a) but a replay of its history accepts it (~a): repairing the replica"
                   (subseq id 0 8) (up:update-seq update) condition why)
@@ -4911,7 +4986,8 @@
     (when targets
       (let* ((fault (up:decode-update (hex->bytes (getf (getf proof :evidence) :fault-update-hex))))
              (prefix (fault-prefix node (getf (getf proof :evidence) :fault-ledger-id) fault)))
-        (multiple-value-bind (ok why) (fr:verify-non-conforming-cosignature proof prefix)
+        (multiple-value-bind (ok why) (fr:verify-non-conforming-cosignature
+                                        proof prefix :prefix-ledger-fn (prefix-ledger-fn (find-record node (getf (getf proof :evidence) :fault-ledger-id))))
           (if (not ok)
               (log! node "contagion proof against ~a rejected: ~a" (subseq (getf proof :accused) 0 8) why)
               (dolist (rec targets)
@@ -5592,7 +5668,8 @@
                       (fr:verify-dispute-dereliction proof (reverse (record-history rec)) hob
                                                      :defrauded-updates (updates-of-ledger node (getf original :ledger-id)))
                       (values nil "no original proof")))
-                (fr:verify-proof proof :history (reverse (record-history rec)) :height-of-block hob)))
+                (fr:verify-proof proof :history (reverse (record-history rec)) :height-of-block hob
+                                       :prefix-ledger-fn (prefix-ledger-fn rec))))
         (when (and ok (eq (getf proof :type) :uncredited-onchain-payment) (not (fr::e proof :source-qb-update)))
           ;; DEP-06: a proven-uncredited payment is owed at confiscation: keep it to record before arming
           (pushnew (w:json (fr:proof->json proof)) (gethash id (node-obligation-proofs node)) :test #'string=))
@@ -5619,6 +5696,45 @@
   (if (record-fork-p rec)
       (format nil "ledger_~a_fork_~a.json" (subseq (record-id-hex rec) 0 16) (subseq (bytes->hex (record-fork-operator rec)) 0 16))
       (format nil "ledger_~a.json" (subseq (record-id-hex rec) 0 16))))
+
+;;; Verified checkpoints on disk: ckpt_<id16>.sexp holds the newest one, so a restart loads it and
+;;; replays forward instead of from genesis.  Its digest guards against a damaged file, and the
+;;; update it was taken at must be the one in the ledger file (same chain hash), or it is ignored.
+
+(defun checkpoint-path (node rec)
+  (merge-pathnames (format nil "ckpt_~a.sexp" (subseq (record-id-hex rec) 0 16)) (node-data-dir node)))
+
+(defun drain-checkpoint-events (node rec)
+  (loop for m = (pop (record-ckpt-events rec)) while m do (log! node "~a" m)))
+
+(defun persist-checkpoint (node rec)
+  "Write REC's newest checkpoint if it is newer than the one on disk (base records only)."
+  (let ((cp (first (record-checkpoints rec))))
+    (when (and cp (node-data-dir node) (not (record-fork-p rec)) (not (record-fork-base rec))
+               (> (car cp) (record-ckpt-persisted rec)))
+      (let ((u (record-update-at rec (car cp))))
+        (when u
+          (let* ((path (checkpoint-path node rec))
+                 (tmp (make-pathname :type "tmp" :defaults path))
+                 (state (lg:encode-state (cdr cp))))
+            (with-open-file (out tmp :direction :output :if-exists :supersede :external-format :utf-8)
+              (with-standard-io-syntax
+                (prin1 (list :seq (car cp) :chain-hash (bytes->hex (up:chain-hash u))
+                             :digest (bytes->hex (sha256 (sb-ext:string-to-octets state :external-format :utf-8)))
+                             :state state)
+                       out)))
+            (uiop:rename-file-overwriting-target tmp path)
+            (setf (record-ckpt-persisted rec) (car cp))))))))
+
+(defun read-checkpoint (path)
+  "(values seq chain-hash-hex ledger) from a checkpoint file, or NIL if absent or damaged."
+  (handler-case
+      (when (probe-file path)
+        (let ((f (with-open-file (in path :external-format :utf-8)
+                   (with-standard-io-syntax (let ((*read-eval* nil)) (read in))))))
+          (when (string= (getf f :digest) (bytes->hex (sha256 (sb-ext:string-to-octets (getf f :state) :external-format :utf-8))))
+            (values (getf f :seq) (getf f :chain-hash) (lg:decode-state (getf f :state))))))
+    (error () nil)))
 
 (defun save-record (node rec)
   "Persist the history as a JSON array of base64 updates, one per line (a fork: only the
@@ -5651,7 +5767,9 @@
               (format out "[~{~s~^,~%~}]~%" (mapcar (lambda (u) (base64-encode (up:encode-update u)))
                                                     (reverse (subseq (record-history rec) 0 n)))))
             (uiop:rename-file-overwriting-target tmp path)))
-      (setf (record-persisted rec) n))))
+      (setf (record-persisted rec) n)
+      (persist-checkpoint node rec)))
+  (drain-checkpoint-events node rec))
 
 (defun load-record (node path &key owned-p)
   "Rebuild a record from a saved (or fixture) file, validating as we go.  A
@@ -5699,7 +5817,22 @@
     ;; other one, one open-seek-write each.  With a million updates across the
     ;; soak's replicas and forks, that and ~2M Schnorr verifications made a
     ;; restart take 20 minutes.
-    (let ((*deferred-saves* (list nil)))
+    ;; A verified checkpoint on disk: take its state and the updates through it as they are, and
+    ;; replay only what follows.  It must sit on this file's chain (same update, same hash).
+    (unless (or fork-p *verify-on-load* (null (node-data-dir node)))
+      (multiple-value-bind (cseq chash cledger) (read-checkpoint (checkpoint-path node rec))
+        (let ((at (and cseq (nth cseq updates))))
+          (if (and at (= (up:update-seq at) cseq) (string= (bytes->hex (up:chain-hash at)) chash)
+                   (= (lg:ledger-sequence cledger) cseq))
+              (let ((prefix (subseq updates 0 (1+ cseq))))
+                (setf (record-ledger rec) cledger
+                      (record-history rec) (reverse prefix)
+                      (record-checkpoints rec) (list (cons cseq (lg:copy-ledger cledger)))
+                      (record-ckpt-persisted rec) cseq)
+                (index-record rec)
+                (log! node "~a: from its checkpoint at seq ~a, replaying ~a" (file-namestring path) cseq (- (length updates) cseq 1)))
+              (when cseq (log! node "~a: checkpoint at seq ~a is not on this file's chain; replaying from genesis" (file-namestring path) cseq))))))
+    (let ((*deferred-saves* (list nil)) (*replaying* t))
      (dolist (u updates)
       (when (> (up:update-seq u) (lg:ledger-sequence (record-ledger rec)))   ; a fork file's inherited prefix: skipped
         (handler-case
@@ -5714,6 +5847,7 @@
                   (file-namestring path) (up:update-seq u) e (record-count rec))
             (setf clean nil) (return))))))
     (unless fork-p (setf (gethash (record-id-hex rec) (node-ledgers node)) rec))
+    (when (and clean (not fork-p)) (ignore-errors (persist-checkpoint node rec)))
     ;; A damaged file is rewritten whole on the next save; so is a fork file in the old format,
     ;; which repeated its base's whole history before the fork's own updates.
     (setf (record-persisted rec) (if (and clean (or (not fork-p) (null inherited-in-file) (zerop inherited-in-file)))
