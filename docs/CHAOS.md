@@ -64,6 +64,9 @@ anyone is zero. Each one is a finding.
 
 | Observation | Seen | Notes |
 |---|---|---|
+| cl wallets time out on transfer_lock / transfer_complete against Rust-operated ledgers (B D F H J L), rising since Oct 30 22:00 | Oct 31 | After the v6 stochastic deploy; not diagnosed |
+| cld1's dispute on F, entered on its own false NonConformingUpdate (fixed in cl b0747f7), stays standing with an 8M-sat pledge | Oct 30 23:33Z | No withdrawal by design; does it ever resolve or expire? |
+| Does Rust verify its own proofs against a replay before publishing (DEP-06 "Verify before publishing")? | Oct 31 | cl does since b0747f7 |
 | cl nodes rejected 6 fork updates as "HeightDecreases" during restarts | Oct 28 05:32–05:41 | Not investigated |
 | Whether a Rust operator stands down after losing custody to a lottery winner | Oct 28 | The reset removed the state that showed it |
 | A cl bot's empty reply before any other fault | Oct 20 21:00:56 | Unexplained |
