@@ -209,6 +209,22 @@
           (check "a conforming update is not a valid proof"
                  (not (fr:verify-non-conforming-update (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) u1)
                                                        (reverse (nd:record-history la))))))
+        ;; --- A replica whose state is wrong (an update applied twice, as racing catch-ups did on
+        ;; the soak, 2026-10-30) refuses a conforming update on its commitments.  The fault is
+        ;; ours: no proof, no dispute, the replica is rebuilt from its history.
+        (let* ((hist (nd:record-history la))
+               (rec (nd::index-record (nd::make-record :id-hex id :ledger (lg:replay (reverse hist)) :history hist)))
+               (dep (lg:find-deposit (nd:record-ledger rec) d1))
+               (right (lg:deposit-balance dep))
+               (dd (nd::node-data-dir a)))
+          (incf (lg:deposit-balance dep) 7)
+          (setf (nd::node-data-dir a) nil)
+          (unwind-protect
+               (check-equal "a replica's own fault is not reported" (nd::report-non-conforming a rec u1 "test: commitment mismatch") nil)
+            (setf (nd::node-data-dir a) dd))
+          (check-equal "and the replica is repaired from its history"
+                       (lg:deposit-balance (lg:find-deposit (nd:record-ledger rec) d1)) right)
+          (check "with no dispute fork" (not (nd::live-fork a id (nd:node-pubkey a)))))
         ;; --- Relabelling (red team, the reference's bedabe0/f581dba): ledger_id is signed by
         ;; no one and A signs its other ledger with the same key, so any of that ledger's
         ;; updates carries a valid signature under this ledger's id.  None of them is proof.
