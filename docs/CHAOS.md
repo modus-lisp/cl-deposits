@@ -68,3 +68,4 @@ anyone is zero. Each one is a finding.
 | Whether a Rust operator stands down after losing custody to a lottery winner | Oct 28 | The reset removed the state that showed it |
 | A cl bot's empty reply before any other fault | Oct 20 21:00:56 | Unexplained |
 | A cl bot's balance view drifting (InsufficientDepositBalance) | Oct 24 | |
+| cl memo tables are process-global: `*pledge-verdicts*`, `*obligations-memo*`, `*rebuilt-confiscations*`, `*rebuild-misses*`, keyed by ledger rather than by node | Oct 30 (code reading) | Gates and chaos tests run several nodes in one image, so one node's cached verdict could leak into another's |
