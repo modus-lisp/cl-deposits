@@ -49,6 +49,7 @@ anyone is zero. Each one is a finding.
 | Stalled mining (no block for a long stretch), then a burst | idea | Windows are in blocks; check nothing assumes block rate |
 | bitcoind restart or RPC outage on one node | idea | |
 | One node's bitcoind lagging behind the others | idea | Judging needs to tolerate a different tip |
+| Two writers on one checkout: a docs commit made with `-a` in a checkout whose submodules were stale rolled four dependency pins back (55a567f, fixed in a4f871b) | idea (process) | A gate or pre-commit check that refuses a commit moving a submodule pin backwards |
 | Signet difficulty climb | have (by accident) | Mining one block a minute raises difficulty 4x every 2016 blocks; reset when it hurts |
 
 ## Scale and time
@@ -64,9 +65,9 @@ anyone is zero. Each one is a finding.
 
 | Observation | Seen | Notes |
 |---|---|---|
-| cl wallets time out on transfer_lock / transfer_complete against Rust-operated ledgers (B D F H J L), rising since Oct 30 22:00 | Oct 31 | After the v6 stochastic deploy; not diagnosed |
-| cld1's dispute on F, entered on its own false NonConformingUpdate (fixed in cl b0747f7), stays standing with an 8M-sat pledge | Oct 30 23:33Z | No withdrawal by design; does it ever resolve or expire? |
-| Does Rust verify its own proofs against a replay before publishing (DEP-06 "Verify before publishing")? | Oct 31 | cl does since b0747f7 |
+| cl wallets time out on transfer_lock / transfer_complete against Rust-operated ledgers (B D F H J L), Oct 30 20:00 – Oct 31 02:00 EDT | Oct 31 | **Explained.** Rust replicas left a deposit's open block and fee baseline at 0 (set only on the operator's commit path), so Rust operators proposed FeeCollects from height 2016; cl members refused until 2317 (open 301 + 2016), and each refused round held the operator's cosign pipeline. Fixed: deposits-rust c088582 / 136ac8f, DEP-07 4edaf08, vector `deposit_baseline.txt`. Existing soak deposits keep `opened_at_block` 0 in Rust's state snapshots (affects `fee_change_after_blocks` and `blocks_since_open_below` only) |
+| cld1's dispute on F, entered on its own false NonConformingUpdate (fixed in cl b0747f7), stays standing with an 8M-sat pledge | Oct 30 23:33Z | Goes dormant once F's vault is spent by a rotation, but cld1 keeps refusing to cosign F ("we disputed it") forever. Design question: a node whose own proof no longer verifies has no way to stand down |
+| Does Rust verify its own proofs against a replay before publishing (DEP-06 "Verify before publishing")? | Oct 31 | **Done** in deposits-rust c088582: every proof goes through `publish_fraud_proof`, and a non-conforming verdict from replica state is re-verified from the history before arming |
 | cl nodes rejected 6 fork updates as "HeightDecreases" during restarts | Oct 28 05:32–05:41 | Not investigated |
 | Whether a Rust operator stands down after losing custody to a lottery winner | Oct 28 | The reset removed the state that showed it |
 | A cl bot's empty reply before any other fault | Oct 20 21:00:56 | Unexplained |
