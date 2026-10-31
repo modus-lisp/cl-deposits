@@ -114,6 +114,26 @@
                                               :fees (op:make-fees :annualized-msats am :annualized-bps bps :frequency-blocks freq))))
                      (check-equal (format nil "fees due ~a" line) (lg:fees-due d h) due))))
       (check-equal "the fee vector has 8 cases" n 8)))
+;; DEP-07 deposit baselines (shared with deposits-rust): the DepositOpen transition sets the
+;; open block and the fee baseline, so every path that applies it agrees (signet soak, Oct 31).
+(with-open-file (in (vector-path "deposit_baseline.txt"))
+  (let ((n 0))
+    (loop for line = (read-line in nil) while line
+          unless (or (zerop (length line)) (char= (char line 0) #\#))
+            do (destructuring-bind (genesis h opened last first)
+                   (with-input-from-string (s line) (loop repeat 5 collect (read s)))
+                 (incf n)
+                 (let* ((dep (u:sha256 (hx "b1")))
+                        (l (let ((l (lg:make-ledger))) (setf (lg:ledger-genesis-block l) genesis) l))
+                        (d (progn
+                             (let ((lg:*block-height* h))
+                               (lg:apply-operation l (list :type :deposit-open :deposit-id dep
+                                                           :descriptor "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)")))
+                             (gethash dep (lg:ledger-deposits l)))))
+                   (check-equal (format nil "opened_at_block ~a" line) (lg:deposit-opened-at-block d) opened)
+                   (check-equal (format nil "last_fee_assessment ~a" line) (lg:deposit-last-fee-assessment d) last)
+                   (check-equal (format nil "first FeeCollect ~a" line) (+ (lg:deposit-last-fee-assessment d) 2016) first))))
+    (check-equal "the baseline vector has 5 cases" n 5)))
   (let* ((dep (u:sha256 (hx "d1"))) (pay (u:sha256 (u:sha256 (hx "77")))) (pre (u:sha256 (hx "77")))
          (l (lg:make-ledger))
          (d (lg::make-deposit :id dep :balance 1000000 :locked-balance 0 :last-fee-assessment 1000
