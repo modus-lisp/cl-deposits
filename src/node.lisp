@@ -1489,6 +1489,11 @@
                 (setf (gethash (record-id-hex rec) (node-refused node)) (up:update-seq u))
                 (log! node "catch-up on ~a stopped at seq ~a, which the rules reject: ~a (not retried)"
                       (subseq (record-id-hex rec) 0 8) (up:update-seq u) e)
+                ;; A cosigned update the rules reject is a fault whether it arrived live or by
+                ;; catch-up: report it as the live path does, so our dispute carries its proof
+                ;; (DEP-03 §Grounded arms).  REPORT-NON-CONFORMING checks the cosignatures and
+                ;; verifies the proof by replay before publishing anything.
+                (ignore-errors (report-non-conforming node rec u e))
                 (return))
               (error (e) (log! node "catch-up on ~a stopped at seq ~a: ~a" (subseq (record-id-hex rec) 0 8) (up:update-seq u) e)
                 (return)))))

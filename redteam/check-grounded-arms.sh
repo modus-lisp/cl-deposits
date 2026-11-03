@@ -19,7 +19,7 @@ EXP=$(cld_ctl $OP "(:info)" | tr '()' '\n\n' | grep -F "\"$W\"" | grep -oE ':EXP
 echo "== quorum expiry ${EXP:-?}; waiting past it"
 for i in $(seq 1 $((WAIT / 10))); do
   [ -n "$EXP" ] && [ "$(bcli getblockcount)" -gt $((EXP + 2)) ] && break
-  sleep 10
+  mine 1 >/dev/null; sleep 10   # the block ticker may be paused by another scenario
 done
 [ "$(bcli getblockcount)" -gt $((${EXP:-0} + 2)) ] || fail "the quorum did not expire within ${WAIT}s"
 taint "$OP" $G1 $G2 $U1 $M5 $M6
