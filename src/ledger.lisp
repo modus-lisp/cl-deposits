@@ -47,15 +47,17 @@
 ;; balance-anchor-v6 is anchor-ladder-v5's rules plus that one.  We enforce every rule of every
 ;; registered ruleset, so we declare them all.  A ruleset's rules are frozen once registered: a
 ;; change is a new name.
-(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6"))
-(defparameter +supported-rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6"))
-(defparameter +current-ruleset+ "balance-anchor-v6"
+(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7"))
+(defparameter +supported-rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7"))
+(defparameter +current-ruleset+ "grounded-arms-v7"
   "What a new ledger's LedgerOpen names, and what a quorum moves to when every member declares it.")
 
 (defparameter +ruleset-rules+
   '(("balance-commit-v4" :missing-balance-commitment)
     ("anchor-ladder-v5" :signed-header :born-expired :collateral-floor :vault-spend-proofs)
-    ("balance-anchor-v6" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment))
+    ("balance-anchor-v6" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment)
+    ("grounded-arms-v7" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
+     :grounded-arms))
   "DEP-18: the gated rules each ruleset adds to the intrinsic ones.")
 
 (defun ruleset-rule-p (ruleset rule)
@@ -141,11 +143,12 @@
 
 (defun planned-ruleset (current declarations)
   "DEP-18 §operator policy, not consensus: the ruleset an operator names at its next QuorumBegin.
-   balance-anchor-v6 (+current-ruleset+) when every member declares it; otherwise a
-   balance-commit-v4 ledger keeps it (anchor-ladder-v5 lacks MissingBalanceCommitment), any other
+   grounded-arms-v7 (+current-ruleset+) when every member declares it, else balance-anchor-v6 when
+   every member declares that; otherwise a balance-commit-v4 ledger keeps it (anchor-ladder-v5 lacks MissingBalanceCommitment), any other
    moves to anchor-ladder-v5 when every member declares it; else the current ruleset, else
    cltv-offset-v2."
   (cond ((every-declares-p +current-ruleset+ declarations) +current-ruleset+)
+        ((every-declares-p "balance-anchor-v6" declarations) "balance-anchor-v6")
         ((equal current "balance-commit-v4") current)
         ((every-declares-p "anchor-ladder-v5" declarations) "anchor-ladder-v5")
         (current current)

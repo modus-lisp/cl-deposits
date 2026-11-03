@@ -114,7 +114,8 @@
      (:balance-after 223 :u64 :optional) (:locked-after 225 :u64 :optional))
     (54 :dispute-enter
      (:last-valid-sequence 102 :u64) (:reason 100 :string) (:anchor-block-hash 292 :bytes32 :optional)
-     (:anchor-block-height 294 :u32 :optional) (:fraud-proof-hash 344 :bytes32 :optional))
+     (:anchor-block-height 294 :u32 :optional) (:fraud-proof-hash 344 :bytes32 :optional)
+     (:fraud-proof 345 :string :optional))
     (55 :dispute-acquire
      (:new-custodian 108 :pubkey) (:claim-txid 110 :bytes32) (:new-reserves-address 120 :string)
      (:confiscation-txid 352 :bytes32 :optional))

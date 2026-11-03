@@ -142,6 +142,8 @@
   (utxos-fn nil)                               ; (lambda (address)) -> list of plists :txid :vout :sats :confirmations
   (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
   (dispute-notes (make-hash-table :test #'equal))   ; ledger id -> the last dispute-driver state we logged
+  (parent nil)                                 ; a DISPUTE-VIEW's node: whose records judge an arm's grounds
+  (grounds-verdicts (make-hash-table :test #'equalp :synchronized t)) ; DisputeEnter chain hash -> (verdict . why)
   (refused (make-hash-table :test #'equal :synchronized t))   ; ledger id -> seq whose update the rules rejected
   (spender-fn nil)                             ; (lambda (from to outpoints)) -> spend plists (:txid :vout :tx :prevouts :block-hash :height)
   (feerate-fn nil)                             ; (lambda (height)) -> block feerate (DEP-03 Reference feerate)
@@ -3467,8 +3469,22 @@
     (setf (gethash (fork-key (record-id-hex rec) operator33) (node-ledgers node)) fork)
     fork)))
 
-(defun enter-dispute (node rec last-valid-seq &key (reason "fraud") anchor-block-hash anchor-block-height fraud-proof-hash)
-  "We are a quorum member of REC's ledger and have grounds: fork it and publish DisputeEnter."
+(defvar *received-broadcast* nil
+  "The broadcast JSON text of the fraud proof being handled, so a DisputeEnter it grounds carries
+   it exactly as received (DEP-02 TLV 345), embedding and causal chain included.")
+
+(defun dispute-grounds-json (fraud-proof-hash fraud-proof)
+  "DEP-03 §Grounded arms: the broadcast a punitive DisputeEnter carries as its grounds: the one being
+   handled when its proof has FRAUD-PROOF-HASH, else FRAUD-PROOF (a proof we built) as we publish it."
+  (or (and *received-broadcast* fraud-proof-hash
+           (ignore-errors (equalp (fr:proof-hash (fr:json->broadcast (w:parse-json *received-broadcast*))) fraud-proof-hash))
+           *received-broadcast*)
+      (and fraud-proof (w:json (fr:broadcast->json fraud-proof)))))
+
+(defun enter-dispute (node rec last-valid-seq &key (reason "fraud") anchor-block-hash anchor-block-height fraud-proof-hash fraud-proof)
+  "We are a quorum member of REC's ledger and have grounds: fork it and publish DisputeEnter.  A
+   punitive one carries its proof (FRAUD-PROOF, or the broadcast being handled) as TLV 345, so an
+   arm on our fork has grounds a cosigner can judge from the fork alone (DEP-03 §Grounded arms)."
   (let ((stale (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and stale (not (fork-live-p node stale))) (retire-fork node stale)))
   (let ((fork (or (find-fork node (record-id-hex rec) (node-pubkey node))
@@ -3476,7 +3492,8 @@
     (commit-update node fork (new-update node fork (%strip-nil-fields
                                                     (list :type :dispute-enter :last-valid-sequence last-valid-seq :reason reason
                                                           :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height
-                                                          :fraud-proof-hash fraud-proof-hash))))
+                                                          :fraud-proof-hash fraud-proof-hash
+                                                          :fraud-proof (dispute-grounds-json fraud-proof-hash fraud-proof)))))
     (drive-dispute-now node fork)
     fork))
 
@@ -3786,13 +3803,150 @@
         (if why (push (cons a why) out) (push a in))))
     (values (nreverse in) (nreverse out) snapshot)))
 
+;;; DEP-03 §Grounded arms (grounded-arms-v7): an arm counts only if its
+;;; fork's DisputeEnter has grounds, an expiry ground or a proven one carried on the fork as
+;;; fraud_proof (TLV 345).  The winner's fork becomes the ledger's history, so we never sign a
+;;; lottery that could make a DisputeEnter without grounds canonical.  Motive is never examined:
+;;; a member may arm on another's grounds by citing them.  Mirrors deposits-rust's
+;;; armers::grounds_verdict; vector inspect/vectors/grounded_arms.txt.
+
+(defun verify-received-proof (node proof)
+  "Whether PROOF verifies as we judge a received proof of its type: (values ok why), third value
+   :UNKNOWN when we cannot judge it yet (evidence we do not hold)."
+  (let* ((id (getf proof :ledger-id))
+         (hob (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))))
+    (handler-case
+        (case (getf proof :type)
+          (:unauthorized-vault-spend (vault-spend-proof-verdict node proof))
+          (:non-conforming-cosignature
+           (let* ((ev (getf proof :evidence))
+                  (fault-id (getf ev :fault-ledger-id))
+                  (fault (up:decode-update (hex->bytes (getf ev :fault-update-hex))))
+                  (prefix (fault-prefix node fault-id fault)))
+             (if prefix
+                 (fr:verify-non-conforming-cosignature proof prefix :prefix-ledger-fn (prefix-ledger-fn (find-record node fault-id)))
+                 (values nil "the fault ledger's history is not held" :unknown))))
+          (t
+           (let ((rec (find-record node id)))
+             (if (null rec)
+                 (values nil "the accused ledger is not held" :unknown)
+                 (case (getf proof :type)
+                   (:unhonoured-obligation
+                    (fr:verify-proof proof :history (reverse (record-history (ledger-chain-record node id))) :height-of-block hob))
+                   (:dispute-dereliction
+                    (let ((original (getf (getf proof :evidence) :original-proof)))
+                      (if original
+                          (fr:verify-dispute-dereliction proof (reverse (record-history rec)) hob
+                                                         :defrauded-updates (updates-of-ledger node (getf original :ledger-id)))
+                          (values nil "no original proof"))))
+                   (t (fr:verify-proof proof :history (reverse (record-history rec)) :height-of-block hob
+                                             :prefix-ledger-fn (prefix-ledger-fn rec))))))))
+      (error (e) (values nil (format nil "not judged yet: ~a" e) :unknown)))))
+
+(defun grounds-class (enter-op enter-height governing-expiry fork-point-operator)
+  "DEP-03 §Grounded arms from the DisputeEnter alone: :EXPIRY (grounded), :UNGROUNDED, or a proof to
+   verify (the decoded broadcast proof).  Second value: why.  Pure, for the shared vector."
+  (let ((reason (op:field enter-op :reason))
+        (hash (op:field enter-op :fraud-proof-hash))
+        (body (op:field enter-op :fraud-proof)))
+    (cond ((dispute-ground-expiry-p reason (op:field enter-op :anchor-block-height) hash enter-height governing-expiry)
+           (if (and governing-expiry (> enter-height governing-expiry))
+               (values :expiry "a quorum_expired dispute entered past the quorum_expiry")
+               (values :ungrounded (format nil "a quorum_expired dispute entered at ~a, not past the quorum_expiry ~a" enter-height governing-expiry))))
+          ((null body) (values :ungrounded "a punitive DisputeEnter that carries no fraud_proof"))
+          (t (let ((proof (ignore-errors (fr:json->broadcast (w:parse-json body)))))
+               (cond ((null proof) (values :ungrounded "its fraud_proof does not parse"))
+                     ((not (and hash (equalp (fr:proof-hash proof) hash)))
+                      (values :ungrounded "its fraud_proof does not hash to its fraud_proof_hash"))
+                     ((not (and fork-point-operator (stringp (getf proof :accused))
+                                (string-equal (getf proof :accused) (bytes->hex fork-point-operator))))
+                      (values :ungrounded "its proof does not accuse the operator at its fork point"))
+                     (t (values proof "a proof to verify"))))))))
+
+(defun arm-grounds (node id-hex fork)
+  "(values verdict why) for FORK's DisputeEnter, VERDICT :GROUNDED, :UNGROUNDED or :UNKNOWN."
+  (multiple-value-bind (u o) (fork-op fork :dispute-enter)
+    (unless u (return-from arm-grounds (values :ungrounded "no DisputeEnter on its fork")))
+    ;; Judged by the node the view belongs to when it holds the ledger, else by the view itself,
+    ;; whose base record is the chain the relay gave (a judge that never followed the ledger).
+    (let* ((judge (if (and (node-parent node) (find-record (node-parent node) id-hex)) (node-parent node) node))
+           (key (up:chain-hash u))
+           (hit (gethash key (node-grounds-verdicts judge))))
+      (when hit (return-from arm-grounds (values (car hit) (cdr hit))))
+      (let* ((base (find-record node id-hex))
+             (lvs (op:field o :last-valid-sequence))
+             (l (and base (ignore-errors (ledger-at base lvs))))
+             (pt (and base (record-update-at base lvs))))
+        (multiple-value-bind (class why)
+            (grounds-class o (up:update-block-height u) (and l (lg:ledger-quorum-expiry l)) (and pt (up:update-operator-id pt)))
+          (multiple-value-bind (verdict why)
+              (case class
+                (:expiry (values :grounded why))
+                (:ungrounded (values :ungrounded why))
+                (t (multiple-value-bind (ok vwhy unknown) (verify-received-proof judge class)
+                     (cond (ok (values :grounded "its proof verifies"))
+                           (unknown (values :unknown vwhy))
+                           (t (values :ungrounded (format nil "its proof does not verify: ~a" vwhy)))))))
+            (unless (eq verdict :unknown) (setf (gethash key (node-grounds-verdicts judge)) (cons verdict why)))
+            (values verdict why)))))))
+
+(defun cut-by-grounds (ruleset entries)
+  "DEP-03 §Grounded arms over ENTRIES ((item verdict why) ...), VERDICT :GROUNDED, :UNGROUNDED or
+   :UNKNOWN: (values kept excluded), EXCLUDED ((item . reason) ...).  Every item is kept under a
+   RULESET without grounded arms; under one with them, an :UNKNOWN verdict stops the cut.  Pure,
+   for the shared vector."
+  (if (not (lg:ruleset-rule-p ruleset :grounded-arms))
+      (values (mapcar #'first entries) '())
+      (let ((kept '()) (out '()))
+        (loop for (item verdict why) in entries
+              do (case verdict
+                   (:grounded (push item kept))
+                   (:ungrounded (push (cons item (format nil "no grounds: ~a" why)) out))
+                   (t (fail "grounds not judged yet: ~a" why))))
+        (values (nreverse kept) (nreverse out)))))
+
+(defun shape-by-grounds (ruleset entries)
+  "DEP-06 §Respectful vs punitive over ENTRIES ((reason verdict) ...): :RESPECTFUL iff every counted
+   DisputeEnter is for a lapsed quorum, and at least one counts.  Under grounded arms only the
+   :GROUNDED ones count (an :UNKNOWN stops it); otherwise every one.  Pure, for the shared vector."
+  (let ((reasons (if (lg:ruleset-rule-p ruleset :grounded-arms)
+                     (loop for (reason verdict) in entries
+                           when (eq verdict :unknown) do (fail "grounds not judged yet")
+                           when (eq verdict :grounded) collect reason)
+                     (mapcar #'first entries))))
+    (if (and reasons (every #'expiry-reason-p reasons)) :respectful :punitive)))
+
+(defun ruleset-at-fork-point (node id-hex)
+  "The ruleset in force at the dispute's fork point (its ledger state there)."
+  (let ((base (find-record node id-hex)) (lvs (dispute-last-valid-seq node id-hex)))
+    (and base lvs (lg:ledger-active-ruleset (ledger-at base lvs)))))
+
+(defun grounded-armers (node id-hex armers)
+  "ARMERS (armers-of entries) with grounds, under a ruleset with grounded arms: (values kept
+   excluded), EXCLUDED ((entry . reason) ...).  An arm whose grounds cannot be judged yet stops
+   the cut: we neither build, cosign nor judge on a guess."
+  (let ((ruleset (ruleset-at-fork-point node id-hex)))
+    (if (not (lg:ruleset-rule-p ruleset :grounded-arms))
+        (values armers '())
+        (cut-by-grounds ruleset
+                        (mapcar (lambda (a)
+                                  (let ((fork (find-fork node id-hex (first a))))
+                                    (multiple-value-bind (verdict why) (if fork (arm-grounds node id-hex fork) (values :ungrounded "no fork"))
+                                      (list a verdict (if (eq verdict :unknown)
+                                                          (format nil "armer ~a: ~a" (subseq (bytes->hex (first a)) 0 8) why)
+                                                          why)))))
+                                armers)))))
+
 (defun lottery-armers (node id-hex)
   "The lottery's participants: (values participants excluded snapshot floor).  Once the
    confiscation has confirmed, the arms above its block do not count (DEP-03)."
   (let ((floor-sats (eligibility-floor-sats node id-hex))
         (c (gethash id-hex (node-confiscation-heights node))))
     (multiple-value-bind (in out snapshot)
-        (split-armers (armers-of node id-hex :until c) floor-sats (node-pledge-fn node) :tip (height node) :confiscated-at c)
+        (multiple-value-bind (grounded ungrounded) (grounded-armers node id-hex (armers-of node id-hex :until c))
+          (multiple-value-bind (in out snapshot)
+              (split-armers grounded floor-sats (node-pledge-fn node) :tip (height node) :confiscated-at c)
+            (values in (append ungrounded out) snapshot)))
       (dolist (x out)
         (log! node "armer ~a excluded from ~a's lottery: ~a" (subseq (bytes->hex (first (car x))) 0 8) (subseq id-hex 0 8) (cdr x)))
       ;; Comparable with the reference's "lottery participants of" line: the set and E.
@@ -4285,9 +4439,24 @@
     (cl-consensus.encoding:segwit-encode (rs:hrp-for (intern (string-upcase (node-network node)) :keyword))
                                          (if (>= witver #x50) (- witver #x50) witver) program)))
 
+(defun grounded-shape-respectful (node id-hex)
+  "Under grounded arms (DEP-03 §Grounded arms): :RESPECTFUL or :PUNITIVE from the grounded
+   DisputeEnters of the current dispute alone, so a DisputeEnter without grounds cannot turn a
+   respectful confiscation punitive; NIL when the ruleset has no grounded arms.  Signals when a
+   ground cannot be judged yet."
+  (let ((ruleset (ruleset-at-fork-point node id-hex)))
+    (when (lg:ruleset-rule-p ruleset :grounded-arms)
+      (shape-by-grounds ruleset
+                        (loop for f in (dispute-forks node id-hex)
+                              for (u o) = (multiple-value-list (fork-op f :dispute-enter))
+                              when u collect (list (op:field o :reason) (arm-grounds node id-hex f)))))))
+
 (defun dispute-respectful-p (node id-hex)
   "Whether our dispute of ID-HEX is for a lapsed quorum (a respectful confiscation, DEP-06),
-   from our own fork's DisputeEnter: never from a proposer."
+   from our own fork's DisputeEnter: never from a proposer.  Under grounded arms, from the
+   grounded DisputeEnters (GROUNDED-SHAPE-RESPECTFUL)."
+  (let ((g (grounded-shape-respectful node id-hex)))
+    (when g (return-from dispute-respectful-p (eq g :respectful))))
   (let ((fork (find-fork node id-hex (node-pubkey node))))
     (and fork (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
                 (and enter (expiry-reason-p (op:field enter-op :reason)))))))
@@ -4310,8 +4479,12 @@
             (declare (ignore built prevouts reserves tier _))
             ;; DEP-03 §Confiscation ladder: any rung of the rebuild
             (cond ((find (unsigned-bytes tx) rungs :key #'unsigned-bytes :test #'equalp) (values :ours lottery))
-                  (t (let ((l (ignore-errors (lottery-paid-by node id-hex (btx:txout-script (first (btx:tx-outputs tx)))))))
-                       (when l
+                  (t (let* ((l (ignore-errors (lottery-paid-by node id-hex (btx:txout-script (first (btx:tx-outputs tx))))))
+                            ;; DEP-03 §Grounded arms: a lottery over an arm without grounds is no subset of the cut
+                            (grounded (and l (ignore-errors (mapcar (lambda (a) (up:x-only (first a)))
+                                                                    (grounded-armers node id-hex (armers-of node id-hex)))))))
+                       (when (and l (every (lambda (p) (member (lot:participant-pubkey p) grounded :test #'equalp))
+                                           (lot:lottery-participants l)))
                          (loop for built in rungs
                                for swapped = (btx:make-tx :version (btx:tx-version built) :locktime (btx:tx-locktime built) :segwit-p t
                                                           :inputs (btx:tx-inputs built)
@@ -4365,7 +4538,8 @@
                                     (setf (aref k 0) 2) (loop for i from 1 below 33 do (setf (aref k i) (random 256))) k)
                           :network (node-network node) :height-fn (node-height-fn node) :chain-fn (node-chain-fn node)
                           :pledge-fn (node-pledge-fn node) :spender-fn (node-spender-fn node) :feerate-fn (node-feerate-fn node)
-                          :height-of-block (node-height-of-block node) :block-hash-fn (node-block-hash-fn node)))
+                          :height-of-block (node-height-of-block node) :block-hash-fn (node-block-hash-fn node)
+                          :parent node))
            (top (first base))
            (ours (find-record node id-hex))
            (same (and ours (not (record-fork-p ours))
@@ -4390,7 +4564,9 @@
 
 (defun view-respectful-p (view id-hex)
   "DEP-06: a confiscation is respectful iff every DisputeEnter of the dispute is for a lapsed
-   quorum; any punitive ground makes it punitive."
+   quorum; any punitive ground makes it punitive.  Under grounded arms, every grounded one."
+  (let ((g (grounded-shape-respectful view id-hex)))
+    (when g (return-from view-respectful-p (eq g :respectful))))
   (let ((reasons (loop for f in (dispute-forks view id-hex)
                        for (u o) = (multiple-value-list (fork-op f :dispute-enter))
                        when u collect (op:field o :reason))))
@@ -4404,7 +4580,8 @@
   (let* ((reserves (disputed-reserves view (find-record view id-hex)))
          (tiers (rs:reserves-tiers reserves))
          (ti (position (btx:tx-locktime tx) tiers :key #'rs:tier-locktime))
-         (all (sort (copy-list (armers-of view id-hex :until (gethash id-hex (node-confiscation-heights view)))) #'bytes< :key #'first))
+         (all (sort (copy-list (grounded-armers view id-hex (armers-of view id-hex :until (gethash id-hex (node-confiscation-heights view)))))
+                    #'bytes< :key #'first))
          (floor-sats (eligibility-floor-sats view id-hex))
          (respectful (view-respectful-p view id-hex))
          (want (unsigned-bytes tx))
@@ -5002,7 +5179,7 @@
           ;; DEP-19 §6: our DisputeEnter cites the proof; watch co-members who ignore it.
           (watch-derelicts node id proof
                            (enter-dispute node rec (lg:ledger-sequence ledger) :reason "non_conforming_update"
-                                                                                :fraud-proof-hash (fr:proof-hash proof))))))))
+                                                                                :fraud-proof-hash (fr:proof-hash proof) :fraud-proof proof)))))))
 
 ;;; Contagion (DEP-19 §5-6).  A cosigner of a non-conforming update is slashable on
 ;;; every ledger it operates, by that ledger's own quorum.  Without it, signing a
@@ -5075,7 +5252,7 @@
               (dolist (rec targets)
                 (log! node "contagion: ~a cosigned a non-conforming update on ~a; disputing its ledger ~a"
                       (subseq (getf proof :accused) 0 8) (subseq (getf (getf proof :evidence) :fault-ledger-id) 0 8) (subseq (record-id-hex rec) 0 8))
-                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "non_conforming_cosignature" :fraud-proof-hash (fr:proof-hash proof)))))))))
+                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "non_conforming_cosignature" :fraud-proof-hash (fr:proof-hash proof) :fraud-proof proof))))))))
 
 (defun updates-of-ledger (node id-hex)
   "Every update we hold of ID-HEX — its own chain and each fork of it — or, holding none,
@@ -5610,22 +5787,11 @@
   "Seconds a spend's verdict is reused: long enough to absorb one theft's proof storm, short
    enough that a QuorumBegin or confiscation learned later changes the answer.")
 
-(defun handle-vault-spend-fraud (node proof)
-  "An UnauthorizedVaultSpend against a ledger the accused operates: if we cosign it, verify
-   and dispute (the accused signed a theft of someone's vault)."
-  (let* ((ev (getf proof :evidence))
-         (accused (hex->bytes (getf proof :accused)))
-         (spent-id (getf ev :spent-ledger-id))
-         (targets (loop for rec being the hash-values of (node-ledgers node)
-                        when (and (not (record-owned-p rec)) (not (record-fork-p rec))
-                                  (not (string= (record-id-hex rec) spent-id))
-                                  (equalp (lg:ledger-operator-key (record-ledger rec)) accused)
-                                  (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
-                                  (not (live-fork node (record-id-hex rec) (node-pubkey node))))
-                          collect rec)))
-    (when targets
-      (multiple-value-bind (ok why)
-          (let* ((key (list (getf proof :accused) spent-id (getf ev :spend-tx-hex) (getf ev :governing-quorumbegin-seq)
+(defun vault-spend-proof-verdict (node proof)
+  "Whether the UnauthorizedVaultSpend PROOF verifies as a received proof does: (values ok why),
+   third value :UNKNOWN when it cannot be judged yet.  Cached per proof for a while."
+  (let* ((ev (getf proof :evidence)) (spent-id (getf ev :spent-ledger-id)))
+    (let* ((key (list (getf proof :accused) spent-id (getf ev :spend-tx-hex) (getf ev :governing-quorumbegin-seq)
                             (getf ev :challenge-update)))
                  (hit (gethash key (node-vault-spend-verdicts node))))
             (if (and hit (< (- (get-universal-time) (first hit)) *vault-spend-verdict-ttl*))
@@ -5645,16 +5811,32 @@
                            :answered-fn (lambda (txid anchor reserves tier-index)
                                           (declare (ignore txid anchor))
                                           (spend-answered-p node spent-id tx gseq reserves tier-index :spend-height spend-height)))
-                        (error (e) (return-from handle-vault-spend-fraud
-                                     (log! node "vault-spend proof against ~a not judged yet: ~a" (subseq (getf proof :accused) 0 8) e))))
+                        (error (e) (return-from vault-spend-proof-verdict
+                                     (values nil (format nil "not judged yet: ~a" e) :unknown))))
                     (setf (gethash key (node-vault-spend-verdicts node)) (list (get-universal-time) ok why))
-                    (values ok why)))))
+                    (values ok why)))))))
+
+(defun handle-vault-spend-fraud (node proof)
+  "An UnauthorizedVaultSpend against a ledger the accused operates: if we cosign it, verify
+   and dispute (the accused signed a theft of someone's vault)."
+  (let* ((ev (getf proof :evidence))
+         (accused (hex->bytes (getf proof :accused)))
+         (spent-id (getf ev :spent-ledger-id))
+         (targets (loop for rec being the hash-values of (node-ledgers node)
+                        when (and (not (record-owned-p rec)) (not (record-fork-p rec))
+                                  (not (string= (record-id-hex rec) spent-id))
+                                  (equalp (lg:ledger-operator-key (record-ledger rec)) accused)
+                                  (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
+                                  (not (live-fork node (record-id-hex rec) (node-pubkey node))))
+                          collect rec)))
+    (when targets
+      (multiple-value-bind (ok why) (vault-spend-proof-verdict node proof)
           (if (not ok)
               (log! node "vault-spend proof against ~a rejected: ~a" (subseq (getf proof :accused) 0 8) why)
               (dolist (rec targets)
                 (log! node "contagion: ~a signed an unauthorised spend of ~a's vault; disputing its ledger ~a"
                       (subseq (getf proof :accused) 0 8) (subseq spent-id 0 8) (subseq (record-id-hex rec) 0 8))
-                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "unauthorized_vault_spend" :fraud-proof-hash (fr:proof-hash proof))))))))
+                (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "unauthorized_vault_spend" :fraud-proof-hash (fr:proof-hash proof) :fraud-proof proof)))))))
 
 (defun broadcast-fraud (node proof)
   (bus:bus-publish (node-bus node) (w:fraud-event (node-keypair node) (getf proof :ledger-id) (getf proof :accused) (fr:broadcast->json proof))))
@@ -5664,7 +5846,8 @@
   ;; operating its own ledgers.  DEP-19 §6 makes that provable dereliction; the harness
   ;; redteam/attack-dereliction.sh drives it (docs/REDTEAM.md).
   (when (getf (node-adversary node) :ignore-fraud) (return-from handle-fraud nil))
-  (let ((proof (fr:json->broadcast (w:parse-json (ev:event-content event)))))
+  (let ((proof (fr:json->broadcast (w:parse-json (ev:event-content event))))
+        (*received-broadcast* (ev:event-content event)))
     (case (getf proof :type)
       (:non-conforming-cosignature (handle-cosigner-fraud node proof))
       (:unauthorized-vault-spend (handle-vault-spend-fraud node proof))
@@ -5717,7 +5900,7 @@
                (release-pledges node id)
                (retire-fork node own)))
            (enter-dispute node chain (lg:ledger-sequence l) :reason "unhonoured_obligation"
-                                                            :fraud-proof-hash (fr:proof-hash proof))))))
+                                                            :fraud-proof-hash (fr:proof-hash proof) :fraud-proof proof)))))
 
 (defun handle-operator-fraud (node proof)
   (let* ((proof proof)
@@ -5766,7 +5949,7 @@
                                          ;; ("quorum_expired", dispute.rs); "quorum-expired" made our
                                          ;; expiry disputes unrecognisable, to it and to our own driver.
                                          :reason (substitute #\_ #\- (string-downcase (symbol-name (getf proof :type))))
-                                         :fraud-proof-hash (fr:proof-hash proof))))
+                                         :fraud-proof-hash (fr:proof-hash proof) :fraud-proof proof)))
                 (unless (member (getf proof :type) '(:dispute-dereliction :quorum-expired))
                   (watch-derelicts node id proof fork))))
             (log! node "fraud proof rejected: ~a" why))))))

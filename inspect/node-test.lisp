@@ -5,6 +5,11 @@
 (in-package #:cl-deposits.test)
 
 (defvar *height* 1000)
+
+;; These gates predate grounded arms (DEP-18 grounded-arms-v7): many of their disputes carry the
+;; reason "test" and no proof, which grounded-arms-v7 disregards.  They run under the ruleset
+;; before it; the gate "grounded arms" below runs under grounded-arms-v7.
+(setf lg:+current-ruleset+ "balance-anchor-v6")
 (defvar *d2-theft* nil "The D2 theft transaction, for the authorised_confiscation vector.")
 
 (with-gate ("nodes: quorum formation over the bus")
@@ -2167,5 +2172,70 @@
             (nd::handle-operator-fraud n (funcall proof-at 11))
             (check (format nil "held as ~a: the same proof again opens nothing new" (car shape))
                    (= before (length (nd:record-history (nd::find-fork n id (nd:node-pubkey n))))))))))))
+
+(with-gate ("grounded arms (grounded-arms-v7): an arm without grounds is disregarded")
+  (let ((lg:+current-ruleset+ "grounded-arms-v7"))
+    (dolist (rs '("grounded-arms-v7" "balance-anchor-v6"))
+      (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+             (chain (make-hash-table :test #'equalp))
+             (cf (lambda (txid vout) (let ((v (gethash (cons (coerce txid 'list) vout) chain))) (and v (list :value-sats v :confirmations 3)))))
+             (pf (lambda (txid vout scan-from) (declare (ignore scan-from))
+                   (let ((v (gethash (cons (coerce txid 'list) vout) chain)))
+                     (list :created 1 :value-sats (or v 1) :spend (if v :unspent :before)))))
+             (a (nd:make-node :priv (tk 11111111111111111111) :bus bus :height-fn hf))
+             (b (nd:make-node :priv (tk 22222222222222222222) :bus bus :height-fn hf :chain-fn cf :pledge-fn pf))
+             (c (nd:make-node :priv (tk 33333333333333333333) :bus bus :height-fn hf :chain-fn cf :pledge-fn pf))
+             (d (nd:make-node :priv (tk 44444444444444444444) :bus bus :height-fn hf :chain-fn cf :pledge-fn pf))
+             (la (nd:open-ledger a :reserves-id (format nil "genesis:g7-~a" rs) :reserves 15600000 :collateral 23400000))
+             (id (nd:record-id-hex la)))
+        (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+          (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+        (setf (gethash (cons (coerce (u:sha256 (u:ascii->bytes rs)) 'list) 0) chain) (floor (+ 15600000 23400000) 1000))
+        (nd:begin-quorum a la :funding-txid (u:sha256 (u:ascii->bytes rs)) :funding-vout 0 :amount-msats 15600000
+                              :collateral-msats 23400000 :expiry-blocks 100 :ruleset rs)
+        (check-equal (format nil "~a: the quorum is seated under it" rs) (lg:ledger-active-ruleset (nd:record-ledger la)) rs)
+        (let* ((w (nd:make-wallet :priv (tk 55555555555555555555) :bus bus)) (dw (nd:wallet-open-deposit w id)))
+          (nd:credit-onchain a la dw 4000000 :txid (u:sha256 (u:ascii->bytes (format nil "credit ~a" rs))))
+          (let ((floor-sats (nd:collateral-floor-sats la))
+                (expiry (lg:ledger-quorum-expiry (nd:record-ledger la))))
+            (dolist (m (list b c d))
+              (setf (gethash (cons (coerce (u:sha256 (nd:node-pubkey m)) 'list) 1) chain) (+ floor-sats 1000)))
+            ;; Past the quorum's expiry: b and c have an expiry ground; d enters on no grounds at all.
+            (setf *height* (+ expiry 10))
+            (let ((lvs (lg:ledger-sequence (nd:record-ledger la))))
+              (dolist (m (list b c)) (nd:enter-dispute m la lvs :reason "quorum_expired"))
+              (nd:enter-dispute d la lvs :reason "non_conforming_update"))
+            (dolist (m (list b c d))
+              (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 1 (+ floor-sats 1000))))
+            (multiple-value-bind (in out) (nd::lottery-armers b id)
+              (if (string= rs "grounded-arms-v7")
+                  (progn
+                    (check-equal "v7: the two grounded armers are the participants" (length in) 2)
+                    (check "v7: the armer without grounds is excluded, and says why"
+                           (and (= (length out) 1) (equalp (first (car (first out))) (nd:node-pubkey d)) (search "no grounds" (cdr (first out))))))
+                  (check-equal "v6: every armer is a participant (grounds are not examined)" (length in) 3)))
+            ;; The pure classifier the vector pins.
+            (multiple-value-bind (u o) (nd::fork-op (nd:find-fork d id (nd:node-pubkey d)) :dispute-enter)
+              (check-equal (format nil "~a: a punitive DisputeEnter with no fraud_proof is ungrounded" rs)
+                           (nd::grounds-class o (up:update-block-height u) expiry (nd:node-pubkey a)) :ungrounded))
+            (when (string= rs "grounded-arms-v7")
+              ;; A proposal whose lottery includes d is refused by a cosigner; ours is accepted.
+              (let* ((all (sort (copy-list (nd:armers-of b id)) #'u:bytes< :key #'first))
+                     (resp (nd::dispute-respectful-p b id))
+                     (with-d (ignore-errors (nd::build-confiscation b id :armers all :respectful resp)))
+                     (ours (nd::build-confiscation b id :respectful resp)))
+                (check "v7: a cosigner refuses a confiscation whose lottery includes the ungrounded arm"
+                       (and with-d (null (nd::confiscation-match c id with-d))))
+                (check "v7: a cosigner accepts the grounded cut's confiscation" (nd::confiscation-match c id ours))
+                ;; A judge that never followed the ledger rebuilds it from every node's updates and excuses it.
+                (let* ((fresh (nd:make-node :priv (tk 99999999999999999999) :bus bus :height-fn hf :chain-fn cf :pledge-fn pf))
+                       (updates (remove-duplicates
+                                 (append (nd:record-history la)
+                                         (loop for m in (list b c d) append (nd:record-history (nd:find-fork m id (nd:node-pubkey m)))))
+                                 :test #'equalp :key #'up:chain-hash)))
+                  (check "v7: a judge that never saw the dispute excuses the grounded confiscation"
+                         (nd::rebuilt-confiscation-p fresh id ours :updates updates))
+                  (check "v7: the same judge does not excuse the one over the ungrounded arm"
+                         (not (nd::rebuilt-confiscation-p fresh id with-d :updates updates))))))))))))
 
 (report)
