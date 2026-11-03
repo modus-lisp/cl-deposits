@@ -55,6 +55,9 @@ Status: next.
 
 | Attack | Status | Notes |
 |---|---|---|
+| Arm on another member's grounds by copying its carried proof into one's own DisputeEnter (allowed by grounded-arms-v7; motive is never examined) | idea | Check the copy counts exactly like the original |
+| Carry a proof that verifies but accuses someone else, or an old one from an earlier vault period | have (vector) | grounded_arms.txt: wrong accused is ungrounded; an old valid proof still grounds a new dispute (by design?) |
+| A groundless DisputeEnter entered first, then the real proof arrives: one DisputeEnter per live fork keeps the groundless one | idea | Race in redteam scenarios that enter disputes by hand; a member could lose its grounds |
 | Colluding majority (Q7) and contagion | have | `attack-collude-q7.sh` |
 | Withholding a reveal | have | `attack-withhold-reveal.sh` |
 | Dereliction (a member that won't confirm a disclosed fraud) | have | `attack-dereliction.sh` |
