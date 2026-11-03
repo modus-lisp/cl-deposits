@@ -49,6 +49,9 @@
    (make-sc :name "confiscation-bump" :script "check-confiscation-bump.sh" :ledger-var "REDTEAM_CB"
             :env '("REFS=" "WAIT=900") :timeout 2400 :tags '(:contagion)
             :note "DEP-03 confiscation ladder: a stuck rung 0 is replaced by a higher rung, and its lottery is claimed")
+   (make-sc :name "grounded-arms" :script "check-grounded-arms.sh" :ledger-var "REDTEAM_GA"
+            :env '("WAIT=1500") :timeout 2400 :tags '(:contagion)
+            :note "DEP-18 grounded-arms-v7: an arm whose DisputeEnter has no grounds is disregarded")
    (make-sc :name "exit" :script "check-exit.sh" :ledger-var "REDTEAM_EXIT" :timeout 1200
             :note "DEP-20 exits settle at the rotation (mixed quorum); dust carried; cancel releases")
    (make-sc :name "splice" :script "check-splice.sh" :ledger-var "REDTEAM_SPLICE" :timeout 2400

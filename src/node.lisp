@@ -3487,6 +3487,11 @@
    arm on our fork has grounds a cosigner can judge from the fork alone (DEP-03 §Grounded arms)."
   (let ((stale (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and stale (not (fork-live-p node stale))) (retire-fork node stale)))
+  ;; One DisputeEnter per dispute: a live fork that already entered keeps the grounds it entered
+  ;; on (a second, groundless one would be its latest and lose them, DEP-03 §Grounded arms).
+  (let ((live (find-fork node (record-id-hex rec) (node-pubkey node))))
+    (when (and live (fork-op live :dispute-enter) (>= (dispute-fork-point-of live) last-valid-seq))
+      (return-from enter-dispute live)))
   (let ((fork (or (find-fork node (record-id-hex rec) (node-pubkey node))
                   (make-fork node rec last-valid-seq (node-pubkey node)))))
     (commit-update node fork (new-update node fork (%strip-nil-fields
