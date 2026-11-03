@@ -9,9 +9,9 @@
 # node challenges or proves anything against it, and one of the two claims custody.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-1500}
 source "$(dirname "$0")/_lib.sh"
-pick OP G1 G2 U1 M5   # five members: Q must be 3, 5 or 7
+pick OP G1 G2 U1 M5 M6   # five members besides the operator: Q must be 3, 5 or 7
 ROW=${REDTEAM_GA:-GA$RANDOM}
-W=$(COLLATERAL_SATS=25000000 FORM_EXPIRY=${FORM_EXPIRY:-40} form_ledger "$ROW" $OP grounded-arms-v7 $G1 $G2 $U1 $M5) || exit 1; echo "== ledger $W"
+W=$(COLLATERAL_SATS=25000000 FORM_EXPIRY=${FORM_EXPIRY:-40} form_ledger "$ROW" $OP grounded-arms-v7 $G1 $G2 $U1 $M5 $M6) || exit 1; echo "== ledger $W"
 RS=$(cld_ctl $OP "(:info)" | tr '()' '\n\n' | grep -F "\"$W\"" | grep -oE ':RULESET "[^"]*"' | head -1)
 echo "== $RS"
 case "$RS" in *grounded-arms-v7*) ;; *) fail "the ledger is not on grounded-arms-v7 ($RS)";; esac
@@ -22,7 +22,7 @@ for i in $(seq 1 $((WAIT / 10))); do
   sleep 10
 done
 [ "$(bcli getblockcount)" -gt $((${EXP:-0} + 2)) ] || fail "the quorum did not expire within ${WAIT}s"
-taint "$OP" $G1 $G2 $U1 $M5
+taint "$OP" $G1 $G2 $U1 $M5 $M6
 echo "== $U1 disputes on a punitive reason it carries no proof of; $G1 and $G2 on the expiry"
 cld_ctl $U1 "(:dispute-enter :ledger \"$W\" :reason \"non_conforming_update\")" >/dev/null
 for n in $G1 $G2; do cld_ctl $n "(:dispute-enter :ledger \"$W\" :reason \"quorum_expired\")" >/dev/null; done
@@ -30,7 +30,7 @@ for n in $G1 $G2; do cld_ctl $n "(:dispute-enter :ledger \"$W\" :reason \"quorum
 echo "== waiting for the confiscation (arm, cosign, broadcast) — up to ${WAIT}s"
 conf=""
 for i in $(seq 1 $((WAIT / 5))); do
-  conf=$(for n in $G1 $G2 $M5; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain" | grep -F "${W:0:8}" | grep -oE '[0-9a-f]{64}' | head -1; done | head -1)
+  conf=$(for n in $G1 $G2 $M5 $M6; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain" | grep -F "${W:0:8}" | grep -oE '[0-9a-f]{64}' | head -1; done | head -1)
   [ -n "$conf" ] && break
   [ $((i % 6)) -eq 0 ] && mine 1 >/dev/null
   sleep 5
@@ -38,7 +38,7 @@ done
 lines=$(for n in $G1 $G2 $U1 $M5; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "lottery participants of ${W:0:16}" | tail -1; done)
 echo "$lines" | sed 's/^/   /'
 uk=$(cld_pubkey $U1 | cut -c1-16)
-excl=$(for n in $G1 $G2 $M5; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "excluded from ${W:0:8}'s lottery: no grounds" | grep -F "${uk:0:8}" | tail -1; done | head -1)
+excl=$(for n in $G1 $G2 $M5 $M6; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "excluded from ${W:0:8}'s lottery: no grounds" | grep -F "${uk:0:8}" | tail -1; done | head -1)
 echo "   $excl"
 [ -n "$excl" ] || fail "no member excluded $U1's groundless arm"
 echo "$lines" | grep -F "participants of ${W:0:16}" | grep -oE '\[[^]]*\];' | grep -qF "$uk" && fail "$U1 is a lottery participant"

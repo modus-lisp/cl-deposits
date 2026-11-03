@@ -3490,7 +3490,11 @@
   ;; One DisputeEnter per dispute: a live fork that already entered keeps the grounds it entered
   ;; on (a second, groundless one would be its latest and lose them, DEP-03 §Grounded arms).
   (let ((live (find-fork node (record-id-hex rec) (node-pubkey node))))
-    (when (and live (fork-op live :dispute-enter) (>= (dispute-fork-point-of live) last-valid-seq))
+    (when (and live (>= (dispute-fork-point-of live) last-valid-seq)
+               (multiple-value-bind (u o) (fork-op live :dispute-enter)
+                 (and u (or (null (dispute-grounds-json fraud-proof-hash fraud-proof))
+                            (op:field o :fraud-proof)
+                            (expiry-reason-p (op:field o :reason))))))
       (return-from enter-dispute live)))
   (let ((fork (or (find-fork node (record-id-hex rec) (node-pubkey node))
                   (make-fork node rec last-valid-seq (node-pubkey node)))))
@@ -3816,8 +3820,10 @@
 ;;; armers::grounds_verdict; vector inspect/vectors/grounded_arms.txt.
 
 (defun verify-received-proof (node proof)
-  "Whether PROOF verifies as we judge a received proof of its type: (values ok why), third value
-   :UNKNOWN when we cannot judge it yet (evidence we do not hold)."
+  "Whether PROOF's evidence verifies (DEP-06 §Verification, the per-type check; DEP-03 §Grounded
+   arms: its embedding is not asked for, the DisputeEnter that carries it being a signed, dated
+   update on a fork of the accused ledger): (values ok why), third value :UNKNOWN when we cannot
+   judge it yet (evidence we do not hold)."
   (let* ((id (getf proof :ledger-id))
          (hob (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))))
     (handler-case
