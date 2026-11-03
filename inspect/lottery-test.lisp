@@ -552,4 +552,47 @@
           (check-equal (format nil "~a: voters" (car c)) ours voters)
           (check-equal (format nil "~a: threshold" (car c)) (lg:majority-threshold (length ours)) threshold))))))
 
+
+;;; inspect/vectors/dispute_scope.txt: DEP-03 §"The dispute", shared with deposits-rust
+;;; (deposits-core/tests/dispute_scope_vector.rs).
+(with-gate ("dispute scope: only the current dispute's DisputeEnters count (shared vector)")
+  (let ((ups '()) (name nil) (cases 0) (keys (make-hash-table)))
+    (flet ((key (c) (or (gethash c keys)
+                        (setf (gethash c keys) (let ((k (make-array 33 :element-type '(unsigned-byte 8) :initial-element (char-code c))))
+                                                 (setf (aref k 0) 2) k))))
+           (msg (kind arg)
+             (op:encode-operation
+              (cond ((string= kind "open") (list :type :ledger-open :operator-id (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2)
+                                                 :reserves-id "r" :genesis-block 0 :reserves-amount 1 :collateral-amount 1))
+                    ((string= kind "qb") (list :type :quorum-begin :reserves-id "r" :spending-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                               :new-outpoint-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
+                                               :new-outpoint-vout 0 :amount 1 :quorum-expiry 1000000
+                                               :ledger-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                               :quorum-members '() :collateral-amount 1))
+                    ((string= kind "enter") (list :type :dispute-enter :last-valid-sequence arg :reason "quorum_expired"))
+                    (t (list :type :dispute-yield))))))
+      (with-open-file (in (vector-path "dispute_scope.txt"))
+        (loop for line = (read-line in nil) while line
+              for w = (let ((out '()) (cur '()))
+                        (loop for c across line
+                              do (if (member c '(#\Space #\Tab))
+                                     (when cur (push (coerce (nreverse cur) 'string) out) (setf cur '()))
+                                     (push c cur)))
+                        (when cur (push (coerce (nreverse cur) 'string) out))
+                        (nreverse out))
+              do (cond ((or (null w) (char= (char (first w) 0) #\#)))
+                       ((string= (first w) "case") (setf name (second w) ups '()))
+                       ((string= (first w) "u")
+                        (let* ((who (char (second w) 0)) (seq (parse-integer (third w)))
+                               (u (up:make-signed-update :operator-id (key who) :ledger-id (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)
+                                                         :seq seq :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                                         :message (msg (fourth w) (and (fifth w) (parse-integer (fifth w)))))))
+                          (setf ups (append ups (list (cons (format nil "~a:~a" who seq) u))))))
+                       ((string= (first w) "expect")
+                        (let* ((kept (nd::dispute-scope (mapcar #'cdr ups)))
+                               (got (mapcar (lambda (k) (car (find k ups :key #'cdr))) kept)))
+                          (incf cases)
+                          (check-equal (format nil "dispute_scope ~a" name) got (rest w))))))))
+    (check-equal "every dispute_scope case ran" cases 5)))
+
 (report)

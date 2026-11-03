@@ -3596,6 +3596,77 @@
         (error (e) (log! node "adversary: could not spend our pledge: ~a" e))))
     preimage))
 
+;;; DEP-03 §"The dispute": which DisputeEnters are this dispute.  A disputant may hold an older
+;;; DisputeEnter on a vault the ledger has since rotated away (a dispute gone dormant, or one
+;;; entered on a proof that did not verify); it is no part of the current one.  Q is the operator's
+;;; latest QuorumBegin at or below the highest last_valid_sequence any DisputeEnter names (the vault
+;;; being confiscated); a disputant counts only through its latest DisputeEnter at or above Q, and
+;;; only its updates past that fork point.  The builder, the cosigner, the watch and the verifier all
+;;; judge through this (DISPUTE-FORKS on a node's records, DISPUTE-SCOPE on a list of updates), so
+;;; they cannot disagree on the fork point, the arms, the shape or the obligations.  (Signet soak,
+;;; 2026-11-02: a stale DisputeEnter moved the watch's fork point, its anchor missed the
+;;; confiscation, and its challenge lapsed into contagion against three honest members.)
+;;; Mirrors deposits-rust's rotation_order::dispute_scope; vector inspect/vectors/dispute_scope.txt.
+
+(defun dispute-scope-q (base-rec top-lvs)
+  "The sequence of BASE-REC's latest QuorumBegin at or below TOP-LVS, or 0."
+  (let ((qb (and base-rec top-lvs (record-latest base-rec :quorum-begin :below (1+ top-lvs)))))
+    (if qb (up:update-seq qb) 0)))
+
+(defun dispute-forks (node id-hex)
+  "The forks of ID-HEX that are its current dispute (see above).  A view built under the reading
+   before this rule (DISPUTE-VIEW :every-enter) takes every fork."
+  (when (gethash :every-enter (node-dispute-notes node)) (return-from dispute-forks (forks-of node id-hex)))
+  (let* ((forks (forks-of node id-hex))
+         (lvs-of (mapcar (lambda (f) (multiple-value-bind (u o) (fork-op f :dispute-enter)
+                                       (and u (op:field o :last-valid-sequence))))
+                         forks))
+         (top (reduce (lambda (a b) (if (and a b) (max a b) (or a b))) lvs-of :initial-value nil)))
+    (if (null top)
+        forks
+        (let ((q (dispute-scope-q (let ((r (find-record node id-hex))) (and r (not (record-fork-p r)) r)) top)))
+          (loop for f in forks for l in lvs-of when (and l (>= l q)) collect f)))))
+
+(defun dispute-fork-point-of (fork)
+  "The last_valid_sequence of FORK's latest DisputeEnter: its updates at or below it belong to an
+   earlier dispute (DEP-03 §\"The dispute\")."
+  (multiple-value-bind (u o) (fork-op fork :dispute-enter)
+    (if u (op:field o :last-valid-sequence) -1)))
+
+(defun dispute-fork-updates (fork type)
+  "FORK's own updates of TYPE in the current dispute: after its latest DisputeEnter's fork point."
+  (let ((lvs (dispute-fork-point-of fork)))
+    (remove-if-not (lambda (u) (> (up:update-seq u) lvs)) (fork-own-updates fork type))))
+
+(defun dispute-scope (updates)
+  "UPDATES (a disputed ledger's, every operator's) reduced to its current dispute (see above)."
+  (let* ((open (find-if (lambda (u) (zerop (up:update-seq u))) updates))
+         (origin (and open (up:update-operator-id open)))
+         (enters (and origin
+                      (loop for u in updates
+                            when (and (not (equalp (up:update-operator-id u) origin))
+                                      (eq (ignore-errors (op:update-type u)) :dispute-enter))
+                              collect (list (up:update-operator-id u) (up:update-seq u)
+                                            (op:field (op:update-op u) :last-valid-sequence))))))
+    (if (null enters)
+        updates
+        (let* ((top (reduce #'max enters :key #'third))
+               (q (or (loop for u in updates
+                            when (and (equalp (up:update-operator-id u) origin) (<= (up:update-seq u) top)
+                                      (eq (ignore-errors (op:update-type u)) :quorum-begin))
+                              maximize (up:update-seq u))
+                      0))
+               (fork-of (make-hash-table :test #'equalp)))
+          (dolist (e enters)
+            (destructuring-bind (op seq lvs) e
+              (when (>= lvs q)
+                (let ((cur (gethash op fork-of)))
+                  (when (or (null cur) (> seq (car cur))) (setf (gethash op fork-of) (cons seq lvs)))))))
+          (remove-if-not (lambda (u) (or (equalp (up:update-operator-id u) origin)
+                                         (let ((f (gethash (up:update-operator-id u) fork-of)))
+                                           (and f (> (up:update-seq u) (cdr f))))))
+                         updates)))))
+
 (defun armers-of (node id-hex &key until)
   "Each armer's latest DisputeArmed (highest sequence) on any fork of the ledger:
    (pubkey33 commitment target collateral arm-height seq), ARM-HEIGHT being the
@@ -3613,12 +3684,14 @@
 
 (defun %all-arms (node id-hex)
   "Every DisputeArmed on every fork of the ledger, newest first within each fork."
-  (loop for fork in (forks-of node id-hex)
+  (loop for fork in (dispute-forks node id-hex)
         ;; A fork's arms are its operator's own updates; the prefix it inherited from the base
         ;; (~180k updates on a soaked ledger) is the base operator's, and decoding it on every
         ;; lottery and confiscation decision saturated the node (signet soak, 2026-10-27).
+        for lvs = (dispute-fork-point-of fork)
         append (loop for u in (if (record-fork-base fork) (gethash :dispute-armed (record-index fork)) (record-updates-of fork :dispute-armed))
                      for o = (and (equalp (up:update-operator-id u) (record-fork-operator fork))
+                                  (> (up:update-seq u) lvs)   ; an arm of an earlier dispute on this fork does not count
                                   (op:update-op u))
                      when o
                        collect (list (up:update-operator-id u) (op:field o :commitment-hash) (op:field o :target-reserves)
@@ -3638,8 +3711,9 @@
   "DEP-03 claim_fee_floor when the governing QuorumBegin records no reference feerate.")
 
 (defun dispute-last-valid-seq (node id-hex)
-  "The dispute's fork point: the lowest last_valid_sequence any fork's DisputeEnter names."
-  (loop for f in (forks-of node id-hex)
+  "The dispute's fork point: the lowest last_valid_sequence any fork of the current dispute
+   (DISPUTE-FORKS) names in its DisputeEnter."
+  (loop for f in (dispute-forks node id-hex)
         for (u o) = (multiple-value-list (fork-op f :dispute-enter))
         when u minimize (op:field o :last-valid-sequence)))
 
@@ -3654,7 +3728,7 @@
    lowest last_valid_sequence any DisputeEnter names), as any fork or our replica holds it."
   (let ((lvs (dispute-last-valid-seq node id-hex)))
     (unless lvs (fail "no fork point for ~a's confiscation anchor" (subseq id-hex 0 8)))
-    (let ((u (or (loop for r in (cons (find-record node id-hex) (forks-of node id-hex))
+    (let ((u (or (loop for r in (cons (find-record node id-hex) (dispute-forks node id-hex))
                        thereis (and r (record-update-at r lvs)))
                  (fail "no update at ~a's fork point ~a" (subseq id-hex 0 8) lvs))))
       (fork-point-anchor u))))
@@ -3843,7 +3917,7 @@
         (let ((seen '()))
           (dolist (p participants)
             (let ((fork (find-fork node id-hex (first p))))
-              (dolist (u (and fork (reverse (fork-own-updates fork :obligation-record))))
+              (dolist (u (and fork (reverse (dispute-fork-updates fork :obligation-record))))
                 (let ((o (ignore-errors (op:update-op u))))
                   (when (and o (< (up:update-seq u) (sixth p)))
                     (multiple-value-bind (notice qb qu to-us)
@@ -3868,7 +3942,7 @@
           (hob (or (node-height-of-block node) (lambda (b) (declare (ignore b)) nil))))
       (dolist (p participants)
         (let ((fork (find-fork node id-hex (first p))))
-          (dolist (u (and fork (reverse (fork-own-updates fork :obligation-record))))
+          (dolist (u (and fork (reverse (dispute-fork-updates fork :obligation-record))))
             (let ((o (ignore-errors (op:update-op u))))
               (when (and o (op:field o :uncredited-proof)
                          (< (up:update-seq u) (sixth p)))
@@ -4254,7 +4328,7 @@
 ;;; lottery over a set the cut yields for some subset of the arms.  Never "one we know of": a
 ;;; member that missed the dispute rebuilds it from the relay like anyone else.
 
-(defun dispute-view (node id-hex updates &key confiscated-at)
+(defun dispute-view (node id-hex updates &key confiscated-at every-enter)
   "A scratch node holding ID-HEX's ledger and its dispute forks as UPDATES (the relay's, every
    operator's) give them: the original operator's chain, and for each member that entered a
    dispute, the base to its DisputeEnter's fork point then its own updates.  It shares NODE's
@@ -4311,12 +4385,13 @@
                          (when (> (up:update-seq u) lvs) (record-push fork u)))
                        (setf (gethash (fork-key id-hex op) (node-ledgers s)) fork)))))
       (when confiscated-at (setf (gethash id-hex (node-confiscation-heights s)) confiscated-at))
+      (when every-enter (setf (gethash :every-enter (node-dispute-notes s)) t))
       s)))
 
 (defun view-respectful-p (view id-hex)
   "DEP-06: a confiscation is respectful iff every DisputeEnter of the dispute is for a lapsed
    quorum; any punitive ground makes it punitive."
-  (let ((reasons (loop for f in (forks-of view id-hex)
+  (let ((reasons (loop for f in (dispute-forks view id-hex)
                        for (u o) = (multiple-value-list (fork-op f :dispute-enter))
                        when u collect (op:field o :reason))))
     (and reasons (every #'expiry-reason-p reasons))))
@@ -4375,8 +4450,15 @@
       (when (and miss (= (first miss) (length updates)) (= (second miss) disputes))
         (setf (third miss) (get-universal-time))
         (return-from rebuilt-confiscation-p nil))
-      (let* ((view (and updates (ignore-errors (dispute-view node id-hex updates :confiscated-at spend-height))))
-             (verdict (and view (forks-of view id-hex) (ignore-errors (rebuild-matches-p view id-hex tx)))))
+      ;; The current dispute (DISPUTE-SCOPE) first.  A confiscation built before that rule, over every
+      ;; DisputeEnter a disputant ever made, is excused too: that reading only ever excuses more,
+      ;; never convicts more, so it holds under every ruleset (DEP-18).
+      (let* ((scoped (dispute-scope updates))
+             (verdict (or (let ((view (and scoped (ignore-errors (dispute-view node id-hex scoped :confiscated-at spend-height)))))
+                            (and view (forks-of view id-hex) (ignore-errors (rebuild-matches-p view id-hex tx))))
+                          (and (/= (length scoped) (length updates))
+                               (let ((view (ignore-errors (dispute-view node id-hex updates :confiscated-at spend-height :every-enter t))))
+                                 (and view (forks-of view id-hex) (ignore-errors (rebuild-matches-p view id-hex tx))))))))
         ;; Only a match is final; a miss may be a relay that has not delivered every arm yet.
         (if verdict
             (progn (bt:with-lock-held (*rebuilt-confiscations-lock*) (setf (gethash txid *rebuilt-confiscations*) t))
@@ -4627,8 +4709,8 @@
           (incf n))))
     (let ((jsons (remove-duplicates
                   (append (gethash id (node-obligation-proofs node))
-                          (loop for f in (forks-of node id)
-                                append (loop for u in (fork-own-updates f :obligation-record)
+                          (loop for f in (dispute-forks node id)
+                                append (loop for u in (dispute-fork-updates f :obligation-record)
                                              for o = (ignore-errors (op:update-op u))
                                              when (and o (op:field o :uncredited-proof))
                                                collect (bytes->ascii (op:field o :uncredited-proof)))))

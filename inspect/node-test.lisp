@@ -442,6 +442,26 @@
           (let ((stranger (nd:make-node :priv (tk 88888888888888888888) :bus bus :height-fn hf)))
             (check "a node that never saw the dispute excuses the real confiscation"
                    (nd::rebuilt-confiscation-p stranger id ctx :spend-height *height*)))
+          ;; DEP-03 §"The dispute": a member's older DisputeEnter, on a vault the ledger rotated away
+          ;; before this dispute, is no part of it.  The confiscation the disputants built must still
+          ;; be recognised by a watch that sees that stale DisputeEnter (signet soak, 2026-11-02: it
+          ;; moved the watch's fork point, the anchor missed, and the challenge lapsed into contagion).
+          (clrhash nd::*rebuilt-confiscations*) (clrhash nd::*rebuilt-misses*)
+          (let* ((stranger (nd:make-node :priv (tk 88888888888888888887) :bus bus :height-fn hf))
+                 (q (nd::latest-quorum-begin-seq (nd:find-record b id)))
+                 (stale (let ((u (up:make-signed-update :operator-id (nd:node-pubkey c) :ledger-id (u:hex->bytes id) :seq (max 1 (- q 1))
+                                                        :prev-hash (u:sha256 (hx "57a1e"))
+                                                        :block-height 1 :block-hash (u:sha256 (u:ascii->bytes "block"))
+                                                        :message (op:encode-operation (list :type :dispute-enter :last-valid-sequence (max 0 (- q 2))
+                                                                                            :reason "non_conforming_update")))))
+                          (up:sign-operator u (nd::node-priv c)) u))
+                 (relay (nd::ledger-updates-from-relays stranger id)))
+            (check "a stale DisputeEnter is outside the dispute's scope"
+                   (not (member stale (nd::dispute-scope (cons stale relay)))))
+            (check "a watch that sees a member's stale DisputeEnter still excuses the real confiscation"
+                   (nd::rebuilt-confiscation-p stranger id ctx :spend-height *height* :updates (cons stale relay)))
+            (check "and the builder's anchor is the scoped fork point's"
+                   (equalp (rot:anchor-of ctx) (nd::dispute-anchor (nd::dispute-view stranger id (nd::dispute-scope (cons stale relay))) id))))
           ;; --- Reveal.  Red team #7: once B has revealed, D publishes B's preimage as its
           ;; own (signed by D).  It opens B's commitment, not D's; honest nodes must not
           ;; count it, or D could pick, after seeing every reveal, the copy that makes it win.
