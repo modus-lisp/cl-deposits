@@ -45,10 +45,10 @@ for txid, e in json.load(sys.stdin).items():
 # A spike only bites while rotations or confiscations are in the mempool, and the soak's are mostly
 # off-chain, so a cl rotation starting ($SOAK/log/rotate.log) also starts one, CHAINCHAOS_ROTATION_PCT
 # (30) of the time: its low rungs then stall for real.
-seen=$(grep -c 'rotating' "$SOAK/log/rotate.log" 2>/dev/null || echo 0); last=$(date +%s)
+seen=$(grep -c 'rotating' "$SOAK/log/rotate.log" 2>/dev/null || true); seen=${seen:-0}; last=$(date +%s)
 while true; do
   sleep 60
-  now_seen=$(grep -c 'rotating' "$SOAK/log/rotate.log" 2>/dev/null || echo 0)
+  now_seen=$(grep -c 'rotating' "$SOAK/log/rotate.log" 2>/dev/null || true); now_seen=${now_seen:-0}
   [ -e "$SOAK/chainchaos.pause" ] && { seen=$now_seen; last=$(date +%s); continue; }   # rotations while paused are not ours
   if [ "$now_seen" -gt "$seen" ]; then
     seen=$now_seen
