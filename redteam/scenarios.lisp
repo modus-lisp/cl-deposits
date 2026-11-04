@@ -46,6 +46,9 @@
             :note "a watcher whose replica lags behind the QuorumBegin does not take the rotation for a theft")
    (make-sc :name "rotation-bump" :script "check-rotation-bump.sh" :ledger-var "REDTEAM_BUMP" :timeout 1800
             :note "DEP-03 fee ladder: a stuck rung 0 is replaced by a higher rung, and the next rotation spends it")
+   (make-sc :name "confiscation-answer" :script "check-confiscation-answer.sh" :ledger-var "REDTEAM_CA"
+            :env '("WAIT=1200") :timeout 3000 :tags '(:contagion)
+            :note "DEP-06 spend challenge: a confiscation challenge is answered by a reference member holding the dispute")
    (make-sc :name "confiscation-bump" :script "check-confiscation-bump.sh" :ledger-var "REDTEAM_CB"
             :env '("REFS=" "WAIT=900") :timeout 2400 :tags '(:contagion)
             :note "DEP-03 confiscation ladder: a stuck rung 0 is replaced by a higher rung, and its lottery is claimed")
