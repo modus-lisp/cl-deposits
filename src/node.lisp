@@ -3985,6 +3985,32 @@
                                                           why)))))
                                 armers)))))
 
+(defun dispute-accused-keys (node id-hex)
+  "DEP-03 §Lottery: the x-only keys the dispute's own grounds convict: the operator at the fork
+   point, and every key the proof each counted DisputeEnter carries (TLV 345) convicts
+   (FR:PROOF-ACCUSED-KEYS).  Under grounded arms only grounded DisputeEnters count.  Only this
+   dispute's grounds: a key convicted on another ledger is not excluded here."
+  (let* ((ruleset (ruleset-at-fork-point node id-hex))
+         (base (find-record node id-hex))
+         (lvs (dispute-last-valid-seq node id-hex))
+         (pt (and base lvs (record-update-at base lvs)))
+         (keys (and pt (list (up:x-only (up:update-operator-id pt))))))
+    (dolist (fork (forks-of node id-hex) (remove-duplicates keys :test #'equalp))
+      (multiple-value-bind (u o) (fork-op fork :dispute-enter)
+        (when (and u (op:field o :fraud-proof)
+                   (or (not (lg:ruleset-rule-p ruleset :grounded-arms))
+                       (eq (ignore-errors (arm-grounds node id-hex fork)) :grounded)))
+          (let ((proof (ignore-errors (fr:json->broadcast (w:parse-json (op:field o :fraud-proof))))))
+            (when proof (setf keys (append (fr:proof-accused-keys proof) keys)))))))))
+
+(defun accused-cut (armers accused)
+  "ARMERS (armers-of entries) without the ACCUSED x-only keys: (values kept excluded).  Pure."
+  (let ((kept '()) (out '()))
+    (dolist (a armers (values (nreverse kept) (nreverse out)))
+      (if (member (up:x-only (first a)) accused :test #'equalp)
+          (push (cons a "accused by the dispute's own grounds") out)
+          (push a kept)))))
+
 (defun lottery-armers (node id-hex)
   "The lottery's participants: (values participants excluded snapshot floor).  Once the
    confiscation has confirmed, the arms above its block do not count (DEP-03)."
@@ -3992,9 +4018,12 @@
         (c (gethash id-hex (node-confiscation-heights node))))
     (multiple-value-bind (in out snapshot)
         (multiple-value-bind (grounded ungrounded) (grounded-armers node id-hex (armers-of node id-hex :until c))
-          (multiple-value-bind (in out snapshot)
-              (split-armers grounded floor-sats (node-pledge-fn node) :tip (height node) :confiscated-at c)
-            (values in (append ungrounded out) snapshot)))
+          ;; DEP-03 §Lottery: a key the dispute's grounds convict never wins.  Dropped before the cut,
+          ;; so the lottery is the cut of a subset of the arms, which every judge already accepts.
+          (multiple-value-bind (grounded accused) (accused-cut grounded (dispute-accused-keys node id-hex))
+            (multiple-value-bind (in out snapshot)
+                (split-armers grounded floor-sats (node-pledge-fn node) :tip (height node) :confiscated-at c)
+              (values in (append ungrounded accused out) snapshot))))
       (dolist (x out)
         (log! node "armer ~a excluded from ~a's lottery: ~a" (subseq (bytes->hex (first (car x))) 0 8) (subseq id-hex 0 8) (cdr x)))
       ;; Comparable with the reference's "lottery participants of" line: the set and E.
@@ -5516,22 +5545,38 @@
                                             (and o (equalp (up:update-prev-hash u) anchor)
                                                  (member txid (fr:rotation-rungs o) :test #'equalp))))
                               (record-updates-of rec :quorum-begin)))
-             (fork (find-if (lambda (f) (or (and (record-confiscation f) (equalp (btx:tx-txid (record-confiscation f)) txid))
-                                            ;; DEP-03 §Confiscation ladder: a rung of one we signed
-                                            (find txid (gethash id (node-signed-confiscations node)) :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)))
-                            (forks-of node id))))
+             (fork (or (find-if (lambda (f) (or (and (record-confiscation f) (equalp (btx:tx-txid (record-confiscation f)) txid))
+                                                ;; DEP-03 §Confiscation ladder: a rung of one we signed
+                                                (find txid (gethash id (node-signed-confiscations node)) :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)))
+                                (forks-of node id))
+                       ;; Any holder answers (DEP-06), signer or not: a rung of our own rebuild at any tier.
+                       (and (forks-of node id) (rebuilt-rung-p node id txid) (first (forks-of node id))))))
          (cond (answer
                 (log! node "answering the challenge of ~a's spend ~a: its rotation's QuorumBegin (seq ~a)"
                       (subseq id 0 8) (subseq (bytes->hex txid) 0 16) (up:update-seq answer))
                 (bus:bus-publish (node-bus node) (w:challenge-answer-event (node-keypair node) id (bytes->hex txid) (bytes->hex anchor)
                                                                            (list (base64-encode (up:encode-update answer))))))
                (fork
-                (log! node "answering the challenge of ~a's spend ~a: our dispute fork" (subseq id 0 8) (subseq (bytes->hex txid) 0 16))
+                (log! node "answering the challenge of ~a's spend ~a: its confiscation's dispute" (subseq id 0 8) (subseq (bytes->hex txid) 0 16))
+                ;; Every disputant's updates we hold, not only our own fork's: a judge that missed
+                ;; some arms rebuilds the same lottery from them.
                 (bus:bus-publish (node-bus node) (w:challenge-answer-event (node-keypair node) id (bytes->hex txid) (bytes->hex anchor)
-                                                                           (mapcar (lambda (u) (base64-encode (up:encode-update u)))
-                                                                                   (remove-if (lambda (u) (equalp (up:update-operator-id u)
-                                                                                                                  (lg:ledger-operator-key (record-ledger rec))))
-                                                                                              (fork-own-segment fork))))))))))))
+                                                                           (remove-duplicates
+                                                                            (loop for f in (forks-of node id)
+                                                                                  append (mapcar (lambda (u) (base64-encode (up:encode-update u)))
+                                                                                                 (remove-if (lambda (u) (equalp (up:update-operator-id u)
+                                                                                                                                (lg:ledger-operator-key (record-ledger rec))))
+                                                                                                            (fork-own-segment f))))
+                                                                            :test #'string=))))))))))
+
+(defun rebuilt-rung-p (node id-hex txid)
+  "TXID is a rung of the confiscation of ID-HEX we rebuild from what we hold, at any confiscation tier."
+  (let ((reserves (ignore-errors (disputed-reserves node (find-record node id-hex)))))
+    (and reserves
+         (loop for tier in (rs:reserves-tiers reserves) for ti from 0
+               thereis (and (not (rs:tier-tie-breaker-p tier))
+                            (let ((rungs (ignore-errors (nth-value 5 (build-confiscation node id-hex :tier-index ti :respectful (dispute-respectful-p node id-hex))))))
+                              (find txid rungs :key #'btx:tx-txid :test #'equalp)))))))
 
 (defun handle-challenge-answer (node event)
   "Kind 9112: keep the updates answering a challenge, for every later judgement of that ledger's spends."

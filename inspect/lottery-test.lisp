@@ -649,4 +649,37 @@
                        (t (setf (gethash head fields) rest))))))
     (check-equal "every grounded_arms case ran" cases 24)))
 
+;;; inspect/vectors/lottery_accused.txt: DEP-03 §Lottery, a key the dispute's own grounds convict
+;;; never wins; shared with deposits-rust (deposits-protocol/tests/lottery_accused_vector.rs).
+(with-gate ("lottery: accused keys never win (shared vector)")
+  (let ((kind nil) (name nil) (fields (make-hash-table :test #'equal)) (cases 0))
+    (flet ((keys (s) (if (or (null s) (string= s "none")) '() (split-sequence-simple s))))
+      (with-open-file (in (vector-path "lottery_accused.txt"))
+        (loop for line = (read-line in nil) while line
+              for sp = (position #\Space line)
+              for head = (if sp (subseq line 0 sp) line)
+              for rest = (if sp (subseq line (1+ sp)) "")
+              do (cond ((or (zerop (length line)) (char= (char line 0) #\#)))
+                       ((member head '("accused" "cut") :test #'string=)
+                        (if (and kind (string= kind "cut") (string= head "accused"))
+                            (setf (gethash "accused" fields) rest)
+                            (progn (setf kind head name rest) (clrhash fields))))
+                       ((string= head "end")
+                        (incf cases)
+                        (let ((expect (gethash "expect" fields)))
+                          (if (string= kind "accused")
+                              (let ((got (sort (mapcar #'u:bytes->hex
+                                                       (fr:proof-accused-keys (fr:json->broadcast (w:parse-json (gethash "proof" fields)))))
+                                               #'string<)))
+                                (check-equal (format nil "lottery_accused ~a" name)
+                                             (if got (format nil "~{~a~^ ~}" got) "none") expect))
+                              (let* ((armers (mapcar (lambda (k) (list (u:cat (u:octets 2) (u:hex->bytes k)))) (keys (gethash "armers" fields))))
+                                     (accused (mapcar #'u:hex->bytes (keys (gethash "accused" fields))))
+                                     (kept (mapcar (lambda (a) (u:bytes->hex (up:x-only (first a)))) (nd::accused-cut armers accused))))
+                                (check-equal (format nil "lottery_accused cut ~a" name)
+                                             (if kept (format nil "~{~a~^ ~}" kept) "none") expect)))
+                          (setf kind nil)))
+                       (t (setf (gethash head fields) rest))))))
+    (check-equal "every lottery_accused case ran" cases 14)))
+
 (report)

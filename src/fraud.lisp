@@ -19,7 +19,7 @@
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:uncredited-migration-proof #:latest-migration #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
-           #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers
+           #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers #:proof-accused-keys
            #:rotation-rungs #:rotation-answer #:spend-window #:challenge-op #:spent-vault
            #:unhonoured-obligation-proof #:verify-unhonoured-obligation #:make-uncredited-offer-proof))
 (in-package #:cl-deposits.fraud)
@@ -1086,3 +1086,46 @@
                 ((handler-case (let ((seq (up:update-seq breach)))
                                  (lg:speculate state (lg:fill-balance-commitments state o height seq) height seq) nil)
                    (lg:ledger-error (e) (format nil "the request was not servable at the deadline: ~a" e)))))))))
+
+
+;;; DEP-03 §Lottery: the keys a dispute's grounds convict never win its lottery.
+
+(defun witness-signer-keys (tx)
+  "The x-only keys of TX's tapscript witnesses that carry a 64-byte signature, in each input's leaf
+   (keys in script order, signatures in reverse stack order, as a CHECKSIG/CHECKSIGADD leaf takes
+   them).  Used only on a spend whose proof has already verified, so the signatures are not
+   checked again here."
+  (loop for stack in (btx:tx-witnesses tx)
+        for n = (length stack)
+        when (>= n 3)
+          append (let* ((leaf (nth (- n 2) stack))
+                        (keys (loop with i = 0 while (< i (length leaf))
+                                    for op = (aref leaf i)
+                                    if (and (= op 32) (<= (+ i 33) (length leaf)))
+                                      collect (subseq leaf (1+ i) (+ i 33)) and do (incf i 33)
+                                    else do (incf i)))
+                        (sigs (reverse (subseq stack 0 (- n 2)))))
+                   (loop for k in keys for sig in sigs when (= (length sig) 64) collect k))))
+
+(defun update-signer-keys (update)
+  "The x-only keys that signed UPDATE: its operator and every cosigner."
+  (cons (up:x-only (up:update-operator-id update))
+        (mapcar (lambda (c) (up:x-only (up:cosig-pubkey c))) (up:update-cosignatures update))))
+
+(defun proof-accused-keys (proof)
+  "The x-only keys PROOF convicts, from its own evidence (DEP-03 §Lottery): its accused, plus the
+   signers of the faulty update (non-conforming update or cosignature), the keys that signed both
+   updates (equivocation), or the spend's witness signers (unauthorised vault spend).  An omission
+   (uncredited payment, unhonoured obligation) or an expiry convicts only its accused."
+  (let ((accused (ignore-errors (up:x-only (hex->bytes (getf proof :accused)))))
+        (more (ignore-errors
+               (case (getf proof :type)
+                 ((:non-conforming-update :non-conforming-cosignature)
+                  (update-signer-keys (up:decode-update (hex->bytes (e proof :fault-update-hex)))))
+                 (:equivocation
+                  (let ((a (update-signer-keys (up:decode-update (hex->bytes (e proof :update-a-hex)))))
+                        (b (update-signer-keys (up:decode-update (hex->bytes (e proof :update-b-hex))))))
+                    (intersection a b :test #'equalp)))
+                 (:unauthorized-vault-spend
+                  (witness-signer-keys (btx:parse-tx (bw:make-reader (hex->bytes (e proof :spend-tx-hex))))))))))
+    (remove-duplicates (remove nil (cons accused more)) :test #'equalp)))
