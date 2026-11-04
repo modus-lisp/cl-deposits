@@ -4688,9 +4688,9 @@
 (defun rebuilt-confiscation-p (node id-hex tx &key spend-height updates updates-fn)
   "DEP-06: TX (a spend of ID-HEX's vault, confirmed at SPEND-HEIGHT) is the confiscation the
    rules build from public state.  UPDATES (or what UPDATES-FN returns, called only when needed)
-   default to the relay's.  A match is cached by txid; a miss is remembered with how many
-   dispute updates it saw, and not rebuilt again until more arrive (a relay that had not yet
-   delivered every arm)."
+   default to the relay's.  A match is cached by txid; a miss is remembered for
+   *REBUILT-MISS-SECONDS* and then rebuilt again (arms the relay had not delivered, pledges not
+   yet confirmed)."
   (let ((txid (btx:tx-txid tx)))
     (multiple-value-bind (hit found) (bt:with-lock-held (*rebuilt-confiscations-lock*) (gethash txid *rebuilt-confiscations*))
       (when found (return-from rebuilt-confiscation-p hit)))
@@ -4701,9 +4701,12 @@
            (disputes (count-if (lambda (u) (member (ignore-errors (op:update-type u)) '(:dispute-enter :dispute-armed :obligation-record)))
                                updates))
            (miss (gethash txid *rebuilt-misses*)))
-      (when (and miss (= (first miss) (length updates)) (= (second miss) disputes))
-        (setf (third miss) (get-universal-time))
-        (return-from rebuilt-confiscation-p nil))
+      ;; A miss over the same updates is not final either: the rebuild also reads the chain
+      ;; (pledge confirmations, the confiscation's block), so it is tried again once
+      ;; *REBUILT-MISS-SECONDS* have passed (above).  Refreshing the miss here instead, on an
+      ;; unchanged update count, never retried it: a judge holding the answer let its challenge
+      ;; lapse into false proofs (regtest confiscation-answer, 2026-11-04).
+      (declare (ignorable miss disputes))
       ;; The current dispute (DISPUTE-SCOPE) first.  A confiscation built before that rule, over every
       ;; DisputeEnter a disputant ever made, is excused too: that reading only ever excuses more,
       ;; never convicts more, so it holds under every ruleset (DEP-18).
@@ -5852,6 +5855,9 @@
                        (multiple-value-bind (c l opened) (lapsed-challenge node e)
                          (setf cu c lapse l)
                          (when opened (setf (getf e :challenge) opened changed t)))
+                       ;; DEP-06 "Verify before publishing": a lapse is judged afresh, never from a
+                       ;; cached miss of the confiscation rebuild.
+                       (when lapse (remhash (btx:tx-txid tx) *rebuilt-misses*))
                        (multiple-value-bind (reserves) (fr:spent-vault (let ((r (find-record node (getf e :id)))) (if r (spent-vault-updates r) '())) (getf e :qb))
                          (when (and reserves (ignore-errors (spend-answered-p node (getf e :id) tx (getf e :qb) reserves (getf e :tier)
                                                                               :spend-height (getf e :height))))

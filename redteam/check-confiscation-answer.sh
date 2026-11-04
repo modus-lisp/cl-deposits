@@ -8,8 +8,9 @@
 # spend as a rung of it answers, with the dispute's disputant updates.
 #
 # A fresh ledger: a cl operator, three cl members that cosign blind, a reference member R1 that
-# disputes, and a cl member BLIND whose replica is frozen before the fault and which reads nothing
-# of the ledger on the relay (it never disputes, and cannot rebuild the confiscation).  The
+# disputes, and a muted cl member BLIND that reads nothing of the ledger on the relay: it follows
+# the base ledger but never sees the dispute's updates, so only an answer lets it rebuild the
+# confiscation (a judge that missed the dispute, the case DEP-06's answer 2 is for).  The
 # operator forges a lock; R1 disputes; the confiscation confirms.
 # PASS = BLIND challenged the confiscation, R1 answered it (its log: "its confiscation's dispute"),
 # BLIND accepted the answer, and nobody proved a theft against anyone.
@@ -21,7 +22,6 @@ ROW=${REDTEAM_CA:-CA$RANDOM}
 W=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" $C2 $C3 $C4 $BLIND $R1) || exit 1; echo "== ledger $W"
 FROM=$(fresh_deposits "$ROW" $OP "$W" 1 | head -1); [ -n "$FROM" ] || fail "no deposit on the ledger"
 trap 'for n in $C2 $C3 $C4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null 2>&1; done; cld_ctl $BLIND "(:adversary :set :lag-replica nil)" >/dev/null 2>&1; cld_ctl $BLIND "(:adversary :set :blind-relay nil)" >/dev/null 2>&1; disarm :mute $BLIND' EXIT
-expect "$(cld_ctl $BLIND "(:adversary :set :lag-replica \"${W:0:16}\")")" "lag-replica"
 expect "$(cld_ctl $BLIND "(:adversary :set :blind-relay \"${W:0:16}\")")" "blind-relay"
 arm :mute $BLIND
 
@@ -44,6 +44,7 @@ for i in $(seq 1 $((WAIT / 10))); do
     [ -n "$conf" ] || conf=spent
     break
   fi
+  [ $((i % 3)) -eq 0 ] && mine 1 >/dev/null   # the arm window and the tier close on height; never rely on the ticker
   sleep 10
 done
 [ -n "$conf" ] || fail "the vault was not spent within ${WAIT}s"
@@ -62,9 +63,16 @@ echo "   $R1: ${answered:-no answer}"
 [ -n "$answered" ] || fail "$R1 did not answer the challenge of the confiscation"
 sleep 30; mine 1 >/dev/null; sleep 20
 for n in $OP $C2 $C3 $C4 $BLIND; do
-  if cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND|lapsed" | grep -qF "${W:0:8}"; then
+  if cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND: |vault spend: .* signed it" | grep -qF "${W:0:8}"; then
     fail "$n proved the confiscation of $W as a theft"
   fi
 done
-if tail -c 30000000 "$(ref_dir $R1)/node.log" 2>/dev/null | sed "s/\x1b\[[0-9;]*m//g" | grep -E "VAULT SPEND|lapsed" | grep -qF "${W:0:8}"; then fail "$R1 proved the confiscation as a theft"; fi
+if tail -c 30000000 "$(ref_dir $R1)/node.log" 2>/dev/null | sed "s/\x1b\[[0-9;]*m//g" | grep -E "UNAUTHORI[SZ]ED VAULT SPEND|Broadcast fraud proof.*UnauthorizedVaultSpend" | grep -qF "${W:0:8}"; then fail "$R1 proved the confiscation as a theft"; fi
+accepted=""
+for i in $(seq 1 72); do   # it re-judges its open challenges about once a minute
+  accepted=$(cld_ctl $BLIND '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "challenge of ${W:0:8}" | grep -F "is answered" | head -1)
+  [ -n "$accepted" ] && break; sleep 10
+done
+[ -n "$accepted" ] || fail "$BLIND never accepted the answer"
+echo "   $BLIND: $accepted"
 echo "PASS: $BLIND challenged the confiscation of $W, $R1 answered with its dispute, and nobody proved a theft."
