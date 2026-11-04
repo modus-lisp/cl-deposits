@@ -34,9 +34,9 @@ Nov 2 lapsed-challenge vault-spend proofs.
 
 | Attacker | Status | Notes |
 |---|---|---|
-| Attacker ledgers: two or three ledgers whose operators periodically run an attack from the catalogue below | next | Expected result asserted by the oracle each time |
-| Byzantine member seated in honest quorums: randomly withholds or delays cosignatures, omits balance commitments, withholds ruleset declarations | next | Switches exist: `:omit-commitments`, `:withhold-rulesets` |
-| Hostile depositor bot: malformed descriptors, replays, duplicate deliveries, reused nonces, dust exits, fee-griefing | next | |
+| Attacker ledgers: two or three ledgers whose operators periodically run an attack from the catalogue below | **have** | `soak-attackers.sh`: a red-team scenario every 4 h (vault-spend, vault-anchored, collude-q7, dereliction, withhold-reveal) with pool actors only (cld7..; minted on signet when short). First run Nov 4 03:55: vault-spend, oracle PASS 5 |
+| Byzantine member seated in honest quorums: randomly withholds or delays cosignatures, omits balance commitments, withholds ruleset declarations | **have** (partial) | `soak-byzantine.sh`: every 6 h a soak cl member lags one replica (`:lag-replica`) or withholds v7 from its consents (`:withhold-rulesets`) for 30–60 min; delays come from `soak-netchaos.sh`. `:omit-commitments` acts as an operator, not a member, so it is not in the loop |
+| Hostile depositor bot: malformed descriptors, replays, duplicate deliveries, reused nonces, dust exits, fee-griefing | **have** (partial) | `soak-hostile.sh` + `devnet/hostile-wallet.lisp`, every 20 min from a fresh key: bad-descriptor, overdraw, dust-exit, nonce-reuse. Its deposits are empty, so nonce-reuse and dust are refused for balance before their own rules: funding hostile deposits is next |
 | Lagging or blind judge, kept permanently behind | idea | `:lag-replica` exists; the challenge path should absorb it |
 
 ## Operator attacks

@@ -19,8 +19,8 @@ anyone is zero. Each one is a finding.
 | Random node restarts (chaos loop) | **have** | `devnet/soak-chaos.sh`; nodes are started with `setsid -f`, so no wrapper shell survives a restart |
 | Stochastic deploys: each node switches build at a random time inside a window and converges by a fixed point | **have** | `devnet/soak-deploy.sh`; first used Oct 30 for balance-anchor-v6 |
 | Continuous version churn: repeated stochastic deploys, so mixed versions are normal, with occasional rollbacks | idea | `soak-deploy.sh --rollback` exists but has not been run |
-| Freeze a node (SIGSTOP 5–20 min), then resume it far behind | next | Exercises gap-fill, the replica lane and stale cosigns |
-| kill -9 mid-write | next | Crash consistency of append-only ledger persistence and fork files |
+| Freeze a node (SIGSTOP 5–20 min), then resume it far behind | **have** | `soak-chaos.sh`, 20% of turns (CHAOS_FREEZE_PCT). Exercises gap-fill, the replica lane and stale cosigns |
+| kill -9 mid-write | **have** | `soak-chaos.sh`, 20% of turns (CHAOS_KILL9_PCT). Crash consistency of append-only ledger persistence and fork files |
 | Disk full on one node | idea | What does a failed persist do? It must never sign past what it saved |
 | Slow disk or I/O stalls | idea | |
 | Memory pressure / heap exhaustion on a cl node | idea | |
@@ -30,8 +30,8 @@ anyone is zero. Each one is a finding.
 
 | Fault | Status | Notes |
 |---|---|---|
-| Drop, delay, duplicate and reorder relay events per node | next | Through beacon's event-policy hook. Duplicate delivery is DEP-17; reordering is the lagging-replica case (Oct 21) |
-| Cut one node off the relay for minutes | next | |
+| Drop, delay, duplicate and reorder relay events per node | **have** | `soak-netchaos.sh` (every 30 min, one node, 5–20 min): delay, jitter (reorder), dup, lossy. Rules in `devnet/beacon-relay.lisp`; dup is beacon's `(:DUP s)` verdict (beacon 3413ba6). Faults apply to what the node publishes: beacon cannot tell which connection is which node |
+| Cut one node off the relay for minutes | **have** | `soak-netchaos.sh` `cut`: everything it publishes and every request addressed to it is refused. It still reads; a full cut would need per-connection identity in beacon |
 | Partition: two groups of nodes see different relays | idea | Needs a second beacon instance |
 | Relay restart / store loss | idea | Does everyone recover history, or does a ledger strand? |
 | Relay serving truncated history (page caps, `until` edges) | idea | The Rust reimport walk once relied on page size |
@@ -42,9 +42,9 @@ anyone is zero. Each one is a finding.
 
 | Fault | Status | Notes |
 |---|---|---|
-| Short reorgs (invalidate 1–3 blocks, mine a competing branch) | next | The 3-deep spend rule, proof dating by signed height, spends that reorg out |
+| Short reorgs (invalidate 1–3 blocks, mine a competing branch) | **have** | `soak-chainchaos.sh` (every 2 h, reorg or fee spike). First depth-1 reorg by hand at height 810, Nov 4 |
 | Deep reorg past the 3-block rule | idea | What does each implementation do when a "judged" spend vanishes? |
-| Fee spikes: raise the mempool's feerate for a while | next | Rotations and confiscations should actually climb their fee ladders |
+| Fee spikes: raise the mempool's feerate for a while | **have** | `soak-chainchaos.sh`: for 20–45 min every mempool tx below 12 sat/vB is held out of blocks (prioritisetransaction), so low rungs stall |
 | Mempool eviction of a rung | idea | |
 | Stalled mining (no block for a long stretch), then a burst | idea | Windows are in blocks; check nothing assumes block rate |
 | bitcoind restart or RPC outage on one node | idea | |
