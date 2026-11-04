@@ -25,6 +25,7 @@ await_active "$X" $OP $C1 $C2 $C3; await_active "$Y" $OP2 $C1 $C2 $C3
 read -r ftx fvout <"$S/redteam-$NAME.outpoint"
 D3=$(sx "$(w w3 "$X" open)" ":DEPOSIT"); [ -n "$D3" ] || fail "w3 open"
 expect "$(cld_ctl $OP "(:credit :ledger \"$X\" :deposit \"$D3\" :msat 600000 :txid \"$ftx\" :vout $fvout)")" "credit the small deposit"
+taint $OP2   # Y never credits what it owes: its operator is the attacker (soak oracle: a proof against it is a PASS)
 echo "== source $X (small dormant $D3), receiver $Y ($OP2)"
 mine 7 >/dev/null; sleep 5; H=$(bcli getblockcount)
 r=$(cld_ctl $OP "(:dormancy-offer :ledger \"$X\")"); expect "$r" "dormancy-offer"; M=$(sx "$r" ":MANIFEST")
