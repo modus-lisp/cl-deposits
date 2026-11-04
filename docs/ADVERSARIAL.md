@@ -23,7 +23,12 @@ False accusations have been the most damaging class of bug so far (Oct 21:
 an honest rotation proven as theft, then spread to four ledgers by slashing).
 Without the oracle, a busy adversarial soak is noise.
 
-Status: next.
+Status: **have**: `devnet/soak-oracle.py`, started by `soak.sh start` (summary in `soak.sh status`,
+verdicts in `soak/log/oracle.log`). It judges what nodes publish on the relay, the same for both
+implementations: fraud proofs (9101), spend challenges (9111) and answers (9112). Adversaries are
+listed in `soak/adversaries.tsv`, scheduled attacks in `soak/attacks.tsv`. Replaying the Nov 3 archive
+(`--replay`) gives ALARM 11: the Oct 30 NonConformingUpdate and its four contagion proofs, and the
+Nov 2 lapsed-challenge vault-spend proofs.
 
 ## Live attackers in the soak
 

@@ -9,6 +9,7 @@
 #   devnet/soak.sh start            # mining clock, ref swarms, cl bot workers, monitor, chaos
 #   devnet/soak.sh status           # latest monitor snapshot + bot counters
 #   devnet/soak.sh topup            # one pass: re-credit every deposit below SOAK_TOPUP_FLOOR_MSAT (start runs it as a loop)
+#   devnet/soak.sh names            # refresh $SOAK/names.tsv (node -> key), which the oracle reports by
 #   devnet/soak.sh stop             # stop the soak processes (nodes stay up)
 #   devnet/soak.sh reset            # stop + forget setup (next setup forms fresh ledgers)
 #
@@ -188,6 +189,12 @@ topup_collateral() {   # disputes pledge these coins and red-team runs leave dis
   [ $sent -gt 0 ] && mine 1 >/dev/null
   echo "$(date +%FT%T) collateral pass: $sent coins sent"
 }
+oracle_names() {   # every node's protocol key, so the oracle names who accused whom
+  local n k; : >"$SOAK/names.tsv.new"
+  for n in $(cld_names); do k=$(timeout 20 bash -c "source '$CLD_SRC/devnet/_common.sh' >/dev/null 2>&1; cld_pubkey $n"); [ ${#k} -ge 64 ] && echo "$n $k" >>"$SOAK/names.tsv.new"; done
+  for n in $(ref_names); do [ -s "$SOAK/pubkey.$n" ] && echo "$n $(cat "$SOAK/pubkey.$n")" >>"$SOAK/names.tsv.new"; done
+  mv "$SOAK/names.tsv.new" "$SOAK/names.tsv"
+}
 topup_loop() { while true; do topup; sleep "$SOAK_TOPUP_EVERY"; done; }
 start() {
   [ -s "$SOAK/ledgers.tsv" ] && [ -s "$SOAK/deposits.tsv" ] || fail "run setup first"
@@ -200,6 +207,8 @@ start() {
   for i in $(seq 1 "$SOAK_CL_WORKERS"); do alive "clbot-$i" || spawn "clbot-$i" env SOAK_WORKER="$i" "$CLD_SRC/devnet/soak-clbot.sh"; done
   if [ "${SOAK_TOPUP_EVERY:=900}" -gt 0 ]; then alive topup || spawn topup "$0" topup-loop; fi
   alive monitor || spawn monitor "$CLD_SRC/devnet/soak-monitor.sh"
+  [ -s "$SOAK/names.tsv" ] || oracle_names
+  alive oracle || spawn oracle env SOAK="$SOAK" RELAY_URL="$RELAY_URL" python3 "$CLD_SRC/devnet/soak-oracle.py" --loop "${SOAK_ORACLE_EVERY:-120}"
   alive rotate || spawn rotate "$CLD_SRC/devnet/soak-rotate.sh"
   if [ "$SOAK_RESTART_EVERY" -gt 0 ]; then alive chaos || spawn chaos "$CLD_SRC/devnet/soak-chaos.sh"; fi
 }
@@ -207,11 +216,12 @@ stop() { for f in "$SOAK"/pids/*; do [ -f "$f" ] || continue; p=$(cat "$f"); kil
 status() {
   for f in "$SOAK"/pids/*; do [ -f "$f" ] && printf '%-9s %s\n' "$(basename "$f")" "$(alive "$(basename "$f")" && echo running || echo STOPPED)"; done
   echo; [ -f "$SOAK/status.txt" ] && cat "$SOAK/status.txt"
+  [ -f "$SOAK/oracle/summary" ] && { echo; cat "$SOAK/oracle/summary"; }
   echo; echo "versions (version file / running):"; versions_report
   [ -f "$SOAK/deploy/plan.tsv" ] && { echo; "$(dirname "$0")/soak-deploy.sh" --status; }
 }
 case "${1:-}" in
-  setup) setup;; fund-cl) fund_cl_collateral;; start) start;; stop) stop;; status) status;;
+  setup) setup;; fund-cl) fund_cl_collateral;; names) oracle_names;; start) start;; stop) stop;; status) status;;
   topup) topup;; collateral) topup_collateral;; topup-loop) SOAK_TOPUP_EVERY=${SOAK_TOPUP_EVERY:-900}; topup_loop;;
   reset) stop; rm -f "$ENV" "$SOAK/ledgers.tsv" "$SOAK/deposits.tsv" "$SOAK/.collateral-funded" "$SOAK/.cl-collateral-funded"; echo "reset (ledgers on the nodes are untouched)";;
   *) sed -n '2,19p' "$0"; exit 2;;
