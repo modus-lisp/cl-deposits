@@ -704,6 +704,27 @@
       (dolist (id (cosign-round-request-ids round)) (remhash id (node-late-cosign-requests node)))
       (remhash (up::cosign-data update) (node-cosign-rounds node)))))
 
+(defun republish-missed (node rec response)
+  "A member that refuses with 'expected seq N' while we hold N has missed our updates N..: the
+   relay refused or lost them (a publish is fire-and-forget, so a refused one is never retried).
+   Republish them, at most 64, so the member can chain onto them; nothing else would ever send
+   them again, and every later update would be refused the same way.  (Signet soak, 2026-11-04:
+   a lossy relay rule refused one of ledger I's updates; I stood at that seq for two hours, its
+   operator's inbox grew past 75,000 requests, and two other ledgers could not rotate for want of
+   its consent.)"
+  (let* ((err (and (hash-table-p response) (w:jget response "error")))
+         (at (and (stringp err) (search "expected seq " err)))
+         (n (and at (parse-integer err :start (+ at 13) :junk-allowed t)))
+         (tip (lg:ledger-sequence (record-ledger rec))))
+    (when (and n (<= n tip))
+      (let ((sent 0))
+        (loop for seq from n to (min tip (+ n 63))
+              for u = (record-update-at rec seq)
+              while u
+              do (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) u)) (incf sent))
+        (log! node "republished ~a update(s) of ~a from seq ~a: a member expected seq ~a"
+              sent (subseq (record-id-hex rec) 0 8) n n)))))
+
 (defun solicit-cosignatures (node rec update signers required)
   "Ask the quorum; return when REQUIRED valid cosignatures are in the update."
   (let* ((data (up::cosign-data update))
@@ -748,7 +769,8 @@
                                                         (push id (cosign-round-request-ids round)))
                                                       (setf (gethash id (node-late-cosign-requests node)) data))
                                         :timeout (if (zerop attempt) *cosign-response-seconds* 3)))
-                 (round-add round (response-cosignature r)))
+                 (round-add round (response-cosignature r))
+                 (republish-missed node rec r))
                (take-round)
                (incf attempt)
                (unless (enough) (sleep 0.3))))
