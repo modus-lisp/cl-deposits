@@ -74,6 +74,9 @@ class World:
                     self.names[xonly(k)] = f.split(".", 1)[1]
         self.ledger_names = {r[1].lower(): r[0] for r in load_table(os.path.join(soak, "ledgers.tsv")) if len(r) >= 2}
         self.attacks = [r for r in load_table(os.path.join(soak, "attacks.tsv")) if len(r) >= 5]
+        # <unix time> <attack> <scenario verdict> <seconds>: each live attack's end-to-end result
+        # (devnet/soak-attackers.sh), e.g. confiscated and the depositors paid
+        self.outcomes = [r for r in load_table(os.path.join(soak, "attack-outcomes.tsv")) if len(r) >= 3]
         burned = {r[0] for r in load_table(os.path.join(soak, "redteam-tainted"))}
         self.burned = {k for k, n in self.names.items() if n in burned}
 
@@ -156,12 +159,24 @@ def judge(events, world, now=None):
         if not hit and now > t + window:
             counts["MISS"] += 1
             verdicts.append((t, "MISS", False, f"{attack} on {world.lname(led)} (accused {acc[:12]}): no proof within {int(window)} s"))
+    per = {}
+    for r in world.outcomes:
+        ok = r[2].startswith("PASS")
+        a = per.setdefault(r[1], [0, 0])
+        a[0] += ok; a[1] += 1
+        if not ok:
+            verdicts.append((float(r[0]), "ATTACK", False, f"{r[1]}: scenario verdict {r[2]}"))
+    counts["attacks"] = per
     return verdicts, counts
 
 
 def summary_line(counts):
-    return ("oracle: PASS {PASS}  MISS {MISS}  ALARM {ALARM}  expiry {EXPIRY}  challenges {challenged}"
+    line = ("oracle: PASS {PASS}  MISS {MISS}  ALARM {ALARM}  expiry {EXPIRY}  challenges {challenged}"
             " (answered {answered}, pending {pending})").format(**counts)
+    per = counts.get("attacks") or {}
+    if per:
+        line += "  attacks " + " ".join(f"{a}={p}/{n}" for a, (p, n) in sorted(per.items()))
+    return line
 
 
 async def fetch(since):

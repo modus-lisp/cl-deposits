@@ -5,6 +5,9 @@
 ;;;;   overdraw         TransferLock of 1 BTC out of a fresh, empty deposit
 ;;;;   dust-exit        ExitRequest of 1 msat to a valid address, out of an empty deposit
 ;;;;   nonce-reuse      two different ExitRequests under one nonce (DEP-17: the second is refused)
+;;;;   replay           DEP-17 duplicate delivery: one ExitRequest sent twice, identical, then a
+;;;;                    different one under the same nonce.  Behaves = the duplicate gets the
+;;;;                    original's result and the different one is refused (printed as :refused T)
 ;;;;   open             open a deposit and print its id (the soak loop then funds it: HOSTILE_DEPOSIT)
 ;;;; With HOSTILE_DEPOSIT set, overdraw/dust-exit/nonce-reuse use that (funded) deposit instead of
 ;;;; a fresh empty one, so they meet their own rule rather than the balance check.
@@ -43,6 +46,17 @@
                       (ignore-errors (cl-deposits.node:wallet-exit wal ledger d 600000 addr :height h))
                       (setf (cl-deposits.node::wallet-nonce wal) n)     ; the same nonce, a different request
                       (cl-deposits.node:wallet-exit wal ledger d 700000 addr :height h)))))
+            ((string= action "replay")
+             (let* ((d (fresh)) (n (cl-deposits.node::wallet-nonce wal)))
+               (multiple-value-bind (e1 r1) (try (lambda () (cl-deposits.node:wallet-exit wal ledger d 600000 addr :height h)))
+                 (setf (cl-deposits.node::wallet-nonce wal) n)       ; the same request again
+                 (multiple-value-bind (e2 r2) (try (lambda () (cl-deposits.node:wallet-exit wal ledger d 600000 addr :height h)))
+                   (setf (cl-deposits.node::wallet-nonce wal) n)     ; the same nonce, a different request
+                   (multiple-value-bind (e3 r3) (try (lambda () (cl-deposits.node:wallet-exit wal ledger d 700000 addr :height h)))
+                     (values (and (not e1) (not e2) (string= r1 r2) e3)
+                             (format nil "original ~a; duplicate ~a~a; different ~a ~a"
+                                     (if e1 "ERR" "ok") (if e2 "ERR" "ok") (if (string= r1 r2) " (same)" " (DIFFERS)")
+                                     (if e3 "refused" "ACCEPTED") (subseq r3 0 (min 80 (length r3))))))))))
             (t (values nil (format nil "unknown action ~a" action))))
         (format t "~s~%" (list :action action :refused refused :detail (subseq detail 0 (min 200 (length detail)))))))
     (ignore-errors (cl-deposits.nostr-bus:close-nostr-bus bus))

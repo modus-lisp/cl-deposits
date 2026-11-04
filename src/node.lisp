@@ -797,11 +797,21 @@
     ;; MissingBalanceCommitment under balance-commit-v4 and balance-anchor-v6).
     (unless (getf (node-adversary node) :omit-commitments)
      (let ((height (max height (if (tip rec) (up:update-block-height (tip rec)) 0))))
-      (setf op (lg:fill-balance-commitments (record-ledger rec) op height (1+ (lg:ledger-sequence (record-ledger rec)))))))
+      (setf op (lg:fill-balance-commitments (record-ledger rec) op height (1+ (lg:ledger-sequence (record-ledger rec)))))
+      ;; ADVERSARY :falsify-commitments — an operator that declares a balance 1 msat off the real
+      ;; one (red team: DEP-02 BalanceCommitmentMismatch, which members must refuse to cosign).
+      (when (getf (node-adversary node) :falsify-commitments)
+        (let ((target (first (lg::commitment-targets (record-ledger rec) op))))
+          (when target
+            (destructuring-bind (id bk lk) target
+              (declare (ignore id lk))
+              (when (op:field op bk)
+                (setf op (lg::op-with op bk (1+ (op:field op bk)))))))))))
     ;; Would it apply?  Check on a copy before asking anyone to cosign it.
     ;; ADVERSARY :sign-invalid — an operator that asks its quorum to cosign an
     ;; operation its own validator rejects (red team #1).
-    (unless (or (getf (node-adversary node) :sign-invalid) (getf (node-adversary node) :omit-commitments))
+    (unless (or (getf (node-adversary node) :sign-invalid) (getf (node-adversary node) :omit-commitments)
+                (getf (node-adversary node) :falsify-commitments))
       (let ((why (cf:descriptor-refusal (record-ledger rec) op))) (when why (fail "~a" why)))
       (lg:speculate (record-ledger rec) op (max height (if (tip rec) (up:update-block-height (tip rec)) 0))
                     (1+ (lg:ledger-sequence (record-ledger rec)))))
