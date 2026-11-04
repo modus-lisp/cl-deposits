@@ -17,7 +17,8 @@
 #        SOAK_CL_WORKERS (4), SOAK_CREDIT_MSAT (20000000), SOAK_BLOCK_EVERY (60 s),
 #        SOAK_BOT_INTERVAL_MS (10000), SOAK_CL_INTERVAL (20 s), SOAK_MONITOR_EVERY (300 s),
 #        SOAK_RESTART_EVERY (10800 s; 0 = no chaos), SOAK_CHAOS_NODES,
-#        SOAK_TOPUP_EVERY (900 s; 0 = off), SOAK_TOPUP_FLOOR_MSAT (2000000).
+#        SOAK_TOPUP_EVERY (900 s; 0 = off), SOAK_TOPUP_FLOOR_MSAT (2000000),
+#        NETCHAOS_EVERY (1800 s; 0 = no network faults; devnet/soak-netchaos.sh), SOAK_ORACLE_EVERY (120 s).
 # State: $CLD_ROOT/soak/{env,ledgers.tsv,deposits.tsv,refwallet-*,log/,pids/,status.*}
 source "$(dirname "$0")/_common.sh"
 SOAK="$CLD_ROOT/soak"; mkdir -p "$SOAK/pids" "$SOAK/log"
@@ -211,6 +212,7 @@ start() {
   alive oracle || spawn oracle env SOAK="$SOAK" RELAY_URL="$RELAY_URL" python3 "$CLD_SRC/devnet/soak-oracle.py" --loop "${SOAK_ORACLE_EVERY:-120}"
   alive rotate || spawn rotate "$CLD_SRC/devnet/soak-rotate.sh"
   if [ "$SOAK_RESTART_EVERY" -gt 0 ]; then alive chaos || spawn chaos "$CLD_SRC/devnet/soak-chaos.sh"; fi
+  if [ "${NETCHAOS_EVERY:=1800}" -gt 0 ]; then alive netchaos || spawn netchaos env NETCHAOS_EVERY="$NETCHAOS_EVERY" "$CLD_SRC/devnet/soak-netchaos.sh"; fi
 }
 stop() { for f in "$SOAK"/pids/*; do [ -f "$f" ] || continue; p=$(cat "$f"); kill -- -"$p" 2>/dev/null || kill "$p" 2>/dev/null; rm -f "$f"; echo "  stopped $(basename "$f")"; done; pkill -f "deposit-bot --data-dir $SOAK/" 2>/dev/null; true; }
 status() {

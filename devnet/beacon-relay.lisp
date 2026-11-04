@@ -16,6 +16,12 @@
 ;;;;     "drop": true, "delay": 30} — all fields optional, every matching rule applies.
 ;;;;    drop: refuse (OK false); delay: accept now, deliver/store that many seconds late.
 ;;;;    action is the "action" tag of 20101/20102 (or "action" in a response's content).
+;;;;    For the soak's network chaos (devnet/soak-netchaos.sh), also:
+;;;;     "jitter": N   delay each matching event by a random 0..N seconds (reorders them);
+;;;;     "dup": N      deliver each matching event to live subscribers again N seconds later;
+;;;;     "p": 0..1     apply the rule to that fraction of matching events (lossy, not total);
+;;;;     "until": T    unix time after which the rule is ignored (rules expire on their own).
+;;;;    Drop wins over dup, dup over delay.
 
 (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))
 (let ((*compile-verbose* nil)) (funcall (intern "QUICKLOAD" "QL") :beacon :silent t))
@@ -65,7 +71,9 @@
 
 (defun rule-matches-p (r e)
   (flet ((field (k) (beacon::json-get r k)))
-    (and (or (null (field "kind")) (eql (field "kind") (beacon:event-kind e)))
+    (and (or (not (realp (field "until"))) (< (- (get-universal-time) 2208988800) (field "until")))
+         (or (not (realp (field "p"))) (< (random 1.0) (field "p")))
+         (or (null (field "kind")) (eql (field "kind") (beacon:event-kind e)))
          (or (null (field "author"))
              (let ((pk (beacon:hex-encode (beacon:event-pubkey e))))
                (and (<= (length (field "author")) 64) (string= (field "author") pk :end2 (length (field "author"))))))
@@ -73,12 +81,15 @@
          (or (null (field "to")) (member (field "to") (tag-values e "p") :test #'string=)))))
 
 (defun fault-policy (e)
-  (let ((drop nil) (delay 0))
+  (let ((drop nil) (dup nil) (delay 0))
     (dolist (r (faults))
       (when (and (listp r) (rule-matches-p r e))
         (when (eq (beacon::json-get r "drop") :true) (setf drop t))
+        (let ((d (beacon::json-get r "dup"))) (when (realp d) (setf dup (max (or dup 0) d))))
+        (let ((j (beacon::json-get r "jitter"))) (when (and (realp j) (plusp j)) (setf delay (max delay (random (float j))))))
         (let ((d (beacon::json-get r "delay"))) (when (realp d) (setf delay (max delay d))))))
     (cond (drop '(:drop "policy"))
+          (dup (list :dup dup))
           ((plusp delay) delay))))
 
 ;;; ---- import relay.py's store ----------------------------------------------------------
