@@ -16,7 +16,11 @@ source "$(dirname "$0")/_common.sh"
 SOAK="$CLD_ROOT/soak"; EVERY=${NETCHAOS_EVERY:-1800}
 NODES=(${NETCHAOS_NODES:-$(cld_names | head -n "${SOAK_PLAN_CL:-6}") $(ref_names)})
 FAULTS=(${NETCHAOS_FAULTS:-delay jitter dup lossy cut})
-key_of() { awk -v n="$1" '$1==n { k=$2; if (length(k)==66) k=substr(k,3); print k }' "$SOAK/names.tsv"; }
+key_of() {   # the key N publishes with: $SOAK/nostr.tsv (soak.sh names), else its protocol key
+  local k; k=$(awk -v n="$1" '$1==n {print $2}' "$SOAK/nostr.tsv" 2>/dev/null)
+  [ -n "$k" ] && { echo "$k"; return; }
+  awk -v n="$1" '$1==n { k=$2; if (length(k)==66) k=substr(k,3); print k }' "$SOAK/names.tsv"
+}
 write_rule() {   # write_rule JSON-RULE...: replace this loop's live rules with these, keep everyone else's
   python3 - "$RELAY_FAULTS" "$@" <<'EOF'
 import json, sys, time, os

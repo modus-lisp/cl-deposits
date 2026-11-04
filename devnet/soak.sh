@@ -199,6 +199,8 @@ oracle_names() {   # every node's protocol key, so the oracle names who accused 
   for n in $(cld_names); do k=$(timeout 20 bash -c "source '$CLD_SRC/devnet/_common.sh' >/dev/null 2>&1; cld_pubkey $n"); [ ${#k} -ge 64 ] && echo "$n $k" >>"$SOAK/names.tsv.new"; done
   for n in $(ref_names); do [ -s "$SOAK/pubkey.$n" ] && echo "$n $(cat "$SOAK/pubkey.$n")" >>"$SOAK/names.tsv.new"; done
   mv "$SOAK/names.tsv.new" "$SOAK/names.tsv"
+  # the key each operator publishes with (a reference node's Nostr key is not its protocol key)
+  SOAK="$SOAK" RELAY_URL="$RELAY_URL" python3 "$CLD_SRC/devnet/soak-nostr-keys.py" >"$SOAK/nostr.tsv.new" 2>/dev/null && [ -s "$SOAK/nostr.tsv.new" ] && mv "$SOAK/nostr.tsv.new" "$SOAK/nostr.tsv"
 }
 topup_loop() { while true; do topup; sleep "$SOAK_TOPUP_EVERY"; done; }
 start() {

@@ -64,8 +64,9 @@ class World:
         self.adv_ledgers = [(r[1].lower(), " ".join(r[2:])) for r in rows if r[0] == "ledger"]
         self.pool = {xonly(r[1]) for r in rows if r[0] == "pool"}
         self.names = {}
-        for r in load_table(os.path.join(soak, "names.tsv")):        # <node> <pubkey>, every node
-            self.names[xonly(r[1])] = r[0]
+        for t in ("names.tsv", "nostr.tsv"):        # <node> <pubkey>: protocol keys, and the keys nodes publish with
+            for r in load_table(os.path.join(soak, t)):
+                self.names[xonly(r[1])] = r[0]
         for f in os.listdir(soak) if os.path.isdir(soak) else []:
             if f.startswith("pubkey."):
                 k = open(os.path.join(soak, f)).read().strip()
