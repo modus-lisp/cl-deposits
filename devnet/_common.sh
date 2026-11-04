@@ -83,7 +83,13 @@ start_bitcoind() {   # regtest only: a private chain under CLD_ROOT with a funde
   $BCLI -named createwallet wallet_name="$MINER_WALLET" load_on_startup=true >/dev/null 2>&1 || $BCLI loadwallet "$MINER_WALLET" >/dev/null
   [ "$(bcli getblockcount)" -ge 101 ] || mine 101
 }
-stop_bitcoind() { bitcoind_running && $BCLI stop >/dev/null 2>&1; }
+stop_bitcoind() {   # returns once bitcoind has exited: an RPC stop returns first, and an `up` that
+  # followed at once found the datadir still locked and aborted (CHAOS.md lead, Nov 3)
+  local pid; pid=$(cat "$BITCOIN_DATADIR/regtest/bitcoind.pid" 2>/dev/null) || pid=$(pgrep -f "[b]itcoind .*-datadir=$BITCOIN_DATADIR" | head -1)
+  bitcoind_running && $BCLI stop >/dev/null 2>&1
+  local i; for i in $(seq 1 120); do [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0; sleep 1; done
+  echo "bitcoind ($pid) still running 120 s after stop" >&2; return 1
+}
 
 # ─── Reference nodes (deposits-rust) ─────────────────────────────────────────
 # The second implementation in the quorum, as LND is to CLN on the Lightning

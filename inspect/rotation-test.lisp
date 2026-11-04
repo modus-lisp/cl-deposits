@@ -107,7 +107,8 @@
   (with-open-file (in "inspect/vectors/dispute_entry.txt")
     (let ((n 0))
       (loop for line = (read-line in nil) while line
-            unless (or (zerop (length line)) (char= (char line 0) #\#))
+            unless (or (zerop (length line)) (char= (char line 0) #\#)
+                       (and (> (length line) 9) (string= "forkpoint" line :end2 9)))
               do (destructuring-bind (tag name emb ruleset req entry) (uiop:split-string line)
                    (declare (ignore tag))
                    (let ((type (car (rassoc name fr::+type-names+ :test #'string=)))
@@ -122,7 +123,20 @@
                      (unless (fr:requires-embedding-p type)
                        (check (format nil "~a is broadcast without an embedding" name)
                               (null (w:jget (fr:broadcast->json (list :type type :ledger-id "00" :accused "00" :evidence '())) "embedding")))))))
-      (check-equal "the vector covers eleven types, three embeddings, two rulesets" n 66))))
+      (check-equal "the vector covers eleven types, three embeddings, two rulesets" n 66)))
+  ;; where the dispute forks: fault or evidence at 40, replica tip 52
+  (with-open-file (in "inspect/vectors/dispute_entry.txt")
+    (let ((n 0))
+      (loop for line = (read-line in nil) while line
+            when (and (> (length line) 9) (string= "forkpoint" line :end2 9))
+              do (destructuring-bind (tag name want) (uiop:split-string line)
+                   (declare (ignore tag))
+                   (let ((type (car (rassoc name fr::+type-names+ :test #'string=))))
+                     (incf n)
+                     (check-equal (format nil "~a forks ~a" name want)
+                                  (fr:dispute-fork-point (list :type type :evidence (list :sequence 40 :fault-sequence 40 :proof-sequence 40)) 52)
+                                  (if (string= want "tip") 52 39)))))
+      (check-equal "seven fork-point cases" n 7))))
 
 (with-gate ("FINDINGS L6: operations no depositor signs are checked by every member and replica")
   ;; DEP-07 fee cap, shared vector

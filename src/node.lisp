@@ -5961,10 +5961,7 @@
           ;; DEP-06: a proven-uncredited payment is owed at confiscation: keep it to record before arming
           (pushnew (w:json (fr:proof->json proof)) (gethash id (node-obligation-proofs node)) :test #'string=))
         (if ok
-            (let ((last-valid (min (lg:ledger-sequence (record-ledger rec))
-                                   (case (getf proof :type)
-                                     ((:equivocation :non-conforming-update) (1- (getf (getf proof :evidence) (if (eq (getf proof :type) :equivocation) :sequence :fault-sequence))))
-                                     (t (lg:ledger-sequence (record-ledger rec)))))))
+            (let ((last-valid (fr:dispute-fork-point proof (lg:ledger-sequence (record-ledger rec)))))
               (log! node "fraud proof ~a on ~a verified: disputing from seq ~a" (getf proof :type) (subseq id 0 8) last-valid)
               (let ((fork (enter-dispute node rec last-valid
                                          ;; snake_case, as the reference writes and matches it

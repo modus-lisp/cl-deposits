@@ -65,6 +65,7 @@ anyone is zero. Each one is a finding.
 
 | Observation | Seen | Notes |
 |---|---|---|
+| An UncreditedLightningPayment proof has nothing that dates the payment: it shows the preimage and an accused update at proof_sequence with no credit, but proof_sequence could precede the payment. Its embedding is checked only for presence and causal chain, never against proof_sequence | Nov 4 (reading, dispute-entry fork) | cl has no lightning verifier and declines these; Rust accepts them with an embedding. Needs a settle-time anchor (e.g. the invoice's expiry, or an accused update acknowledging the HTLC) |
 | regtest `down` returns while bitcoind still holds its datadir lock, so the next `up` aborts and no cl node starts | Nov 3 | devnet/regtest-net.sh should wait for bitcoind to exit |
 | cl's builder and cosigner take a confiscation's shape from their *own* fork's reason; DEP-06 and the watch take it from every DisputeEnter | Nov 3 (code reading, grounded-arms-v7 work) | Under grounded-arms-v7 both use the grounded DisputeEnters; under earlier rulesets a dispute with mixed reasons can still split builder and watch |
 | Grounds after a custody change: Rust reads the ruleset and governing quorum_expiry from the original operator's chain, cl from its base record's state | Nov 3 (code reading) | A dispute of a new custodian (DEP-06 proof 11) may judge an expiry ground differently; no vector covers it |

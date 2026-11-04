@@ -15,7 +15,7 @@
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire) (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
-           #:proof->json #:json->proof #:requires-embedding-p #:entry-permitted-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
+           #:proof->json #:json->proof #:requires-embedding-p #:entry-permitted-p #:dispute-fork-point #:broadcast->json #:json->broadcast #:make-equivocation-proof
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:uncredited-migration-proof #:latest-migration #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
@@ -987,6 +987,17 @@
    2026-11-04 the reference required one and refused disputes we entered on offer proofs.
    The reference classifies the same way (FraudProofType::requires_embedding)."
   (member type '(:uncredited-lightning-payment)))
+
+(defun dispute-fork-point (proof tip)
+  "DEP-06 (Entering a dispute, where it forks): the last_valid_sequence of a dispute entered on
+   PROOF from a replica whose tip is TIP.  A faulty update forks from the update before the fault;
+   an omission or a lapse forks from the tip, keeping the valid update the proof cites as evidence.
+   Vector: dispute_entry.txt (forkpoint rows)."
+  (let ((ev (getf proof :evidence)))
+    (min tip (case (getf proof :type)
+               (:equivocation (1- (getf ev :sequence)))
+               (:non-conforming-update (1- (getf ev :fault-sequence)))
+               (t tip)))))
 
 (defun entry-permitted-p (type embedding)
   "DEP-06 (Entering a dispute): whether the rule lets a member enter a dispute on a proof of TYPE
