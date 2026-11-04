@@ -74,7 +74,7 @@ case $FAULT in
     exit 0;;
   *) fail "unknown fault $FAULT";;
 esac
-echo "$(date +%s) $FAULT ${E:0:16} ${OPK:0:16} $WAIT" >>"$S/attacks.tsv"   # the oracle's MISS clock for this fault
+echo "$(date +%s) $FAULT ${E:0:16} ${OPK:2:16} $WAIT" >>"$S/attacks.tsv"   # x-only prefix, as proofs name keys
 
 proven=""; spent=""; claim=""
 for i in $(seq 1 $((WAIT / 10))); do
