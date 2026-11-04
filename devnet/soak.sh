@@ -18,7 +18,9 @@
 #        SOAK_BOT_INTERVAL_MS (10000), SOAK_CL_INTERVAL (20 s), SOAK_MONITOR_EVERY (300 s),
 #        SOAK_RESTART_EVERY (10800 s; 0 = no chaos), SOAK_CHAOS_NODES,
 #        SOAK_TOPUP_EVERY (900 s; 0 = off), SOAK_TOPUP_FLOOR_MSAT (2000000),
-#        NETCHAOS_EVERY (1800 s; 0 = no network faults; devnet/soak-netchaos.sh), SOAK_ORACLE_EVERY (120 s).
+#        NETCHAOS_EVERY (1800 s; 0 = no network faults; devnet/soak-netchaos.sh),
+#        CHAINCHAOS_EVERY (7200 s; 0 = no reorgs or fee spikes), CHAOS_FREEZE_PCT / CHAOS_KILL9_PCT (20 each),
+#        SOAK_ORACLE_EVERY (120 s).
 # State: $CLD_ROOT/soak/{env,ledgers.tsv,deposits.tsv,refwallet-*,log/,pids/,status.*}
 source "$(dirname "$0")/_common.sh"
 SOAK="$CLD_ROOT/soak"; mkdir -p "$SOAK/pids" "$SOAK/log"
@@ -213,6 +215,7 @@ start() {
   alive rotate || spawn rotate "$CLD_SRC/devnet/soak-rotate.sh"
   if [ "$SOAK_RESTART_EVERY" -gt 0 ]; then alive chaos || spawn chaos "$CLD_SRC/devnet/soak-chaos.sh"; fi
   if [ "${NETCHAOS_EVERY:=1800}" -gt 0 ]; then alive netchaos || spawn netchaos env NETCHAOS_EVERY="$NETCHAOS_EVERY" "$CLD_SRC/devnet/soak-netchaos.sh"; fi
+  if [ "${CHAINCHAOS_EVERY:=7200}" -gt 0 ]; then alive chainchaos || spawn chainchaos env CHAINCHAOS_EVERY="$CHAINCHAOS_EVERY" "$CLD_SRC/devnet/soak-chainchaos.sh"; fi
 }
 stop() { for f in "$SOAK"/pids/*; do [ -f "$f" ] || continue; p=$(cat "$f"); kill -- -"$p" 2>/dev/null || kill "$p" 2>/dev/null; rm -f "$f"; echo "  stopped $(basename "$f")"; done; pkill -f "deposit-bot --data-dir $SOAK/" 2>/dev/null; true; }
 status() {
