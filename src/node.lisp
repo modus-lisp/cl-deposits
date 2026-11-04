@@ -5461,6 +5461,12 @@
     (when anchor
       (let ((updates (spend-answer-updates node id-hex gseq anchor)))
         (or (fr:rotation-answer updates anchor (btx:tx-txid tx) reserves tier-index)
+            ;; A rung of a confiscation we signed: we checked it byte for byte against our own rebuild
+            ;; before signing (HANDLE-CONFISCATION-SIGN), so we never challenge it.  A rebuild from the
+            ;; relay later can miss (arms it has not delivered, a cut it judges otherwise): Nov 4 soak,
+            ;; a member challenged rung 1 of a confiscation it had signed, and the challenge lapsed.
+            (find (btx:tx-txid tx) (gethash id-hex (node-signed-confiscations node))
+                  :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
             (rebuilt-confiscation-p node id-hex tx :spend-height spend-height
                                                    :updates-fn (lambda ()
                                                                  (append (unless (getf (node-adversary node) :blind-relay)
