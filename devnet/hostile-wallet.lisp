@@ -5,6 +5,9 @@
 ;;;;   overdraw         TransferLock of 1 BTC out of a fresh, empty deposit
 ;;;;   dust-exit        ExitRequest of 1 msat to a valid address, out of an empty deposit
 ;;;;   nonce-reuse      two different ExitRequests under one nonce (DEP-17: the second is refused)
+;;;;   open             open a deposit and print its id (the soak loop then funds it: HOSTILE_DEPOSIT)
+;;;; With HOSTILE_DEPOSIT set, overdraw/dust-exit/nonce-reuse use that (funded) deposit instead of
+;;;; a fresh empty one, so they meet their own rule rather than the balance check.
 ;;;; Prints (:action A :refused T/NIL :detail "...").  env: CLD_RELAYS, HOSTILE_HEIGHT (chain tip), HOSTILE_ADDRESS
 (require :asdf)
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-deposits"))
@@ -23,9 +26,11 @@
     (setf (cl-deposits.node::wallet-nonce wal) (get-universal-time))
     (flet ((try (thunk) (handler-case (values nil (princ-to-string (funcall thunk)))
                           (error (e) (values t (princ-to-string e)))))
-           (fresh () (cl-deposits.node:wallet-open-deposit wal ledger)))
+           (fresh () (let ((d (env "HOSTILE_DEPOSIT"))) (if (and d (plusp (length d))) (cl-deposits.util:hex->bytes d) (cl-deposits.node:wallet-open-deposit wal ledger)))))
       (multiple-value-bind (refused detail)
           (cond
+            ((string= action "open")
+             (try (lambda () (cl-deposits.util:bytes->hex (cl-deposits.node:wallet-open-deposit wal ledger)))))
             ((string= action "bad-descriptor")
              (try (lambda () (cl-deposits.node:wallet-open-deposit wal ledger :descriptor "pk(v6-1234)"))))
             ((string= action "overdraw")
@@ -35,9 +40,9 @@
             ((string= action "nonce-reuse")
              (try (lambda ()
                     (let ((d (fresh)) (n (cl-deposits.node::wallet-nonce wal)))
-                      (ignore-errors (cl-deposits.node:wallet-exit wal ledger d 1000 addr :height h))
+                      (ignore-errors (cl-deposits.node:wallet-exit wal ledger d 600000 addr :height h))
                       (setf (cl-deposits.node::wallet-nonce wal) n)     ; the same nonce, a different request
-                      (cl-deposits.node:wallet-exit wal ledger d 2000 addr :height h)))))
+                      (cl-deposits.node:wallet-exit wal ledger d 700000 addr :height h)))))
             (t (values nil (format nil "unknown action ~a" action))))
         (format t "~s~%" (list :action action :refused refused :detail (subseq detail 0 (min 200 (length detail)))))))
     (ignore-errors (cl-deposits.nostr-bus:close-nostr-bus bus))

@@ -233,7 +233,7 @@ status() {
   [ -f "$SOAK/deploy/plan.tsv" ] && { echo; "$(dirname "$0")/soak-deploy.sh" --status; }
 }
 case "${1:-}" in
-  setup) setup;; fund-cl) fund_cl_collateral;; names) oracle_names;; start) start;; stop) stop;; status) status;;
+  setup) setup;; fund-cl) fund_cl_collateral;; names) oracle_names;; credit) shift; credit "$@";; start) start;; stop) stop;; status) status;;
   topup) topup;; collateral) topup_collateral;; topup-loop) SOAK_TOPUP_EVERY=${SOAK_TOPUP_EVERY:-900}; topup_loop;;
   reset) stop; rm -f "$ENV" "$SOAK/ledgers.tsv" "$SOAK/deposits.tsv" "$SOAK/.collateral-funded" "$SOAK/.cl-collateral-funded"; echo "reset (ledgers on the nodes are untouched)";;
   *) sed -n '2,19p' "$0"; exit 2;;
