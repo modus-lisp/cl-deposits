@@ -101,6 +101,29 @@
             (check "JSON round trip keeps the proof hash" (equalp (fr:proof-hash proof) (fr:proof-hash back)))
             (check "prevouts survive the round trip" (equal (getf (getf back :evidence) :prevouts) (getf (getf proof :evidence) :prevouts)))))))))
 
+;;; inspect/vectors/dispute_entry.txt: DEP-06 §Entering a dispute, shared with deposits-rust.  Which
+;;; proofs need an embedding, and whether a member may enter on one given how its broadcast carries it.
+(with-gate ("DEP-06 entering a dispute: an embedding is asked of a type that needs one, of no other")
+  (with-open-file (in "inspect/vectors/dispute_entry.txt")
+    (let ((n 0))
+      (loop for line = (read-line in nil) while line
+            unless (or (zerop (length line)) (char= (char line 0) #\#))
+              do (destructuring-bind (tag name emb ruleset req entry) (uiop:split-string line)
+                   (declare (ignore tag))
+                   (let ((type (car (rassoc name fr::+type-names+ :test #'string=)))
+                         (e (intern (string-upcase emb) :keyword)))
+                     (incf n)
+                     (check (format nil "~a is a known proof type" name) type)
+                     (check-equal (format nil "~a requires an embedding (~a)" name ruleset)
+                                  (if (fr:requires-embedding-p type) "1" "0") req)
+                     (check-equal (format nil "~a with embedding ~a under ~a" name emb ruleset)
+                                  (if (fr:entry-permitted-p type e) "permitted" "refused") entry)
+                     ;; a self-evident proof goes out with no embedding at all
+                     (unless (fr:requires-embedding-p type)
+                       (check (format nil "~a is broadcast without an embedding" name)
+                              (null (w:jget (fr:broadcast->json (list :type type :ledger-id "00" :accused "00" :evidence '())) "embedding")))))))
+      (check-equal "the vector covers eleven types, three embeddings, two rulesets" n 66))))
+
 (with-gate ("FINDINGS L6: operations no depositor signs are checked by every member and replica")
   ;; DEP-07 fee cap, shared vector
   (with-open-file (in (vector-path "fees_due.txt"))

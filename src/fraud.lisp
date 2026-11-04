@@ -15,7 +15,7 @@
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire) (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
-           #:proof->json #:json->proof #:requires-embedding-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
+           #:proof->json #:json->proof #:requires-embedding-p #:entry-permitted-p #:broadcast->json #:json->broadcast #:make-equivocation-proof
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:uncredited-migration-proof #:latest-migration #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
@@ -978,13 +978,22 @@
     (list :type type :accused (w:jget j "accused") :ledger-id (w:jget j "ledger_id") :evidence ev)))
 
 (defun requires-embedding-p (type)
-  "DEP-06 (Embedding): only a proof whose evidence is off the ledger or depends on
-   when something was known needs its hash embedded and causally chained.  A proof
-   that is itself cryptographic evidence of non-conformity (a non-conforming update,
-   an equivocation, a stale or non-conforming co-signature, a winner collateral
-   deviation, an expired quorum) needs neither, and verifiers must not require one.
+  "DEP-06 (Embedding): only a proof whose evidence is off the ledger and depends on when
+   something was known needs its hash embedded and causally chained: an uncredited lightning
+   payment, whose preimage does not say when the payment settled.  Every other type is itself
+   cryptographic evidence of non-conformity, and verifiers must not require one.  An uncredited
+   on-chain payment dates itself (its confirming block, and the accused's own update signed at
+   least service_response_blocks later without crediting it), so it needs none either; before
+   2026-11-04 the reference required one and refused disputes we entered on offer proofs.
    The reference classifies the same way (FraudProofType::requires_embedding)."
-  (member type '(:uncredited-onchain-payment :uncredited-lightning-payment)))
+  (member type '(:uncredited-lightning-payment)))
+
+(defun entry-permitted-p (type embedding)
+  "DEP-06 (Entering a dispute): whether the rule lets a member enter a dispute on a proof of TYPE
+   whose own evidence verified, given how its broadcast carries the embedding: :none, :placeholder
+   (present but in no history) or :valid (verified in the accused's history).  The rule holds
+   under every ruleset.  Vector: dispute_entry.txt."
+  (or (not (requires-embedding-p type)) (eq embedding :valid)))
 
 (defun broadcast->json (proof &key embedding (causal-chain '()))
   "A self-evident proof goes out with no embedding key at all.  It used to carry a

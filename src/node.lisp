@@ -5936,6 +5936,12 @@
     ;; Already disputing (another proof came first): an offer proof is still owed at confiscation.
     (when (and rec (not (record-owned-p rec)) (offer-proof-p proof) (live-fork node id (node-pubkey node)))
       (ignore-errors (note-obligation-proof node rec proof)))
+    ;; DEP-06 Entering a dispute: a type that needs an embedding is entered only on a verified one.
+    ;; We verify none (and have no lightning verifier), so we decline every such proof.
+    (when (and rec (fr:requires-embedding-p (getf proof :type)))
+      (log! node "fraud proof ~a on ~a: needs an embedding we do not verify; not disputing"
+            (getf proof :type) (subseq id 0 8))
+      (return-from handle-operator-fraud nil))
     (when (and rec (not (record-owned-p rec))
                (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
                (not (live-fork node id (node-pubkey node))))

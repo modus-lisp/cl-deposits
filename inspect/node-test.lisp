@@ -1241,8 +1241,11 @@
              (proof (fr:make-non-conforming-update-proof (nd:node-pubkey a) (u:hex->bytes id) fault)))
         (check "a self-evident proof is broadcast without an embedding"
                (null (nth-value 1 (gethash "embedding" (fr:broadcast->json proof)))))
-        (check "an off-ledger proof still carries one"
-               (nth-value 1 (gethash "embedding" (fr:broadcast->json (list :type :uncredited-onchain-payment :accused "00" :ledger-id id :evidence '()))))))
+        (check "an off-ledger proof whose timing needs one still carries one"
+               (nth-value 1 (gethash "embedding" (fr:broadcast->json (list :type :uncredited-lightning-payment :accused "00" :ledger-id id :evidence '())))))
+        ;; DEP-06 §Embedding (2026-11-04): an offer proof dates itself, so it goes out bare too.
+        (check "an uncredited on-chain payment proof is broadcast without an embedding"
+               (null (nth-value 1 (gethash "embedding" (fr:broadcast->json (list :type :uncredited-onchain-payment :accused "00" :ledger-id id :evidence '())))))))
       ;; Finding 10: an armer that declares no replacement collateral is never a
       ;; lottery participant (it could win custody with no bond).  DEP-03 excludes
       ;; it rather than refusing; here that leaves one participant.
