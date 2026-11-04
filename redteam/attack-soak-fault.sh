@@ -39,8 +39,8 @@ S0=$(seq_of)
 blind() { for n in $M1 $M2 $M3; do cld_ctl $n "(:adversary :set :cosign-blind $1)" >/dev/null; done; }
 cleanup() {
   blind nil; for k in :sign-invalid :omit-commitments :falsify-commitments; do cld_ctl $OP "(:adversary :set $k nil)" >/dev/null 2>&1; done
-  # Burned minted nodes have no further use; stopping them keeps the soak's load bounded.
-  for n in $OP $M1 $M2 $M3; do tainted $n && [[ " $SOAK_NODES " != *" $n "* ]] && stop_cld $n >/dev/null 2>&1; done
+  # Burned nodes stay up: they are still members of this ledger and of its dispute, and a stopped
+  # member cannot answer a challenge of the confiscation it signed (Nov 4: one lapsed unanswered).
 }
 trap cleanup EXIT
 
@@ -89,7 +89,8 @@ for i in $(seq 1 $((WAIT / 10))); do
     [ -n "$claim" ] && break
     tail -c 3000000 "$(ref_dir ${REFS%% *})/node.log" 2>/dev/null | grep -F "${E:0:16}" | grep -qiE "won the lottery|claim(ed)? .*custody|DisputeAcquire" && { claim="${REFS%% *}: reference"; break; }
   fi
-  [ $((i % 6)) -eq 0 ] && mine 1 >/dev/null
+  # On signet the soak's own miner keeps time: mining here too would shorten every window in the soak.
+  [ "$CLD_CHAIN" = regtest ] && [ $((i % 6)) -eq 0 ] && mine 1 >/dev/null
   sleep 10
 done
 echo "== detection: ${proven:-none}"

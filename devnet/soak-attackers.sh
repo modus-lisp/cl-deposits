@@ -16,9 +16,11 @@ source "$(dirname "$0")/_common.sh"
 SOAK="$CLD_ROOT/soak"; EVERY=${ATTACK_EVERY:-14400}; WINDOW=${ATTACK_WINDOW:-3600}
 # Each entry is SCRIPT or SCRIPT:ARG.  The default covers the fault classes the live attacker ledgers
 # exercise end to end (docs/ADVERSARIAL.md): uncredited payment + unhonoured obligation with payouts
-# (check-obligations), forged lock, invalid credit, equivocation, unanchored and forged-anchor vault
+# (check-obligations: NOT in the default on signet, since it mines about 120 blocks in minutes, which
+# collapses every block-counted window in the soak, the 72-block challenge window included; run it on
+# regtest), forged lock, invalid credit, equivocation, unanchored and forged-anchor vault
 # spends, and the omitted / falsified balance commitments that must be refused, not proven.
-ATTACKS=(${ATTACKS:-check-obligations attack-soak-fault:forge-lock attack-vault-spend attack-soak-fault:omit-commitments attack-soak-fault:equivocate attack-soak-fault:invalid-credit attack-vault-anchored attack-soak-fault:falsify-commitments})
+ATTACKS=(${ATTACKS:-attack-soak-fault:forge-lock attack-vault-spend attack-soak-fault:omit-commitments attack-soak-fault:equivocate attack-soak-fault:invalid-credit attack-vault-anchored attack-soak-fault:falsify-commitments})
 REFUSAL_ATTACKS=" attack-soak-fault:omit-commitments attack-soak-fault:falsify-commitments "   # nothing to prove: no MISS clock
 SOAK_OPS=$(cld_names | head -n "${SOAK_PLAN_CL:-6}" | tr '\n' ' ')
 # The soak's own cl nodes (operators and members), recorded once: attacker roles are never drawn

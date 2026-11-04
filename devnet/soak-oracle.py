@@ -162,8 +162,12 @@ def judge(events, world, now=None):
     per = {}
     for r in world.outcomes:
         ok = r[2].startswith("PASS")
-        a = per.setdefault(r[1], [0, 0])
-        a[0] += ok; a[1] += 1
+        moot = r[2].startswith(("INVALID", "SKIP"))   # the scenario's precondition did not arise: no verdict
+        a = per.setdefault(r[1], [0, 0, 0])
+        if moot:
+            a[2] += 1
+        else:
+            a[0] += ok; a[1] += 1
         if not ok:
             verdicts.append((float(r[0]), "ATTACK", False, f"{r[1]}: scenario verdict {r[2]}"))
     counts["attacks"] = per
@@ -175,7 +179,7 @@ def summary_line(counts):
             " (answered {answered}, pending {pending})").format(**counts)
     per = counts.get("attacks") or {}
     if per:
-        line += "  attacks " + " ".join(f"{a}={p}/{n}" for a, (p, n) in sorted(per.items()))
+        line += "  attacks " + " ".join(f"{a}={p}/{n}" + (f"+{m}moot" if m else "") for a, (p, n, m) in sorted(per.items()))
     return line
 
 
