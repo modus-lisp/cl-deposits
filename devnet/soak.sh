@@ -20,7 +20,8 @@
 #        SOAK_TOPUP_EVERY (900 s; 0 = off), SOAK_TOPUP_FLOOR_MSAT (2000000),
 #        NETCHAOS_EVERY (1800 s; 0 = no network faults; devnet/soak-netchaos.sh),
 #        CHAINCHAOS_EVERY (7200 s; 0 = no reorgs or fee spikes), CHAOS_FREEZE_PCT / CHAOS_KILL9_PCT (20 each),
-#        SOAK_ORACLE_EVERY (120 s).
+#        HOSTILE_EVERY (1200 s; hostile depositor), ATTACK_EVERY (14400 s; red-team attackers),
+#        SOAK_ORACLE_EVERY (120 s).  Touch soak/{netchaos,chainchaos,hostile,attackers}.pause to pause one.
 # State: $CLD_ROOT/soak/{env,ledgers.tsv,deposits.tsv,refwallet-*,log/,pids/,status.*}
 source "$(dirname "$0")/_common.sh"
 SOAK="$CLD_ROOT/soak"; mkdir -p "$SOAK/pids" "$SOAK/log"
@@ -216,6 +217,8 @@ start() {
   if [ "$SOAK_RESTART_EVERY" -gt 0 ]; then alive chaos || spawn chaos "$CLD_SRC/devnet/soak-chaos.sh"; fi
   if [ "${NETCHAOS_EVERY:=1800}" -gt 0 ]; then alive netchaos || spawn netchaos env NETCHAOS_EVERY="$NETCHAOS_EVERY" "$CLD_SRC/devnet/soak-netchaos.sh"; fi
   if [ "${CHAINCHAOS_EVERY:=7200}" -gt 0 ]; then alive chainchaos || spawn chainchaos env CHAINCHAOS_EVERY="$CHAINCHAOS_EVERY" "$CLD_SRC/devnet/soak-chainchaos.sh"; fi
+  if [ "${HOSTILE_EVERY:=1200}" -gt 0 ]; then alive hostile || spawn hostile env HOSTILE_EVERY="$HOSTILE_EVERY" "$CLD_SRC/devnet/soak-hostile.sh"; fi
+  if [ "${ATTACK_EVERY:=14400}" -gt 0 ]; then alive attackers || spawn attackers env ATTACK_EVERY="$ATTACK_EVERY" CLD_SRC="$CLD_SRC" "$CLD_SRC/devnet/soak-attackers.sh"; fi
 }
 stop() { for f in "$SOAK"/pids/*; do [ -f "$f" ] || continue; p=$(cat "$f"); kill -- -"$p" 2>/dev/null || kill "$p" 2>/dev/null; rm -f "$f"; echo "  stopped $(basename "$f")"; done; pkill -f "deposit-bot --data-dir $SOAK/" 2>/dev/null; true; }
 status() {

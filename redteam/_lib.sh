@@ -146,14 +146,16 @@ clean_cl() {
 # nodes is a SKIP, not a FAIL: the scenario cannot tell its result apart from earlier taint.
 # mint_cl K — on regtest, start K more cl nodes with fresh keys (cldN+1..), each with collateral coins,
 # so a scenario never runs out of untainted actors.  They persist (counted in $CLD_ROOT/minted-cl).
-mint_cl() {
-  [ "$CLD_CHAIN" = regtest ] || return 1
+mint_cl() {   # on signet only for the adversarial soak (REDTEAM_MINT=1): new nodes run the version cld7 runs
+  [ "$CLD_CHAIN" = regtest ] || [ "${REDTEAM_MINT:-}" = 1 ] || return 1
   local k=$1 have i n a j
   have=$(cld_names | wc -l)
   echo $(( $(cat "$CLD_ROOT/minted-cl" 2>/dev/null || echo 0) + k )) >"$CLD_ROOT/minted-cl"
   source "$CLD_SRC/devnet/_common.sh" >/dev/null 2>&1
   for i in $(seq $((have + 1)) $((have + k))); do
-    n=cld$i; start_cld "$n" >&2   # may report "did not come up" while still loading under load
+    n=cld$i; mkdir -p "$(cld_dir "$n")"
+    [ -f "$(cld_dir "$n")/version" ] || [ ! -f "$(cld_dir cld7)/version" ] || cp "$(cld_dir cld7)/version" "$(cld_dir "$n")/version"
+    start_cld "$n" >&2   # may report "did not come up" while still loading under load
     local w; for w in $(seq 1 60); do cld_ctl "$n" '(:info)' 2>/dev/null | grep -q ":STATUS :OK" && break; sleep 5; done
     pubkey_of "$n" >/dev/null
     a=$(sx "$(cld_ctl "$n" '(:address)')" ":ADDRESS") || return 1
@@ -164,7 +166,7 @@ mint_cl() {
 }
 pick() {
   local pool=($(clean_cl)) i=0 v
-  if [ ${#pool[@]} -lt $# ] && [ "$CLD_CHAIN" = regtest ]; then
+  if [ ${#pool[@]} -lt $# ] && { [ "$CLD_CHAIN" = regtest ] || [ "${REDTEAM_MINT:-}" = 1 ]; }; then
     mint_cl $(( $# - ${#pool[@]} )) && pool=($(clean_cl))
   fi
   [ ${#pool[@]} -ge $# ] || { echo "SKIP: needs $# clean cl nodes ($*), have ${#pool[@]} (${pool[*]:-none}); add fresh-key nodes (devnet/_common.sh CLD_NODES)"; exit 0; }

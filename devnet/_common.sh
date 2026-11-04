@@ -29,6 +29,9 @@ case "$CLD_CHAIN" in
                "cld11:10055" "cld12:10056" "cld13:10057" "cld14:10058"   # 10101+ are the regtest network's
                "cld15:10059" "cld16:10060" "cld17:10061" "cld18:10062")
     CLD_ROOT="${CLD_ROOT:-$SIGNET_ROOT/deposits}"        # data dirs live OUTSIDE the repo
+    # Red-team actors minted on signet for the adversarial soak (redteam/_lib.sh mint_cl): cld19.., ports 10063..10099.
+    _nm=$(cat "$CLD_ROOT/minted-cl" 2>/dev/null || echo 0); [ "$_nm" -gt 37 ] && _nm=37
+    for _i in $(seq 1 "$_nm"); do CLD_NODES+=("cld$((18 + _i)):$((10062 + _i))"); done
     BITCOIN_DATADIR="$SIGNET_ROOT/bitcoin"
     BITCOIN_CLI="${BITCOIN_CLI:-$SIGNET_ROOT/bin/bitcoin-cli}"
     BCLI="$BITCOIN_CLI -signet -datadir=$BITCOIN_DATADIR"

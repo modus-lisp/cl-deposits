@@ -16,6 +16,10 @@ from a dispute, which follows from one of the above.
 
 Adversaries ($SOAK/adversaries.tsv, '#' comments):   key <hex prefix> [label]
                                                     ledger <id prefix> [label]
+                                                    pool <key> [label]
+A pool key is a red-team actor (devnet/soak-attackers.sh): adversarial once a scenario burns it
+(it is then in $SOAK/redteam-tainted), honest otherwise.  A proof against a pool key that is not
+burned yet waits ORACLE_POOL_GRACE_S (1800) for the scenario to record it before it is an ALARM.
 Scheduled attacks ($SOAK/attacks.tsv, appended by attackers):
     <unix time> <attack> <ledger id> <accused key prefix> <window s>
 
@@ -30,6 +34,7 @@ import asyncio, json, os, sys, time
 SOAK = os.environ.get("SOAK") or os.path.join(os.environ.get("CLD_ROOT", "/mnt/lisp/signet/deposits"), "soak")
 RELAY = os.environ.get("RELAY_URL", "ws://127.0.0.1:7777")
 # DEP-06 spend challenge window: service_response_blocks (72) at the soak's one block a minute, with slack
+POOL_GRACE_S = int(os.environ.get("ORACLE_POOL_GRACE_S", "1800"))
 CHALLENGE_WINDOW_S = int(os.environ.get("ORACLE_CHALLENGE_WINDOW_S", str(72 * 60 * 3 // 2)))
 KINDS = (9101, 9111, 9112)
 
@@ -57,6 +62,7 @@ class World:
         rows = load_table(os.path.join(soak, "adversaries.tsv"))
         self.adv_keys = [(xonly(r[1]), " ".join(r[2:])) for r in rows if r[0] == "key"]
         self.adv_ledgers = [(r[1].lower(), " ".join(r[2:])) for r in rows if r[0] == "ledger"]
+        self.pool = {xonly(r[1]) for r in rows if r[0] == "pool"}
         self.names = {}
         for r in load_table(os.path.join(soak, "names.tsv")):        # <node> <pubkey>, every node
             self.names[xonly(r[1])] = r[0]
@@ -67,10 +73,15 @@ class World:
                     self.names[xonly(k)] = f.split(".", 1)[1]
         self.ledger_names = {r[1].lower(): r[0] for r in load_table(os.path.join(soak, "ledgers.tsv")) if len(r) >= 2}
         self.attacks = [r for r in load_table(os.path.join(soak, "attacks.tsv")) if len(r) >= 5]
+        burned = {r[0] for r in load_table(os.path.join(soak, "redteam-tainted"))}
+        self.burned = {k for k, n in self.names.items() if n in burned}
 
     def adversarial_key(self, k):
         x = xonly(k)
-        return bool(x) and any(x.startswith(p) for p, _ in self.adv_keys)
+        return bool(x) and (x in self.burned or any(x.startswith(p) for p, _ in self.adv_keys))
+
+    def pool_key(self, k):
+        return xonly(k) in self.pool
 
     def adversarial_ledger(self, l):
         l = (l or "").lower()
@@ -112,6 +123,9 @@ def judge(events, world, now=None):
             v = "EXPIRY"
         elif world.adversarial_key(acc) or world.adversarial_ledger(led):
             v = "PASS"
+        elif world.pool_key(acc) and now - e["created_at"] < POOL_GRACE_S:
+            counts["pending"] += 0 if dup else 1
+            continue
         else:
             v = "ALARM"
         if not dup:
@@ -135,7 +149,8 @@ def judge(events, world, now=None):
         t, window = float(t), float(window)
         hit = any(typ != "QuorumExpired" and e["created_at"] >= t - 60 and e["created_at"] <= t + window
                   and (led.lower() == "-" or led2.lower().startswith(led.lower()))
-                  and (acc == "-" or xonly(acc2).startswith(xonly(acc)))
+                  and (xonly(acc2).startswith(xonly(acc)) if acc != "-"
+                       else world.adversarial_key(acc2) or world.adversarial_ledger(led2))
                   for e, typ, acc2, led2 in proofs)
         if not hit and now > t + window:
             counts["MISS"] += 1
