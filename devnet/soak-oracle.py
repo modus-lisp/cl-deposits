@@ -77,6 +77,16 @@ class World:
         # <unix time> <attack> <scenario verdict> <seconds>: each live attack's end-to-end result
         # (devnet/soak-attackers.sh), e.g. confiscated and the depositors paid
         self.outcomes = [r for r in load_table(os.path.join(soak, "attack-outcomes.tsv")) if len(r) >= 3]
+        # Known false accusations whose cause is fixed ($SOAK/alarms-resolved.tsv: <accused prefix>
+        # <ledger prefix> <note...>).  They stay counted as ALARMs; the summary also says how many are
+        # resolved, so a new ALARM stands out.
+        self.resolved = [r for r in load_table(os.path.join(soak, "alarms-resolved.tsv")) if len(r) >= 2]
+
+    def resolution(self, accused, ledger):
+        for r in self.resolved:
+            if xonly(accused).startswith(xonly(r[0])) and ledger.lower().startswith(r[1].lower()):
+                return " ".join(r[2:]) or "resolved"
+        return None
         burned = {r[0] for r in load_table(os.path.join(soak, "redteam-tainted"))}
         self.burned = {k for k, n in self.names.items() if n in burned}
 
@@ -117,7 +127,7 @@ def judge(events, world, now=None):
             challenges.setdefault(key, e)
         elif e["kind"] == 9112:
             answers.add((c.get("challenged_ledger_id", ""), c.get("txid", "")))
-    verdicts, counts = [], {"PASS": 0, "MISS": 0, "ALARM": 0, "EXPIRY": 0, "challenged": 0, "answered": 0, "pending": 0}
+    verdicts, counts = [], {"PASS": 0, "MISS": 0, "ALARM": 0, "resolved": 0, "EXPIRY": 0, "challenged": 0, "answered": 0, "pending": 0}
     seen = set()
     for e, typ, acc, led in proofs:
         k = (typ, acc, led)
@@ -132,10 +142,14 @@ def judge(events, world, now=None):
             continue
         else:
             v = "ALARM"
+        note = world.resolution(acc, led) if v == "ALARM" else None
         if not dup:
             counts[v] += 1
+            if note:
+                counts["resolved"] += 1
         verdicts.append((e["created_at"], v, dup,
-                         f"{typ} against {world.who(acc)} on {world.lname(led)} (published by {world.who(e['pubkey'])})"))
+                         f"{typ} against {world.who(acc)} on {world.lname(led)} (published by {world.who(e['pubkey'])})"
+                         + (f" [resolved: {note}]" if note else "")))
     for (led, txid), e in challenges.items():
         counts["challenged"] += 1
         adv = world.adversarial_ledger(led)
@@ -175,7 +189,7 @@ def judge(events, world, now=None):
 
 
 def summary_line(counts):
-    line = ("oracle: PASS {PASS}  MISS {MISS}  ALARM {ALARM}  expiry {EXPIRY}  challenges {challenged}"
+    line = ("oracle: PASS {PASS}  MISS {MISS}  ALARM {ALARM} ({resolved} resolved)  expiry {EXPIRY}  challenges {challenged}"
             " (answered {answered}, pending {pending})").format(**counts)
     per = counts.get("attacks") or {}
     if per:
