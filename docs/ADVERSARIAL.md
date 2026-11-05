@@ -71,6 +71,7 @@ Nov 2 lapsed-challenge vault-spend proofs.
 | Strategic seating to capture quorums | have (sim) | `analysis/seating_sim.py` |
 | A receiver whose whole quorum is attacker keys (L4) | idea | Seating / trust-model limit |
 | Lottery griefing: arming without ever claiming | idea | |
+| A guilty majority confiscates into a lottery of its own colluders (`:lottery-include-accused`) | next | Authorised under v7, a theft under strict-lottery-v8; scenario not yet wired |
 
 ## Depositor and wallet attacks
 
