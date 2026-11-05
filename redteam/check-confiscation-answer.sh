@@ -25,6 +25,16 @@ trap 'for n in $C2 $C3 $C4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" 
 expect "$(cld_ctl $BLIND "(:adversary :set :blind-relay \"${W:0:16}\")")" "blind-relay"
 arm :mute $BLIND
 
+# RUNG1=1: rung 0 is made unmineable as soon as it is broadcast, so a higher rung confirms and is
+# the spend that is challenged and answered (signet soak, 2026-11-04: rung 1 of 6056fb38's
+# confiscation, which a cl judge could not rebuild).  The ticker is paused so rung 0 is not
+# mined before it is stalled.
+if [ "${RUNG1:-0}" = 1 ]; then
+  "$CLD_SRC/devnet/regtest-net.sh" ticker stop
+  trap '"$CLD_SRC/devnet/regtest-net.sh" ticker start; for n in $C2 $C3 $C4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null 2>&1; done; cld_ctl $BLIND "(:adversary :set :lag-replica nil)" >/dev/null 2>&1; cld_ctl $BLIND "(:adversary :set :blind-relay nil)" >/dev/null 2>&1; disarm :mute $BLIND' EXIT
+fi
+R0=""
+
 # The fault: $OP locks a depositor's funds with no witness, $C2..$C4 cosign blind.
 for n in $C2 $C3 $C4; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
 cld_ctl $OP "(:forge-lock :ledger \"$W\" :from \"$FROM\" :to \"$FROM\" :msat 1000000)" >/dev/null
@@ -44,10 +54,21 @@ for i in $(seq 1 $((WAIT / 10))); do
     [ -n "$conf" ] || conf=spent
     break
   fi
+  if [ "${RUNG1:-0}" = 1 ] && [ -z "$R0" ]; then
+    R0=$(bcli gettxspendingprevout "[{\"txid\":\"$VINTX\",\"vout\":$VINVOUT}]" 2>/dev/null \
+           | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r[0].get("spendingtxid",""))' 2>/dev/null)
+    if [ -n "$R0" ]; then bcli prioritisetransaction "$R0" 0 -100000000 >/dev/null; echo "== rung 0 $R0 made unmineable"; fi
+  fi
   [ $((i % 3)) -eq 0 ] && mine 1 >/dev/null   # the arm window and the tier close on height; never rely on the ticker
   sleep 10
 done
 [ -n "$conf" ] || fail "the vault was not spent within ${WAIT}s"
+if [ "${RUNG1:-0}" = 1 ]; then
+  [ -n "$R0" ] || fail "rung 0 was never seen in the mempool to stall"
+  r0c=$(bcli getrawtransaction "$R0" 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+  [ "${r0c:-0}" = 0 ] || fail "rung 0 confirmed despite being stalled"
+  echo "== a higher rung confirmed in place of rung 0 ($R0)"
+fi
 echo "== the vault is spent; mining past the spend-judging grace and waiting for a challenge and its answer"
 answered="" challenged=""
 for i in $(seq 1 $((WAIT / 10))); do
