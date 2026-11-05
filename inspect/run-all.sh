@@ -21,7 +21,17 @@ lisp_gate () {  # name, then test files
   for f in "$@"; do args+=(--load "$f"); done
   run_gate "$name" "$SBCL" "${args[@]}"
 }
+# A fresh compile of our own systems must not warn of an undefined variable: one is a stray form
+# (Nov 5: a docstring that quoted a phrase with bare double quotes became code, and the soak's
+# build raised "variable A is unbound" in the vault-spend verifier while this suite, compiled
+# differently, passed).
+compile_gate () {
+  local out; out=$("$SBCL" --non-interactive --eval '(require :asdf)' --eval '(asdf:load-system "cl-deposits" :force (list "cl-deposits"))' 2>&1)
+  if grep -E 'undefined variable: (CL-DEPOSITS|COMMON-LISP:)' <<<"$out"; then return 1; fi
+  grep -q 'compilation unit' <<<"$out" || grep -q . <<<"$out"
+}
 echo "== cl-deposits offline gate suite =="
+run_gate compile compile_gate
 lisp_gate vectors inspect/update-test.lisp inspect/operation-test.lisp inspect/dep17-test.lisp inspect/dep16-test.lisp inspect/descriptor-test.lisp inspect/reserves-test.lisp inspect/rotation-test.lisp inspect/commitment-test.lisp inspect/lottery-test.lisp
 lisp_gate nodes   inspect/update-test.lisp inspect/operation-test.lisp inspect/index-test.lisp inspect/node-test.lisp
 lisp_gate property inspect/update-test.lisp inspect/operation-test.lisp inspect/property-test.lisp

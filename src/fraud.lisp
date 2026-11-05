@@ -540,8 +540,8 @@
    (a rotation or an authorised confiscation); a known answer rebuts the lapsed form.
    ANSWERS-READABLE is false when the verifier could not read every place DEP-06 says answers go
    (the relays and its own store): a lapsed form with no answer found is then no verdict, third
-   value :UNKNOWN, never a conviction (DEP-06 §Spend challenge, "a lapse is judged where answers
-   are read")."
+   value :UNKNOWN, never a conviction (DEP-06 §Spend challenge: a lapse is judged where answers
+   are read)."
   (handler-case
       (let* ((ev (getf proof :evidence))
              (tx (btx:parse-tx (bw:make-reader (hex->bytes (getf ev :spend-tx-hex)))))
