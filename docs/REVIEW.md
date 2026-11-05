@@ -21,30 +21,34 @@ proposed, not adopted; **open** = a question with no rule yet.
   vectors `lottery_accused.txt` (22 cases) and `ruleset_naming.txt` (48) pass in both
   implementations. No live colluder self-lottery has run under v8 yet (`:lottery-include-accused`
   exists; the scenario is not wired).
-- **Before freezing:** decide entries 2–5, since several would change the lottery output's script
-  and so belong in v8 or a v9.
+- **Before freezing:** review entries 2, 4 and 5. Entry 2 changes the lottery output's script, so it
+  is part of v8.
 
-## 2. Recovery voters are not shrunk (provisional)
+## 2. Recovery voters exclude the accused (provisional)
 
-- **What:** the lottery's recovery voters stay the full governing quorum minus the operator, even
-  when some voters are accused.
-- **Why not shrink:** recovery voters also attest which participants revealed (DEP-06 Phase 4,
-  `lottery_subset_attest`). A proper-subset claim needs a threshold of voter signatures, so a voter
-  set shrunk below the leaves' thresholds leaves honest winners unable to claim.
-- **Known gap:** accused voters remain voters. The CSV-8064 timeout leaf has threshold 1, so a single
-  accused voter can spend the lottery output after 8064 blocks; at CSV 144 the accused can meet T
-  when they are a majority of voters (30ea46ac: 3 of 5).
-- **Where:** DEP-06 §Lottery (recovery voters); no code change.
+- **What:** under `strict-lottery-v8` the lottery's recovery voters are the governing quorum's members
+  minus the operator minus Accused(grounds). Every threshold (subset attestation and the recovery
+  tiers) is sized over what remains by the existing rule: T = ⌊r/2⌋ + 1, tiers T / T−1 / T−2 / 1.
+  With no voter left (the whole quorum accused) the lottery has only its full-set leaf: the
+  all-revealed claim works, anything else strands, and that is accepted.
+- **Where:** spec DEP-06 §Lottery, `730c7cf`. cl `lot:strict-voters` and node `lottery-voters`
+  (`40622cb`); Rust `types::strict_voters`, `armers::lottery_voters_with` and
+  `Node::lottery_voters` at every lottery site (`5be6517`).
+- **Why:** accused voters could otherwise meet the recovery thresholds and take the output (30ea46ac:
+  3 of 5 voters accused; the CSV-8064 leaf needs only 1).
+- **Alternatives dropped:** shrinking the voter set to a minimum (it breaks subset-claim
+  attestation); thresholds of at least |Accused| + 1 over the full quorum (the user: "asking losers
+  to help winners"); proper-subset claims without attestation (entry 6, dropped).
+- **Evidence:** the shared vector `lottery_voters_accused.txt` (0, 1, 3 and 5 of 5 accused: voters,
+  thresholds, tiers, leaf count, address, leaves) passes in both implementations. cl's vectors gate
+  also spends each lottery under consensus: a subset claim attested by the remaining voters
+  verifies, attestations by accused keys don't count, and the all-accused lottery has only its
+  full-set claim.
 
-## 3. Raised recovery and attestation thresholds (held, not adopted)
+## 3. Raised thresholds (dropped)
 
-- **Proposal:** every recovery tier and subset-attestation threshold becomes at least
-  |Accused(grounds) ∩ voters| + 1, so the accused can never spend or attest alone (the output
-  strands rather than being stolen).
-- **Objection (user, 2026-11-05):** "seems like you're asking losers to help winners though." Subset
-  claims already depend on recovery voters, mostly losers, attesting R; raising the thresholds makes
-  winners need more help from parties with no stake in helping them.
-- **Status:** not implemented. Entry 6 is the direction under consideration instead.
+Proposed (every threshold at least |Accused| + 1 over the full quorum) and dropped in favour of
+entry 2.
 
 ## 4. A lottery unclaimed despite revealers also re-arms (provisional)
 
@@ -69,61 +73,12 @@ proposed, not adopted; **open** = a question with no rule yet.
   claimed vsize against a fully witnessed spend.
 - **Not done:** the round's orchestration (detecting the deadline, collecting the round's arms,
   proposing and signing the spend, reveal and claim against the new output) in either
-  implementation, and the all-yield regtest scenario. Recovery voters must still sign the spend, so
-  entry 6's objection applies here too.
+  implementation, and the all-yield regtest scenario.
 
-## 6. Proper-subset claims without voter attestation (open, design under consideration)
+## 6. Proper-subset claims without voter attestation (dropped)
 
-**Proposal.** After the reveal deadline a participant may claim through a subset leaf with no voter
-signatures. The subset S must equal the reveals R published before the deadline; a claim through
-any other subset is a provable fault, slashed from the claimant's replacement collateral.
-
-**Assessment: sound only with three changes; it trades prevention for punishment.**
-
-1. *Without attestation every revealer can win.* The singleton leaf {self} pays its only member, and
-   with |R| ≥ 2 most revealers find some S ⊆ R that they win. Claims become a race among all
-   revealers through leaves that open at the same height; the draw no longer decides the outcome
-   unless deterrence does. When everyone revealed, the honest full-set winner can claim at once (no
-   CSV), ahead of every subset leaf; this only matters when someone withholds.
-2. *R must be dated by the chain, not by signed updates.* Signed `block_height` is only
-   non-decreasing on its signer's own chain and is never checked against Bitcoin. A withholder could
-   publish a back-dated "reveal" after seeing an honest claim through S = R, making S ⊊ R'
-   retroactively: a framing attack on the honest winner. Dating each reveal by its spend of the
-   armer-share reveal-claim leaf, which already publishes the preimage on chain, makes R the set of
-   reveal spends confirmed by the deadline. Every verifier with the chain computes the same R.
-3. *The proofs.* S ⊊ R (the claimant left out a revealer to pick a favourable subset) is literal: the
-   claim witness plus the omitted member's on-chain reveal at height ≤ deadline. S ⊄ R (S includes a
-   member with no timely reveal, so its preimage was shared privately) is judged from the chain,
-   which deterministically shows that the member's share was not spent through its reveal leaf by
-   the deadline. Neither needs a relay, a challenge window or any voter.
-
-**The race and which spend wins.** All claims spend the same lottery outpoint and the first to
-confirm wins; nothing in script prefers the honest R-claim. The claim's shape is fixed (DEP-03: one
-output to the claimant's own `target_reserves`, with its declared replacement collateral as input
-1), so a misclaimant cannot redirect value elsewhere. It becomes the custodian, holding the lottery
-value plus its own collateral in its declared vault, with a provable fault on record.
-
-**What slashing can recover.** The faulty claim makes the misclaimant's new custody disputable on
-literal grounds, so the ledger goes to another confiscation and lottery and the honest participants
-can arm again. This recovers everything, the lottery value and the misclaimant's collateral, only if
-the misclaimant's `target_reserves` vault is confiscatable by honest keys. Today `target_reserves` is
-an address the armer declares freely. If it is a key the misclaimant alone controls, nothing is
-recoverable: slashing "from the replacement collateral" reaches nothing, because that collateral sits
-in the same output. So the scheme also needs:
-
-- `target_reserves` constrained to a reserves vault whose tiers include the dispute's honest recovery
-  voters (or the next governing quorum), checked when the arm is made; and
-- the expected gain of misclaiming (the lottery output) to be outweighed by the loss (the collateral,
-  plus losing custody again). Since the lottery output can far exceed the collateral, deterrence
-  rests on re-confiscation succeeding, not on the collateral alone.
-
-**A simpler alternative, with no subset leaves at all.** Keep only the full-set leaf. If anyone
-withholds, nobody can claim, and after the deadline the output goes to the re-arm round (entry 5)
-over the revealers only, the withholders having forfeited their shares and an arm. The draw is then
-always over everyone who revealed, there is nothing to attest and nothing to race, and a withholder
-gains nothing and loses its share. The cost is an extra round whenever someone withholds, and the
-re-arm spend still needs recovery voters to sign it. That is liveness help (moving the output to the
-next round's lottery), not choosing a winner.
-
-**Recommendation for review:** prefer the full-set-only alternative. If proper-subset claims stay,
-they need chain-dated reveals and a constrained `target_reserves` before attestation can be dropped.
+Considered and dropped: holdouts are already handled by the subset leaves. The assessment, in short:
+without attestation every revealer can claim through a favourable subset (the singleton leaf at
+least), so claims become a race. It would be sound only with chain-dated reveals (signed heights
+can be back-dated to frame an honest claimant) and a `target_reserves` that honest keys can
+re-confiscate.
