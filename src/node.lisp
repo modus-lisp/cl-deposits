@@ -2791,9 +2791,8 @@
 (defun lottery-paid-by (node id-hex spk)
   "The lottery over a subset of ID-HEX's armers whose output script is SPK (our cut
    first, then every subset, largest first), or NIL."
-  (let* ((base (find-record node id-hex)) (voters (recovery-voters base (dispute-last-valid-seq node id-hex)))
-         (threshold (lg:majority-threshold (length voters)))
-         (network (intern (string-upcase (node-network node)) :keyword)))
+  (let* ((network (intern (string-upcase (node-network node)) :keyword)))
+    (multiple-value-bind (voters threshold) (lottery-voters node id-hex)
     (flet ((try (armers)
              (let ((ps (loop for (pk c target) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target))))
                (when ps
@@ -2803,7 +2802,7 @@
           (let ((all (sort (copy-list (armers-of node id-hex)) #'bytes< :key #'first)))
             (when (<= (length all) 8)
               (loop for mask from (1- (ash 1 (length all))) downto 1
-                    thereis (try (loop for a in all for i from 0 when (logbitp i mask) collect a)))))))))
+                    thereis (try (loop for a in all for i from 0 when (logbitp i mask) collect a))))))))))
 
 (defun reveal-deadline-passed-p (node conf)
   (let ((info (and (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid conf) 0))))
@@ -4003,6 +4002,18 @@
           (let ((proof (ignore-errors (fr:json->broadcast (w:parse-json (op:field o :fraud-proof))))))
             (when proof (setf keys (append (fr:proof-accused-keys proof) keys)))))))))
 
+(defun lottery-voters (node id-hex)
+  "DEP-06 §Lottery: the lottery's recovery voters and threshold, (values voters threshold).  The
+   members of the governing QuorumBegin other than the operator; under strict-lottery-v8
+   (provisional, docs/REVIEW.md) also without Accused(grounds), the threshold the strict majority
+   of what remains (0 when nothing remains: then the lottery has only its full-set leaf).
+   ADVERSARY :lottery-include-accused keeps the accused here too (the pre-v8 lottery)."
+  (let* ((base (find-record node id-hex))
+         (all (recovery-voters base (dispute-last-valid-seq node id-hex)))
+         (strict (and (lg:ruleset-rule-p (ruleset-at-fork-point node id-hex) :strict-lottery)
+                      (not (getf (node-adversary node) :lottery-include-accused)))))
+    (lot:strict-voters all (and strict (dispute-accused-keys node id-hex)))))
+
 (defun accused-cut (armers accused)
   "ARMERS (armers-of entries) without the ACCUSED x-only keys: (values kept excluded).  Pure."
   (let ((kept '()) (out '()))
@@ -4210,11 +4221,11 @@
    of RUNGS, the fee ladder (DEP-03 §Confiscation ladder)."
   (let* ((base (or (find-record node id-hex) (fail "unknown ledger")))
          (armers (sort (copy-list (or armers (lottery-armers node id-hex))) #'bytes< :key #'first))
-         (voters (recovery-voters base (dispute-last-valid-seq node id-hex)))
-         (threshold (lg:majority-threshold (length voters)))
+         (voters (recovery-voters base (dispute-last-valid-seq node id-hex)))   ; the vault's members, for the fee
          (participants (loop for (pk c target) in armers collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target)))
          (lottery (progn (when (null participants) (fail "no armer is a lottery participant"))
-                         (lot:build-lottery participants voters threshold :network (intern (string-upcase (node-network node)) :keyword)))))
+                         (multiple-value-bind (lvoters threshold) (lottery-voters node id-hex)
+                           (lot:build-lottery participants lvoters threshold :network (intern (string-upcase (node-network node)) :keyword))))))
     (multiple-value-bind (reserves txid vout sats operator collateral-msats feerate) (disputed-reserves node base)
       (multiple-value-bind (swept splice-outs residue)
           (confiscation-obligations node id-hex armers (or snapshot (nth-value 2 (lottery-armers node id-hex))))

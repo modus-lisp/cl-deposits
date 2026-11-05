@@ -27,7 +27,7 @@
            #:confiscation-outputs #:confiscation-tx #:revealers-from-witness #:tapbuilder-tree #:p2tr-spk #:key-path-spk
            #:+reveal-csv+ #:+armer-sweep-csv+ #:+max-disputants+ #:+timeout-recovery-csv+
            #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+ #:confiscation-ladder #:+confiscation-rungs+ #:claim-tx #:+claim-fee-floor+
-           #:rearm-spend-vsize #:rearm-spend))
+           #:rearm-spend-vsize #:rearm-spend #:strict-voters))
 (in-package #:cl-deposits.lottery)
 
 (defconstant +max-disputants+ 7 "MAX_LOTTERY_PARTICIPANTS: the subset tree has 2^k - 1 claim leaves.")
@@ -100,6 +100,12 @@
            (append (loop for k in (rest keys) collect (cat (pushb k) (octets +op-checksigadd+)))
                    (list (pint threshold) (octets +op-greaterthanorequal+ +op-verify+))))))
 
+(defun strict-voters (voters accused)
+  "strict-lottery-v8 (provisional): VOTERS without the ACCUSED x-only keys, and the threshold over
+   what remains, the strict majority (0 when none remain).  (values voters threshold).  Pure."
+  (let ((v (remove-if (lambda (k) (member k accused :test #'equalp)) voters)))
+    (values v (if v (1+ (floor (length v) 2)) 0))))
+
 (defun subset-indices (k)
   "Nonempty proper subsets of 0..k-1: by decreasing size, then lexicographically."
   (labels ((combos (start m) (if (zerop m) (list '())
@@ -107,9 +113,10 @@
     (loop for m from (1- k) downto 1 append (combos 0 m))))
 
 (defun subset-leaves (participants voters threshold)
-  "(indices . leaf) for every nonempty proper subset; none for k < 2."
+  "(indices . leaf) for every nonempty proper subset; none for k < 2, and none with no recovery
+   voters (strict-lottery-v8, a wholly accused quorum: only the full-set leaf can be claimed)."
   (let ((k (length participants)))
-    (when (>= k 2)
+    (when (and (>= k 2) voters)
       (loop for idx in (subset-indices k)
             collect (cons idx (cat (csv-prefix +reveal-csv+) (attest-voters voters threshold)
                                    (claim-body (mapcar (lambda (i) (nth i participants)) idx))))))))
@@ -166,8 +173,10 @@
   (let* ((ps (sort (copy-list participants) #'bytes< :key #'participant-pubkey))
          (subsets (subset-leaves ps recovery-voters recovery-threshold))
          (leaves (append (list (lottery-script ps)) (mapcar #'cdr subsets)
-                         (loop for (csv . th) in (recovery-specs recovery-threshold)
-                               collect (recovery-script recovery-voters th csv))))
+                         ;; No recovery voters (strict-lottery-v8, every voter accused): no recovery leaves.
+                         (and recovery-voters
+                              (loop for (csv . th) in (recovery-specs recovery-threshold)
+                                    collect (recovery-script recovery-voters th csv)))))
          (hashes (mapcar #'tr::tapleaf-hash leaves)))
     (multiple-value-bind (root paths) (tapbuilder-tree hashes (leaf-depths (length leaves)))
       (multiple-value-bind (spk parity) (p2tr-spk rs:+nums-point+ root)
