@@ -27,8 +27,8 @@ while true; do
        cld_ctl "$n" "(:adversary :set :lag-replica \"${l:0:16}\")" >/dev/null
        echo "$(date +%FT%T) $n: lag-replica on ${l:0:16} for ${d}s"; sleep "$d"
        cld_ctl "$n" "(:adversary :set :lag-replica nil)" >/dev/null;;
-    1) cld_ctl "$n" '(:adversary :set :withhold-rulesets ("grounded-arms-v7"))' >/dev/null
-       echo "$(date +%FT%T) $n: withholding grounded-arms-v7 from its declarations for ${d}s"; sleep "$d"
+    1) cld_ctl "$n" '(:adversary :set :withhold-rulesets ("strict-lottery-v8"))' >/dev/null
+       echo "$(date +%FT%T) $n: withholding strict-lottery-v8 from its declarations for ${d}s"; sleep "$d"
        cld_ctl "$n" "(:adversary :set :withhold-rulesets nil)" >/dev/null;;
   esac
   echo "$(date +%FT%T) $n: back to honest"

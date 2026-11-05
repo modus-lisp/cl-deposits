@@ -921,4 +921,4 @@
                        ((string= (first w) "propose")
                         (check-equal line (lg:proposed-ruleset (rs (second w)) (first (decls (third w)))) (fourth w)))
                        (t (check (format nil "unknown case ~a" line) nil))))))
-      (check-equal "ruleset_naming cases" n 41))))
+      (check-equal "ruleset_naming cases" n 48))))

@@ -30,7 +30,7 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:quorum-expiry-ok-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:proposed-ruleset #:member-declaration #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger #:encode-state #:decode-state #:state-digest
+           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:lottery-admissible-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:proposed-ruleset #:member-declaration #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger #:encode-state #:decode-state #:state-digest
            #:speculate #:fill-balance-commitments #:commitment-targets))
 (in-package #:cl-deposits.ledger)
 
@@ -47,9 +47,9 @@
 ;; balance-anchor-v6 is anchor-ladder-v5's rules plus that one.  We enforce every rule of every
 ;; registered ruleset, so we declare them all.  A ruleset's rules are frozen once registered: a
 ;; change is a new name.
-(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7"))
-(defparameter +supported-rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7"))
-(defparameter +current-ruleset+ "grounded-arms-v7"
+(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7" "strict-lottery-v8"))
+(defparameter +supported-rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7" "strict-lottery-v8"))
+(defparameter +current-ruleset+ "strict-lottery-v8"
   "What a new ledger's LedgerOpen names, and what a quorum moves to when every member declares it.")
 
 (defparameter +ruleset-rules+
@@ -57,13 +57,24 @@
     ("anchor-ladder-v5" :signed-header :born-expired :collateral-floor :vault-spend-proofs)
     ("balance-anchor-v6" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment)
     ("grounded-arms-v7" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
-     :grounded-arms))
+     :grounded-arms)
+    ("strict-lottery-v8" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
+     :grounded-arms :strict-lottery))
   "DEP-18: the gated rules each ruleset adds to the intrinsic ones.")
 
 (defun ruleset-rule-p (ruleset rule)
   "Does RULESET (a name, or NIL for none) enforce the gated RULE?  NIL is dormant: a ledger
    with no active ruleset yet, or a QuorumBegin that names none, is never judged by a gated rule."
   (and ruleset (member rule (cdr (assoc ruleset +ruleset-rules+ :test #'string=))) t))
+
+(defun lottery-admissible-p (ruleset participants accused)
+  "DEP-06 §Authorised confiscation, the lottery's participant set: under a ruleset with the strict
+   lottery (strict-lottery-v8, judged at the dispute's fork point), no participant (x-only key) may
+   be in ACCUSED, the keys the dispute's own grounds convict with the operator at the fork point.
+   Under any other, every set is admissible here (the subset-of-the-arms rule is the rebuild's).
+   Shared with deposits-rust's lottery_admissible; vector: the judge cases of lottery_accused.txt."
+  (or (not (ruleset-rule-p ruleset :strict-lottery))
+      (notany (lambda (p) (member p accused :test #'equalp)) participants)))
 
 (defun reserves-family (ruleset)
   (when (member ruleset +rulesets+ :test #'equal) "cltv-offset-v2"))
@@ -143,11 +154,12 @@
 
 (defun planned-ruleset (current declarations)
   "DEP-18 §operator policy, not consensus: the ruleset an operator names at its next QuorumBegin.
-   grounded-arms-v7 (+current-ruleset+) when every member declares it, else balance-anchor-v6 when
+   strict-lottery-v8 (+current-ruleset+) when every member declares it, else grounded-arms-v7, else balance-anchor-v6 when
    every member declares that; otherwise a balance-commit-v4 ledger keeps it (anchor-ladder-v5 lacks MissingBalanceCommitment), any other
    moves to anchor-ladder-v5 when every member declares it; else the current ruleset, else
    cltv-offset-v2."
   (cond ((every-declares-p +current-ruleset+ declarations) +current-ruleset+)
+        ((every-declares-p "grounded-arms-v7" declarations) "grounded-arms-v7")
         ((every-declares-p "balance-anchor-v6" declarations) "balance-anchor-v6")
         ((equal current "balance-commit-v4") current)
         ((every-declares-p "anchor-ladder-v5" declarations) "anchor-ladder-v5")

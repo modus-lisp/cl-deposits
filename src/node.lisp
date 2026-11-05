@@ -4561,7 +4561,11 @@
                             (grounded (and l (ignore-errors (mapcar (lambda (a) (up:x-only (first a)))
                                                                     (grounded-armers node id-hex (armers-of node id-hex)))))))
                        (when (and l (every (lambda (p) (member (lot:participant-pubkey p) grounded :test #'equalp))
-                                           (lot:lottery-participants l)))
+                                           (lot:lottery-participants l))
+                                  ;; DEP-03 §The accused never win (strict-lottery-v8)
+                                  (let ((rs (ruleset-at-fork-point node id-hex)))
+                                    (lg:lottery-admissible-p rs (mapcar #'lot:participant-pubkey (lot:lottery-participants l))
+                                                             (and (lg:ruleset-rule-p rs :strict-lottery) (dispute-accused-keys node id-hex)))))
                          (loop for built in rungs
                                for swapped = (btx:make-tx :version (btx:tx-version built) :locktime (btx:tx-locktime built) :segwit-p t
                                                           :inputs (btx:tx-inputs built)
@@ -4671,6 +4675,11 @@
                     #'bytes< :key #'first))
          (floor-sats (eligibility-floor-sats view id-hex))
          (respectful (view-respectful-p view id-hex))
+         ;; DEP-03 §The accused never win, under strict-lottery-v8 (the fork point's ruleset, as
+         ;; grounded arms): a lottery with a key the dispute's grounds convict is no confiscation.
+         ;; Earlier rulesets still accept it (the cut of a subset of the arms).
+         (ruleset (ruleset-at-fork-point view id-hex))
+         (accused (and (lg:ruleset-rule-p ruleset :strict-lottery) (dispute-accused-keys view id-hex)))
          (want (unsigned-bytes tx))
          (tried '()))
     (when (and ti (not (rs:tier-tie-breaker-p (nth ti tiers))) all (<= (length all) 8))
@@ -4679,7 +4688,8 @@
             thereis (multiple-value-bind (in out snapshot) (split-armers arms floor-sats (node-pledge-fn view) :tip (height view))
                       (declare (ignore out))
                       (let ((key (mapcar #'first in)))
-                        (when (and in (not (member key tried :test #'equalp)))
+                        (when (and in (not (member key tried :test #'equalp))
+                                   (lg:lottery-admissible-p ruleset (mapcar (lambda (a) (up:x-only (first a))) in) accused))
                           (push key tried)
                           (let ((rungs (ignore-errors (nth-value 5 (build-confiscation view id-hex :tier-index ti :respectful respectful
                                                                                                    :armers in :snapshot snapshot)))))
