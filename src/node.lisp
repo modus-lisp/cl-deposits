@@ -4610,6 +4610,16 @@
                                           :test #'equalp :key #'up:chain-hash)
             while (= (length next) 1)
             do (push (first next) chain))
+      ;; DEP-06 §Authorised confiscation: the base ends at the dispute's last fork point.  An
+      ;; operator chain that carries on past it carries the fault itself (a colluding majority's
+      ;; invalid credit), and replaying that refused (OVER-OBLIGATION), so the rebuild silently
+      ;; failed and a judge challenged an honest rung (soak, 6056fb38 rung 1, Nov 4).
+      (let ((fork-points (loop for op being the hash-keys of by-operator using (hash-value mine)
+                               for e = (and (not (equalp op origin)) (find :dispute-enter mine :key #'op:update-type))
+                               when e collect (op:field (op:update-op e) :last-valid-sequence))))
+        (when fork-points
+          (let ((last-fork (reduce #'max fork-points)))
+            (setf chain (or (member-if (lambda (u) (<= (up:update-seq u) last-fork)) chain) (last chain))))))
       (setf base chain))                                  ; newest first
     (let* ((s (%make-node :pubkey (let ((k (make-array 33 :element-type '(unsigned-byte 8))))
                                     (setf (aref k 0) 2) (loop for i from 1 below 33 do (setf (aref k i) (random 256))) k)

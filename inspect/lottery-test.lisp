@@ -396,9 +396,9 @@
 ;;; inspect/vectors/authorised_confiscation.txt: DEP-06 "Authorised confiscation", shared with
 ;;; deposits-rust (deposits-node/tests/vectors): a vault spend is excused iff it is the rebuild from
 ;;; public state.  A node that never saw the dispute judges from the relay's updates alone.
-(with-gate ("DEP-06 authorised confiscation: the rebuild from public state, against the shared vector")
+(defun authorised-confiscation-vector (file)
   (let ((kv (make-hash-table :test #'equal)) (updates '()) (pledges (make-hash-table :test #'equalp)) (cases '()))
-    (with-open-file (in (vector-path "authorised_confiscation.txt"))
+    (with-open-file (in (vector-path file))
       (loop for line = (read-line in nil) while line
             unless (or (zerop (length line)) (char= (char line 0) #\#))
               do (let ((w (uiop:split-string line :separator " ")))
@@ -420,6 +420,15 @@
           (check-equal (format nil "~a: ~:[not excused~;excused~]" name (string= verdict "1"))
                        (and (nd::rebuild-matches-p view id (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes hex)))) t)
                        (string= verdict "1")))))))
+
+(with-gate ("DEP-06 authorised confiscation: the rebuild from public state, against the shared vector")
+  (authorised-confiscation-vector "authorised_confiscation.txt"))
+
+;;; inspect/vectors/confiscation_past_fault.txt: the base ends at the dispute's last fork point
+;;; (DEP-06), from the signet soak's ledger 6056fb38: the operator's chain carries on past it with
+;;; the fault, and a rebuild that replayed the fault never recognised the honest rung 1.
+(with-gate ("DEP-06 authorised confiscation: the base ends at the fork point (soak 6056fb38)")
+  (authorised-confiscation-vector "confiscation_past_fault.txt"))
 
 ;;; inspect/vectors/dispute_rearm.json: DEP-03's re-arm shape, shared with deposits-rust
 ;;; (deposits-core/tests/vectors/dispute_rearm.json).

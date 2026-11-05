@@ -467,6 +467,30 @@
                    (nd::rebuilt-confiscation-p stranger id ctx :spend-height *height* :updates (cons stale relay)))
             (check "and the builder's anchor is the scoped fork point's"
                    (equalp (rot:anchor-of ctx) (nd::dispute-anchor (nd::dispute-view stranger id (nd::dispute-scope (cons stale relay))) id))))
+          ;; DEP-06 §Authorised confiscation: the base ends at the dispute's last fork point.  The
+          ;; operator's chain may carry on past it with the fault itself (a colluding majority's
+          ;; invalid credit): a judge that replayed it failed to rebuild an honest rung and
+          ;; challenged it (signet soak, 6056fb38 rung 1, 2026-11-04).  Here the relay shows one of
+          ;; the two equivocating updates, then an operator update over the reserves after it.
+          (clrhash nd::*rebuilt-confiscations*) (clrhash nd::*rebuilt-misses*)
+          (let* ((stranger (nd:make-node :priv (tk 88888888888888888886) :bus bus :height-fn hf))
+                 (relay (nd::ledger-updates-from-relays stranger id))
+                 (lvs (loop for u in relay when (eq (ignore-errors (op:update-type u)) :dispute-enter)
+                            minimize (op:field (op:update-op u) :last-valid-sequence)))
+                 (mine (lambda (u) (equalp (up:update-operator-id u) (nd:node-pubkey a))))
+                 (at-fork (find-if (lambda (u) (and (funcall mine u) (= (up:update-seq u) lvs))) relay))
+                 (over (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id) :seq (1+ lvs)
+                                                       :prev-hash (up:chain-hash at-fork)
+                                                       :block-height *height* :block-hash (u:sha256 (u:ascii->bytes "block"))
+                                                       :message (op:encode-operation (list :type :onchain-credit :txid (u:sha256 (hx "0b0e")) :vout 0
+                                                                                           :deposit-id (u:sha256 (hx "d0")) :amount 999999999999
+                                                                                           :funding-address "x")))))
+                         (up:sign-operator u (nd::node-priv a)) u))
+                 ;; the operator's chain carries on linearly from the fork point with the fault
+                 (seen (cons over (remove-if (lambda (u) (and (funcall mine u) (> (up:update-seq u) lvs))) relay))))
+            (check "the fork point's update is on the relay" at-fork)
+            (check "the base ends at the fork point: an operator chain past it that does not replay is not read"
+                   (nd::rebuilt-confiscation-p stranger id ctx :spend-height *height* :updates seen)))
           ;; --- Reveal.  Red team #7: once B has revealed, D publishes B's preimage as its
           ;; own (signed by D).  It opens B's commitment, not D's; honest nodes must not
           ;; count it, or D could pick, after seeing every reveal, the copy that makes it win.
