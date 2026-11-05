@@ -81,14 +81,16 @@ class World:
         # <ledger prefix> <note...>).  They stay counted as ALARMs; the summary also says how many are
         # resolved, so a new ALARM stands out.
         self.resolved = [r for r in load_table(os.path.join(soak, "alarms-resolved.tsv")) if len(r) >= 2]
+        burned = {r[0] for r in load_table(os.path.join(soak, "redteam-tainted"))}
+        self.burned = {k for k, n in self.names.items() if n in burned}
 
     def resolution(self, accused, ledger):
         for r in self.resolved:
-            if xonly(accused).startswith(xonly(r[0])) and ledger.lower().startswith(r[1].lower()):
+            want = r[0].lower()
+            if (accused.lower().startswith(want) or xonly(accused).startswith(want[2:] if len(want) % 2 == 0 and want[:2] in ("02", "03") else want)) \
+                    and ledger.lower().startswith(r[1].lower()):
                 return " ".join(r[2:]) or "resolved"
         return None
-        burned = {r[0] for r in load_table(os.path.join(soak, "redteam-tainted"))}
-        self.burned = {k for k, n in self.names.items() if n in burned}
 
     def adversarial_key(self, k):
         x = xonly(k)
