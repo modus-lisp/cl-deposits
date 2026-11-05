@@ -26,7 +26,8 @@
            #:armer-share-leaves #:armer-share-control-block #:forfeit-sweep-outputs
            #:confiscation-outputs #:confiscation-tx #:revealers-from-witness #:tapbuilder-tree #:p2tr-spk #:key-path-spk
            #:+reveal-csv+ #:+armer-sweep-csv+ #:+max-disputants+ #:+timeout-recovery-csv+
-           #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+ #:confiscation-ladder #:+confiscation-rungs+ #:claim-tx #:+claim-fee-floor+))
+           #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+ #:confiscation-ladder #:+confiscation-rungs+ #:claim-tx #:+claim-fee-floor+
+           #:rearm-spend-vsize #:rearm-spend))
 (in-package #:cl-deposits.lottery)
 
 (defconstant +max-disputants+ 7 "MAX_LOTTERY_PARTICIPANTS: the subset tree has 2^k - 1 claim leaves.")
@@ -365,3 +366,39 @@
               punitive
               (list (cons lottery-spk lottery-value)
                     (cons (cat (octets 0 20) (hash160 operator-pubkey33)) change)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The re-arm round's recovery spend (DEP-06 Phase 4, draft)
+
+(defun %compact-size-len (n) (cond ((< n 253) 1) ((<= n #xffff) 3) ((<= n #xffffffff) 5) (t 9)))
+
+(defun rearm-spend-vsize (l tier)
+  "DEP-06 Phase 4: the vsize of L's recovery spend through TIER (0..3) into one P2TR output, as
+   signed by the tier's threshold: ceil((4 x 94 + W) / 4), W the witness bytes (marker and flag,
+   item count, signature items, leaf and control block with their length prefixes)."
+  (let* ((idx (recovery-leaf-index l tier))
+         (th (cdr (nth tier (recovery-specs (lottery-recovery-threshold l)))))
+         (r (length (lottery-recovery-voters l)))
+         (leaf (nth idx (lottery-leaves l)))
+         (cb (lottery-control-block l idx))
+         (sig-items (if (= th 1) 65 (+ (* th 65) (- r th))))
+         (items (+ (if (= th 1) 1 r) 2))
+         (w (+ 2 (%compact-size-len items) sig-items
+               (%compact-size-len (length leaf)) (length leaf)
+               (%compact-size-len (length cb)) (length cb))))
+    (ceiling (+ (* 4 94) w) 4)))
+
+(defun rearm-spend (l lottery-txid lottery-vout lottery-sats tier next-spk &key (feerate +confiscation-default-feerate+))
+  "DEP-06 Phase 4 (draft): the unsigned recovery spend of lottery L (LOTTERY-TXID:LOTTERY-VOUT
+   worth LOTTERY-SATS) through recovery TIER (0..3, CSV 144/1008/4032/8064) into the re-arm
+   round's lottery output NEXT-SPK.  Version 2, nLockTime 0, nSequence the tier's CSV, one output
+   of LOTTERY-SATS less FEERATE x (rearm-spend-vsize L TIER).  Returns (values tx fee vsize)."
+  (let* ((csv (car (nth tier (recovery-specs (lottery-recovery-threshold l)))))
+         (vsize (rearm-spend-vsize l tier))
+         (fee (* feerate vsize)))
+    (when (< (- lottery-sats fee) 330) (error "a re-arm spend of ~a sats cannot pay its ~a-sat fee" lottery-sats fee))
+    (values (btx:make-tx :version 2 :locktime 0 :segwit-p t
+                         :inputs (list (btx:make-txin :prev-hash lottery-txid :prev-index lottery-vout :script (octets) :sequence csv))
+                         :outputs (list (btx:make-txout :value (- lottery-sats fee) :script next-spk))
+                         :witnesses (list nil))
+            fee vsize)))
