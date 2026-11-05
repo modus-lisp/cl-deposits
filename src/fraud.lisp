@@ -530,14 +530,18 @@
             (when (>= (length signers) (rs:tier-threshold tier))
               (values signers idx tier-index))))))))
 
-(defun verify-unauthorized-vault-spend (proof spent-history height-of-block &key answered-fn)
+(defun verify-unauthorized-vault-spend (proof spent-history height-of-block &key answered-fn (answers-readable t))
   "DEP-06 UnauthorizedVaultSpend.  SPENT-HISTORY is what we hold of the spent ledger (any order).
    The accused must have signed (to threshold) a spend of the vault (output 0 of a rung of the
    governing QuorumBegin) confirmed in a block we know.  Unanchored form: the spend carries no
    anchor.  Lapsed form: its anchor H was challenged by CHALLENGE-UPDATE, and LAPSE-BLOCK-HASH is a
    block at least the spent ledger's service window past the later of the challenge and the
    spend.  ANSWERED-FN (txid anchor reserves tier-index) -> true when the verifier knows an answer
-   (a rotation or an authorised confiscation); a known answer rebuts the lapsed form."
+   (a rotation or an authorised confiscation); a known answer rebuts the lapsed form.
+   ANSWERS-READABLE is false when the verifier could not read every place DEP-06 says answers go
+   (the relays and its own store): a lapsed form with no answer found is then no verdict, third
+   value :UNKNOWN, never a conviction (DEP-06 §Spend challenge, "a lapse is judged where answers
+   are read")."
   (handler-case
       (let* ((ev (getf proof :evidence))
              (tx (btx:parse-tx (bw:make-reader (hex->bytes (getf ev :spend-tx-hex)))))
@@ -580,6 +584,8 @@
                                    (values nil (format nil "the challenge's window (~a blocks) has not lapsed" w)))
                                   ((and answered-fn (funcall answered-fn txid anchor reserves tier-index))
                                    (values nil "the spend is answered"))
+                                  ((not answers-readable)
+                                   (values nil "no verdict: the places answers go could not be read" :unknown))
                                   (t (values t nil)))))))))))
     (error (c) (values nil (princ-to-string c)))))
 

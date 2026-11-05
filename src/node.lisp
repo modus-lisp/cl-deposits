@@ -5501,9 +5501,40 @@
                   :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
             (rebuilt-confiscation-p node id-hex tx :spend-height spend-height
                                                    :updates-fn (lambda ()
-                                                                 (append (unless (getf (node-adversary node) :blind-relay)
-                                                                           (ledger-updates-from-relays node id-hex))
-                                                                         updates))))))))
+                                                                 ;; Our own base chain too: an answer carries
+                                                                 ;; only the dispute's updates, and a judge whose
+                                                                 ;; relay lacks the ledger rebuilt from them alone,
+                                                                 ;; with no LedgerOpen, and could never accept it
+                                                                 ;; (regtest confiscation-answer, 2026-11-04).
+                                                                 (distinct-updates
+                                                                  (append (unless (getf (node-adversary node) :blind-relay)
+                                                                            (ledger-updates-from-relays node id-hex))
+                                                                          (let ((r (find-record node id-hex)))
+                                                                            (and r (not (record-fork-p r)) (record-history r)))
+                                                                          updates)))))))))
+
+(defun distinct-updates (updates)
+  "UPDATES without repeats (by chain hash), first occurrence kept."
+  (let ((seen (make-hash-table :test #'equalp)))
+    (remove-if-not (lambda (u) (let ((k (up:chain-hash u))) (unless (gethash k seen) (setf (gethash k seen) t))))
+                   updates)))
+
+(defun refresh-spend-answers (node id-hex)
+  "Read the answers (Kind 9112) the relays hold to challenges of ID-HEX's spends into our store, so
+   a judgement sees every answer published, not only those our subscription delivered."
+  (dolist (e (ignore-errors (bus:bus-fetch (node-bus node)
+                                           (flt:make-filter :kinds (list w:+kind-challenge-answer+)
+                                                            :tags (list (cons "d" (list (subseq id-hex 0 16))))))))
+    (handle-challenge-answer node e)))
+
+(defun answers-readable-p (node id-hex gseq)
+  "DEP-06 §Spend challenge: whether we can read the places answers to a challenge of ID-HEX's spend
+   go: the relays (they hold the spent ledger at its governing QuorumBegin GSEQ) and our own store.
+   A judge that cannot reaches no verdict on a lapse."
+  (and (not (let ((p (getf (node-adversary node) :blind-relay)))
+              (and (stringp p) (>= (length id-hex) (length p)) (string-equal p (subseq id-hex 0 (length p))))))
+       (ledger-updates-from-relays node id-hex :from gseq :to gseq)
+       t))
 
 (defun authorised-spend-p (node rec tx &key spend-height)
   "DEP-06 §Spend challenge: TX's spend of one of REC's vaults is answered (a rotation naming it,
@@ -5856,14 +5887,27 @@
                          (setf cu c lapse l)
                          (when opened (setf (getf e :challenge) opened changed t)))
                        ;; DEP-06 "Verify before publishing": a lapse is judged afresh, never from a
-                       ;; cached miss of the confiscation rebuild.
-                       (when lapse (remhash (btx:tx-txid tx) *rebuilt-misses*))
+                       ;; cached miss of the confiscation rebuild, and over every answer the relays
+                       ;; hold now (re-read, not only what our subscription delivered).
+                       (when lapse
+                         (remhash (btx:tx-txid tx) *rebuilt-misses*)
+                         (refresh-spend-answers node (getf e :id)))
                        (multiple-value-bind (reserves) (fr:spent-vault (let ((r (find-record node (getf e :id)))) (if r (spent-vault-updates r) '())) (getf e :qb))
                          (when (and reserves (ignore-errors (spend-answered-p node (getf e :id) tx (getf e :qb) reserves (getf e :tier)
                                                                               :spend-height (getf e :height))))
                            (log! node "the challenge of ~a's spend ~a is answered; nothing to prove" (subseq (getf e :id) 0 8)
                                  (subseq (txid-hex (btx:tx-txid tx)) 0 16))
-                           (setf (getf e :done) t (getf e :answered) t lapse nil changed t))))
+                           (setf (getf e :done) t (getf e :answered) t lapse nil changed t)))
+                       ;; DEP-06: a lapse asserts that no answer exists, which only a judge that reads
+                       ;; where answers go can say.  One that cannot reaches no verdict and judges again
+                       ;; later; the entry stays owed (regtest confiscation-answer, 2026-11-04: a judge
+                       ;; blind to the relay proved an honest lottery participant).
+                       (when (and lapse (not (answers-readable-p node (getf e :id) (getf e :qb))))
+                         (unless (getf e :unreadable-logged)
+                           (log! node "the challenge of ~a's spend ~a has lapsed, but we cannot read where its answers go: no verdict"
+                                 (subseq (getf e :id) 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16))
+                           (setf (getf e :unreadable-logged) t changed t))
+                         (setf lapse nil)))
                      (when (or (eq (getf e :form) :unanchored) lapse)
                        (dolist (xh (getf e :signers))
                          (let ((x (hex->bytes xh)))
@@ -5898,8 +5942,10 @@
   (let* ((ev (getf proof :evidence)) (spent-id (getf ev :spent-ledger-id)))
     (let* ((key (list (getf proof :accused) spent-id (getf ev :spend-tx-hex) (getf ev :governing-quorumbegin-seq)
                             (getf ev :challenge-update)))
+                 (lapsed (getf ev :challenge-update))
                  (hit (gethash key (node-vault-spend-verdicts node))))
-            (if (and hit (< (- (get-universal-time) (first hit)) *vault-spend-verdict-ttl*))
+            ;; A lapsed form is judged afresh every time: an answer, however late, rebuts it.
+            (if (and hit (not lapsed) (< (- (get-universal-time) (first hit)) *vault-spend-verdict-ttl*))
                 (values (second hit) (third hit))
                 (let* ((srec (find-record node spent-id))
                        (relay (ledger-updates-from-relays node spent-id))
@@ -5908,18 +5954,23 @@
                        (spend-height (ignore-errors (and (node-height-of-block node)
                                                          (funcall (node-height-of-block node) (getf ev :spend-block-hash)))))
                        (gseq (getf ev :governing-quorumbegin-seq)))
-                  (multiple-value-bind (ok why)
+                  (when lapsed (refresh-spend-answers node spent-id))
+                  (multiple-value-bind (ok why unknown)
                       (handler-case
                           (fr:verify-unauthorized-vault-spend
                            proof history (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node)))
-                           ;; DEP-06: a lapsed challenge is rebutted by any answer we can find
+                           ;; DEP-06: a lapsed challenge is rebutted by any answer we can find, and is
+                           ;; no verdict where we cannot read the places answers go
                            :answered-fn (lambda (txid anchor reserves tier-index)
                                           (declare (ignore txid anchor))
-                                          (spend-answered-p node spent-id tx gseq reserves tier-index :spend-height spend-height)))
+                                          (spend-answered-p node spent-id tx gseq reserves tier-index :spend-height spend-height))
+                           :answers-readable (or (not lapsed) (answers-readable-p node spent-id gseq)))
                         (error (e) (return-from vault-spend-proof-verdict
                                      (values nil (format nil "not judged yet: ~a" e) :unknown))))
-                    (setf (gethash key (node-vault-spend-verdicts node)) (list (get-universal-time) ok why))
-                    (values ok why)))))))
+                    (if unknown
+                        (values nil why :unknown)
+                        (progn (setf (gethash key (node-vault-spend-verdicts node)) (list (get-universal-time) ok why))
+                               (values ok why)))))))))
 
 (defun handle-vault-spend-fraud (node proof)
   "An UnauthorizedVaultSpend against a ledger the accused operates: if we cosign it, verify

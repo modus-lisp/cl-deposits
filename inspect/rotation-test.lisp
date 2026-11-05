@@ -833,8 +833,15 @@
                       ;; DEP-18 twins: the same spends of a vault created under cltv-offset-v2
                       (list "unanchored_under_cltv_offset_v2" 0 (funcall proof (first m-privs) bare :governing 9))
                       (list "lapsed_under_cltv_offset_v2" 0 (funcall proof (second m-privs) forged :challenge c-forged :lapse 1073 :governing 9)))
-                do (format o "proof ~a ~a ~a ~a~%" name verdict (u:bytes->hex (fr:proof-hash p)) (w:json (fr:proof->json p))))))))
-  (let ((updates '()) (blocks (make-hash-table :test #'equalp)) (spends (make-hash-table :test #'equal)) (answers '()) (proofs '())
+                do (format o "proof ~a ~a ~a ~a~%" name verdict (u:bytes->hex (fr:proof-hash p)) (w:json (fr:proof->json p))))
+          ;; DEP-06: a lapse is judged where answers are read.  judge NAME readable|unreadable VERDICT
+          ;; (1 proven, 0 rejected, u no verdict): an answer found still rebuts; none found, unread, is
+          ;; no verdict; a form that needs no answer is unaffected.
+          (format o "# judge: a proof above judged with the places answers go readable or not; 1 proven, 0 rejected, u no verdict.~%")
+          (loop for (name r v) in '(("lapsed" "readable" "1") ("lapsed" "unreadable" "u") ("lapsed_but_answered" "unreadable" "0")
+                                    ("unanchored" "unreadable" "1") ("lapse_too_early" "unreadable" "0"))
+                do (format o "judge ~a ~a ~a~%" name r v))))))
+  (let ((updates '()) (blocks (make-hash-table :test #'equalp)) (spends (make-hash-table :test #'equal)) (answers '()) (proofs '()) (judges '())
         (governing nil) (prevout nil))
     (with-open-file (in (vector-path "vault_spend_anchor.txt"))
       (loop for line = (read-line in nil) while line
@@ -846,6 +853,7 @@
                          ((string= (first w) "block") (setf (gethash (u:hex->bytes (second w)) blocks) (parse-integer (third w))))
                          ((string= (first w) "spend") (setf (gethash (second w) spends) (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes (third w))))))
                          ((string= (first w) "answer") (push (rest w) answers))
+                         ((string= (first w) "judge") (push (rest w) judges))
                          ((string= (first w) "proof")
                           (push (list (second w) (third w) (fourth w)
                                       (subseq line (+ (search (fourth w) line) (length (fourth w)) 1)))
@@ -875,7 +883,20 @@
                                                                   :answered-fn (lambda (txid anchor reserves tier)
                                                                                  (fr:rotation-answer updates anchor txid reserves tier)))
                               t)
-                         (string= verdict "1"))))))))
+                         (string= verdict "1")))))
+      ;; DEP-06: a lapse is judged where answers are read
+      (check-equal "the vector judges five proofs by readability" (length judges) 5)
+      (dolist (j (reverse judges))
+        (destructuring-bind (name readable want) j
+          (let ((proof (fr:json->proof (w:parse-json (fourth (find name proofs :key #'first :test #'string=))))))
+            (multiple-value-bind (ok why unknown)
+                (fr:verify-unauthorized-vault-spend proof updates hob
+                                                    :answered-fn (lambda (txid anchor reserves tier)
+                                                                   (fr:rotation-answer updates anchor txid reserves tier))
+                                                    :answers-readable (string= readable "readable"))
+              (declare (ignore why))
+              (check-equal (format nil "~a judged with answers ~a" name readable)
+                           (cond (ok "1") (unknown "u") (t "0")) want))))))))
 
 ;;; inspect/vectors/ruleset_naming.txt: DEP-18, shared with deposits-rust.  Rulesets are named,
 ;;; not ordered.  seat and upgrade verdicts are consensus; plan is the reference operator policy.
