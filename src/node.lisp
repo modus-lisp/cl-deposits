@@ -4020,7 +4020,12 @@
         (multiple-value-bind (grounded ungrounded) (grounded-armers node id-hex (armers-of node id-hex :until c))
           ;; DEP-03 §Lottery: a key the dispute's grounds convict never wins.  Dropped before the cut,
           ;; so the lottery is the cut of a subset of the arms, which every judge already accepts.
-          (multiple-value-bind (grounded accused) (accused-cut grounded (dispute-accused-keys node id-hex))
+          ;; ADVERSARY :lottery-include-accused — a builder that keeps the accused in its lottery (the
+          ;; reading every judge accepted before strict-lottery-v8; red team: a guilty majority that
+          ;; confiscates into a lottery of its own).
+          (multiple-value-bind (grounded accused) (if (getf (node-adversary node) :lottery-include-accused)
+                                                      (values grounded '())
+                                                      (accused-cut grounded (dispute-accused-keys node id-hex)))
             (multiple-value-bind (in out snapshot)
                 (split-armers grounded floor-sats (node-pledge-fn node) :tip (height node) :confiscated-at c)
               (values in (append ungrounded accused out) snapshot))))
