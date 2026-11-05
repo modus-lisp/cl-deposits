@@ -14,10 +14,11 @@ source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/en
 source "$(dirname "$0")/_lib.sh"
 pick OP T2 T3 T4
 R1=${R1:-ref6}; R2=${R2:-ref7}; R3=${R3:-ref5}; R4=${R4:-ref4}
+POLICY_RS=${POLICY_RS:-strict-lottery-v8}   # DEP-18 §operator policy: what a rotation moves the quorum to
 ruleset_of() { cld_ctl "$1" "(:info)" | grep -oE "\(:ID \"$2\"[^)]*" | grep -oE ':RULESET "[^"]*"|:RULESET NIL' | head -1; }
 ctl() { printf '%s\n' "$2" | timeout 300 bash -c "exec 3<>/dev/tcp/127.0.0.1/$(cld_port $1); cat >&3; head -n1 <&3"; }
 
-echo "== part 1: anchor-ladder-v5 -> balance-anchor-v6 by rotation, and the commitment rule"
+echo "== part 1: anchor-ladder-v5 -> $POLICY_RS by rotation, and the commitment rule"
 L=$(OPEN_RULESET=anchor-ladder-v5 form_ledger "V6$RANDOM" $OP anchor-ladder-v5 $T2 $T3 $T4 $R1 $R2) || exit 1
 r0=$(ruleset_of $T2 "$L"); echo "   $L before: $r0"
 [ "$r0" = ':RULESET "anchor-ladder-v5"' ] || fail "$L is not under anchor-ladder-v5: $r0"
@@ -30,7 +31,7 @@ expect "$r" "begin-quorum"
 mine 3 >/dev/null; sleep 20
 for n in $OP $T2 $T3 $T4; do
   ra=$(ruleset_of $n "$L"); echo "   $L on $n after: $ra"
-  [ "$ra" = ':RULESET "balance-anchor-v6"' ] || fail "$n did not move $L to balance-anchor-v6: $ra"
+  [ "$ra" = ":RULESET \"$POLICY_RS\"" ] || fail "$n did not move $L to $POLICY_RS: $ra"
 done
 D=$(sx "$(cld_ctl $OP "(:deposit-open :ledger \"$L\" :descriptor \"pk($(pubkey_of $T4))\")")" ":DEPOSIT")
 [ -n "$D" ] || fail "open a deposit on $L"
@@ -38,7 +39,7 @@ expect "$(cld_ctl $OP '(:adversary :set :omit-commitments t)')"
 bad=$(ctl $OP "(:credit :ledger \"$L\" :deposit \"$D\" :msat 100000 :txid \"$(openssl rand -hex 32)\")")
 cld_ctl $OP '(:adversary :set :omit-commitments nil)' >/dev/null
 echo "   credit without a commitment: $(echo "$bad" | cut -c1-200)"
-case "$bad" in *":STATUS :OK"*) fail "a credit with no balance commitment committed under balance-anchor-v6";; esac
+case "$bad" in *":STATUS :OK"*) fail "a credit with no balance commitment committed under $POLICY_RS";; esac
 sleep 5
 refused=$(cld_ctl $T2 '(:log)' 2>/dev/null | grep -ac "MISSING-BALANCE-COMMITMENT" || true)
 rref=0; for x in $R1 $R2; do c=$(tail -c 2000000 "$(ref_dir $x)/node.log" 2>/dev/null | grep -ac "MissingBalanceCommitment" || true); rref=$((rref + c)); done
@@ -79,4 +80,4 @@ for x in $R2 $R3 $R4; do
   echo "   $RL on $x: ${ok:+applied the QuorumUpgrade to balance-anchor-v6}"
   [ -n "$ok" ] || fail "$x has no QuorumUpgrade to balance-anchor-v6 for $RL"
 done
-echo "PASS: $L moved anchor-ladder-v5 -> balance-anchor-v6 and refused a credit without its commitment; $RL moved balance-commit-v4 -> balance-anchor-v6 by QuorumUpgrade"
+echo "PASS: $L moved anchor-ladder-v5 -> $POLICY_RS and refused a credit without its commitment; $RL moved balance-commit-v4 -> balance-anchor-v6 by QuorumUpgrade"
