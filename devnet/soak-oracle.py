@@ -161,6 +161,15 @@ def judge(events, world, now=None):
                              f"challenge of {world.lname(led)}'s spend {txid[:12]} by {world.who(e['pubkey'])}: answered"))
         elif now - e["created_at"] < CHALLENGE_WINDOW_S:
             counts["pending"] += 1
+        elif not adv and any(typ == "UnauthorizedVaultSpend" and led2.lower().startswith(led.lower()[:16])
+                             and world.adversarial_key(acc2) for _, typ, acc2, led2 in proofs) \
+                and not any(typ == "UnauthorizedVaultSpend" and led2.lower().startswith(led.lower()[:16])
+                            and not world.adversarial_key(acc2) for _, typ, acc2, led2 in proofs):
+            # The lapse proved the spend's signers, and every one of them is an attacker: an attack
+            # ledger the oracle was not told about (an attack scenario's fresh ledger), not an
+            # honest one.  Its proofs are counted as PASS above.
+            verdicts.append((e["created_at"], "INFO", False,
+                             f"challenge of {world.lname(led)}'s spend {txid[:12]} by {world.who(e['pubkey'])}: lapsed, every signer proven is an attacker"))
         elif not adv:
             counts["ALARM"] += 1
             verdicts.append((e["created_at"], "ALARM", False,
