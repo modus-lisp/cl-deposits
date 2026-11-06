@@ -45,7 +45,7 @@ while true; do
   script=${a%%:*}; arg=""; [[ "$a" == *:* ]] && arg=${a#*:}
   [[ "$REFUSAL_ATTACKS" == *" $a "* ]] || echo "$t $a - - $WINDOW" >>"$SOAK/attacks.tsv"
   echo "$(date +%FT%T) running $a"
-  ( export DEVNET=signet REDTEAM_ON_SIGNET=1 REDTEAM_MINT=1 REDTEAM_AVOID="$SOAK_OPS" REFS="${ATTACK_REFS-ref6 ref7}"
+  ( export REDTEAM_V="V$(date +%s)" DEVNET=signet REDTEAM_ON_SIGNET=1 REDTEAM_MINT=1 REDTEAM_AVOID="$SOAK_OPS" REFS="${ATTACK_REFS-ref6 ref7}"
     timeout --kill-after=60 5400 bash "$CLD_SRC/redteam/$script.sh" $arg ) >"$out" 2>&1
   rc=$?; v=$(grep -oE '^(PASS|FAIL|SKIP|INVALID)[^ ]*' "$out" | tail -1)
   "$CLD_SRC/devnet/soak.sh" names >/dev/null 2>&1; register_pool   # nodes minted during the run
