@@ -129,6 +129,9 @@
   (height-of-block nil)                        ; (lambda (hash32)) -> height or NIL (fraud-proof anchors)
   (block-hash-fn nil)                          ; (lambda (height)) -> hash32 or NIL (TransferFail anchors)
   (reveals (make-hash-table :test #'equal))    ; ledger id hex -> alist (member-pubkey33 . preimage)
+  ;; DEP-06 Phase 4 (re-arm, provisional): ledger id hex -> the re-arm rounds whose lottery
+  ;; output we have seen on chain, newest first: plists (:round r :tx tx :height h).
+  (rearms (make-hash-table :test #'equal :synchronized t))
   (relays '())                                 ; relay URLs, for advertisements
   (ignore-actions '())                         ; testing: wallet actions the operator silently drops
   (adversary '())                              ; red team (docs/REDTEAM.md): plist of misbehaviours this node performs on purpose
@@ -1349,6 +1352,7 @@
           ((string= action "rotation_sign") (handle-rotation-sign node event params))
           ((string= action "cosign_offer") (handle-cosign-offer node event params))
           ((string= action "lottery_subset_attest") (handle-lottery-subset-attest node event params))
+          ((string= action "lottery_rearm_sign") (handle-lottery-rearm-sign node event params))
           ((string= action "lottery_reveal") (handle-lottery-reveal-request node event params))
           ((string= action "consent_request") (handle-consent node event params))
           ((string= action "cosign_invoice") (handle-cosign-invoice node event params))
@@ -2813,8 +2817,10 @@
    canonical order."
   (let ((reveals (reveals-of node id-hex)) (idx '()) (pre '()))
     (loop for p in (lot:lottery-participants lottery) for i from 0
-          for r = (cdr (find (lot:participant-pubkey p) reveals :key (lambda (r) (up:x-only (car r))) :test #'equalp))
-          when (and r (equalp (lot:commitment-of r) (lot:participant-commitment p)) (<= 17 (length r) lot:+max-preimage-len+))
+          for r = (cdr (find-if (lambda (r) (and (equalp (up:x-only (car r)) (lot:participant-pubkey p))
+                                                  (equalp (lot:commitment-of (cdr r)) (lot:participant-commitment p))))
+                                reveals))
+          when (and r (<= 17 (length r) lot:+max-preimage-len+))
             do (push i idx) (push r pre))
     (values (nreverse idx) (nreverse pre))))
 
@@ -2825,7 +2831,7 @@
   (let ((id (w:event-ledger-id event)))
     (unless (find-record node id) (return-from handle-lottery-subset-attest nil))
     (handler-case
-        (multiple-value-bind (conf lottery) (fork-lottery node id)
+        (multiple-value-bind (conf lottery) (current-lottery node id)   ; a re-arm round's, else round 1's
           (unless (and conf lottery) (fail "no pending lottery on chain"))
           (unless (member (up:x-only (node-pubkey node)) (lot:lottery-recovery-voters lottery) :test #'equalp)
             (fail "not a recovery voter"))
@@ -2942,8 +2948,12 @@
                (commit-update node fork (new-update node fork (list :type :dispute-yield)))
                (release-pledges node id)
                (return-from drive-dispute (apply #'note-dispute node id fmt args))))
+        (when (find-if (lambda (r) (> (getf r :round) 1)) (rearm-rounds node id))
+          (return-from drive-dispute (note-dispute node id "in a re-arm round (DRIVE-REARM)")))
         (when (or (fork-op fork :dispute-acquire) (fork-op fork :dispute-yield))
-          (when (loop for v being the hash-values of (node-pledges node) thereis (equal v id)) (release-pledges node id))
+          (when (and (loop for v being the hash-values of (node-pledges node) thereis (equal v id))
+                     (not (rearm-rounds node id)))
+            (release-pledges node id))
           (return-from drive-dispute (note-dispute node id "concluded")))
         (multiple-value-bind (conf lottery lstate) (fork-lottery node id)
           ;; DEP-05 §"When a quorum_expired dispute ends": a QuorumBegin after the dispute's
@@ -3087,7 +3097,8 @@
                               :name "drive-dispute")))
           (bt:with-lock-held ((drive-lock node rec))
             (handler-case (drive-dispute node rec)
-              (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e))))))))
+              (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e))))))
+    (drive-rearms node)))
 
 (defvar *drive-dispute-async* nil
   "Drive a newly entered dispute on its own thread (the daemon sets it; tests drive inline).")
@@ -3577,7 +3588,7 @@
   (cl-consensus.encoding:segwit-encode (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)) 1
                                        (subseq (lot:key-path-spk (up:x-only (node-pubkey node))) 2)))
 
-(defun lottery-seed (node id-hex)
+(defun lottery-seed (node id-hex &optional (round 1))
   "Our lottery seed for a dispute on ID-HEX, derived from the node key so a
    restarted node recovers the preimage it committed to."
   (let ((out (make-array 32 :element-type '(unsigned-byte 8))))
@@ -3585,6 +3596,8 @@
       (natrium:sha256-update c (ascii->bytes "deposits/cl/lottery-seed/v1"))
       (natrium:sha256-update c (node-priv node))          ; streamed: never concatenated
       (natrium:sha256-update c (hex->bytes id-hex))
+      ;; DEP-06 Phase 4: a re-arm round commits a fresh preimage; round 1's seed is unchanged
+      (when (> round 1) (natrium:sha256-update c (ascii->bytes (format nil "/rearm-round/~d" round))))
       (natrium:sha256-final-into c out))
     out))
 
@@ -3633,9 +3646,10 @@
                  (log! node "recorded an uncredited payment of ~a on our fork" (subseq id 0 8)))
         (error (e) (log! node "uncredited payment not recorded on ~a: ~a" (subseq id 0 8) e))))))
 
-(defun arm-dispute (node fork &key seed replacement)
-  "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL."
-  (let ((preimage (lot:derive-preimage (or seed (lottery-seed node (record-id-hex fork))))))
+(defun arm-dispute (node fork &key seed replacement (round 1))
+  "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL.  ROUND > 1:
+   an arm for that re-arm round (DEP-06 Phase 4), with its own preimage."
+  (let ((preimage (lot:derive-preimage (or seed (lottery-seed node (record-id-hex fork) round)))))
     (when replacement (await-pledge-height node replacement))
     ;; DEP-06 §Confiscation obligations: record a dangling migration before arming.
     (handler-case (record-obligations node fork)
@@ -3647,7 +3661,8 @@
                                                           :target-reserves (our-target-address node)
                                                           :replacement-collateral-txid (first replacement)
                                                           :replacement-collateral-vout (second replacement)
-                                                          :replacement-collateral-amount (third replacement)))))
+                                                          :replacement-collateral-amount (third replacement)
+                                                          :rearm-round (and (> round 1) round)))))
     ;; ADVERSARY :spend-pledge — arm, then spend the pledged coin back to ourselves.
     ;; Under the old rule every cosigner then refused the confiscation: one armer
     ;; vetoed the dispute.  DEP-03 now excludes it instead (redteam/attack-veto-pledge.sh).
@@ -3729,7 +3744,7 @@
                                            (and f (> (up:update-seq u) (cdr f))))))
                          updates)))))
 
-(defun armers-of (node id-hex &key until)
+(defun armers-of (node id-hex &key until (round 1))
   "Each armer's latest DisputeArmed (highest sequence) on any fork of the ledger:
    (pubkey33 commitment target collateral arm-height seq), ARM-HEIGHT being the
    update's signed-header block height.  A member may re-arm to add the replacement
@@ -3739,10 +3754,12 @@
   (let ((arms (make-hash-table :test #'equalp)))
     (dolist (a (%all-arms node id-hex))
       (unless (and until (> (fifth a) until)) (push a (gethash (first a) arms))))
-    ;; Only the first +max-arms+ arms (by sequence) count, so a griefer cannot keep moving E.
+    ;; Only the first +max-arms+ arms (by sequence) count, so a griefer cannot keep moving E.  The
+    ;; bound spans every re-arm round (DEP-06 Phase 4); ROUND picks that round's latest counted arm.
     (loop for list being the hash-values of arms
-          collect (let ((counted (subseq (sort (copy-list list) #'< :key #'sixth) 0 (min +max-arms+ (length list)))))
-                    (car (last counted))))))
+          for counted = (subseq (sort (copy-list list) #'< :key #'sixth) 0 (min +max-arms+ (length list)))
+          for mine = (remove-if-not (lambda (a) (eql (seventh a) round)) counted)
+          when mine collect (car (last mine)))))
 
 (defun %all-arms (node id-hex)
   "Every DisputeArmed on every fork of the ledger, newest first within each fork."
@@ -3760,7 +3777,8 @@
                                      (and (op:field o :replacement-collateral-txid)
                                           (list (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)
                                                 (op:field o :replacement-collateral-amount)))
-                                     (up:update-block-height u) (up:update-seq u)))))
+                                     (up:update-block-height u) (up:update-seq u)
+                                     (or (op:field o :rearm-round) 1)))))
 
 ;;; DEP-03 §"Replacement collateral declaration": who is in the lottery is a
 ;;; deterministic function of the ledger and the confirmed chain.  E is the highest
@@ -4866,14 +4884,15 @@
   (let* ((id (or (w:jget params "ledger_id") (w:event-ledger-id event)))
          (preimage (hex->bytes (or (w:jget params "preimage") (return-from handle-lottery-reveal-request nil))))
          (armer (and (find-record node id)
-                     (find (lot:commitment-of preimage) (armers-of node id) :key #'second :test #'equalp))))
+                     (find (lot:commitment-of preimage) (%all-arms node id) :key #'second :test #'equalp))))
     (when armer
       (log! node "lottery reveal for ~a from ~a opens ~a's commitment" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8) (subseq (bytes->hex (first armer)) 0 8))
       (note-reveal node id (first armer) preimage))))
 
 (defun note-reveal (node id-hex member33 preimage)
   (let ((alist (gethash id-hex (node-reveals node))))
-    (unless (assoc member33 alist :test #'equalp)
+    ;; A member reveals once per re-arm round (DEP-06 Phase 4): keep each preimage it opens.
+    (unless (find-if (lambda (r) (and (equalp (car r) member33) (equalp (cdr r) preimage))) alist)
       (setf (gethash id-hex (node-reveals node)) (cons (cons member33 preimage) alist))
       (save-reveals node id-hex))))
 
@@ -4903,18 +4922,18 @@
                ;; before: a member waited for the others' reveals and published, as its
                ;; own, whichever copy made it the winner, never opening its own.
                (find-if (lambda (a) (and (equalp (first a) member) (equalp (second a) (lot:commitment-of preimage))))
-                        (armers-of node id)))
+                        (%all-arms node id)))
       (note-reveal node id member preimage))))
 
 (defun reveals-of (node id-hex) (gethash id-hex (node-reveals node)))
 
-(defun claim-or-yield (node id-hex &key confiscation-txid (fee lot:+claim-fee-floor+))
+(defun claim-or-yield (node id-hex &key confiscation-txid (fee lot:+claim-fee-floor+) ((:lottery lottery-key)) lottery-tx)
   "The drawn winner claims the lottery output and takes custody (DisputeAcquire);
    everyone else yields.  Every participant revealed: the full-set leaf.  Past the
    reveal deadline with some missing: the leaf of the revealers we hold, with the
    recovery voters' attestation.  Returns (values :won-or-:yielded claim-tx)."
   (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork")))
-         (lottery (or (record-lottery fork)
+         (lottery (or lottery-key (record-lottery fork)
                       ;; After a restart: rebuild from public state (the unsigned tx has the claim's
                       ;; txid).  Its nLockTime is its tier's CLTV, so take the tier whose rebuild is
                       ;; the one on chain; without a chain view, the tier open now.
@@ -4926,7 +4945,9 @@
                         l)))
          (participants (lot:lottery-participants lottery))
          (k (length participants))
-         (conf (record-confiscation fork)))
+         ;; CONF: the transaction whose output 0 is the lottery output (a re-arm round's
+         ;; recovery spend, DEP-06 Phase 4, or the confiscation)
+         (conf (or lottery-tx (record-confiscation fork))))
     (multiple-value-bind (idx preimages) (revealed-indices node id-hex lottery)
       (let ((full (= (length idx) k)))
         (cond ((= k 1) (setf idx '(0) preimages (list nil) full t))
@@ -4939,6 +4960,7 @@
             (commit-update node fork (new-update node fork (list :type :dispute-yield)))
             (return-from claim-or-yield (values :yielded nil)))
           (let* ((txid (or confiscation-txid (and conf (btx:tx-txid conf)) (fail "no confiscation tx")))
+                 (claim-txid (if lottery-tx (btx:tx-txid lottery-tx) txid))   ; the output we spend
                  (amount (btx:txout-value (first (btx:tx-outputs conf))))
                  (target (lot:participant-target (nth winner participants)))
                  (spk (multiple-value-bind (witver program)
@@ -4949,7 +4971,7 @@
                  (coll-spk (and coll (lot:key-path-spk (up:x-only (node-pubkey node)))))
                  ;; DEP-03: the shared claim shape (deposits-core build_lottery_claim_tx).
                  (tx (btx:parse-tx (bw:make-reader
-                                    (btx:serialize-tx (lot:claim-tx txid 0 amount coll spk :fee fee :subset (not full))))))
+                                    (btx:serialize-tx (lot:claim-tx claim-txid 0 amount coll spk :fee fee :subset (not full))))))
                  (prevouts (coerce (append (list (cons amount (lot:lottery-spk lottery))) (and coll (list (cons (third coll) coll-spk)))) 'vector))
                  (leaf (if full (first (lot:lottery-leaves lottery))
                            (nth (lot:subset-leaf-index lottery idx) (lot:lottery-leaves lottery))))
@@ -5048,6 +5070,257 @@
                 (push (cons pk sig) sigs)))))))
     (when (< (length sigs) threshold) (fail "only ~a of ~a subset attestations" (length sigs) threshold))
     (mapcar (lambda (v) (cdr (assoc v sigs :test #'equalp))) voters)))
+
+;;; DEP-06 Phase 4: the re-arm round (strict-lottery-v8, provisional; docs/REVIEW.md).  A lottery
+;;; output nobody claims (nobody revealed by its deadline, or revealers but no claim by the time
+;;; its CSV-144 recovery leaf opens) is spent by its recovery voters into the lottery of a fresh
+;;; arm round over the same dispute; reveals and the claim then run against that output.  Every
+;;; honest voter rebuilds the spend byte for byte from public state: the round's arms (DisputeArmed
+;;; with rearm_round r, inside the round's window), its cut, and the lottery output being spent.
+
+(defun rearm-rounds (node id-hex) (gethash id-hex (node-rearms node)))
+
+(defun rearms-file-name (id-hex) (format nil "rearms_~a.json" (subseq id-hex 0 16)))
+
+(defun save-rearms (node id-hex)
+  (when (node-data-dir node)
+    (ensure-directories-exist (node-data-dir node))
+    (with-open-file (out (merge-pathnames (rearms-file-name id-hex) (node-data-dir node)) :direction :output :if-exists :supersede)
+      (format out "[~{~a~^,~%~}]~%"
+              (mapcar (lambda (r) (format nil "[~d,~d,~d,~d,~s]" (getf r :round) (or (getf r :height) 0)
+                                          (or (getf r :opens) 0) (or (getf r :closes) 0)
+                                          (bytes->hex (btx:serialize-tx (getf r :tx)))))
+                      (reverse (rearm-rounds node id-hex)))))))
+
+(defun load-rearms (node id-hex path)
+  (let ((j (w:parse-json (uiop:read-file-string path))))
+    (setf (gethash id-hex (node-rearms node))
+          (reverse (loop for e in (coerce j 'list)
+                         for v = (coerce e 'list)
+                         collect (list :round (first v) :height (and (plusp (second v)) (second v))
+                                       :opens (third v) :closes (fourth v)
+                                       :tx (btx:parse-tx (bw:make-reader (hex->bytes (fifth v))))))))))
+
+(defun note-rearm-round (node id-hex round tx height &key lottery opens closes)
+  "Remember round ROUND's lottery output TX (confirmed at HEIGHT, NIL while unconfirmed), its
+   LOTTERY when known, and the window (OPENS, CLOSES] its arms were taken from (round > 1)."
+  (let* ((old (find round (rearm-rounds node id-hex) :key (lambda (r) (getf r :round))))
+         (rounds (remove round (rearm-rounds node id-hex) :key (lambda (r) (getf r :round)))))
+    (setf (gethash id-hex (node-rearms node))
+          (cons (list :round round :tx tx :height (or height (getf old :height)) :lottery (or lottery (getf old :lottery))
+                      :opens (or opens (getf old :opens)) :closes (or closes (getf old :closes)))
+                rounds))
+    (save-rearms node id-hex)
+    (log! node "dispute ~a: re-arm round ~a's lottery output is ~a~@[ (block ~a)~]" (subseq id-hex 0 8) round
+          (txid-hex (btx:tx-txid tx)) height)))
+
+(defun rearm-window (node id-hex lottery-height revealed-p)
+  "(values opens closes) for the round after a lottery output confirmed at LOTTERY-HEIGHT: it
+   opens at the reveal deadline when nobody revealed, else when the CSV-144 recovery leaf opens
+   (provisional), and takes arms through the dispute's arm window."
+  (let* ((opens (+ lottery-height (if revealed-p 144 lot:+reveal-csv+)))
+         (base (find-record node id-hex))
+         (window (let ((named (and base (loop for m in (lg:ledger-quorum-members (record-ledger base))
+                                               for b = (lg::member-dispute-arm-blocks m) when (and b (plusp b)) collect b))))
+                   (if named (reduce #'max named) *default-dispute-arm-blocks*))))
+    (values opens (+ opens window))))
+
+(defun rearm-armers (node id-hex round opens closes)
+  "Round ROUND's participants: the arms for that round signed inside (OPENS, CLOSES], through the
+   same grounds, accused exclusion and eligibility cut as round 1.  (values participants excluded)."
+  (let* ((arms (remove-if-not (lambda (a) (< opens (fifth a) (1+ closes))) (armers-of node id-hex :round round)))
+         (floor-sats (eligibility-floor-sats node id-hex)))
+    (multiple-value-bind (grounded ungrounded) (grounded-armers node id-hex arms)
+      (multiple-value-bind (grounded accused) (accused-cut grounded (dispute-accused-keys node id-hex))
+        (multiple-value-bind (in out) (split-armers grounded floor-sats (node-pledge-fn node) :tip (height node) :confiscated-at closes)
+          (values in (append ungrounded accused out)))))))
+
+(defun rearm-lottery (node id-hex round opens closes)
+  "Round ROUND's lottery (the same recovery voters and threshold as round 1), or NIL when its cut
+   is empty."
+  (let ((in (rearm-armers node id-hex round opens closes)))
+    (when in
+      (multiple-value-bind (voters threshold) (lottery-voters node id-hex)
+        (lot:build-lottery (loop for (pk c target) in (sort (copy-list in) #'bytes< :key #'first)
+                                 collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target))
+                           voters threshold :network (intern (string-upcase (node-network node)) :keyword))))))
+
+(defun lottery-output-height (node tx)
+  (let ((info (and (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid tx) 0))))
+    (and info (getf info :confirmations) (plusp (getf info :confirmations))
+         (- (1+ (height node)) (getf info :confirmations)))))
+
+(defun current-lottery (node id-hex)
+  "(values tx lottery round height) of ID-HEX's newest lottery output that is unspent: a re-arm
+   round's (its lottery rebuilt from that round's arms and window), else round 1's (FORK-LOTTERY),
+   or NIL."
+  (let ((r (first (rearm-rounds node id-hex))))
+    (when (and r (> (getf r :round) 1))
+      (let ((tx (getf r :tx)) (round (getf r :round)))
+        (when (and (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid tx) 0))
+          (let ((l (or (getf r :lottery) (rearm-lottery node id-hex round (getf r :opens) (getf r :closes))))
+                (h (or (getf r :height) (lottery-output-height node tx))))
+            (when (and l (equalp (lot:lottery-spk l) (btx:txout-script (first (btx:tx-outputs tx)))))
+              (when (and h (not (getf r :height))) (note-rearm-round node id-hex round tx h))
+              (setf (getf (first (gethash id-hex (node-rearms node))) :lottery) l)
+              (return-from current-lottery (values tx l round h)))))
+        (return-from current-lottery nil))))
+  (multiple-value-bind (tx l) (fork-lottery node id-hex)
+    (when tx (values tx l 1 (gethash id-hex (node-confiscation-heights node))))))
+
+(defun rearm-spend-for (node id-hex tx lottery round height)
+  "The recovery spend of the lottery output of TX (LOTTERY, round ROUND, confirmed at HEIGHT) into
+   round ROUND+1's lottery, through the lowest recovery tier open now: (values spend next-lottery
+   tier prevouts), or NIL while the next round cannot be built (window open, empty cut, no tier)."
+  (multiple-value-bind (idx) (revealed-indices node id-hex lottery)
+    (multiple-value-bind (opens closes) (rearm-window node id-hex height (and idx t))
+      (when (<= (height node) closes) (return-from rearm-spend-for nil))
+      (let* ((next (or (rearm-lottery node id-hex (1+ round) opens closes) (return-from rearm-spend-for nil)))
+             (age (1+ (- (height node) height)))
+             (tier (position-if (lambda (spec) (>= age (car spec))) (lot::recovery-specs (lot:lottery-recovery-threshold lottery))))
+             (sats (btx:txout-value (first (btx:tx-outputs tx))))
+             (feerate (nth-value 6 (disputed-reserves node (find-record node id-hex)))))
+        (unless (and tier (plusp (lot:lottery-recovery-threshold lottery))) (return-from rearm-spend-for nil))
+        (let ((spend (lot:rearm-spend lottery (btx:tx-txid tx) 0 sats tier (lot:lottery-spk next) :feerate (or feerate 2))))
+          (values spend next tier (vector (cons sats (lot:lottery-spk lottery)))))))))
+
+(defun rearm-signatures (node id-hex lottery spend tier prevouts)
+  "The recovery voters' signatures on SPEND through TIER, parallel to the sorted voters (NIL where
+   absent): ours if we are a voter, then lottery_rearm_sign until the tier's threshold is met."
+  (let* ((voters (lot::sorted-keys (lot:lottery-recovery-voters lottery)))
+         (th (cdr (nth tier (lot::recovery-specs (lot:lottery-recovery-threshold lottery)))))
+         (leaf (nth (lot::recovery-leaf-index lottery tier) (lot:lottery-leaves lottery)))
+         (sighash (rot:tier-sighash spend 0 prevouts leaf))
+         (me (up:x-only (node-pubkey node)))
+         (sigs (and (member me voters :test #'equalp) (list (cons me (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))))
+    (when (< (length sigs) th)
+      (dolist (r (send-request node id-hex "lottery_rearm_sign"
+                               (w:json-object "unsigned_tx" (unsigned-tx-hex spend) "tier" tier "sighash" (bytes->hex sighash))
+                               :want (- th (length sigs)) :timeout 30 :successes-only t))
+        (let ((res (w:jget r "result")))
+          (when (and (w:jget r "success") res)
+            (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
+              (when (and (member pk voters :test #'equalp) (schnorr:schnorr-verify pk sighash sig) (not (assoc pk sigs :test #'equalp)))
+                (push (cons pk sig) sigs)))))))
+    (when (< (length sigs) th) (fail "only ~a of ~a re-arm signatures" (length sigs) th))
+    ;; A threshold-1 leaf names only the lowest sorted voter: keep that voter's signature only.
+    (if (= th 1)
+        (let ((low (first voters))) (list (cdr (assoc low sigs :test #'equalp))))
+        (mapcar (lambda (v) (cdr (assoc v sigs :test #'equalp))) voters))))
+
+(defun handle-lottery-rearm-sign (node event params)
+  "A recovery voter (DEP-06 Phase 4): sign a re-arm recovery spend only if it is byte for byte the
+   one we rebuild from public state, through a tier whose CSV has elapsed."
+  (let ((id (w:event-ledger-id event)))
+    (unless (find-record node id) (return-from handle-lottery-rearm-sign nil))
+    (handler-case
+        (multiple-value-bind (tx lottery round height) (current-lottery node id)
+          (unless (and tx lottery height) (fail "no unclaimed lottery output on chain"))
+          (unless (member (up:x-only (node-pubkey node)) (lot:lottery-recovery-voters lottery) :test #'equalp)
+            (fail "not a recovery voter"))
+          (multiple-value-bind (ours next tier prevouts) (rearm-spend-for node id tx lottery round height)
+            (declare (ignore next))
+            (unless ours (fail "no re-arm spend is due for ~a's round ~a" (subseq id 0 8) round))
+            (let ((asked (btx:parse-tx (bw:make-reader (hex->bytes (w:jget params "unsigned_tx"))))))
+              (unless (and (eql tier (w:jget params "tier"))
+                           (equalp (btx:serialize-tx asked :witness nil) (btx:serialize-tx ours :witness nil)))
+                (fail "the re-arm spend is not the one we rebuild (tier ~a)" tier))
+              (let* ((leaf (nth (lot::recovery-leaf-index lottery tier) (lot:lottery-leaves lottery)))
+                     (sighash (rot:tier-sighash ours 0 prevouts leaf)))
+                (log! node "signed the re-arm spend of ~a's round-~a lottery (tier ~a)" (subseq id 0 8) round tier)
+                (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
+                                                             "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))))))
+      (error (e) (log! node "refused lottery_rearm_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
+
+(defun follow-rearm-spend (node id-hex r)
+  "If the lottery output of round R (a NOTE-REARM-ROUND plist with its lottery and height) was
+   spent into the next round's lottery, register that round.  Returns the spend or NIL."
+  (let ((tx (getf r :tx)) (round (getf r :round)) (height (getf r :height)) (l (getf r :lottery)))
+    (when (and (node-spender-fn node) height l)
+      (let ((spend (find-if (lambda (s) (equalp (getf s :txid) (btx:tx-txid tx)))
+                            (ignore-errors (funcall (node-spender-fn node) height (height node) (list (list (btx:tx-txid tx) 0)))))))
+        (when spend
+          (let ((stx (getf spend :tx)))
+            (when (and stx (= 1 (length (btx:tx-inputs stx))) (= 1 (length (btx:tx-outputs stx))))
+              (multiple-value-bind (opens closes) (rearm-window node id-hex height (and (revealed-indices node id-hex l) t))
+                (let ((next (rearm-lottery node id-hex (1+ round) opens closes)))
+                  (when (and next (equalp (lot:lottery-spk next) (btx:txout-script (first (btx:tx-outputs stx)))))
+                    (note-rearm-round node id-hex (1+ round) stx (getf spend :height) :lottery next :opens opens :closes closes)
+                    stx))))))))))
+
+(defun drive-rearm (node id-hex)
+  "One pass of the re-arm round for ID-HEX (DEP-06 Phase 4, strict-lottery-v8): follow a spent
+   lottery output into the next round; arm a round that has opened; past its window, as a voter,
+   build and sign the recovery spend; in a later round, reveal and claim against its output."
+  (unless (lg:ruleset-rule-p (ruleset-at-fork-point node id-hex) :strict-lottery) (return-from drive-rearm nil))
+  (let ((fork (find-fork node id-hex (node-pubkey node))))
+    (unless (and fork (fork-op fork :dispute-enter) (not (fork-op fork :dispute-acquire))) (return-from drive-rearm nil))
+    (multiple-value-bind (tx lottery round height) (current-lottery node id-hex)
+      (unless tx
+        ;; The newest output we know of is gone: follow it (a claim ends the dispute; a re-arm
+        ;; spend opens the next round).
+        (let ((r (first (rearm-rounds node id-hex))))
+          (when r (follow-rearm-spend node id-hex r)))
+        (return-from drive-rearm nil))
+      (unless height (return-from drive-rearm nil))
+      (when (and (= round 1) (not (rearm-rounds node id-hex)))
+        (note-rearm-round node id-hex 1 tx height :lottery lottery))
+      (let* ((h (height node)) (idx (revealed-indices node id-hex lottery))
+             (me (node-pubkey node))
+             (participant (member (up:x-only me) (mapcar #'lot:participant-pubkey (lot:lottery-participants lottery)) :test #'equalp)))
+        (multiple-value-bind (opens closes) (rearm-window node id-hex height (and idx t))
+          ;; A later round: reveal, then claim or yield (once per round: only while armed).
+          (when (and (> round 1) participant (eq (lg:ledger-dispute-state (record-ledger fork)) :armed))
+            (let ((pre (record-preimage fork)))
+              (when (and pre (not (find-if (lambda (r) (and (equalp (car r) me) (equalp (cdr r) pre))) (reveals-of node id-hex))))
+                (publish-reveal node id-hex)
+                (note-dispute node id-hex "re-arm round ~a's lottery on chain; revealed" round)))
+            (when (or (= (length (revealed-indices node id-hex lottery)) (length (lot:lottery-participants lottery)))
+                      (>= (1+ (- h height)) lot:+reveal-csv+))
+              (handler-case
+                  (note-dispute node id-hex "re-arm round ~a: ~(~a~)" round
+                                (claim-or-yield node id-hex :lottery lottery :lottery-tx tx
+                                                            :confiscation-txid (let ((r1 (find 1 (rearm-rounds node id-hex) :key (lambda (r) (getf r :round)))))
+                                                                                 (and r1 (btx:tx-txid (getf r1 :tx))))))
+                (error (e) (note-dispute node id-hex "re-arm round ~a: claim not yet: ~a" round e)))
+              (return-from drive-rearm nil)))
+          (cond
+            ;; The next round's window is open: arm it with a fresh preimage.
+            ((and (< opens h) (<= h closes))
+             (unless (or (find me (armers-of node id-hex :round (1+ round)) :key #'first :test #'equalp)
+                         (>= (count me (%all-arms node id-hex) :key #'first :test #'equalp) +max-arms+))
+               (let ((p (pledge-collateral node id-hex)))
+                 (if p
+                     (progn (arm-dispute node fork :replacement p :round (1+ round))
+                            (note-dispute node id-hex "lottery round ~a unclaimed; armed round ~a" round (1+ round)))
+                     (note-dispute node id-hex "lottery round ~a unclaimed; waiting for collateral to arm round ~a" round (1+ round))))))
+            ;; The window has closed: as a recovery voter, spend the output into the next round.
+            ((and (> h closes) (member (up:x-only me) (lot:lottery-recovery-voters lottery) :test #'equalp))
+             (multiple-value-bind (spend next tier prevouts) (rearm-spend-for node id-hex tx lottery round height)
+               (if (not spend)
+                   (note-dispute node id-hex "lottery round ~a unclaimed; no re-arm spend yet (empty cut or no tier open)" round)
+                   (handler-case
+                       (let* ((sigs (rearm-signatures node id-hex lottery spend tier prevouts))
+                              (w0 (lot:recovery-witness lottery tier sigs))
+                              (signed (btx:parse-tx (bw:make-reader
+                                                     (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t
+                                                                                    :inputs (btx:tx-inputs spend) :outputs (btx:tx-outputs spend)
+                                                                                    :witnesses (list w0)))))))
+                         (unless (rot:verify-spend signed 0 prevouts) (fail "the re-arm spend does not verify"))
+                         (broadcast node signed)
+                         (note-rearm-round node id-hex (1+ round) signed nil :lottery next :opens opens :closes closes)
+                         (note-dispute node id-hex "lottery round ~a unclaimed; spent into round ~a's lottery (tier ~a)" round (1+ round) tier))
+                     (error (e) (note-dispute node id-hex "lottery round ~a unclaimed; re-arm spend not yet: ~a" round e))))))))))))
+
+(defun drive-rearms (node)
+  "DRIVE-REARM for every dispute we hold a fork in (a yielded one included: a yield ends a round,
+   not the dispute)."
+  (let ((ids (remove-duplicates (loop for r being the hash-values of (node-ledgers node)
+                                      when (and (record-fork-p r) (record-owned-p r)) collect (record-id-hex r))
+                                :test #'equal)))
+    (dolist (id ids)
+      (handler-case (drive-rearm node id)
+        (error (e) (note-dispute node id "re-arm: ~a" e))))))
 
 ;;; Testing only: the operator publishes a conflicting update at its current tip
 ;;; sequence, so members can be seen catching it.
@@ -6324,8 +6597,9 @@
     (when (and fork-p (record-owned-p rec))
       (let ((armed (first (fork-own-updates rec :dispute-armed))))   ; the latest arm
         (when armed
-          (let ((preimage (lot:derive-preimage (lottery-seed node id-hex))))
-            (if (equalp (lot:commitment-of preimage) (op:field (op:decode-operation (up:update-message armed)) :commitment-hash))
+          (let* ((aop (op:decode-operation (up:update-message armed)))
+                 (preimage (lot:derive-preimage (lottery-seed node id-hex (or (op:field aop :rearm-round) 1)))))
+            (if (equalp (lot:commitment-of preimage) (op:field aop :commitment-hash))
                 (setf (record-preimage rec) preimage)
                 (log! node "fork ~a: armed with a preimage we cannot re-derive" (subseq id-hex 0 8)))))))
     rec))
@@ -6365,5 +6639,9 @@
         (if id
             (handler-case (load-reveals node id f) (error (e) (funcall log-fn "could not load ~a: ~a" f e)))
             (funcall log-fn "reveals file ~a for a ledger we do not hold" (file-namestring f)))))
+    (dolist (f (directory (merge-pathnames "rearms_*.json" dir)))
+      (let* ((prefix (subseq (pathname-name f) 7))
+             (id (loop for k being the hash-keys of (node-ledgers node) when (and (>= (length k) 16) (string= prefix (subseq k 0 16))) return k)))
+        (when id (handler-case (load-rearms node id f) (error (e) (funcall log-fn "could not load ~a: ~a" f e))))))
     (handler-case (load-pledges node) (error (e) (funcall log-fn "could not load pledges: ~a" e)))
     node))

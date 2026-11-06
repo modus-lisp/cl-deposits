@@ -209,6 +209,7 @@
   (chain-tip (make-array 32 :element-type '(unsigned-byte 8)))
   (joined-quorums '())
   (dispute-state :normal)
+  (arm-round nil)      ; DEP-06 Phase 4: the latest DisputeArmed's rearm_round (NIL: none yet)
   ;; DEP-20 §3: request id (chain_hash of the ExitRequest update) -> plist
   (pending-exits (make-hash-table :test #'equalp))
   (vault-current-p nil)             ; a QuorumBegin vault the next QuorumBegin rotates
@@ -894,6 +895,22 @@
       (:dispute-armed
        ;; DEP-03 (vector dispute_rearm.json): a re-arm repeats the commitment and declares
        ;; collateral; a fresh pledge after a failed one is a valid re-arm.
+       ;; DEP-06 Phase 4 (provisional): an arm for a later re-arm round (rearm_round above the
+       ;; fork's last) starts that round afresh: a new commitment, from :disputed, :armed or
+       ;; :tombstoned (a yield ends a round, not the dispute).  Within a round the rule above holds.
+       (let ((round (or (f :rearm-round) 1)) (last (or (ledger-arm-round ledger) 1)))
+         (cond ((> round last)
+                (unless (member (ledger-dispute-state ledger) '(:disputed :armed :tombstoned))
+                  (fail :dispute-armed-rearm (format nil "a round-~a arm needs a dispute (state ~(~a~))" round (ledger-dispute-state ledger))))
+                (setf (ledger-dispute-state ledger) :rearming))
+               ((< round last)
+                (fail :dispute-armed-rearm (format nil "a round-~a arm after a round-~a arm" round last)))
+               ;; a yielded fork takes no further arm of the same round (as deposits-rust: Tombstoned
+               ;; allows nothing); only a later round reopens it
+               ((eq (ledger-dispute-state ledger) :tombstoned)
+                (fail :dispute-armed-rearm "a yielded fork takes an arm only for a later re-arm round")))
+         (setf (ledger-arm-round ledger) round))
+       (when (eq (ledger-dispute-state ledger) :rearming) (setf (ledger-dispute-state ledger) :disputed))
        (when (eq (ledger-dispute-state ledger) :armed)
          (unless (equalp (f :commitment-hash) (ledger-arm-commitment ledger))
            (fail :dispute-armed-commitment-changed "a re-arm must repeat the prior arm's commitment_hash"))

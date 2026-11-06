@@ -762,6 +762,10 @@
 
 
 
+;; These gates arm by hand: a dispute driven on entry may yield first (an expiry inside its grace,
+;; a test reason), and a yielded fork takes no further arm of its round (DEP-06 Phase 4 fold, as
+;; deposits-rust's Tombstoned).
+(setf cl-deposits.node::*drive-dispute-on-enter* nil)
 (with-gate ("respectful dispute on quorum expiry; the winner re-establishes a quorum on its fork")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (a (nd:make-node :priv (tk 11111111111111111111) :bus bus :height-fn hf))
@@ -814,6 +818,10 @@
 
 
 
+;; These gates arm by hand: a dispute driven on entry may yield first (an expiry inside its grace,
+;; a test reason), and a yielded fork takes no further arm of its round (DEP-06 Phase 4 fold, as
+;; deposits-rust's Tombstoned).
+(setf cl-deposits.node::*drive-dispute-on-enter* nil)
 (with-gate ("replacement collateral: declared, verified, and spent into the new vault by the winner")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (chain (make-hash-table :test #'equalp))      ; "txid:vout" -> sats  (a mock chain view)
@@ -874,6 +882,11 @@
         (remhash (cons (coerce (u:sha256 (nd:node-pubkey d)) 'list) 1) chain)
         (check "no eligible armer: no confiscation is built" (null (ignore-errors (nd:build-confiscation b id))))
         (setf (gethash (cons (coerce (u:sha256 (hx "dd2")) 'list) 0) chain) (+ floor-sats 1000))
+        ;; d yielded its claim above; these re-arms exercise the DEP-03 cut, so put its fork back to
+        ;; armed on every replica (a yielded fork takes no further arm of its round: the DEP-06 Phase 4 fold).
+        (dolist (m (list b c d))
+          (let ((f (nd:find-fork m id (nd:node-pubkey d))))
+            (when f (setf (lg::ledger-dispute-state (nd:record-ledger f)) :armed))))
         (nd:arm-dispute d (nd:find-fork d id (nd:node-pubkey d)) :replacement (list (u:sha256 (hx "dd2")) 0 (+ floor-sats 1000)))
         (check-equal "a re-arm with a fresh pledge reopens it"
                      (mapcar #'first (nd:lottery-armers b id)) (list (nd:node-pubkey d)))
@@ -885,6 +898,8 @@
                      2)))))
 
 
+
+(setf cl-deposits.node::*drive-dispute-on-enter* t)
 
 (with-gate ("couriers: a PTLC route (point locks, courier blinding)")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))

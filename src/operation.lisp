@@ -123,7 +123,9 @@
     (57 :dispute-armed
      (:armed-block 118 :u32) (:commitment-hash 112 :bytes20) (:target-reserves 122 :string)
      (:replacement-collateral-txid 280 :bytes32 :optional) (:replacement-collateral-vout 282 :u32 :optional)
-     (:replacement-collateral-amount 284 :u64 :optional))
+     (:replacement-collateral-amount 284 :u64 :optional)
+     ;; DEP-06 Phase 4 (strict-lottery-v8, provisional): the re-arm round an arm is for; absent = round 1
+     (:rearm-round 366 :u32 :optional))
     (60 :ledger-close)
     (70 :transfer-lock
      (:transfer-nonce 210 :bytes32) (:source-deposit-id 212 :deposit-id) (:destination-deposit-id 214 :deposit-id)
