@@ -52,6 +52,9 @@
    (make-sc :name "confiscation-bump" :script "check-confiscation-bump.sh" :ledger-var "REDTEAM_CB"
             :env '("REFS=" "WAIT=900") :timeout 2400 :tags '(:contagion)
             :note "DEP-03 confiscation ladder: a stuck rung 0 is replaced by a higher rung, and its lottery is claimed")
+   (make-sc :name "rearm" :script "check-rearm.sh" :ledger-var "REDTEAM_RA"
+            :env '("WAIT=1800") :timeout 4800 :tags '(:contagion :slow)
+            :note "DEP-06 Phase 4 re-arm (strict-lottery-v8, provisional): nobody reveals, a fresh round is armed and spent into, and its lottery is claimed")
    (make-sc :name "grounded-arms" :script "check-grounded-arms.sh" :ledger-var "REDTEAM_GA"
             :env '("WAIT=1500") :timeout 2400 :tags '(:contagion)
             :note "DEP-18 grounded-arms-v7: an arm whose DisputeEnter has no grounds is disregarded")
