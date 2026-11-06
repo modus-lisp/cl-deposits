@@ -16,7 +16,9 @@ pick OP C2 C3 C4 H H2
 ROW=${REDTEAM_RA:-RA$RANDOM}
 W=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" $C2 $C3 $C4 $H $H2) || exit 1; echo "== ledger $W"
 FROM=$(fresh_deposits "$ROW" $OP "$W" 1 | head -1); [ -n "$FROM" ] || fail "no deposit on the ledger"
-trap 'for n in $C2 $C3 $C4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null 2>&1; done; for n in $H $H2; do cld_ctl $n "(:adversary :set :withhold-reveal nil)" >/dev/null 2>&1; done' EXIT
+# The block ticker would race the paced mining below: pause it for the run.
+"$CLD_SRC/devnet/regtest-net.sh" ticker stop
+trap '"$CLD_SRC/devnet/regtest-net.sh" ticker start; for n in $C2 $C3 $C4; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null 2>&1; done; for n in $H $H2; do cld_ctl $n "(:adversary :set :withhold-reveal nil)" >/dev/null 2>&1; done' EXIT
 
 for n in $H $H2; do expect "$(cld_ctl $n "(:adversary :set :withhold-reveal t)")"; done
 for n in $C2 $C3 $C4; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
@@ -52,11 +54,18 @@ done
 echo "== confiscation $CONF; its lottery output withheld by both participants"
 # The withholding stays on: it holds back round 1's reveals only; a re-arm round's reveal is sent
 # regardless (DRIVE-REARM), so round 2 can be claimed.
-echo "== waiting for the re-arm spend of $CONF:0 (needs the CSV-144 recovery leaf: mining)"
+HC=$(bcli getrawtransaction "$CONF" 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["blockhash"])')
+HC=$(bcli getblockheader "$HC" | python3 -c 'import json,sys; print(json.load(sys.stdin)["height"])')
+echo "== confiscation at height $HC: round 2's arm window opens at $((HC + 72)), its spend needs height $((HC + 144))"
+# Mine fast up to the window, slowly through it (members arm once a minute), fast to the CSV-144
+# leaf, then slowly while the voters build and sign the spend.
+slow_until() { while [ "$(bcli getblockcount)" -lt "$1" ]; do mine 1 >/dev/null; sleep "$2"; done; }
+slow_until $((HC + 70)) 1; slow_until $((HC + 72 + 14)) 15; slow_until $((HC + 143)) 1
+echo "== waiting for the re-arm spend of $CONF:0"
 R2=""
 for i in $(seq 1 $((WAIT / 5))); do
   if [ -z "$(bcli gettxout "$CONF" 0 true 2>/dev/null | head -1)" ]; then R2=$(spender_of "$CONF" 0); [ -n "$R2" ] && break; fi
-  [ $((i % 2)) -eq 0 ] && mine 2 >/dev/null
+  [ $((i % 4)) -eq 0 ] && mine 1 >/dev/null
   sleep 5
 done
 [ -n "$R2" ] || fail "the round-1 lottery output $CONF:0 was not spent within ${WAIT}s"

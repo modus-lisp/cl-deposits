@@ -5137,8 +5137,10 @@
 
 (defun rearm-lottery (node id-hex round opens closes)
   "Round ROUND's lottery (the same recovery voters and threshold as round 1), or NIL when its cut
-   is empty."
-  (let ((in (rearm-armers node id-hex round opens closes)))
+   is empty.  An empty cut over (OPENS, CLOSES] reopens the window once, for the same span after
+   CLOSES (DEP-06 Phase 4 step 3, as DEP-03 §\"No participant\")."
+  (let ((in (or (rearm-armers node id-hex round opens closes)
+                (rearm-armers node id-hex round closes (+ closes (- closes opens))))))
     (when in
       (multiple-value-bind (voters threshold) (lottery-voters node id-hex)
         (lot:build-lottery (loop for (pk c target) in (sort (copy-list in) #'bytes< :key #'first)
@@ -5166,7 +5168,7 @@
               (return-from current-lottery (values tx l round h)))))
         (return-from current-lottery nil))))
   (multiple-value-bind (tx l) (fork-lottery node id-hex)
-    (when tx (values tx l 1 (gethash id-hex (node-confiscation-heights node))))))
+    (when tx (values tx l 1 (or (gethash id-hex (node-confiscation-heights node)) (lottery-output-height node tx))))))
 
 (defun rearm-spend-for (node id-hex tx lottery round height)
   "The recovery spend of the lottery output of TX (LOTTERY, round ROUND, confirmed at HEIGHT) into
@@ -5174,7 +5176,11 @@
    tier prevouts), or NIL while the next round cannot be built (window open, empty cut, no tier)."
   (multiple-value-bind (idx) (revealed-indices node id-hex lottery)
     (multiple-value-bind (opens closes) (rearm-window node id-hex height (and idx t))
-      (when (<= (height node) closes) (return-from rearm-spend-for nil))
+      (when (or (<= (height node) closes)
+                ;; reopened (nobody armed in the first window): wait for the second to close
+                (and (null (rearm-armers node id-hex (1+ round) opens closes))
+                     (<= (height node) (+ closes (- closes opens)))))
+        (return-from rearm-spend-for nil))
       (let* ((next (or (rearm-lottery node id-hex (1+ round) opens closes) (return-from rearm-spend-for nil)))
              (age (1+ (- (height node) height)))
              (tier (position-if (lambda (spec) (>= age (car spec))) (lot::recovery-specs (lot:lottery-recovery-threshold lottery))))
@@ -5262,7 +5268,7 @@
         (let ((r (first (rearm-rounds node id-hex))))
           (when r (follow-rearm-spend node id-hex r)))
         (return-from drive-rearm nil))
-      (unless height (return-from drive-rearm nil))
+      (unless height (return-from drive-rearm (note-dispute node id-hex "lottery round ~a: its output is not confirmed yet" round)))
       (when (and (= round 1) (not (rearm-rounds node id-hex)))
         (note-rearm-round node id-hex 1 tx height :lottery lottery))
       (let* ((h (height node)) (idx (revealed-indices node id-hex lottery))
@@ -5286,7 +5292,10 @@
               (return-from drive-rearm nil)))
           (cond
             ;; The next round's window is open: arm it with a fresh preimage.
-            ((and (< opens h) (<= h closes))
+            ((and (< opens h) (or (<= h closes)
+                                  ;; the window reopens once when nobody armed in it
+                                  (and (<= h (+ closes (- closes opens)))
+                                       (null (rearm-armers node id-hex (1+ round) opens closes)))))
              (unless (or (find me (armers-of node id-hex :round (1+ round)) :key #'first :test #'equalp)
                          (>= (count me (%all-arms node id-hex) :key #'first :test #'equalp) +max-arms+))
                (let ((p (pledge-collateral node id-hex)))
