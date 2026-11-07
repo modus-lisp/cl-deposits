@@ -58,6 +58,9 @@
    (make-sc :name "rearm-yield" :script "check-rearm-yield.sh" :ledger-var "REDTEAM_RY"
             :env '("WAIT=1800") :timeout 4800 :tags '(:contagion :slow)
             :note "DEP-06 Phase 4 re-arm with revealers (provisional): every fork yields, the winner included; a fresh round recovers the output and is claimed")
+   (make-sc :name "rearm-late" :script "check-rearm-late.sh" :ledger-var "REDTEAM_RL"
+            :env '("WAIT=1800") :timeout 6000 :tags '(:contagion :slow)
+            :note "DEP-06 Phase 4 recurring windows (strict-lottery-v8, ruled 2026-11-07): a lottery stranded past both scheduled windows re-arms at the first recurring one and is claimed")
    (make-sc :name "grounded-arms" :script "check-grounded-arms.sh" :ledger-var "REDTEAM_GA"
             :env '("WAIT=1500") :timeout 2400 :tags '(:contagion)
             :note "DEP-18 grounded-arms-v7: an arm whose DisputeEnter has no grounds is disregarded")
