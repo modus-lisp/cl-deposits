@@ -29,7 +29,7 @@
     (loop for b across bytes do (format s "~(~2,'0x~)" b))))
 
 (defun sha256 (bytes)
-  (ironclad:digest-sequence :sha256 (coerce bytes 'octets)))
+  (natrium:sha256 (coerce bytes 'octets)))
 
 (defun ascii->bytes (string)
   (map 'octets #'char-code string))
