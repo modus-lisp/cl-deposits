@@ -4956,7 +4956,11 @@
               ((not (and conf (reveal-deadline-passed-p node conf))) (fail "missing a reveal before the deadline")))
         (let* ((winner (if (= k 1) 0 (lot:subset-winner idx preimages)))
                (winner-pk (lot:participant-pubkey (nth winner participants))))
-          (unless (equalp winner-pk (up:x-only (node-pubkey node)))
+          ;; ADVERSARY :yield-win — the drawn winner yields its own custody instead of claiming
+          ;; (round 1 only; signet soak 2026-11-04, ledger 30ea46ac): every fork yields, the
+          ;; output stays unspent, and the re-arm round (DEP-06 Phase 4) must recover it.
+          (unless (and (equalp winner-pk (up:x-only (node-pubkey node)))
+                       (not (and (getf (node-adversary node) :yield-win) (null lottery-tx))))
             (commit-update node fork (new-update node fork (list :type :dispute-yield)))
             (return-from claim-or-yield (values :yielded nil)))
           (let* ((txid (or confiscation-txid (and conf (btx:tx-txid conf)) (fail "no confiscation tx")))
@@ -5241,12 +5245,24 @@
 (defun follow-rearm-spend (node id-hex r)
   "If the lottery output of round R (a NOTE-REARM-ROUND plist with its lottery and height) was
    spent into the next round's lottery, register that round.  Returns the spend or NIL."
-  (let ((tx (getf r :tx)) (round (getf r :round)) (height (getf r :height)) (l (getf r :lottery)))
+  (let* ((tx (getf r :tx)) (round (getf r :round)) (height (getf r :height))
+         ;; LOAD-REARMS keeps no lottery: after a restart, rebuild the one whose output TX pays.
+         (spk (btx:txout-script (first (btx:tx-outputs tx))))
+         (l (or (getf r :lottery)
+                (let ((x (if (= round 1)
+                             (lottery-paid-by node id-hex spk)
+                             (and (getf r :opens) (getf r :closes) (rearm-lottery node id-hex round (getf r :opens) (getf r :closes))))))
+                  (and x (equalp (lot:lottery-spk x) spk) x)))))
     (when (and (node-spender-fn node) height l)
       (let ((spend (find-if (lambda (s) (equalp (getf s :txid) (btx:tx-txid tx)))
-                            (ignore-errors (funcall (node-spender-fn node) height (height node) (list (list (btx:tx-txid tx) 0)))))))
+                            ;; Outpoints are (txid . vout), and a spend's :tx is its hex.  This
+                            ;; once passed (txid 0) and read :tx as parsed, so a voter that did
+                            ;; not broadcast the spend itself never followed it into the next
+                            ;; round (regtest, 2026-11-07: cld28 on 75395b59 and 7c4d6b2a).
+                            (ignore-errors (funcall (node-spender-fn node) height (height node) (list (cons (btx:tx-txid tx) 0)))))))
         (when spend
-          (let ((stx (getf spend :tx)))
+          (let ((stx (let ((x (getf spend :tx)))
+                       (if (stringp x) (ignore-errors (btx:parse-tx (bw:make-reader (hex->bytes x)))) x))))
             (when (and stx (= 1 (length (btx:tx-inputs stx))) (= 1 (length (btx:tx-outputs stx))))
               (multiple-value-bind (opens closes) (rearm-window node id-hex height (and (revealed-indices node id-hex l) t))
                 (let ((next (rearm-lottery node id-hex (1+ round) opens closes)))

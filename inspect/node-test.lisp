@@ -2280,4 +2280,47 @@
                   (check "v7: the same judge does not excuse the one over the ungrounded arm"
                          (not (nd::rebuilt-confiscation-p fresh id with-d :updates updates))))))))))))
 
+;;; DEP-06 Phase 4: a voter that did not broadcast the re-arm spend follows it into the next round
+;;; from the chain.  FOLLOW-REARM-SPEND once asked the spender for (txid 0), not (txid . 0), and
+;;; read the spend's :tx hex as a parsed tx, so only the voter that broadcast it ever registered
+;;; round 2 (regtest, 2026-11-07: cld28 never attested round 2's claim on 75395b59 or 7c4d6b2a).
+(let* ((seed (lambda (i) (gossamer:pooled-copy (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))))
+       (mk (lambda (ks) (lot:build-lottery (loop for i in ks collect (lot:make-participant :pubkey (up:x-only (up:compressed-pubkey (tk (funcall seed i))))
+                                                                                         :commitment (make-array 20 :element-type '(unsigned-byte 8) :initial-element i)
+                                                                                         :target (format nil "tb1p~a" i)))
+                                           (loop for j from 1 to 3 collect (up:x-only (up:compressed-pubkey (tk (funcall seed (+ 20 j)))))) 2 :network :regtest)))
+       (rt (lambda (tx) (btx:parse-tx (cl-consensus.wire:make-reader (btx:serialize-tx tx)))))   ; parse fills tx-txid
+       (l1 (funcall mk '(1 2))) (l2 (funcall mk '(3 4)))
+       (r1 (funcall rt (btx:make-tx :version 2 :locktime 0 :inputs (list (btx:make-txin :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9) :prev-index 0 :script (u:octets) :sequence 0))
+                        :outputs (list (btx:make-txout :value 50000000 :script (lot:lottery-spk l1))))))
+       (spend (funcall rt (btx:make-tx :version 2 :locktime 0 :inputs (list (btx:make-txin :prev-hash (btx:tx-txid r1) :prev-index 0 :script (u:octets) :sequence 144))
+                           :outputs (list (btx:make-txout :value 49999000 :script (lot:lottery-spk l2))))))
+       (asked nil)
+       (node (nd:make-node :priv (tk 77777777777) :bus (bus:make-mock-bus) :height-fn (lambda () 1660)
+                           :spender-fn (lambda (from to ops) (declare (ignore from to)) (setf asked ops)
+                                         (loop for o in ops when (and (consp o) (equalp (car o) (btx:tx-txid r1)) (eql (cdr o) 0))
+                                               collect (list :txid (car o) :vout (cdr o) :tx (u:bytes->hex (btx:serialize-tx spend)) :height 1647)))))
+       (id (make-string 64 :initial-element #\a)))
+  (handler-bind ((warning #'muffle-warning))
+    (let ((orig-w (fdefinition 'nd::rearm-window)) (orig-l (fdefinition 'nd::rearm-lottery)))
+      (setf (fdefinition 'nd::rearm-window) (lambda (&rest a) (declare (ignore a)) (values 1575 1581))
+            (fdefinition 'nd::rearm-lottery) (lambda (&rest a) (declare (ignore a)) l2))
+      (unwind-protect
+           (let ((got (nd::follow-rearm-spend node id (list :round 1 :tx r1 :height 1503 :lottery l1))))
+             (check "a re-arm spend is looked up by its (txid . 0) outpoint" (and asked (consp (first asked)) (eql (cdr (first asked)) 0)))
+             (check "a voter that did not broadcast it follows the re-arm spend from the chain"
+                    (and got (equalp (btx:tx-txid got) (btx:tx-txid spend))))
+             (check-equal "and registers round 2 at the spend's block"
+                          (let ((r (first (nd::rearm-rounds node id)))) (list (getf r :round) (getf r :height))) '(2 1647))
+             ;; After a restart LOAD-REARMS has no lottery for round 1: it is rebuilt from the
+             ;; output the round-1 transaction pays.
+             (let ((orig-p (fdefinition 'nd::lottery-paid-by)))
+               (setf (gethash id (nd::node-rearms node)) nil
+                     (fdefinition 'nd::lottery-paid-by) (lambda (n i spk) (declare (ignore n i)) (and (equalp spk (lot:lottery-spk l1)) l1)))
+               (unwind-protect
+                    (check "after a restart (round 1 loaded without its lottery) the spend is still followed"
+                           (nd::follow-rearm-spend node id (list :round 1 :tx r1 :height 1503)))
+                 (setf (fdefinition 'nd::lottery-paid-by) orig-p))))
+        (setf (fdefinition 'nd::rearm-window) orig-w (fdefinition 'nd::rearm-lottery) orig-l)))))
+
 (report)
