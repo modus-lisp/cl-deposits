@@ -80,7 +80,7 @@ echo "== $yielded of 2 participants logged a round-1 yield"
 [ "$yielded" = 2 ] || fail "expected both participants to yield round 1 before the restart, got $yielded"
 # The restart: H comes back with only its files, its forks yielded, the vault confiscated.
 LOGH="$(cld_dir $H)/node.log"; MARK=$(wc -c <"$LOGH")
-echo "== restarting $H at height $(bcli getblockcount) (quorum expiry: ${FORM_EXPIRY:-200} blocks from formation)"
+echo "== restarting $H at height $(bcli getblockcount) (quorum expiry: ${FORM_EXPIRY:-100} blocks from formation)"
 stop_cld $H; start_cld $H || fail "$H did not come back"
 # The adversary knobs live in memory: without this the restarted winner claims round 1 for real.
 expect "$(cld_ctl $H "(:adversary :set :yield-win t)")"
