@@ -30,7 +30,9 @@ TXID=$(sx "$out" ":TXID"); taint $OP $T2 $T3 $T4 $T5
 echo "   unanchored spend $TXID broadcast; watching $HON $R1 $R2 for ${WAIT}s"
 mine 5
 for i in $(seq 1 $WAIT); do sleep 1; done
-hits=$(cld_ctl $HON '(:log)' 2>/dev/null | grep -cE "VAULT SPEND|SPEND CHALLENGED" || true)
+# Only this vault's lines: HON may have judged another scenario's theft earlier (regtest 2026-11-07,
+# cld65 carried vault-spend's e130e1a1 into this check and failed it).
+hits=$(cld_ctl $HON '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND|SPEND CHALLENGED" | grep -cF -e "${P:0:8}" -e "${TXID:0:16}" || true)
 rh=0; for r in $R1 $R2; do
   c=$(tail -c 20000000 "$(ref_dir $r)/node.log" 2>/dev/null | grep -a "$TXID\|${P:0:16}" | grep -acE "UnauthorizedVaultSpend|VAULT SPEND|challeng" || true); rh=$((rh + c)); done
 forks=0; for l in "$L1" "$L2" "$L3" "$L4" "$L5"; do
