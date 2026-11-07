@@ -62,7 +62,9 @@ slow_until() { while [ "$(bcli getblockcount)" -lt "$1" ]; do mine 1 >/dev/null;
 # Slowly through the reveal deadline so both reveal and yield, fast to the CSV-144 leaf, slowly
 # through round 2's arm window.
 slow_until $((HC + 10)) 10; slow_until $((HC + 76)) 3
-yielded=0; for n in $H $H2; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}:" | grep -qE "lottery: yielded" && yielded=$((yielded+1)); done
+# From node.log, not (:log): a busy node's ring buffer can drop the line before we look (regtest,
+# 2026-11-07: cld145's yield was logged but not counted).
+yielded=0; for n in $H $H2; do grep -aF "dispute ${W:0:8}: lottery: yielded" "$(cld_dir $n)/node.log" >/dev/null 2>&1 && yielded=$((yielded+1)); done
 echo "== $yielded of 2 participants logged a round-1 yield"
 slow_until $((HC + 142)) 1; slow_until $((HC + 144 + 14)) 15
 echo "== waiting for the re-arm spend of $CONF:0"

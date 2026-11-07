@@ -2327,9 +2327,11 @@
 ;;; lottery output is unspent.  Regtest 4a6487ee: round 1's output at 649, nobody revealed, so o = 721,
 ;;; w = 6, and both scheduled windows were long past by 1750.  The next recurring window is (1873, 1879].
 (handler-bind ((warning #'muffle-warning))
-  (let ((orig (fdefinition 'nd::rearm-armers)))
+  (let ((orig (fdefinition 'nd::rearm-armers)) (orig-a (fdefinition 'nd::armers-of)))
     (setf (fdefinition 'nd::rearm-armers)
-          (lambda (n i r o c) (declare (ignore n i r)) (and (< o 1875 (1+ c)) (list :an-armer))))
+          (lambda (n i r o c) (declare (ignore n i r)) (and (< o 1875 (1+ c)) (list :an-armer)))
+          ;; one arm, signed at 1875 (an armer entry's fifth element is its block height)
+          (fdefinition 'nd::armers-of) (lambda (&rest a) (declare (ignore a)) (list (list :k :c :t :x 1875))))
     (unwind-protect
          (progn
            (check-equal "past both scheduled windows with no arm, no window has a cut"
@@ -2338,6 +2340,6 @@
                         (multiple-value-list (nd::rearm-round-window-of nil "x" 2 721 727 1880)) '(9 1873 1879))
            (check-equal "while it is still open, no spend is due"
                         (nd::rearm-round-window-of nil "x" 2 721 727 1879) nil))
-      (setf (fdefinition 'nd::rearm-armers) orig))))
+      (setf (fdefinition 'nd::rearm-armers) orig (fdefinition 'nd::armers-of) orig-a))))
 
 (report)
