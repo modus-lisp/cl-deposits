@@ -110,10 +110,8 @@ re-confiscate.
   window runs while a reveal or claim is pending. k > 2w keeps the windows disjoint. Built in cl
   (`lot:rearm-round-window` and friends, `nd::rearm-round-window-of`) and Rust (`rearm_round_window`
   et al.). Vector `rearm_windows.json`; regtest `check-rearm-late.sh`.
-- **Still open:** re-arm, and so the recurring windows, runs only on disputes whose fork point is
-  under strict-lottery-v8 (cl's gate; the spec's "Nobody revealed" paragraph names no ruleset). The
-  soak's pre-v8 stranded lotteries (30ea46ac, f5274842) stay out of reach unless re-arm is also
-  allowed under earlier rulesets. It's a behaviour, not a judged rule: no ruleset convicts a
-  recovery spend into a lottery. But the round's cut would follow the old ruleset (no accused
-  exclusion), and 30ea46ac's recovery voters include its colluders (CHAOS.md). Needs a ruling.
+- **Pre-v8 lotteries (ruled by the user, 2026-11-07: "they're devnet - don't worry too much"):**
+  re-arm stays v8-only. The soak's pre-v8 stranded lotteries (30ea46ac, f5274842) stay stranded as
+  devnet casualties. Extending re-arm to them would mean running a frozen ruleset's lottery with new
+  behaviour, and would give 30ea46ac's colluders recovery votes.
 
