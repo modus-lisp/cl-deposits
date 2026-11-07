@@ -86,7 +86,7 @@ least), so claims become a race. It would be sound only with chain-dated reveals
 can be back-dated to frame an honest claimant) and a `target_reserves` that honest keys can
 re-confiscate.
 
-## 7. Re-arming a lottery whose window has already closed (open: needs a ruling)
+## 7. Re-arming a lottery whose window has already closed (ruled 2026-11-07: option (c), recurring windows)
 
 - **What:** DEP-06 Phase 4 dates round r+1's arm window only from h_L: (h_L + 72, h_L + 72 + w] when
   nobody revealed, (h_L + 144, h_L + 144 + w] otherwise, reopening once. A lottery that stranded
@@ -101,4 +101,19 @@ re-confiscate.
   isn't public); (c) windows recur every k blocks after h_L + 144 while the output is unspent,
   bounded by the four-arm limit. (c) is deterministic from h_L alone, so every voter rebuilds the
   same round, and it's my recommendation (provisional, under strict-lottery-v8).
+- **Ruling (the user, 2026-11-07):** "permanent stranding isn't going to work, so let's go with 3",
+  i.e. option (c). Specified in DEP-06 Phase 4 step 3 (spec, under strict-lottery-v8). Window 0 is
+  (o, o+w] and window 1 its reopening; windows j >= 2 are (o+(j-1)k, o+(j-1)k+w], with
+  k = 144·⌈(2w+1)/144⌉ (144 for w <= 71). The round takes the first window whose cut is non-empty,
+  and the four-arm bound spans every window. Why this k: the first recurring window opens at
+  o + k >= h_L + 216, after the reveal deadline and the CSV-144 claim time for revealers, so no
+  window runs while a reveal or claim is pending. k > 2w keeps the windows disjoint. Built in cl
+  (`lot:rearm-round-window` and friends, `nd::rearm-round-window-of`) and Rust (`rearm_round_window`
+  et al.). Vector `rearm_windows.json`; regtest `check-rearm-late.sh`.
+- **Still open:** re-arm, and so the recurring windows, runs only on disputes whose fork point is
+  under strict-lottery-v8 (cl's gate; the spec's "Nobody revealed" paragraph names no ruleset). The
+  soak's pre-v8 stranded lotteries (30ea46ac, f5274842) stay out of reach unless re-arm is also
+  allowed under earlier rulesets. It's a behaviour, not a judged rule: no ruleset convicts a
+  recovery spend into a lottery. But the round's cut would follow the old ruleset (no accused
+  exclusion), and 30ea46ac's recovery voters include its colluders (CHAOS.md). Needs a ruling.
 

@@ -67,6 +67,8 @@ Nov 2 lapsed-challenge vault-spend proofs.
 | Withholding a reveal | have | `attack-withhold-reveal.sh` |
 | Every participant withholds its reveal, so the lottery can't be claimed | have | `check-rearm.sh` (`:withhold-reveal`): the re-arm round recovers it (DEP-06 Phase 4, provisional) |
 | The drawn winner yields its own custody (every fork yields, nobody claims) | have | `check-rearm-yield.sh` (`:yield-win`, round 1 only; the soak 30ea46ac shape): the re-arm round recovers it |
+| Every voter is down (or runs a build without re-arm) through a round's scheduled windows | have | `check-rearm-late.sh` (`:hold-rearm-until`): the first recurring window re-arms the stranded lottery (DEP-06 Phase 4 step 3, ruled Nov 7) |
+| An armer arms between windows, or in every recurring window with a failing pledge, to burn the four-arm bound | idea | A between-window arm counts against the bound but belongs to no window; once every armer has run out, the output stays unspent until the vault's post-expiry tiers. Untested |
 | A recovery voter refuses to sign or follow the re-arm spend, below the tier's threshold | idea | Should fall through to the later tiers (1008/4032/8064); untested |
 | A participant withholds in every round, burning the four-arm bound to strand the output for good | idea | The spec's named residual risk; check that honest armers' rounds still claim through the subset leaves |
 | Dereliction (a member that won't confirm a disclosed fraud) | have | `attack-dereliction.sh` |

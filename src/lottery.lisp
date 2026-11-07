@@ -27,7 +27,8 @@
            #:confiscation-outputs #:confiscation-tx #:revealers-from-witness #:tapbuilder-tree #:p2tr-spk #:key-path-spk
            #:+reveal-csv+ #:+armer-sweep-csv+ #:+max-disputants+ #:+timeout-recovery-csv+
            #:+contribution-range+ #:+max-preimage-len+ #:confiscation-fee #:+confiscation-default-feerate+ #:confiscation-ladder #:+confiscation-rungs+ #:claim-tx #:+claim-fee-floor+
-           #:rearm-spend-vsize #:rearm-spend #:strict-voters))
+           #:rearm-spend-vsize #:rearm-spend #:strict-voters
+           #:rearm-period #:rearm-window-nth #:rearm-round-window #:rearm-open-window #:rearm-next-window))
 (in-package #:cl-deposits.lottery)
 
 (defconstant +max-disputants+ 7 "MAX_LOTTERY_PARTICIPANTS: the subset tree has 2^k - 1 claim leaves.")
@@ -377,6 +378,43 @@
                     (cons (cat (octets 0 20) (hash160 operator-pubkey33)) change)))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; The re-arm round's arm windows (DEP-06 Phase 4 step 3, strict-lottery-v8, ruled 2026-11-07).
+;;; While the lottery output is unspent the windows recur, so no lottery strands for want of one.
+;;; Vector: rearm_windows.json.
+
+(defun rearm-period (w)
+  "k = 144 x ceil((2W + 1) / 144): the least multiple of 144 above 2W (144 for any W <= 71)."
+  (* 144 (ceiling (1+ (* 2 w)) 144)))
+
+(defun rearm-window-nth (o w j)
+  "Window J of a round opening at O with arm window W: (values opens closes), the window being
+   (opens, closes].  J = 0 is (O, O+W], J = 1 its one reopening (O+W, O+2W], and J >= 2 recur at
+   O + (J-1) x k."
+  (let ((opens (case j (0 o) (1 (+ o w)) (t (+ o (* (1- j) (rearm-period w)))))))
+    (values opens (+ opens w))))
+
+(defun rearm-round-window (o w tip nonempty-p)
+  "The round's window as of TIP: the first window J, in order, that has closed (TIP > closes)
+   and whose cut NONEMPTY-P (called with opens and closes) finds non-empty.  (values j opens
+   closes), or NIL while none has (the first window not yet closed ends the search)."
+  (loop for j from 0
+        do (multiple-value-bind (opens closes) (rearm-window-nth o w j)
+             (unless (> tip closes) (return nil))
+             (when (funcall nonempty-p opens closes) (return (values j opens closes))))))
+
+(defun rearm-open-window (o w tip)
+  "(values j opens closes) of the window that TIP lies in (opens < TIP <= closes), or NIL when TIP
+   falls between windows."
+  (loop for j from 0
+        do (multiple-value-bind (opens closes) (rearm-window-nth o w j)
+             (when (<= tip opens) (return nil))
+             (when (<= tip closes) (return (values j opens closes))))))
+
+(defun rearm-next-window (o w tip)
+  "The opening height of the first window that opens at or after TIP (it takes arms from the
+   block after)."
+  (loop for j from 0 for opens = (rearm-window-nth o w j) when (>= opens tip) return opens))
+
 ;;; The re-arm round's recovery spend (DEP-06 Phase 4, draft)
 
 (defun %compact-size-len (n) (cond ((< n 253) 1) ((<= n #xffff) 3) ((<= n #xffffffff) 5) (t 9)))

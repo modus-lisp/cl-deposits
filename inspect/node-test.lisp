@@ -2323,4 +2323,21 @@
                  (setf (fdefinition 'nd::lottery-paid-by) orig-p))))
         (setf (fdefinition 'nd::rearm-window) orig-w (fdefinition 'nd::rearm-lottery) orig-l)))))
 
+;;; DEP-06 Phase 4 step 3 (strict-lottery-v8, ruled 2026-11-07): a round's windows recur while its
+;;; lottery output is unspent.  Regtest 4a6487ee: round 1's output at 649, nobody revealed, so o = 721,
+;;; w = 6, and both scheduled windows were long past by 1750.  The next recurring window is (1873, 1879].
+(handler-bind ((warning #'muffle-warning))
+  (let ((orig (fdefinition 'nd::rearm-armers)))
+    (setf (fdefinition 'nd::rearm-armers)
+          (lambda (n i r o c) (declare (ignore n i r)) (and (< o 1875 (1+ c)) (list :an-armer))))
+    (unwind-protect
+         (progn
+           (check-equal "past both scheduled windows with no arm, no window has a cut"
+                        (nd::rearm-round-window-of nil "x" 2 721 727 1750) nil)
+           (check-equal "a recurring window armed and closed is the round's window"
+                        (multiple-value-list (nd::rearm-round-window-of nil "x" 2 721 727 1880)) '(9 1873 1879))
+           (check-equal "while it is still open, no spend is due"
+                        (nd::rearm-round-window-of nil "x" 2 721 727 1879) nil))
+      (setf (fdefinition 'nd::rearm-armers) orig))))
+
 (report)
