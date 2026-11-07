@@ -48,6 +48,7 @@ echo "== waiting for the confiscation to confirm"
 CONF=""
 for i in $(seq 1 $((WAIT / 5))); do
   [ -z "$(bcli gettxout "$VINTX" "$VINVOUT" true 2>/dev/null | head -1)" ] && CONF=$(spender_of "$VINTX" "$VINVOUT") && [ -n "$CONF" ] && break
+  [ $((i % 3)) -eq 0 ] && mine 1 >/dev/null   # the ticker is paused: the arm window closes on height
   sleep 5
 done
 [ -n "$CONF" ] || fail "no confiscation confirmed within ${WAIT}s"
