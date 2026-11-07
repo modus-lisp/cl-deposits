@@ -71,9 +71,12 @@ entry 2.
   the later tiers). cl `lot:rearm-spend` (`768e316`), Rust `LotteryOutput::rearm_spend`
   (`ae9f993`). Shared vector `rearm_spend.txt`, 9 cases, byte-identical in both; cl also checks each
   claimed vsize against a fully witnessed spend.
-- **Not done:** the round's orchestration (detecting the deadline, collecting the round's arms,
-  proposing and signing the spend, reveal and claim against the new output) in either
-  implementation, and the all-yield regtest scenario.
+- **Status (Nov 7):** cl orchestrates the round (deadline, the round's arms, proposing and signing
+  the spend, following it, reveal and claim). Regtest passes `rearm` (everyone withholds) and
+  `rearm-yield` (everyone reveals, and the drawn winner yields its own custody, as ref6 did on soak
+  30ea46ac). Both runs had only cl voters: deposits-rust builds the spend byte-identically (vector)
+  but doesn't run a round, so a mixed quorum's re-arm needs a cl voter to propose, and a Rust voter
+  won't sign.
 
 ## 6. Proper-subset claims without voter attestation (dropped)
 
@@ -82,3 +85,20 @@ without attestation every revealer can claim through a favourable subset (the si
 least), so claims become a race. It would be sound only with chain-dated reveals (signed heights
 can be back-dated to frame an honest claimant) and a `target_reserves` that honest keys can
 re-confiscate.
+
+## 7. Re-arming a lottery whose window has already closed (open: needs a ruling)
+
+- **What:** DEP-06 Phase 4 dates round r+1's arm window only from h_L: (h_L + 72, h_L + 72 + w] when
+  nobody revealed, (h_L + 144, h_L + 144 + w] otherwise, reopening once. A lottery that stranded
+  before re-arm was deployed, or while every voter was down, is past both windows and can never
+  re-arm.
+- **Seen:** regtest 4a6487ee (round-1 output at 649, still unspent at 1750, reveals held). The soak's
+  stranded lotteries, 30ea46ac and f5274842, are the same case, so re-arm can't rescue them as the
+  spec stands.
+- **Options:** (a) leave them stranded, the residual risk the spec already names; (b) a late round:
+  the window opens at the first block, at or after h_L + 144, in which a voter sees the output
+  unspent and no window open, which every voter must agree on from public state (hard: "first seen"
+  isn't public); (c) windows recur every k blocks after h_L + 144 while the output is unspent,
+  bounded by the four-arm limit. (c) is deterministic from h_L alone, so every voter rebuilds the
+  same round, and it's my recommendation (provisional, under strict-lottery-v8).
+
