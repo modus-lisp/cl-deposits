@@ -5,4 +5,4 @@ pgrep -f "bitcoind -datadir=$BITCOIN_DATADIR" >/dev/null || { echo "bitcoind not
 start_relay && echo "relay $RELAY_URL"
 start_esplora && echo "esplora shim $ESPLORA_URL"
 for n in $(cld_names); do start_cld "$n"; done
-[ -x "$REF_NODE_BIN" ] && for n in $(ref_names); do start_ref "$n"; done   # the reference nodes, when built
+for n in $(ref_names); do start_ref "$n" || true; done   # the reference nodes: each from its versioned build (start_ref says if one is missing)
