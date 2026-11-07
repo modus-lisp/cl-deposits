@@ -2707,6 +2707,13 @@
    txid depends on the tier (nLockTime) and on whether it was respectful (the
    operator's change output), so both are tried; a rebuild with the defaults
    (non-respectful) never matched a respectful confiscation after a restart."
+  ;; DEP-03: arms above the confiscation's block do not count.  That block is learned when the
+  ;; confiscation is found, so a restarted node rebuilt with every later arm in the cut and missed
+  ;; (751e6951).  The txid of a confiscation we saw confirm is kept (known-confiscations): take
+  ;; the block from it first.
+  (when (node-chain-fn node)
+    (dolist (txid (gethash id-hex (node-known-confiscations node)))
+      (note-confiscation-height node id-hex (funcall (node-chain-fn node) txid 0))))
   (when (and (node-chain-fn node)
              ;; No confiscation can exist while the vault is unspent: one gettxout instead of
              ;; rebuilding every shape x tier x armer subset, each with its obligations (a
@@ -2731,6 +2738,13 @@
               (loop for mask from (1- (ash 1 (length all))) downto 3
                     for subset = (loop for a in all for i from 0 when (logbitp i mask) collect a)
                     thereis (and (>= (length subset) 2) (try subset)))))))))
+
+(defun lottery-output-spent-p (node id-hex)
+  "Literal: a confiscation of ID-HEX we know confirmed (known-confiscations) has its lottery
+   output (output 0) spent."
+  (and (node-chain-fn node)
+       (loop for txid in (gethash id-hex (node-known-confiscations node))
+             thereis (null (funcall (node-chain-fn node) txid 0)))))
 
 (defun confiscation-on-chain (node id-hex)
   "The confiscation of ID-HEX whose lottery output is in the UTXO set (we
@@ -2917,11 +2931,12 @@
           (cond ((not (node-chain-fn node)) (return-from fork-lottery (values tx l :pending)))
                 ((funcall (node-chain-fn node) (btx:tx-txid tx) 0)
                  (note-confiscation node id-hex (btx:tx-txid tx))
+                 (save-confirmed-lottery node id-hex tx l)
                  (return-from fork-lottery (values tx l :pending)))
                 (t (forget)))))
       (multiple-value-bind (tx l state) (confiscated-lottery node id-hex)
         (when tx
-          (when state (note-confiscation node id-hex (btx:tx-txid tx)))
+          (when state (note-confiscation node id-hex (btx:tx-txid tx)) (save-confirmed-lottery node id-hex tx l))
           (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) tx (record-lottery f) l)))
         (values tx l state)))))
 
@@ -2975,9 +2990,10 @@
             (cond
               ;; Nothing left to confiscate (a stranded rotation spent it): arming
               ;; would only tie up a pledge.
-              ((and reserves-spent (null conf) (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
-               ;; We revealed, so a confiscation was on chain; its lottery output is gone
-               ;; and not by our recovery sweep: the winner claimed it.
+              ((and reserves-spent (null conf) (lottery-output-spent-p node id))
+               ;; A confiscation we know confirmed, and its lottery output is spent: claimed (a
+               ;; re-arm spend is DRIVE-REARM's, above).  Not being able to rebuild the lottery
+               ;; proves nothing (751e6951's fellows concluded on that, and it stranded).
                (conclude "lottery claimed by its winner; yielded"))
               ((and reserves-spent (null conf))
                (note-dispute node id "reserves spent, but not by a confiscation we can rebuild"))
@@ -3532,6 +3548,13 @@
   "We are a quorum member of REC's ledger and have grounds: fork it and publish DisputeEnter.  A
    punitive one carries its proof (FRAUD-PROOF, or the broadcast being handled) as TLV 345, so an
    arm on our fork has grounds a cosigner can judge from the fork alone (DEP-03 §Grounded arms)."
+  ;; Nothing left to dispute: the vault was confiscated, and that confiscation is the dispute's
+  ;; end (its lottery, and any re-arm round, are what remain).  A restart forgot this: its forks
+  ;; had yielded, so the ledger looked undisputed and expired, and the node opened a second
+  ;; dispute on the dead vault (signet soak 2026-11-07, 751e6951).
+  (when (reserves-confiscated-p node rec)
+    (note-dispute node (record-id-hex rec) "not disputing (~a): its vault was confiscated" reason)
+    (return-from enter-dispute nil))
   (let ((stale (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and stale (not (fork-live-p node stale))) (retire-fork node stale)))
   ;; One DisputeEnter per dispute: a live fork that already entered keeps the grounds it entered
@@ -4939,6 +4962,11 @@
                       ;; the one on chain; without a chain view, the tier open now.
                       (destructuring-bind (tx l &rest rest)
                           (or (rebuild-confiscation-on-chain node id-hex)
+                              ;; A fresh build is a guess at a confiscation that hasn't happened;
+                              ;; once the vault is spent, only the one on chain has a lottery to
+                              ;; claim (a guessed one "won" off chain, 751e6951).
+                              (and (reserves-confiscated-p node (find-record node id-hex))
+                                   (fail "no confiscation on chain that we can rebuild"))
                               (multiple-value-list (build-confiscation node id-hex)))
                         (declare (ignore rest))
                         (setf (record-lottery fork) l (record-confiscation fork) tx)
@@ -4990,7 +5018,11 @@
                                                                        :witnesses witnesses))))))
             (dotimes (i (length (btx:tx-inputs signed)))
               (unless (rot:verify-spend signed i prevouts) (fail "claim input ~a does not verify" i)))
-            (broadcast node signed)
+            ;; Custody is the claim on chain, not our belief in it: a claim the network refuses
+            ;; takes nothing, so no DisputeAcquire for it.
+            (when (and (node-broadcast-fn node) (null (broadcast node signed)))
+              (fail "claim ~a refused by the network" (txid-hex (btx:tx-txid signed))))
+            (unless (node-broadcast-fn node) (broadcast node signed))
             (commit-update node fork (new-update node fork (list :type :dispute-acquire :new-custodian (node-pubkey node)
                                                                  :claim-txid (btx:tx-txid signed) :new-reserves-address target
                                                                  ;; DEP-06: the confiscation whose residue we now owe
@@ -5287,7 +5319,12 @@
    build and sign the recovery spend; in a later round, reveal and claim against its output."
   (unless (lg:ruleset-rule-p (ruleset-at-fork-point node id-hex) :strict-lottery) (return-from drive-rearm nil))
   (let ((fork (find-fork node id-hex (node-pubkey node))))
-    (unless (and fork (fork-op fork :dispute-enter) (not (fork-op fork :dispute-acquire))) (return-from drive-rearm nil))
+    ;; A DisputeAcquire ends our part only when it is literal: the confiscation's lottery output is
+    ;; spent.  One for a claim that never landed (751e6951's restart, before claims had to be
+    ;; accepted first) took nothing, and must not keep us out of the round that recovers it.
+    (unless (and fork (fork-op fork :dispute-enter)
+                 (not (and (fork-op fork :dispute-acquire) (or (not (node-chain-fn node)) (lottery-output-spent-p node id-hex)))))
+      (return-from drive-rearm nil))
     (multiple-value-bind (tx lottery round height) (current-lottery node id-hex)
       (unless tx
         ;; The newest output we know of is gone: follow it (a claim ends the dispute; a re-arm
@@ -5798,6 +5835,66 @@
               do (let ((sp (position #\Space line)))
                    (when sp (pushnew (reverse (hex->bytes (subseq line (1+ sp))))
                                      (gethash (subseq line 0 sp) (node-known-confiscations node)) :test #'equalp))))))))
+
+;;; The lottery of a confirmed confiscation, kept across restarts.  Everything in it is public
+;;; (the participants' keys, commitments and targets; the recovery voters), but rebuilding it
+;;; after a restart means recomputing the eligibility cut from forks that may since have yielded,
+;;; been retired, or re-armed, and that rebuild missed (signet soak 2026-11-07, 751e6951: cld7
+;;; "won" a lottery off chain, its fellows concluded, and the output never re-armed).  A loaded
+;;; lottery is used only when its script is literally output 0 of the confiscation it was saved
+;;; with, so a stale or corrupt file can never stand in for the real one.
+
+(defun confirmed-lottery-path (node id-hex)
+  (and (node-data-dir node) (merge-pathnames (format nil "lottery_~a.sexp" (subseq id-hex 0 16)) (node-data-dir node))))
+
+(defun save-confirmed-lottery (node id-hex tx lottery)
+  (let ((path (confirmed-lottery-path node id-hex)))
+    (when (and path tx lottery (not (probe-file path)))
+      (ignore-errors
+       (with-open-file (out path :direction :output :if-exists :supersede :if-does-not-exist :create)
+         (with-standard-io-syntax
+           (let ((*print-readably* nil))
+             (prin1 (list :id id-hex :tx (bytes->hex (btx:serialize-tx tx))
+                          :participants (loop for p in (lot:lottery-participants lottery)
+                                              collect (list (bytes->hex (lot:participant-pubkey p))
+                                                            (bytes->hex (lot:participant-commitment p))
+                                                            (lot:participant-target p)))
+                          :voters (mapcar #'bytes->hex (lot:lottery-recovery-voters lottery))
+                          :threshold (lot:lottery-recovery-threshold lottery)
+                          :network (string (intern (string-upcase (node-network node)) :keyword)))
+                    out))))))))
+
+(defun read-confirmed-lottery (path)
+  "PATH's (id tx lottery) when its lottery's script is output 0 of its tx, or NIL."
+  (ignore-errors
+   (let* ((plist (with-open-file (in path) (with-standard-io-syntax (let ((*read-eval* nil)) (read in)))))
+          (tx (btx:parse-tx (bw:make-reader (hex->bytes (getf plist :tx)))))
+          (l (lot:build-lottery (loop for (pk c target) in (getf plist :participants)
+                                      collect (lot:make-participant :pubkey (hex->bytes pk) :commitment (hex->bytes c) :target target))
+                                (mapcar #'hex->bytes (getf plist :voters))
+                                (getf plist :threshold)
+                                :network (intern (getf plist :network) :keyword))))
+     (and (equalp (lot:lottery-spk l) (btx:txout-script (first (btx:tx-outputs tx))))
+          (list (getf plist :id) tx l)))))
+
+(defun load-confirmed-lotteries (node)
+  "Every saved confirmed lottery back among the confiscations we signed (CONFISCATED-LOTTERY
+   reads those first), so a restart neither rebuilds nor loses it."
+  (when (node-data-dir node)
+    (dolist (f (directory (merge-pathnames "lottery_*.sexp" (node-data-dir node))))
+      (destructuring-bind (&optional id tx l) (read-confirmed-lottery f)
+        (when (and id tx l)
+          (unless (find (btx:tx-txid tx) (gethash id (node-signed-confiscations node)) :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
+            (push (cons tx l) (gethash id (node-signed-confiscations node))))
+          (note-confiscation node id (btx:tx-txid tx)))))))
+
+(defun reserves-confiscated-p (node rec)
+  "REC's reserves are spent and we know a confirmed confiscation of its ledger: no vault is left
+   to dispute.  A later custodian's reserves are a new outpoint, unspent, so this is NIL for them."
+  (and rec (node-chain-fn node)
+       (gethash (record-id-hex rec) (node-known-confiscations node))
+       (multiple-value-bind (r txid vout) (ignore-errors (disputed-reserves node rec))
+         (and r txid (not (funcall (node-chain-fn node) txid vout))))))
 
 ;;; DEP-06 §Spend challenge.  A vault spend is judged by its anchor H (its last output): none is
 ;;; theft on its face; with one, H names the one place in the ledger that must answer for it.  A
@@ -6658,6 +6755,7 @@
 
 (defun %load-data-dir (node &key (log-fn (lambda (fmt &rest args) (apply #'log! node fmt args))))
   (load-known-confiscations node)
+  (load-confirmed-lotteries node)
   (load-vault-watch node)
   (let* ((dir (node-data-dir node))
          (log-lock (bt:make-lock "load-log"))
