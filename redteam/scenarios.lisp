@@ -59,7 +59,7 @@
             :env '("WAIT=1800") :timeout 4800 :tags '(:contagion :slow)
             :note "DEP-06 Phase 4 re-arm with revealers (provisional): every fork yields, the winner included; a fresh round recovers the output and is claimed")
    (make-sc :name "rearm-restart" :script "check-rearm-restart.sh" :ledger-var "REDTEAM_RR"
-            :env '("WAIT=1800") :timeout 5400 :tags '(:contagion :slow)
+            :env '("WAIT=1800" "CHECK_TIMEOUT=5000") :timeout 5400 :tags '(:contagion :slow)
             :note "the all-yield re-arm with a participant restarted after its yield, its quorum expired: no second dispute, no phantom win, the output still re-arms (751e6951)")
    (make-sc :name "rearm-late" :script "check-rearm-late.sh" :ledger-var "REDTEAM_RL"
             :env '("WAIT=1800") :timeout 6000 :tags '(:contagion :slow)

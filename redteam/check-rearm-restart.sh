@@ -24,7 +24,7 @@ source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/en
 source "$(dirname "$0")/_lib.sh"
 pick OP C2 C3 C4 H H2
 ROW=${REDTEAM_RR:-RR$RANDOM}
-W=$(FORM_EXPIRY=${FORM_EXPIRY:-200} COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" $C2 $C3 $C4 $H $H2) || exit 1; echo "== ledger $W"
+W=$(FORM_EXPIRY=${FORM_EXPIRY:-100} COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" $C2 $C3 $C4 $H $H2) || exit 1; echo "== ledger $W"
 FROM=$(fresh_deposits "$ROW" $OP "$W" 1 | head -1); [ -n "$FROM" ] || fail "no deposit on the ledger"
 # The block ticker would race the paced mining below: pause it for the run.
 "$CLD_SRC/devnet/regtest-net.sh" ticker stop
@@ -72,12 +72,18 @@ slow_until() { while [ "$(bcli getblockcount)" -lt "$1" ]; do mine 1 >/dev/null;
 slow_until $((HC + 10)) 10; slow_until $((HC + 76)) 3
 # From node.log, not (:log): a busy node's ring buffer can drop the line before we look (regtest,
 # 2026-11-07: cld145's yield was logged but not counted).
-yielded=0; for n in $H $H2; do grep -aF "dispute ${W:0:8}: lottery: yielded" "$(cld_dir $n)/node.log" >/dev/null 2>&1 && yielded=$((yielded+1)); done
+count_yields() { local y=0 n; for n in $H $H2; do grep -aF "dispute ${W:0:8}: lottery: yielded" "$(cld_dir $n)/node.log" >/dev/null 2>&1 && y=$((y+1)); done; echo $y; }
+# Restart only once both have yielded (a busy node reveals late), still well before the CSV-144 leaf.
+while [ "$(count_yields)" -lt 2 ] && [ "$(bcli getblockcount)" -lt $((HC + 120)) ]; do mine 1 >/dev/null; sleep 8; done
+yielded=$(count_yields)
 echo "== $yielded of 2 participants logged a round-1 yield"
+[ "$yielded" = 2 ] || fail "expected both participants to yield round 1 before the restart, got $yielded"
 # The restart: H comes back with only its files, its forks yielded, the vault confiscated.
 LOGH="$(cld_dir $H)/node.log"; MARK=$(wc -c <"$LOGH")
 echo "== restarting $H at height $(bcli getblockcount) (quorum expiry: ${FORM_EXPIRY:-200} blocks from formation)"
 stop_cld $H; start_cld $H || fail "$H did not come back"
+# The adversary knobs live in memory: without this the restarted winner claims round 1 for real.
+expect "$(cld_ctl $H "(:adversary :set :yield-win t)")"
 slow_until $((HC + 142)) 1; slow_until $((HC + 144 + 14)) 15
 echo "== waiting for the re-arm spend of $CONF:0"
 R2=""
@@ -89,6 +95,9 @@ done
 [ -n "$R2" ] || fail "the round-1 lottery output $CONF:0 was not spent within ${WAIT}s"
 nout=$(bcli getrawtransaction "$R2" 1 | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["vout"]))')
 [ "$nout" = 1 ] || fail "$CONF:0 was spent by $R2 with $nout outputs: not a re-arm spend (a claim?)"
+# A claim has one output too: a re-arm spend is the one a voter logs spending into round 2, or follows.
+grep -aE "dispute ${W:0:8}: .*(spent into round 2|round 2)" "$(cld_dir $H)/node.log" "$(cld_dir $H2)/node.log" >/dev/null \
+  || fail "$CONF:0 was spent by $R2, but no voter logged a re-arm into round 2 (a round-1 claim?)"
 for n in $H $H2; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}:" | grep -E "round 2|re-arm" | tail -2 | sed "s/^/   $n: /"; done
 echo "== re-arm spend $R2; waiting for round 2's reveals and claim"
 CLAIM=""
