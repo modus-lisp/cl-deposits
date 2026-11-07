@@ -5143,8 +5143,13 @@
   "Round ROUND's window as of TIP (DEP-06 Phase 4 step 3, recurring windows): OPENS/CLOSES is the
    round's scheduled window (j = 0), which fixes o and w; the round takes the first closed window
    whose cut is non-empty.  (values j opens closes), or NIL."
-  (lot:rearm-round-window opens (- closes opens) tip
-                          (lambda (o c) (rearm-armers node id-hex round o c))))
+  ;; The round's arms are read once; the cut (grounds, accused, pledges) runs only for a window
+  ;; that holds one.  A lottery stranded for weeks has dozens of closed windows, and this runs on
+  ;; every pass (regtest, 2026-11-07: the full cut per window starved a busy node's dispute loop).
+  (let ((arms (armers-of node id-hex :round round)))
+    (lot:rearm-round-window opens (- closes opens) tip
+                            (lambda (o c) (and (find-if (lambda (a) (< o (fifth a) (1+ c))) arms)
+                                               (rearm-armers node id-hex round o c))))))
 
 (defun rearm-lottery (node id-hex round opens closes &optional (tip (height node)))
   "Round ROUND's lottery (the same recovery voters and threshold as round 1), built over the cut
@@ -5313,11 +5318,12 @@
                 (error (e) (note-dispute node id-hex "re-arm round ~a: claim not yet: ~a" round e)))
               (return-from drive-rearm nil)))
           (multiple-value-bind (wj wo wc) (lot:rearm-open-window opens (- closes opens) h)
+          (let ((due (rearm-round-window-of node id-hex (1+ round) opens closes)))
           (cond
             ;; A window of the next round is open (the scheduled one, its reopening, or a recurring
             ;; one) and no earlier window has a non-empty cut: arm it, unless we already armed
             ;; inside this window.
-            ((and wj (not (rearm-round-window-of node id-hex (1+ round) opens closes)))
+            ((and wj (not due))
              ;; ADVERSARY :hold-rearm-until H — testing only: arm no re-arm round before block H, as
              ;; a member that was down through the scheduled windows (redteam/check-rearm-late.sh).
              (unless (or (let ((u (getf (node-adversary node) :hold-rearm-until))) (and u (< h u)))
@@ -5331,7 +5337,7 @@
                      (note-dispute node id-hex "lottery round ~a unclaimed; waiting for collateral to arm round ~a" round (1+ round))))))
             ;; A window has closed with a non-empty cut: as a recovery voter, spend the output into
             ;; the next round.
-            ((and (rearm-round-window-of node id-hex (1+ round) opens closes)
+            ((and due
                   (member (up:x-only me) (lot:lottery-recovery-voters lottery) :test #'equalp))
              (multiple-value-bind (spend next tier prevouts) (rearm-spend-for node id-hex tx lottery round height)
                (if (not spend)
@@ -5348,9 +5354,9 @@
                          (note-rearm-round node id-hex (1+ round) signed nil :lottery next :opens opens :closes closes)
                          (note-dispute node id-hex "lottery round ~a unclaimed; spent into round ~a's lottery (tier ~a)" round (1+ round) tier))
                      (error (e) (note-dispute node id-hex "lottery round ~a unclaimed; re-arm spend not yet: ~a" round e))))))
-            ((and (> h closes) (not (rearm-round-window-of node id-hex (1+ round) opens closes)))
+            ((and (> h closes) (not due))
              (note-dispute node id-hex "lottery round ~a unclaimed; round ~a's next arm window opens after block ~a"
-                           round (1+ round) (lot:rearm-next-window opens (- closes opens) h))))))))))
+                           round (1+ round) (lot:rearm-next-window opens (- closes opens) h)))))))))))
 
 (defun drive-rearms (node)
   "DRIVE-REARM for every dispute we hold a fork in (a yielded one included: a yield ends a round,
