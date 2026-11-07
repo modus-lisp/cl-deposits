@@ -2342,4 +2342,61 @@
                         (nd::rearm-round-window-of nil "x" 2 721 727 1879) nil))
       (setf (fdefinition 'nd::rearm-armers) orig (fdefinition 'nd::armers-of) orig-a))))
 
+;;; A restarted node and a confiscated ledger (signet soak 2026-11-07, 751e6951).  After a restart
+;;; cld7 opened a second dispute on the dead vault, rebuilt a confiscation that was not on chain,
+;;; "won" its lottery off chain, and its fellows concluded "claimed by its winner" from not being
+;;; able to rebuild; the output never re-armed.
+(let* ((seed (lambda (i) (gossamer:pooled-copy (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))))
+       (l (lot:build-lottery (loop for i in '(1 2 3) collect (lot:make-participant :pubkey (up:x-only (up:compressed-pubkey (tk (funcall seed i))))
+                                                                                   :commitment (make-array 20 :element-type '(unsigned-byte 8) :initial-element i)
+                                                                                   :target (format nil "tb1p~a" i)))
+                             (loop for j from 1 to 3 collect (up:x-only (up:compressed-pubkey (tk (funcall seed (+ 20 j)))))) 2 :network :regtest))
+       (conf (btx:parse-tx (cl-consensus.wire:make-reader
+                            (btx:serialize-tx (btx:make-tx :version 2 :locktime 0
+                                                           :inputs (list (btx:make-txin :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7) :prev-index 0 :script (u:octets) :sequence 0))
+                                                           :outputs (list (btx:make-txout :value 50000000 :script (lot:lottery-spk l))))))))
+       (dir (uiop:ensure-directory-pathname (format nil "/tmp/cld-restart-test-~a/" (random 1000000000))))
+       (id (make-string 64 :initial-element #\b))
+       (unspent t)
+       (chain (lambda (txid vout) (declare (ignore vout)) (and unspent (equalp txid (btx:tx-txid conf)) (list :confirmations 3))))
+       (mk (lambda () (nd:make-node :priv (tk 88888888888) :bus (bus:make-mock-bus) :height-fn (lambda () 5500) :network "regtest"
+                                    :data-dir dir :chain-fn chain))))
+  (ensure-directories-exist dir)
+  (unwind-protect
+       (let ((a (funcall mk)))
+         (nd::save-confirmed-lottery a id conf l)
+         (let ((b (funcall mk)))
+           (nd::load-confirmed-lotteries b)
+           (let ((e (first (gethash id (nd::node-signed-confiscations b)))))
+             (check "a confirmed lottery comes back after a restart, with its confiscation"
+                    (and e (equalp (btx:tx-txid (car e)) (btx:tx-txid conf)) (equalp (lot:lottery-spk (cdr e)) (lot:lottery-spk l))))
+             (check "and its confiscation is known again" (member (btx:tx-txid conf) (gethash id (nd::node-known-confiscations b)) :test #'equalp))))
+         ;; A saved lottery that is not output 0 of its confiscation is never used.
+         (let* ((path (nd::confirmed-lottery-path a id))
+                (text (uiop:read-file-string path)))
+           (with-open-file (out path :direction :output :if-exists :supersede)
+             (let ((i (search ":THRESHOLD 2" text))) (write-string (concatenate 'string (subseq text 0 i) ":THRESHOLD 3" (subseq text (+ i 12))) out)))
+           (check "a saved lottery whose script is not the confiscation's output 0 is refused"
+                  (null (nd::read-confirmed-lottery path))))
+         ;; "Claimed by its winner" is literal: the known confiscation's lottery output is spent.
+         (let ((c (funcall mk)))
+           (nd::note-confiscation c id (btx:tx-txid conf))
+           (check "an unspent lottery output is not claimed" (not (nd::lottery-output-spent-p c id)))
+           (setf unspent nil)
+           (check "a spent one is" (nd::lottery-output-spent-p c id))
+           (check "no known confiscation: nothing is claimed" (not (nd::lottery-output-spent-p c (make-string 64 :initial-element #\c))))
+           (setf unspent t)
+           ;; No second dispute on a vault already confiscated.
+           (let ((orig (fdefinition 'nd::disputed-reserves))
+                 (rec (nd::make-record :id-hex id)))
+             (handler-bind ((warning #'muffle-warning))
+               (setf (fdefinition 'nd::disputed-reserves) (lambda (&rest args) (declare (ignore args)) (values :reserves (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5) 0))))
+             (unwind-protect
+                  (progn
+                    (check "reserves spent by a known confiscation: the ledger is confiscated" (nd::reserves-confiscated-p c rec))
+                    (check "and enter-dispute opens no second dispute on it" (null (nd::enter-dispute c rec 8 :reason "quorum_expired")))
+                    (check "a ledger with no known confiscation is not" (not (nd::reserves-confiscated-p c (nd::make-record :id-hex (make-string 64 :initial-element #\c))))))
+               (handler-bind ((warning #'muffle-warning)) (setf (fdefinition 'nd::disputed-reserves) orig))))))
+    (uiop:delete-directory-tree dir :validate (lambda (p) (search "cld-restart-test-" (namestring p))))))
+
 (report)
