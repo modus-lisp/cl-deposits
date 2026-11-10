@@ -3015,7 +3015,16 @@
                ;; A confiscation we know confirmed, and its lottery output is spent: claimed (a
                ;; re-arm spend is DRIVE-REARM's, above).  Not being able to rebuild the lottery
                ;; proves nothing (751e6951's fellows concluded on that, and it stranded).
-               (conclude "lottery claimed by its winner; yielded"))
+               ;;   Literal means CONFIRMED: gettxout drops an output spent in the mempool, while
+               ;; FOLLOW-REARM-SPEND reads blocks.  A voter that had just signed the re-arm spend
+               ;; took it for a claim in the pass before it confirmed, yielded, and so never
+               ;; revealed round 2 (regtest, 2026-11-10: cld193 on 3151f272).
+               (let ((r1 (find 1 (rearm-rounds node id) :key (lambda (r) (getf r :round)))))
+                 (cond ((and r1 (follow-rearm-spend node id r1))
+                        (note-dispute node id "lottery round 1 spent into round 2's lottery"))
+                       ((and r1 (not (lottery-spend-confirmed-p node r1)))
+                        (note-dispute node id "lottery output spent in the mempool; judging it once it confirms"))
+                       (t (conclude "lottery claimed by its winner; yielded")))))
               ((and reserves-spent (null conf))
                (note-dispute node id "reserves spent, but not by a confiscation we can rebuild"))
               ((null (fork-op fork :dispute-armed))
@@ -5346,6 +5355,13 @@
                                                              "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))))))
       (error (e) (log! node "refused lottery_rearm_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
 
+(defun lottery-spend-confirmed-p (node r)
+  "The output of round R's lottery tx is spent in a block (not merely in the mempool).  Without a
+   block reader or R's height, T: the gettxout-only reading."
+  (let ((tx (getf r :tx)) (height (getf r :height)))
+    (or (not (and (node-spender-fn node) height))
+        (and (ignore-errors (funcall (node-spender-fn node) height (height node) (list (cons (btx:tx-txid tx) 0)))) t))))
+
 (defun follow-rearm-spend (node id-hex r)
   "If the lottery output of round R (a NOTE-REARM-ROUND plist with its lottery and height) was
    spent into the next round's lottery, register that round.  Returns the spend or NIL."
@@ -5373,6 +5389,11 @@
                   (when (and next (equalp (lot:lottery-spk next) (btx:txout-script (first (btx:tx-outputs stx)))))
                     (note-rearm-round node id-hex (1+ round) stx (getf spend :height) :lottery next :opens opens :closes closes)
                     stx))))))))))
+
+(defvar *rearm-backoff* (make-hash-table :test #'equal :synchronized t)
+  "Ledger id -> (next-height . gap): a re-arm spend whose signatures fell short is retried after
+   GAP blocks, doubling to +REARM-BACKOFF-MAX+.")
+(defparameter +rearm-backoff-max+ 12)
 
 (defun drive-rearm (node id-hex)
   "One pass of the re-arm round for ID-HEX (DEP-06 Phase 4, strict-lottery-v8): follow a spent
@@ -5442,9 +5463,17 @@
              ;; no re-arm round) re-arms at the tier its signers reach.  Only ever asking tier 0
              ;; left E's round-1 lottery at "3 of 4 re-arm signatures" for 3000 blocks (signet
              ;; soak, 2026-11-08..10).
-             (let ((last-error nil))
+             (let ((last-error nil) (backoff (gethash id-hex *rearm-backoff*)))
+               ;; Every tier's lottery_rearm_sign waits out its 30 s on silent voters, and the
+               ;; passes over a node's disputes are serial: back off by blocks, or one stuck
+               ;; ledger stalls the rest (regtest, 2026-11-10: 5d50d654 delayed 3151f272's claim).
+               (when (and backoff (< h (car backoff)))
+                 (return-from drive-rearm
+                   (note-dispute node id-hex "lottery round ~a unclaimed; re-arm signing backed off until block ~a" round (car backoff))))
                (dolist (tier-try (rearm-open-tiers lottery height h)
                                  (when last-error
+                                   (let ((gap (min +rearm-backoff-max+ (if backoff (* 2 (cdr backoff)) 1))))
+                                     (setf (gethash id-hex *rearm-backoff*) (cons (+ h gap) gap)))
                                    (note-dispute node id-hex "lottery round ~a unclaimed; re-arm spend not yet: ~a" round last-error)))
                  (multiple-value-bind (spend next tier prevouts) (rearm-spend-for node id-hex tx lottery round height :tier tier-try)
                    (when spend
@@ -5459,6 +5488,7 @@
                            (broadcast node signed)
                            (note-rearm-round node id-hex (1+ round) signed nil :lottery next :opens opens :closes closes)
                            (note-dispute node id-hex "lottery round ~a unclaimed; spent into round ~a's lottery (tier ~a)" round (1+ round) tier)
+                           (remhash id-hex *rearm-backoff*)
                            (return))
                        (error (e) (setf last-error (format nil "tier ~a: ~a" tier e))))))))
              )

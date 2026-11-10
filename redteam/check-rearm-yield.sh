@@ -64,7 +64,13 @@ slow_until() { while [ "$(bcli getblockcount)" -lt "$1" ]; do mine 1 >/dev/null;
 slow_until $((HC + 10)) 10; slow_until $((HC + 76)) 3
 # From node.log, not (:log): a busy node's ring buffer can drop the line before we look (regtest,
 # 2026-11-07: cld145's yield was logged but not counted).
-yielded=0; for n in $H $H2; do grep -aF "dispute ${W:0:8}: lottery: yielded" "$(cld_dir $n)/node.log" >/dev/null 2>&1 && yielded=$((yielded+1)); done
+# Past the reveal deadline each yields on its next pass; a busy node's pass can run minutes (reveals
+# wait for 3 confirmations), so poll rather than count once (regtest, 2026-11-10: both yielded,
+# 4 and 6 minutes after the count).
+for i in $(seq 1 60); do
+  yielded=0; for n in $H $H2; do grep -aF "dispute ${W:0:8}: lottery: yielded" "$(cld_dir $n)/node.log" >/dev/null 2>&1 && yielded=$((yielded+1)); done
+  [ "$yielded" -eq 2 ] && break; sleep 10
+done
 echo "== $yielded of 2 participants logged a round-1 yield"
 slow_until $((HC + 142)) 1; slow_until $((HC + 144 + 14)) 15
 echo "== waiting for the re-arm spend of $CONF:0"

@@ -115,3 +115,35 @@ re-confiscate.
   devnet casualties. Extending re-arm to them would mean running a frozen ruleset's lottery with new
   behaviour, and would give 30ea46ac's colluders recovery votes.
 
+
+## 8. A rotation by the non-disputing subset dissolves a standing dispute (open)
+
+- **Seen:** signet soak, ledger J. Members disputed J's expired quorum (QUORUM-EXPIRED); ref6, who
+  had not disputed, then cosigned the operator's re-establishing rotation `27d16c7a`, and J
+  unfroze. Evidence: `/mnt/lisp/signet/archive/cascade-20261107/` (forks snapshot, ref6/cld logs).
+- **As the spec stands:** DEP-05 ends an expiry dispute on any later QuorumBegin, and a QuorumBegin
+  needs only the threshold, so a subset that never disputed can lift the freeze. That's
+  rule-consistent for an expiry ground, which a fresh quorum answers.
+- **Question:** should the same hold for a fraud ground (equivocation, a non-conforming update)?
+  A colluding subset could otherwise rotate an accused operator out of a dispute it should lose.
+- **Options:** (a) keep it as is for every ground; (b) a QuorumBegin ends only expiry disputes,
+  and a fraud dispute stands until its lottery resolves (recommended); (c) require the disputers'
+  consent to any rotation while a dispute stands.
+
+## 9. A DisputeAcquire whose claim never landed (open)
+
+- **Seen:** signet soak, ledger 751e6951. cld7's fork carries a DisputeAcquire at seq 11 for a
+  claim that never reached the chain (a restart before claims had to be accepted first). cl now
+  lets such a node keep re-arming (`drive-rearm`: an acquire counts only once the lottery output is
+  literally spent), but the acquire stays on its fork, and other nodes read it as the dispute's end.
+- **Options:** (a) an acquire is final as published; the node simply lost its turn; (b) an acquire
+  binds only once its claim confirms, and implementations ignore unconfirmed ones (recommended:
+  it matches the "literal = confirmed" rule elsewhere); (c) a later DisputeRetract op voids it.
+
+## 10. soak-rotate keeps a stuck member in the plan (harness, open)
+
+- **Seen:** the Nov 7 cascade began with every rotation of A failing on cld2's silent consent for
+  five hours until A's quorum expired. The consent wait is now 180 s, but a member that never
+  answers still blocks the operator's rotation.
+- **Options:** (a) leave it to the operator; (b) near expiry, rotate without a member whose consent
+  failed N times (recommended for the soak harness; DEP-18 operator policy allows it).
