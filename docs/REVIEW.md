@@ -116,7 +116,7 @@ re-confiscate.
   behaviour, and would give 30ea46ac's colluders recovery votes.
 
 
-## 8. A rotation by the non-disputing subset dissolves a standing dispute (open)
+## 8. A rotation by the non-disputing subset dissolves a standing dispute (ruled 2026-11-10: "no")
 
 - **Seen:** signet soak, ledger J. Members disputed J's expired quorum (QUORUM-EXPIRED); ref6, who
   had not disputed, then cosigned the operator's re-establishing rotation `27d16c7a`, and J
@@ -130,7 +130,16 @@ re-confiscate.
   and a fraud dispute stands until its lottery resolves (recommended); (c) require the disputers'
   consent to any rotation while a dispute stands.
 
-## 9. A DisputeAcquire whose claim never landed (open)
+- **Ruling (2026-11-10, the user: "no"):** option (b). Under `strict-lottery-v8` a QuorumBegin
+  ends only expiry disputes; a dispute on any other ground freezes co-signing whatever its
+  `last_valid_sequence` (DEP-05 §Deposed operator, spec 72ee902). Both implementations
+  (`cosign-refusal` / `cosign_refusal`, ruleset-gated), vector `cosign_refusal.json` (v8 cases),
+  regtest `fraud-rotation`. Still open: a colluding threshold can rotate the vault *away from* the
+  disputants (not re-seating them); the dispute then stands on a vault already spent by a
+  rotation the rules call authorised. That needs its own ruling (a rotation cosigned while a
+  fraud dispute stands as non-conforming, or the dispute following the vault).
+
+## 9. A DisputeAcquire whose claim never landed (ruled 2026-11-10: "yes")
 
 - **Seen:** signet soak, ledger 751e6951. cld7's fork carries a DisputeAcquire at seq 11 for a
   claim that never reached the chain (a restart before claims had to be accepted first). cl now
@@ -140,10 +149,25 @@ re-confiscate.
   binds only once its claim confirms, and implementations ignore unconfirmed ones (recommended:
   it matches the "literal = confirmed" rule elsewhere); (c) a later DisputeRetract op voids it.
 
-## 10. soak-rotate keeps a stuck member in the plan (harness, open)
+- **Ruling (2026-11-10, the user: "yes"):** option (b). Under `strict-lottery-v8` a
+  `DisputeAcquire` binds only once its `claim_txid` is confirmed (DEP-06 §Phase 4, spec 72ee902).
+  cl reads confirmations through `getrawtransaction` (`tx-confs-fn`, cached once confirmed); Rust
+  learns them in the vault watch (`note_confirmed_claims`) so the co-sign path only reads a cache.
+  Vector `cosign_refusal.json`; regtest `acquire-unconfirmed` (red-team op `:phantom-acquire`).
+  Still open: Rust's branch choice (`main_loop`, "chains with DisputeAcquire > longest") and its
+  operator-side custody check still read an acquire as published.
+
+## 10. soak-rotate keeps a stuck member in the plan (ruled 2026-11-10: "permissionless means letting people gfy")
 
 - **Seen:** the Nov 7 cascade began with every rotation of A failing on cld2's silent consent for
   five hours until A's quorum expired. The consent wait is now 180 s, but a member that never
   answers still blocks the operator's rotation.
 - **Options:** (a) leave it to the operator; (b) near expiry, rotate without a member whose consent
   failed N times (recommended for the soak harness; DEP-18 operator policy allows it).
+- **Ruling (2026-11-10, the user: "permissionless means letting people gfy"):** beyond the harness,
+  a spec rule (DEP-11 §Rotating without a silent member, every ruleset, it judges nothing): from
+  `drop_margin` blocks before expiry the operator seats the consenting members, cut to the largest
+  valid size (current members first, then newcomers, each in consent order), and validators never
+  refuse a QuorumBegin for leaving a member out. cl `lg:seat-consenting` + `:trim-staged`, Rust
+  `rotation_seat::seat_consenting` + the auto-refresh drop path, vector `rotation_seat.json`,
+  `soak-rotate` drops a silent member within `SOAK_DROP_MARGIN`, regtest `rotation-drop`.

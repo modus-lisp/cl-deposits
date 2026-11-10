@@ -67,6 +67,12 @@
    (make-sc :name "rearm-late" :script "check-rearm-late.sh" :ledger-var "REDTEAM_RL"
             :env '("WAIT=1800") :timeout 6000 :tags '(:contagion :slow)
             :note "DEP-06 Phase 4 recurring windows (strict-lottery-v8, ruled 2026-11-07): a lottery stranded past both scheduled windows re-arms at the first recurring one and is claimed")
+   (make-sc :name "rotation-drop" :script "check-rotation-drop.sh" :ledger-var "REDTEAM_RD" :timeout 1500
+            :note "DEP-11 rotating without a silent member (ruled 2026-11-10): a silent member is dropped and the consenting ones seated")
+   (make-sc :name "fraud-rotation" :script "check-fraud-rotation.sh" :ledger-var "REDTEAM_FR" :timeout 1500
+            :note "DEP-05 deposed operator (strict-lottery-v8, ruled 2026-11-10): a fraud dispute outlives a rotation")
+   (make-sc :name "acquire-unconfirmed" :script "check-acquire-unconfirmed.sh" :ledger-var "REDTEAM_AU" :timeout 1200
+            :note "DEP-06 Phase 4 (strict-lottery-v8, ruled 2026-11-10): an acquire whose claim never confirms deposes no one")
    (make-sc :name "grounded-arms" :script "check-grounded-arms.sh" :ledger-var "REDTEAM_GA"
             :env '("WAIT=1500") :timeout 2400 :tags '(:contagion)
             :note "DEP-18 grounded-arms-v7: an arm whose DisputeEnter has no grounds is disregarded")

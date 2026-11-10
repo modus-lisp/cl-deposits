@@ -33,7 +33,7 @@
   (:export #:node #:make-node #:node-pubkey #:node-pubkey-hex #:node-ledgers #:node-log
            #:record #:record-ledger #:record-history #:record-owned-p #:record-id-hex #:record-reserves
            #:find-record #:own-ledger
-           #:open-ledger #:append-operation #:add-member #:prepare-quorum #:begin-quorum #:credit-onchain
+           #:open-ledger #:append-operation #:add-member #:trim-staged #:prepare-quorum #:begin-quorum #:credit-onchain
            #:node-chain-fn #:node-pledge-fn #:lottery-armers #:split-armers #:eligibility-floor-sats #:node-min-confs #:node-data-dir #:record-pinned #:height #:tip
            #:node-error #:request #:wallet #:make-wallet #:wallet-pubkey #:wallet-request
            #:wallet-open-deposit #:wallet-balance #:wallet-transfer #:wallet-complete-transfer #:wallet-exit #:wallet-exit-cancel #:wallet-migrate #:wallet-make-offer #:wallet-complete-offer #:address->spk
@@ -149,6 +149,7 @@
   (grounds-verdicts (make-hash-table :test #'equalp :synchronized t)) ; DisputeEnter chain hash -> (verdict . why)
   (refused (make-hash-table :test #'equal :synchronized t))   ; ledger id -> seq whose update the rules rejected
   (spender-fn nil)                             ; (lambda (from to outpoints)) -> spend plists (:txid :vout :tx :prevouts :block-hash :height)
+  (tx-confs-fn nil)                            ; (lambda (txid)) -> confirmations (0 in the mempool), or NIL when unknown
   (feerate-fn nil)                             ; (lambda (height)) -> block feerate (DEP-03 Reference feerate)
   (vault-scanned nil)                          ; the last block height scanned for vault spends
   (reported-vault-spend (make-hash-table :test (quote equal) :synchronized t))
@@ -198,14 +199,14 @@
   (let ((o (op:decode-operation (up:update-message update))))
     (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn pledge-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn feerate-fn)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn pledge-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn feerate-fn tx-confs-fn)
   (let* ((priv (w:even-y-privkey priv))     ; a pooled copy this node owns
          (pub (up:compressed-pubkey priv))
          (node (gossamer:own (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
                            :chain-fn chain-fn :pledge-fn pledge-fn :spender-fn spender-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
-                           :feerate-fn feerate-fn
+                           :feerate-fn feerate-fn :tx-confs-fn tx-confs-fn
                            :broadcast-fn broadcast-fn :height-of-block height-of-block :block-hash-fn block-hash-fn
                            ;; We subscribe below, before the caller loads the data dir.  A
                            ;; cosign request handled then found no record, took the ledger
@@ -915,6 +916,19 @@
                                       :dispute-response-blocks dispute-response-blocks
                                       :member-response (let ((b (w:jget res "member_response"))) (and b (base64-decode b)))
                                       :member-signature (let ((h (w:jget res "member_signature"))) (and h (hex->bytes h)))))))))
+
+(defun trim-staged (node rec)
+  "DEP-11 §Rotating without a silent member: cut REC's staged (consenting) set to the quorum the
+   operator seats (LG:SEAT-CONSENTING), unstaging the rest with QuorumRemoveMember.  Returns the
+   number to be seated; fails with fewer than three consents."
+  (let* ((l (record-ledger rec))
+         (staged (mapcar #'lg:member-pubkey (lg:ledger-next-quorum-members l)))
+         (seat (lg:seat-consenting (mapcar #'lg:member-pubkey (lg:ledger-quorum-members l)) staged)))
+    (unless seat (fail "only ~a members consented (a quorum needs 3)" (length staged)))
+    (dolist (m staged (length seat))
+      (unless (member m seat :test #'equalp)
+        (append-operation node rec (list :type :quorum-remove-member :quorum-member m
+                                         :operator-signature (make-array 64 :element-type '(unsigned-byte 8) :initial-element 0)))))))
 
 (defun %strip-nil-fields (plist)
   (loop for (k v) on plist by #'cddr when v append (list k v)))
@@ -3500,9 +3514,17 @@
             collect (record-fork-operator f) into keys
           finally (return (remove-duplicates keys :test #'equalp)))))
 
+(defun acquire-binds-p (node fork)
+  "FORK's DisputeAcquire moves custody: as published under an earlier ruleset, and under
+   strict-lottery-v8 (the base ledger's ruleset) only once its claim confirmed (DEP-06 §Phase 4)."
+  (and (fork-op fork :dispute-acquire)
+       (let ((base (find-record node (record-id-hex fork))))
+         (or (not (and base (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger base)) :acquire-on-confirm)))
+             (acquire-confirmed-p node fork)))))
+
 (defun acquired-fork (node id-hex)
-  "The fork of ID-HEX's ledger whose DisputeAcquire took custody, if any."
-  (find-if (lambda (f) (fork-op f :dispute-acquire)) (forks-of node id-hex)))
+  "The fork of ID-HEX's ledger whose DisputeAcquire took custody, if any (ACQUIRE-BINDS-P)."
+  (find-if (lambda (f) (acquire-binds-p node f)) (forks-of node id-hex)))
 
 (defun ledger-chain-record (node id-hex)
   "The record holding ID-HEX's ledger as it now runs: the acquired fork after a custody change
@@ -3514,31 +3536,55 @@
    not ours: the ledger's operator from then on (DEP-06)."
   (loop for f in (forks-of node (record-id-hex rec))
         for o = (nth-value 1 (fork-op f :dispute-acquire))
-        when (and o (not (equalp (op:field o :new-custodian) (node-pubkey node))))
+        when (and o (not (equalp (op:field o :new-custodian) (node-pubkey node)))
+                  (acquire-binds-p node f))
           return (op:field o :new-custodian)))
 
-(defun cosign-refusal (own members qb-seq disputes)
+(defvar *confirmed-claims* (make-hash-table :test #'equalp :synchronized t)
+  "Claim txids we have seen confirmed: a confirmation is not re-read.")
+
+(defun acquire-confirmed-p (node fork)
+  "FORK carries a DisputeAcquire whose claim_txid is confirmed on chain (DEP-06, strict-lottery-v8:
+   an acquire binds once its claim confirms).  Without a way to ask the chain, T: the acquire as
+   published, the reading before the rule."
+  (multiple-value-bind (u o) (fork-op fork :dispute-acquire)
+    (declare (ignore u))
+    (and o
+         (let ((txid (op:field o :claim-txid)))
+           (or (null (node-tx-confs-fn node))
+               (and txid (gethash txid *confirmed-claims*))
+               (let ((c (ignore-errors (funcall (node-tx-confs-fn node) txid))))
+                 (when (and c (plusp c))
+                   (setf (gethash txid *confirmed-claims*) t))))))))
+
+(defun cosign-refusal (own members qb-seq disputes &key ruleset)
   "DEP-05 \"Deposed operator\": a reason string when member OWN of MEMBERS must refuse to
    co-sign the operator's chain, else NIL.  DISPUTES are plists (:by :last-valid :reason
-   :acquired), one per fork of the ledger.  Pinned by inspect/vectors/cosign_refusal.json,
-   shared with deposits-rust."
-  (when (some (lambda (d) (getf d :acquired)) disputes)
+   :acquired :acquire-confirmed), one per fork of the ledger.  Under RULESET strict-lottery-v8
+   (the ledger's latest QuorumBegin's; ruled 2026-11-10) a rotation does not end a fraud dispute
+   (a non-expiry dispute counts whatever its :last-valid), and an acquire moves custody only once
+   its claim is confirmed.  Pinned by inspect/vectors/cosign_refusal.json, shared with
+   deposits-rust."
+  (let ((v8-rotation (lg:ruleset-rule-p ruleset :fraud-survives-rotation))
+        (v8-acquire (lg:ruleset-rule-p ruleset :acquire-on-confirm)))
+  (when (some (lambda (d) (and (getf d :acquired) (or (not v8-acquire) (getf d :acquire-confirmed)))) disputes)
     (return-from cosign-refusal "custody moved by DisputeAcquire"))
   (let ((freezing (remove-duplicates
                    (loop for d in disputes
-                         when (and (>= (getf d :last-valid) qb-seq)
+                         when (and (or v8-rotation (>= (getf d :last-valid) qb-seq))
                                    (not (expiry-reason-p (getf d :reason)))
                                    (member (getf d :by) members :test #'equalp))
                            collect (getf d :by))
                    :test #'equalp)))
     (cond ((member own freezing :test #'equalp) "we disputed it; not extending the operator's chain")
           ((> (* 2 (length freezing)) (length members))
-           (format nil "~a of ~a members disputed it" (length freezing) (length members))))))
+           (format nil "~a of ~a members disputed it" (length freezing) (length members)))))))
 
 (defun check-not-deposed (node rec)
   "A member refuses to extend REC's base chain once its operator is deposed (DEP-05):
    custody moved by a DisputeAcquire, or we, or a majority of the quorum, disputed it
-   at or after the latest QuorumBegin other than for expiry."
+   at or after the latest QuorumBegin other than for expiry (under strict-lottery-v8: whenever,
+   and an acquire only once its claim confirmed; see COSIGN-REFUSAL)."
   (let* ((qb-seq (or (let ((u (record-latest rec :quorum-begin))) (and u (up:update-seq u)))
                      0))
          (expiry (lg:ledger-quorum-expiry (record-ledger rec)))
@@ -3549,10 +3595,11 @@
                                               ;; by its ground: a legacy generic label on an expiry
                                               ;; dispute stops freezing co-signing (DEP-05)
                                               :reason (if (dispute-enter-expiry-p u o expiry) "quorum_expired" (op:field o :reason))
-                                              :acquired (and (fork-op f :dispute-acquire) t))))
+                                              :acquired (and (fork-op f :dispute-acquire) t)
+                                              :acquire-confirmed (acquire-confirmed-p node f))))
          (why (cosign-refusal (node-pubkey node)
                               (mapcar #'lg:member-pubkey (lg:ledger-quorum-members (record-ledger rec)))
-                              qb-seq disputes)))
+                              qb-seq disputes :ruleset (lg:ledger-active-ruleset (record-ledger rec)))))
     (when why (fail "ledger disputed: ~a" why))))
 
 (defun make-fork (node rec last-valid-seq operator33)
@@ -3706,6 +3753,23 @@
           (progn (commit-update node fork (new-update node fork (list :type :obligation-record :uncredited-proof (ascii->bytes json))))
                  (log! node "recorded an uncredited payment of ~a on our fork" (subseq id 0 8)))
         (error (e) (log! node "uncredited payment not recorded on ~a: ~a" (subseq id 0 8) e))))))
+
+(defun phantom-acquire (node rec)
+  "Red team (DEP-06 §Phase 4, strict-lottery-v8: an acquire binds once its claim confirms): enter
+   and arm a dispute on REC's ledger if we have none, then append a DisputeAcquire to our fork for
+   a claim that never reaches the chain (a random claim_txid).  Members must not read custody as
+   moved (signet soak, 2026-11-07: cld7's phantom acquire on 751e6951).  Returns the claim txid."
+  (let* ((id (record-id-hex rec))
+         (fork (or (find-fork node id (node-pubkey node))
+                   (progn (enter-dispute node rec (lg:ledger-sequence (record-ledger rec)) :reason "equivocation")
+                          (find-fork node id (node-pubkey node)))
+                   (fail "no fork of ~a after DisputeEnter" (subseq id 0 8))))
+         (claim (let ((b (make-array 32 :element-type '(unsigned-byte 8))))
+                  (dotimes (i 32 b) (setf (aref b i) (random 256))))))
+    (unless (fork-op fork :dispute-armed) (arm-dispute node fork))
+    (commit-update node fork (new-update node fork (list :type :dispute-acquire :new-custodian (node-pubkey node)
+                                                         :claim-txid claim :new-reserves-address "")))
+    claim))
 
 (defun arm-dispute (node fork &key seed replacement (round 1))
   "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL.  ROUND > 1:
@@ -4745,6 +4809,7 @@
                                     (setf (aref k 0) 2) (loop for i from 1 below 33 do (setf (aref k i) (random 256))) k)
                           :network (node-network node) :height-fn (node-height-fn node) :chain-fn (node-chain-fn node)
                           :pledge-fn (node-pledge-fn node) :spender-fn (node-spender-fn node) :feerate-fn (node-feerate-fn node)
+                          :tx-confs-fn (node-tx-confs-fn node)
                           :height-of-block (node-height-of-block node) :block-hash-fn (node-block-hash-fn node)
                           :parent node))
            (top (first base))

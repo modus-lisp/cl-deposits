@@ -30,7 +30,7 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:quorum-expiry-ok-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:lottery-admissible-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:proposed-ruleset #:member-declaration #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger #:encode-state #:decode-state #:state-digest
+           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:seat-consenting #:lottery-admissible-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:proposed-ruleset #:member-declaration #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger #:encode-state #:decode-state #:state-digest
            #:speculate #:fill-balance-commitments #:commitment-targets))
 (in-package #:cl-deposits.ledger)
 
@@ -59,7 +59,7 @@
     ("grounded-arms-v7" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
      :grounded-arms)
     ("strict-lottery-v8" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
-     :grounded-arms :strict-lottery))
+     :grounded-arms :strict-lottery :fraud-survives-rotation :acquire-on-confirm))
   "DEP-18: the gated rules each ruleset adds to the intrinsic ones.")
 
 (defun ruleset-rule-p (ruleset rule)
@@ -168,6 +168,17 @@
 
 (defparameter +valid-quorum-sizes+ '(3 5 7)
   "DEP-03 §Pre-release policy cap: odd for clean majorities, >= 3 for redundancy, <= 7.")
+
+(defun seat-consenting (current staged &key (test #'equalp))
+  "DEP-11 §Rotating without a silent member (ruled 2026-11-10): the members an operator seats from
+   STAGED (the consenting members, in consent order): those in CURRENT first, then newcomers, each
+   in consent order, cut to the largest valid quorum size (3, 5, 7).  NIL with fewer than three.
+   Operator policy, not a validity rule.  Shared with deposits-rust's seat_consenting; vector
+   rotation_seat.json."
+  (let* ((order (append (remove-if-not (lambda (m) (member m current :test test)) staged)
+                        (remove-if (lambda (m) (member m current :test test)) staged)))
+         (size (loop for q in (reverse +valid-quorum-sizes+) when (<= q (length order)) return q)))
+    (and size (subseq order 0 size))))
 
 (defun default-transfer-fees ()
   "DEP-07 §Transfer Fees: the schedule of a deposit whose DepositOpen names none, fixed_msats 2,

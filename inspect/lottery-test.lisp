@@ -470,10 +470,24 @@
           for members = (loop for i below (gethash "members" c) collect (format nil "m~a" i))
           for disputes = (loop for d across (gethash "disputes" c)
                                collect (list :by (gethash "by" d) :last-valid (gethash "last_valid_sequence" d)
-                                             :reason (gethash "reason" d) :acquired (gethash "acquired" d)))
+                                             :reason (gethash "reason" d) :acquired (gethash "acquired" d)
+                                             :acquire-confirmed (gethash "acquire_confirmed" d)))
           do (check-equal (gethash "name" c)
-                          (and (cl-deposits.node::cosign-refusal "m0" members (gethash "latest_quorum_begin_seq" c) disputes) t)
+                          (and (cl-deposits.node::cosign-refusal "m0" members (gethash "latest_quorum_begin_seq" c) disputes
+                                                                 :ruleset (gethash "ruleset" c))
+                               t)
                           (gethash "refuse" c)))))
+
+;;; inspect/vectors/rotation_seat.json: DEP-11 "Rotating without a silent member", shared with
+;;; deposits-rust (deposits-core/tests/vectors/rotation_seat.json).
+(with-gate ("DEP-11 rotating without a silent member: the seated set against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "rotation_seat.json")))))
+    (check "the vector has cases" (>= (length (gethash "cases" v)) 6))
+    (loop for c across (gethash "cases" v)
+          for seat = (gethash "seat" c)
+          do (check-equal (gethash "name" c)
+                          (lg:seat-consenting (coerce (gethash "current" c) 'list) (coerce (gethash "staged" c) 'list) :test #'string=)
+                          (and seat (not (eq seat :null)) (not (eq seat 'null)) (coerce seat 'list))))))
 
 ;;; inspect/vectors/rotation_tx.txt: DEP-03 "Rotation transaction" and §Fee ladder, shared with
 ;;; deposits-rust (deposits-core/tests/vectors/rotation_tx.txt).  Txids there are display (reversed)

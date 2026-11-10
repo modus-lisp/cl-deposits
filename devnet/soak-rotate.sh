@@ -13,6 +13,10 @@
 # into the new one (DEP-03, :rotate-vault); node-side auto-rotation is open.
 source "$(dirname "$0")/_common.sh"; source "$CLD_ROOT/soak/env"
 SOAK="$CLD_ROOT/soak"; EVERY=${SOAK_ROTATE_EVERY:-600}; MARGIN=${SOAK_ROTATE_MARGIN:-300}
+# DEP-11 §Rotating without a silent member (ruled 2026-11-10: "permissionless means letting people
+# gfy"): within DROP_MARGIN blocks of expiry a member whose consent fails is dropped, and the
+# operator seats the members that did consent (LG:SEAT-CONSENTING, via :trim-staged).
+DROP_MARGIN=${SOAK_DROP_MARGIN:-$(( MARGIN / 2 > 72 ? MARGIN / 2 : 72 ))}
 # A rotates to cld4 in place of ref2: ref2 forked A at 81026 (docs/REDTEAM.md
 # organic #1) and has treated A as a gap since, so it never re-consents.
 PLAN=${SOAK_LEDGER_PLAN:-$(soak_plan)}
@@ -20,13 +24,24 @@ PLAN=${SOAK_LEDGER_PLAN:-$(soak_plan)}
 pubkey_of() { [ -s "$SOAK/pubkey.$1" ] && { cat "$SOAK/pubkey.$1"; return; }; case "$1" in cld*) cld_pubkey "$1";; ref*) ref_pubkey "$1";; esac; }
 own_ledger_of() { local v; case "$1" in cld*) v="L${1#cld}";; ref*) v="RL${1#ref}";; esac; echo "${!v}"; }
 rotate() {   # rotate NAME ID OPERATOR "m1,m2,m3"
-  local name=$1 id=$2 op=$3 members=$4 m r prep addr txid vout
-  echo "$(date +%FT%T) rotating $name ($op)"
+  local name=$1 id=$2 op=$3 members=$4 m r prep addr txid vout dropped=()
+  local dropping=; [ -n "${ROT_EXP_BEFORE:-}" ] && [ $(( ROT_EXP_BEFORE - ${h:-0} )) -le "$DROP_MARGIN" ] && dropping=1
+  echo "$(date +%FT%T) rotating $name ($op)${dropping:+ (within $DROP_MARGIN blocks of expiry: silent members are dropped)}"
   for m in ${members//,/ }; do
     # the node waits up to 180 s for the member's consent (+CONSENT-TIMEOUT+); outwait it
     r=$(CLD_CTL_TIMEOUT=240 cld_ctl "$op" "(:add-member :ledger \"$id\" :member \"$(pubkey_of "$m")\" :member-ledger \"$(own_ledger_of "$m")\")")
-    [[ "$r" == *":STATUS :OK"* ]] || { echo "   $m consent: $r"; return 1; }
+    if [[ "$r" != *":STATUS :OK"* ]]; then
+      echo "   $m consent: $r"
+      [ -n "$dropping" ] || return 1
+      dropped+=("$m")
+    fi
   done
+  if [ ${#dropped[@]} -gt 0 ]; then
+    # Seat the consenting members, cut to a valid size; fewer than three cannot rotate.
+    r=$(cld_ctl "$op" "(:trim-staged :ledger \"$id\")")
+    [[ "$r" == *":STATUS :OK"* ]] || { echo "   trim-staged: $r"; return 1; }
+    echo "$(date +%FT%T) $name: dropping silent ${dropped[*]}; seating $(sx "$r" ":SEATED")"
+  fi
   # DEP-03: the rotation spends the old vault into the new one (no fresh funding); a
   # rotation already broadcast but not yet recorded is resumed by :begin-quorum.
   # A rotation recorded already (an earlier pass's begin-quorum outlived its control call)

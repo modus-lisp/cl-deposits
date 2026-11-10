@@ -19,7 +19,7 @@
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:js #:json-simple) (#:fr #:cl-deposits.fraud))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
-           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn #:bitcoin-cli-feerate-fn))
+           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn #:bitcoin-cli-feerate-fn #:bitcoin-cli-tx-confs-fn))
 (in-package #:cl-deposits.daemon)
 
 (defun arg (form key &optional default) (getf (cdr form) key default))
@@ -117,6 +117,9 @@
                           :dispute-response-blocks (arg form :dispute-response-blocks)
                           :dormancy-blocks (arg form :dormancy-blocks) :dormancy-notice-blocks (arg form :dormancy-notice-blocks))
            (ok :staged (length (lg:ledger-next-quorum-members (nd:record-ledger rec))))))
+        (:trim-staged   ; DEP-11 §Rotating without a silent member
+         (let ((rec (rec! node form)))
+           (ok :seated (nd:trim-staged node rec))))
         (:prepare-quorum
          (let* ((rec (rec! node form))
                 (r (nd:prepare-quorum node rec :expiry-blocks (arg form :expiry-blocks 4320) :ruleset (arg form :ruleset nil))))
@@ -228,6 +231,8 @@
          (let ((rec (rec! node form)))
            (ok :seq (lg:ledger-sequence (nd:record-ledger rec)) :tip (bytes->hex (lg:ledger-chain-tip (nd:record-ledger rec)))
                :history (length (nd:record-history rec)))))
+        (:phantom-acquire   ; red team: a DisputeAcquire for a claim that never reaches the chain
+         (ok :claim (txid-hex (nd::phantom-acquire node (rec! node form)))))
         (:equivocate (nd:equivocate node (rec! node form)) (ok :warning "published a conflicting update at the tip sequence"))
         (:vault-spend   ; red team: (:vault-spend :ledger L :address "tb1..." [:tier N]) — spend the
                         ; vault outside any rotation or dispute (docs/MISSING.md, DEP-06 type 7 gap)
@@ -512,6 +517,15 @@
           (list :value-sats (round (* (gethash "value" j) 100000000))
                 :confirmations (gethash "confirmations" j)
                 :spk (let ((spk (gethash "scriptPubKey" j))) (and spk (hex->bytes (gethash "hex" spk))))))))))
+
+(defun bitcoin-cli-tx-confs-fn (cli)
+  "txid (wire bytes) -> its confirmations (0 while in the mempool), or NIL when bitcoind does not
+   know it.  getrawtransaction reads confirmed transactions through -txindex (both devnets run it)."
+  (lambda (txid)
+    (let ((out (run-cli cli "getrawtransaction" (txid-hex txid) "true")))
+      (when (and (plusp (length out)) (char= (char out 0) #\{))
+        (let ((c (gethash "confirmations" (js:parse out))))
+          (if (integerp c) c 0))))))
 
 (defun bitcoin-cli-broadcast-fn (cli)
   "sendrawtransaction; signals with bitcoind's reason when it refuses (callers log it)."
