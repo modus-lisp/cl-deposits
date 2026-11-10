@@ -161,6 +161,7 @@ mint_cl() {   # on signet only for the adversarial soak (REDTEAM_MINT=1): new no
   source "$CLD_SRC/devnet/_common.sh" >/dev/null 2>&1
   for i in $(seq $((have + 1)) $((have + k))); do
     n=cld$i; mkdir -p "$(cld_dir "$n")"
+    [ -n "${REDTEAM_MINTED_FILE:-}" ] && echo "$n" >>"$REDTEAM_MINTED_FILE"   # stopped when the scenario ends (scenarios.lisp)
     [ -f "$(cld_dir "$n")/version" ] || [ ! -f "$(cld_dir cld7)/version" ] || cp "$(cld_dir cld7)/version" "$(cld_dir "$n")/version"
     start_cld "$n" >&2   # may report "did not come up" while still loading under load
     local w; for w in $(seq 1 60); do cld_ctl "$n" '(:info)' 2>/dev/null | grep -q ":STATUS :OK" && break; sleep 5; done

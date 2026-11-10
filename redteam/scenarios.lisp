@@ -202,14 +202,22 @@
          ;; Its own process group, killed whole when it ends: `timeout` alone kills only the
          ;; script's bash, and its subshells (control calls, mining, waits) lived on for hours.
          (pgfile (format nil "~a/~a.pgid" dir (sc-name sc)))
-         (cmd (format nil "setsid bash -c 'echo $$ >~a; exec env ~{~a ~}timeout --kill-after=15 ~a bash redteam/~a~{ ~a~}' >~a 2>&1; rc=$?; pg=$(cat ~a 2>/dev/null); [ -n \"$pg\" ] && kill -KILL -- -$pg 2>/dev/null; rm -f ~a; exit $rc"
-                      pgfile env (sc-timeout sc) (sc-script sc) (sc-args sc) log pgfile pgfile))
+         ;; Every cl node the scenario mints (redteam/_lib.sh mint_cl) is listed here and stopped
+         ;; when it ends, pass or fail: actors were never stopped, and a day of scenarios left 229
+         ;; regtest nodes holding 406 GB (2026-11-10).  Their data dirs stay, for the evidence.
+         (minted (format nil "~a/~a.minted" dir (sc-name sc)))
+         (cmd (format nil "setsid bash -c 'echo $$ >~a; exec env REDTEAM_MINTED_FILE=~a ~{~a ~}timeout --kill-after=15 ~a bash redteam/~a~{ ~a~}' >~a 2>&1; rc=$?; pg=$(cat ~a 2>/dev/null); [ -n \"$pg\" ] && kill -KILL -- -$pg 2>/dev/null; rm -f ~a; exit $rc"
+                      pgfile minted env (sc-timeout sc) (sc-script sc) (sc-args sc) log pgfile pgfile))
          (t0 (now)) exit)
     (format t "~&-- ~a (~{~(~a~)~^,~}) ... " (sc-name sc) (sc-tags sc)) (finish-output)
     (unwind-protect
          (setf exit (sb-ext:process-exit-code (sb-ext:run-program "/bin/bash" (list "-c" cmd) :directory *src* :output nil :error nil)))
       (let ((stuck (disarm-all nodes)))
-        (when stuck (format t "~&   (could not disarm: ~{~a~^ ~})~%" stuck))))
+        (when stuck (format t "~&   (could not disarm: ~{~a~^ ~})~%" stuck)))
+      (when (probe-file minted)
+        (sb-ext:run-program "/bin/bash"
+                            (list "-c" (format nil "source devnet/_common.sh >/dev/null 2>&1; for n in $(sort -u ~a); do stop_cld \"$n\" >/dev/null 2>&1 & done; wait" minted))
+                            :directory *src* :output nil :error nil)))
     (let ((v (verdict log exit)) (dt (- (now) t0)))
       (format t "~a  ~ds~%" v dt)
       (unless (eq v :pass) (dolist (l (excerpt log)) (format t "     | ~a~%" (subseq l 0 (min 160 (length l))))))
