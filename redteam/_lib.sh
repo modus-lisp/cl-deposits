@@ -148,9 +148,16 @@ clean_cl() {
 # so a scenario never runs out of untainted actors.  They persist (counted in $CLD_ROOT/minted-cl).
 mint_cl() {   # on signet only for the adversarial soak (REDTEAM_MINT=1): new nodes run the version cld7 runs
   [ "$CLD_CHAIN" = regtest ] || [ "${REDTEAM_MINT:-}" = 1 ] || return 1
-  local k=$1 have i n a j
+  local k=$1 have i n a j minted
   have=$(cld_names | wc -l)
-  echo $(( $(cat "$CLD_ROOT/minted-cl" 2>/dev/null || echo 0) + k )) >"$CLD_ROOT/minted-cl"
+  minted=$(cat "$CLD_ROOT/minted-cl" 2>/dev/null || echo 0)
+  # Signet has ports for 37 minted actors (devnet/_common.sh: cld19..cld55, 10063..10099).  Counting
+  # past that named nodes no port or key exists for: every attack turn failed "no pubkey for cld56"
+  # from Nov 8 on and the oracle scored nine MISSes.  At the cap, mint nothing: the caller SKIPs.
+  if [ "$CLD_CHAIN" = signet ] && [ $((minted + k)) -gt 37 ]; then
+    echo "== cannot mint $k more cl nodes: signet's 37 minted-actor ports are used (minted-cl $minted)" >&2; return 1
+  fi
+  echo $((minted + k)) >"$CLD_ROOT/minted-cl"
   source "$CLD_SRC/devnet/_common.sh" >/dev/null 2>&1
   for i in $(seq $((have + 1)) $((have + k))); do
     n=cld$i; mkdir -p "$(cld_dir "$n")"

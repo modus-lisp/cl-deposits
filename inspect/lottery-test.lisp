@@ -417,9 +417,15 @@
            (view (nd::dispute-view proto id (reverse updates) :confiscated-at (parse-integer (gethash "spend_height" kv)))))
       (dolist (c (reverse cases))
         (destructuring-bind (name verdict hex) c
-          (check-equal (format nil "~a: ~:[not excused~;excused~]" name (string= verdict "1"))
-                       (and (nd::rebuild-matches-p view id (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes hex)))) t)
-                       (string= verdict "1")))))))
+          (let* ((tx (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes hex))))
+                 ;; DEP-03 §Fee ladder: the judge reads the vault rung from the spend's input and its
+                 ;; value from that output, as its chain reports it (a pledge line in the vector)
+                 (in0 (first (btx:tx-inputs tx)))
+                 (known (gethash (btx:txin-prev-hash in0) pledges))
+                 (nd::*judged-spend* (and known (list tx (cons (second known) nil)))))
+            (check-equal (format nil "~a: ~:[not excused~;excused~]" name (string= verdict "1"))
+                         (and (nd::rebuild-matches-p view id tx) t)
+                         (string= verdict "1"))))))))
 
 (with-gate ("DEP-06 authorised confiscation: the rebuild from public state, against the shared vector")
   (authorised-confiscation-vector "authorised_confiscation.txt"))
@@ -429,6 +435,11 @@
 ;;; the fault, and a rebuild that replayed the fault never recognised the honest rung 1.
 (with-gate ("DEP-06 authorised confiscation: the base ends at the fork point (soak 6056fb38)")
   (authorised-confiscation-vector "confiscation_past_fault.txt"))
+
+;;; inspect/vectors/confiscation_vault_rung.txt: the vault is a bumped rotation rung, judged after
+;;; it was spent (signet soak 2026-11-08, ledger G: rung 0's amounts rebuilt it 6076 sats off).
+(with-gate ("DEP-03 fee ladder: a confiscation of a bumped vault, judged from the spend's input")
+  (authorised-confiscation-vector "confiscation_vault_rung.txt"))
 
 ;;; inspect/vectors/dispute_rearm.json: DEP-03's re-arm shape, shared with deposits-rust
 ;;; (deposits-core/tests/vectors/dispute_rearm.json).

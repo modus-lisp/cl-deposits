@@ -856,7 +856,11 @@
   (list :min-fee-bps (w:jget res "min_fee_bps") :min-fee-fixed (w:jget res "min_fee_fixed")
         :max-fee-period (w:jget res "max_fee_period") :membership-until (w:jget res "membership_expires")))
 
-(defparameter +consent-timeout+ 60 "Seconds to wait for a member's consent.")
+(defparameter +consent-timeout+ 180
+  "Seconds to wait for a member's consent.  A member catches its replica up to the operator's
+   sequence from the relay before it answers; under soak load (relay p99 query 33 s) that outran
+   60 s, every rotation of A failed on one member's silence for five hours, and the quorum expired
+   (signet soak, 2026-11-07).")
 (defparameter +consent-history-limit+ 40
   "How much of the history a consent request carries: the reference's nostr client drops any
    event over 70 KB (~70 updates), and it needs LedgerOpen; the rest is gap-filled from the relay.")
@@ -2917,6 +2921,14 @@
   (dispute-ground-expiry-p (op:field op :reason) (op:field op :anchor-block-height) (op:field op :fraud-proof-hash)
                            (up:update-block-height update) governing-expiry))
 
+(defparameter +reveal-depth+ 3
+  "Confirmations a confiscation needs before a participant reveals (DEP-06 Phase 3), as deposits-rust.")
+
+(defun confiscation-depth (node tx)
+  "Confirmations of TX's output 0 (0 while unconfirmed, or with no chain source)."
+  (let ((info (and (node-chain-fn node) (ignore-errors (funcall (node-chain-fn node) (btx:tx-txid tx) 0)))))
+    (or (and info (getf info :confirmations)) 0)))
+
 (defun fork-lottery (node id-hex)
   "(values confiscation lottery :pending) for ID-HEX while its lottery output is
    unspent, or NIL.  Found once by rebuilding (CONFISCATED-LOTTERY), then kept on
@@ -2929,14 +2941,23 @@
       (when f
         (let ((tx (record-confiscation f)) (l (record-lottery f)))
           (cond ((not (node-chain-fn node)) (return-from fork-lottery (values tx l :pending)))
-                ((funcall (node-chain-fn node) (btx:tx-txid tx) 0)
-                 (note-confiscation node id-hex (btx:tx-txid tx))
-                 (save-confirmed-lottery node id-hex tx l)
+                ((let ((info (funcall (node-chain-fn node) (btx:tx-txid tx) 0)))
+                   ;; gettxout counts the mempool: a broadcast rung is :pending (the ladder bumps
+                   ;; it), but only a confirmed one is noted and saved as THE confiscation.  A
+                   ;; competing proposal over another cut can still confirm in its place (signet
+                   ;; soak, 2026-11-08: B, C, H and L each logged an "on chain" confiscation that
+                   ;; never confirmed).
+                   (when info
+                     (when (>= (or (getf info :confirmations) 0) 1)
+                       (note-confiscation node id-hex (btx:tx-txid tx))
+                       (save-confirmed-lottery node id-hex tx l))
+                     t))
                  (return-from fork-lottery (values tx l :pending)))
                 (t (forget)))))
       (multiple-value-bind (tx l state) (confiscated-lottery node id-hex)
         (when tx
-          (when state (note-confiscation node id-hex (btx:tx-txid tx)) (save-confirmed-lottery node id-hex tx l))
+          (when (and state (>= (confiscation-depth node tx) 1))   ; confirmed, not merely broadcast
+            (note-confiscation node id-hex (btx:tx-txid tx)) (save-confirmed-lottery node id-hex tx l))
           (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) tx (record-lottery f) l)))
         (values tx l state)))))
 
@@ -3024,7 +3045,15 @@
                ;; DEP-03 §Confiscation ladder: until a rung confirms, push the one the schedule names.
                (let ((i (bump-confiscation node id)))
                  (when (and i (plusp i)) (note-dispute node id "confiscation unconfirmed; broadcast rung ~a" i)))
-               (cond ((not (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
+               (cond ((< (confiscation-depth node conf) +reveal-depth+)
+                      ;; DEP-06 Phase 3: reveal once a rung confirms, and deep enough that a reorg
+                      ;; cannot swap in a competing confiscation over another cut of the arms.  A
+                      ;; preimage published while the rung sat in the mempool let any proposer grind
+                      ;; the cut against it (signet soak, 2026-11-08: four confiscations "revealed"
+                      ;; that never confirmed).  deposits-rust reveals at 3 confirmations.
+                      (note-dispute node id "confiscation ~a broadcast (~a confirmations); revealing at ~a"
+                                    (txid-hex (btx:tx-txid conf)) (confiscation-depth node conf) +reveal-depth+))
+                     ((not (assoc (node-pubkey node) (reveals-of node id) :test #'equalp))
                       ;; ADVERSARY :withhold-reveal — an armer that never publishes its
                       ;; preimage: the lottery cannot be claimed, custody waits (red team:
                       ;; the last revealer holds the funds hostage; DEP-06 §Phase 4).
@@ -4119,12 +4148,33 @@
 (defvar *vault-rungs* (make-hash-table :test #'equalp :synchronized t)
   "rung-0 txid -> (txid sats): which rung of a fee ladder confirmed (DEP-03), once seen confirmed.")
 
+(defvar *judged-spend* nil
+  "(TX . PREVOUTS) while a spend is judged: PREVOUTS ((sats . spk)...) in TX's input order, from our
+   own chain read or committed by TX's own signatures (BIP341 sighashes commit every input amount).")
+
+(defun judged-spend-rung (rungs vout)
+  "DEP-03 §Fee ladder: the rung the spend being judged (*JUDGED-SPEND*) spends, as (txid sats), read
+   from the spend itself: its input names the rung that confirmed, its prevout the vault's value.
+   Literal, and it holds after the vault is spent, when the UTXO set no longer shows any rung."
+  (destructuring-bind (&optional tx . prevouts) *judged-spend*
+    (when (and tx prevouts)
+      (loop for in in (btx:tx-inputs tx) for i from 0
+            when (and (= (btx:txin-prev-index in) vout) (member (btx:txin-prev-hash in) rungs :test #'equalp)
+                      (< i (length prevouts)))
+              return (list (btx:txin-prev-hash in) (car (elt prevouts i)))))))
+
 (defun vault-rung (node qb)
   "DEP-03 §Fee ladder: the vault QuorumBegin QB created, (values txid sats): output 0 of the rung
-   our chain holds (unspent; once spent, the one we saw confirm), else rung 0 at QB's amounts."
+   that confirmed: the one the spend being judged spends (JUDGED-SPEND-RUNG), else the one our chain
+   holds (unspent; once spent, the one we saw confirm), else rung 0 at QB's amounts.  Judging a
+   spend from the UTXO set alone fell back to rung 0 once the vault was spent: a node that had not
+   seen the bumped rung confirm (cld4, Nov 8 soak) rebuilt G's confiscation 6076 sats off, challenged
+   it, and its lapse convicted the three members that signed it."
   (let* ((rungs (fr:rotation-rungs qb)) (vout (op:field qb :new-outpoint-vout))
          (recorded (floor (+ (op:field qb :amount) (op:field qb :collateral-amount)) 1000))
-         (known (gethash (first rungs) *vault-rungs*)))
+         (spent (judged-spend-rung rungs vout))
+         (known (or spent (gethash (first rungs) *vault-rungs*))))
+    (when spent (setf (gethash (first rungs) *vault-rungs*) spent))
     (cond (known (values-list known))
           ((or (null (cdr rungs)) (null (node-chain-fn node))) (values (first rungs) recorded))
           (t (loop for txid in rungs for i from 0
@@ -5220,17 +5270,25 @@
   (multiple-value-bind (tx l) (fork-lottery node id-hex)
     (when tx (values tx l 1 (or (gethash id-hex (node-confiscation-heights node)) (lottery-output-height node tx))))))
 
-(defun rearm-spend-for (node id-hex tx lottery round height)
+(defun rearm-open-tiers (lottery height now)
+  "The recovery tiers of LOTTERY (output confirmed at HEIGHT) whose CSV has passed at NOW, tier 0
+   (the highest threshold) first."
+  (let ((age (1+ (- now height))))
+    (loop for (csv . nil) in (lot::recovery-specs (lot:lottery-recovery-threshold lottery)) for i from 0
+          when (>= age csv) collect i)))
+
+(defun rearm-spend-for (node id-hex tx lottery round height &key tier)
   "The recovery spend of the lottery output of TX (LOTTERY, round ROUND, confirmed at HEIGHT) into
-   round ROUND+1's lottery, through the lowest recovery tier open now: (values spend next-lottery
-   tier prevouts), or NIL while the next round cannot be built (window open, empty cut, no tier)."
+   round ROUND+1's lottery, through TIER (default the first open: tier 0) when it is open now:
+   (values spend next-lottery tier prevouts), or NIL while the next round cannot be built (window
+   open, empty cut, TIER not open)."
   (multiple-value-bind (idx) (revealed-indices node id-hex lottery)
     (multiple-value-bind (opens closes) (rearm-window node id-hex height (and idx t))
       ;; No window has closed with a non-empty cut yet (the scheduled one, its reopening, or a
       ;; recurring one): nothing is due.
       (let* ((next (or (rearm-lottery node id-hex (1+ round) opens closes) (return-from rearm-spend-for nil)))
-             (age (1+ (- (height node) height)))
-             (tier (position-if (lambda (spec) (>= age (car spec))) (lot::recovery-specs (lot:lottery-recovery-threshold lottery))))
+             (open (rearm-open-tiers lottery height (height node)))
+             (tier (if tier (and (member tier open) tier) (first open)))
              (sats (btx:txout-value (first (btx:tx-outputs tx))))
              (feerate (nth-value 6 (disputed-reserves node (find-record node id-hex)))))
         (unless (and tier (plusp (lot:lottery-recovery-threshold lottery))) (return-from rearm-spend-for nil))
@@ -5271,9 +5329,12 @@
           (unless (and tx lottery height) (fail "no unclaimed lottery output on chain"))
           (unless (member (up:x-only (node-pubkey node)) (lot:lottery-recovery-voters lottery) :test #'equalp)
             (fail "not a recovery voter"))
-          (multiple-value-bind (ours next tier prevouts) (rearm-spend-for node id tx lottery round height)
+          ;; The tier the proposer asks for, when it is open: it falls through the tiers until its
+          ;; signers reach one's threshold (DEP-06 Phase 4, "or a later tier if fewer sign").
+          (multiple-value-bind (ours next tier prevouts)
+              (rearm-spend-for node id tx lottery round height :tier (let ((tr (w:jget params "tier"))) (and (integerp tr) tr)))
             (declare (ignore next))
-            (unless ours (fail "no re-arm spend is due for ~a's round ~a" (subseq id 0 8) round))
+            (unless ours (fail "no re-arm spend is due for ~a's round ~a at tier ~a" (subseq id 0 8) round (w:jget params "tier")))
             (let ((asked (btx:parse-tx (bw:make-reader (hex->bytes (w:jget params "unsigned_tx"))))))
               (unless (and (eql tier (w:jget params "tier"))
                            (equalp (btx:serialize-tx asked :witness nil) (btx:serialize-tx ours :witness nil)))
@@ -5376,21 +5437,31 @@
             ;; the next round.
             ((and due
                   (member (up:x-only me) (lot:lottery-recovery-voters lottery) :test #'equalp))
-             (multiple-value-bind (spend next tier prevouts) (rearm-spend-for node id-hex tx lottery round height)
-               (if (not spend)
-                   (note-dispute node id-hex "lottery round ~a unclaimed; no re-arm spend yet (empty cut or no tier open)" round)
-                   (handler-case
-                       (let* ((sigs (rearm-signatures node id-hex lottery spend tier prevouts))
-                              (w0 (lot:recovery-witness lottery tier sigs))
-                              (signed (btx:parse-tx (bw:make-reader
-                                                     (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t
-                                                                                    :inputs (btx:tx-inputs spend) :outputs (btx:tx-outputs spend)
-                                                                                    :witnesses (list w0)))))))
-                         (unless (rot:verify-spend signed 0 prevouts) (fail "the re-arm spend does not verify"))
-                         (broadcast node signed)
-                         (note-rearm-round node id-hex (1+ round) signed nil :lottery next :opens opens :closes closes)
-                         (note-dispute node id-hex "lottery round ~a unclaimed; spent into round ~a's lottery (tier ~a)" round (1+ round) tier))
-                     (error (e) (note-dispute node id-hex "lottery round ~a unclaimed; re-arm spend not yet: ~a" round e))))))
+             ;; DEP-06 Phase 4: "through the CSV-144 recovery leaf (or a later tier if fewer sign)".
+             ;; Each open tier in turn: a quorum whose other voters never sign (deposits-rust runs
+             ;; no re-arm round) re-arms at the tier its signers reach.  Only ever asking tier 0
+             ;; left E's round-1 lottery at "3 of 4 re-arm signatures" for 3000 blocks (signet
+             ;; soak, 2026-11-08..10).
+             (let ((last-error nil))
+               (dolist (tier-try (rearm-open-tiers lottery height h)
+                                 (when last-error
+                                   (note-dispute node id-hex "lottery round ~a unclaimed; re-arm spend not yet: ~a" round last-error)))
+                 (multiple-value-bind (spend next tier prevouts) (rearm-spend-for node id-hex tx lottery round height :tier tier-try)
+                   (when spend
+                     (handler-case
+                         (let* ((sigs (rearm-signatures node id-hex lottery spend tier prevouts))
+                                (w0 (lot:recovery-witness lottery tier sigs))
+                                (signed (btx:parse-tx (bw:make-reader
+                                                       (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t
+                                                                                      :inputs (btx:tx-inputs spend) :outputs (btx:tx-outputs spend)
+                                                                                      :witnesses (list w0)))))))
+                           (unless (rot:verify-spend signed 0 prevouts) (fail "the re-arm spend does not verify"))
+                           (broadcast node signed)
+                           (note-rearm-round node id-hex (1+ round) signed nil :lottery next :opens opens :closes closes)
+                           (note-dispute node id-hex "lottery round ~a unclaimed; spent into round ~a's lottery (tier ~a)" round (1+ round) tier)
+                           (return))
+                       (error (e) (setf last-error (format nil "tier ~a: ~a" tier e))))))))
+             )
             ((and (> h closes) (not due))
              (note-dispute node id-hex "lottery round ~a unclaimed; round ~a's next arm window opens after block ~a"
                            round (1+ round) (lot:rearm-next-window opens (- closes opens) h)))))))))))
@@ -5936,12 +6007,13 @@
       (error "the relay holds nothing of ~a at ~a" (subseq id-hex 0 8) gseq))
     (append history relay (gethash id-hex (node-spend-answers node)))))
 
-(defun spend-answered-p (node id-hex tx gseq reserves tier-index &key spend-height)
+(defun spend-answered-p (node id-hex tx gseq reserves tier-index &key spend-height prevouts)
   "DEP-06 §Spend challenge: TX's spend of ID-HEX's vault (under the QuorumBegin at GSEQ, its
    witness at TIER-INDEX of RESERVES) has an answer we can find: the QuorumBegin that is the child
    of its anchor and names it (FR:ROTATION-ANSWER), or the confiscation the rules rebuild from
    public state.  NIL for an unanchored spend.  Signals when we cannot read the relay."
-  (let ((anchor (rot:anchor-of tx)))
+  (let ((anchor (rot:anchor-of tx))
+        (*judged-spend* (if prevouts (cons tx (coerce prevouts 'list)) *judged-spend*)))
     (when anchor
       (let ((updates (spend-answer-updates node id-hex gseq anchor)))
         (or (fr:rotation-answer updates anchor (btx:tx-txid tx) reserves tier-index)
@@ -6272,7 +6344,8 @@
             (unless (lg:ruleset-rule-p ruleset :vault-spend-proofs) (setf signers nil))
             (when signers
               (let ((anchor (rot:anchor-of tx)))
-                (cond ((spend-answered-p node id tx qb reserves tier-index :spend-height (getf spend :height))
+                (cond ((spend-answered-p node id tx qb reserves tier-index :spend-height (getf spend :height)
+                                                                     :prevouts (getf spend :prevouts))
                        (log! node "vault watch: ~a's spend ~a is answered by its anchor (~a)" (subseq id 0 8)
                              (subseq (txid-hex (btx:tx-txid tx)) 0 16) (if (rot:anchor-of tx) "a rotation or confiscation" "-"))
                        nil)
@@ -6346,7 +6419,8 @@
                          (refresh-spend-answers node (getf e :id)))
                        (multiple-value-bind (reserves) (fr:spent-vault (let ((r (find-record node (getf e :id)))) (if r (spent-vault-updates r) '())) (getf e :qb))
                          (when (and reserves (ignore-errors (spend-answered-p node (getf e :id) tx (getf e :qb) reserves (getf e :tier)
-                                                                              :spend-height (getf e :height))))
+                                                                              :spend-height (getf e :height)
+                                                                              :prevouts (ignore-errors (fr::parse-prevouts (getf e :prevouts))))))
                            (log! node "the challenge of ~a's spend ~a is answered; nothing to prove" (subseq (getf e :id) 0 8)
                                  (subseq (txid-hex (btx:tx-txid tx)) 0 16))
                            (setf (getf e :done) t (getf e :answered) t lapse nil changed t)))
@@ -6415,7 +6489,8 @@
                            ;; no verdict where we cannot read the places answers go
                            :answered-fn (lambda (txid anchor reserves tier-index)
                                           (declare (ignore txid anchor))
-                                          (spend-answered-p node spent-id tx gseq reserves tier-index :spend-height spend-height))
+                                          (spend-answered-p node spent-id tx gseq reserves tier-index :spend-height spend-height
+                                                            :prevouts (ignore-errors (fr::parse-prevouts (getf ev :prevouts)))))
                            :answers-readable (or (not lapsed) (answers-readable-p node spent-id gseq)))
                         (error (e) (return-from vault-spend-proof-verdict
                                      (values nil (format nil "not judged yet: ~a" e) :unknown))))

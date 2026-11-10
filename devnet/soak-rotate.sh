@@ -23,7 +23,8 @@ rotate() {   # rotate NAME ID OPERATOR "m1,m2,m3"
   local name=$1 id=$2 op=$3 members=$4 m r prep addr txid vout
   echo "$(date +%FT%T) rotating $name ($op)"
   for m in ${members//,/ }; do
-    r=$(cld_ctl "$op" "(:add-member :ledger \"$id\" :member \"$(pubkey_of "$m")\" :member-ledger \"$(own_ledger_of "$m")\")")
+    # the node waits up to 180 s for the member's consent (+CONSENT-TIMEOUT+); outwait it
+    r=$(CLD_CTL_TIMEOUT=240 cld_ctl "$op" "(:add-member :ledger \"$id\" :member \"$(pubkey_of "$m")\" :member-ledger \"$(own_ledger_of "$m")\")")
     [[ "$r" == *":STATUS :OK"* ]] || { echo "   $m consent: $r"; return 1; }
   done
   # DEP-03: the rotation spends the old vault into the new one (no fresh funding); a

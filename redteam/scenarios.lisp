@@ -49,6 +49,9 @@
    (make-sc :name "confiscation-answer" :script "check-confiscation-answer.sh" :ledger-var "REDTEAM_CA"
             :env '("WAIT=1200") :timeout 3000 :tags '(:contagion)
             :note "DEP-06 spend challenge: a confiscation challenge is answered by a reference member holding the dispute")
+   (make-sc :name "confiscation-vault-rung" :script "check-confiscation-vault-rung.sh" :ledger-var "REDTEAM_CVR"
+            :env '("WAIT=2400") :timeout 4000 :tags '(:contagion)
+            :note "DEP-03 fee ladder: a confiscation of a bumped vault is judged answered by a node that never saw the rung (soak G, Nov 8)")
    (make-sc :name "confiscation-bump" :script "check-confiscation-bump.sh" :ledger-var "REDTEAM_CB"
             :env '("REFS=" "WAIT=900") :timeout 2400 :tags '(:contagion)
             :note "DEP-03 confiscation ladder: a stuck rung 0 is replaced by a higher rung, and its lottery is claimed")
