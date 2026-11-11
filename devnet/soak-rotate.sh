@@ -36,12 +36,11 @@ rotate() {   # rotate NAME ID OPERATOR "m1,m2,m3"
       dropped+=("$m")
     fi
   done
-  if [ ${#dropped[@]} -gt 0 ]; then
-    # Seat the consenting members, cut to a valid size; fewer than three cannot rotate.
-    r=$(cld_ctl "$op" "(:trim-staged :ledger \"$id\")")
-    [[ "$r" == *":STATUS :OK"* ]] || { echo "   trim-staged: $r"; return 1; }
-    echo "$(date +%FT%T) $name: dropping silent ${dropped[*]}; seating $(sx "$r" ":SEATED")"
-  fi
+  # Seat the live consents, cut to a valid size; fewer than three cannot rotate.  Always: a consent
+  # staged in an earlier failed pass is stale, and seating it makes the rotation born expired.
+  r=$(cld_ctl "$op" "(:trim-staged :ledger \"$id\")")
+  [[ "$r" == *":STATUS :OK"* ]] || { echo "   trim-staged: $r"; return 1; }
+  [ ${#dropped[@]} -gt 0 ] && echo "$(date +%FT%T) $name: dropping silent ${dropped[*]}; seating $(sx "$r" ":SEATED")"
   # DEP-03: the rotation spends the old vault into the new one (no fresh funding); a
   # rotation already broadcast but not yet recorded is resumed by :begin-quorum.
   # A rotation recorded already (an earlier pass's begin-quorum outlived its control call)

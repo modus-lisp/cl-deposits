@@ -919,12 +919,20 @@
 
 (defun trim-staged (node rec)
   "DEP-11 §Rotating without a silent member: cut REC's staged (consenting) set to the quorum the
-   operator seats (LG:SEAT-CONSENTING), unstaging the rest with QuorumRemoveMember.  Returns the
-   number to be seated; fails with fewer than three consents."
-  (let* ((l (record-ledger rec))
-         (staged (mapcar #'lg:member-pubkey (lg:ledger-next-quorum-members l)))
-         (seat (lg:seat-consenting (mapcar #'lg:member-pubkey (lg:ledger-quorum-members l)) staged)))
-    (unless seat (fail "only ~a members consented (a quorum needs 3)" (length staged)))
+   operator seats (LG:SEAT-CONSENTING over the live consents), unstaging the rest, stale consents
+   included, with QuorumRemoveMember.  Returns the number to be seated; fails with fewer than three."
+  ;; Only a live consent counts: a member staged in an earlier, failed pass keeps its old
+  ;; membership_until, and seating it bounds the new quorum's expiry by it, so the QuorumBegin is
+  ;; born expired (signet soak, Nov 10: I and K resumed rotations to quorum_expiry 9441 at height
+  ;; 10420, 105 times).  A consent counts when its commitment runs at least 72 blocks past the tip.
+  (let* ((l (record-ledger rec)) (h (height node))
+         (members (lg:ledger-next-quorum-members l))
+         (staged (mapcar #'lg:member-pubkey members))
+         (fresh (loop for m in members
+                      for until = (lg:member-membership-until m)
+                      when (or (null until) (> until (+ h 72))) collect (lg:member-pubkey m)))
+         (seat (lg:seat-consenting (mapcar #'lg:member-pubkey (lg:ledger-quorum-members l)) fresh)))
+    (unless seat (fail "only ~a members hold a live consent (a quorum needs 3)" (length fresh)))
     (dolist (m staged (length seat))
       (unless (member m seat :test #'equalp)
         (append-operation node rec (list :type :quorum-remove-member :quorum-member m
@@ -3542,6 +3550,10 @@
 
 (defvar *confirmed-claims* (make-hash-table :test #'equalp :synchronized t)
   "Claim txids we have seen confirmed: a confirmation is not re-read.")
+(defvar *unconfirmed-claims* (make-hash-table :test #'equalp :synchronized t)
+  "Claim txid -> when we last found it unconfirmed: asked again after a minute, not on every
+   co-sign check (a phantom acquire's claim never confirms, and every check paid a
+   getrawtransaction, which waits on the txindex).")
 
 (defun acquire-confirmed-p (node fork)
   "FORK carries a DisputeAcquire whose claim_txid is confirmed on chain (DEP-06, strict-lottery-v8:
@@ -3553,9 +3565,14 @@
          (let ((txid (op:field o :claim-txid)))
            (or (null (node-tx-confs-fn node))
                (and txid (gethash txid *confirmed-claims*))
-               (let ((c (ignore-errors (funcall (node-tx-confs-fn node) txid))))
-                 (when (and c (plusp c))
-                   (setf (gethash txid *confirmed-claims*) t))))))))
+               (let ((seen (and txid (gethash txid *unconfirmed-claims*))))
+                 (unless (and seen (< (- (get-universal-time) seen) 60))
+                   (let ((c (ignore-errors (funcall (node-tx-confs-fn node) txid))))
+                     (if (and c (plusp c))
+                         (progn (remhash txid *unconfirmed-claims*)
+                                (setf (gethash txid *confirmed-claims*) t))
+                         (progn (when txid (setf (gethash txid *unconfirmed-claims*) (get-universal-time)))
+                                nil))))))))))
 
 (defun cosign-refusal (own members qb-seq disputes &key ruleset)
   "DEP-05 \"Deposed operator\": a reason string when member OWN of MEMBERS must refuse to
