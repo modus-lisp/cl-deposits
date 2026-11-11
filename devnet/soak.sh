@@ -196,7 +196,11 @@ topup_collateral() {   # disputes pledge these coins and red-team runs leave dis
 }
 oracle_names() {   # every node's protocol key, so the oracle names who accused whom
   local n k; : >"$SOAK/names.tsv.new"
-  for n in $(cld_names); do k=$(timeout 20 bash -c "source '$CLD_SRC/devnet/_common.sh' >/dev/null 2>&1; cld_pubkey $n"); [ ${#k} -ge 64 ] && echo "$n $k" >>"$SOAK/names.tsv.new"; done
+  for n in $(cld_names); do   # a stopped node (an idle red-team actor) keeps the key it was last seen with
+    k=$(timeout 20 bash -c "source '$CLD_SRC/devnet/_common.sh' >/dev/null 2>&1; cld_pubkey $n" 2>/dev/null)
+    [ ${#k} -ge 64 ] || k=$(awk -v n="$n" '$1==n {print $2}' "$SOAK/names.tsv" 2>/dev/null)
+    [ ${#k} -ge 64 ] && echo "$n $k" >>"$SOAK/names.tsv.new"
+  done
   for n in $(ref_names); do [ -s "$SOAK/pubkey.$n" ] && echo "$n $(cat "$SOAK/pubkey.$n")" >>"$SOAK/names.tsv.new"; done
   mv "$SOAK/names.tsv.new" "$SOAK/names.tsv"
   # the key each operator publishes with (a reference node's Nostr key is not its protocol key)
