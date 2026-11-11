@@ -45,9 +45,17 @@ while true; do
   script=${a%%:*}; arg=""; [[ "$a" == *:* ]] && arg=${a#*:}
   [[ "$REFUSAL_ATTACKS" == *" $a "* ]] || echo "$t $a - - $WINDOW" >>"$SOAK/attacks.tsv"
   echo "$(date +%FT%T) running $a"
+  up_before=" $(for n in $(cld_names); do cld_running "$n" && echo "$n"; done | tr '\n' ' ') "
   ( export REDTEAM_V="V$(date +%s)" DEVNET=signet REDTEAM_ON_SIGNET=1 REDTEAM_MINT=1 REDTEAM_AVOID="$SOAK_OPS" REFS="${ATTACK_REFS-ref6 ref7}"
     timeout --kill-after=60 5400 bash "$CLD_SRC/redteam/$script.sh" $arg ) >"$out" 2>&1
   rc=$?; v=$(grep -oE '^(PASS|FAIL|SKIP|INVALID)[^ ]*' "$out" | tail -1)
+  # Stop the actors this run started (picked or minted): each is a full cl node, and left up they
+  # added ~4 nodes per turn until the box ran hot (2026-11-11). Re-source for nodes minted meanwhile.
+  source "$(dirname "$0")/_common.sh"
+  for n in $(cld_names); do
+    [[ " $SOAK_OPS " == *" $n "* || "$up_before" == *" $n "* ]] && continue
+    cld_running "$n" && stop_cld "$n" >/dev/null 2>&1 && echo "$(date +%FT%T)   stopped actor $n"
+  done
   "$CLD_SRC/devnet/soak.sh" names >/dev/null 2>&1; register_pool   # nodes minted during the run
   echo "$(date +%s) $a ${v:-none} $(( $(date +%s) - t ))" >>"$SOAK/attack-outcomes.tsv"   # the oracle's per-attack table
   echo "$(date +%FT%T) $a: ${v:-no verdict} (exit $rc, $(( $(date +%s) - t ))s)  $(grep -E '^(PASS|FAIL|SKIP)' "$out" | tail -1 | cut -c1-160)"
