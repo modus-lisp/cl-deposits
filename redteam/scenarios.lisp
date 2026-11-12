@@ -67,6 +67,9 @@
    (make-sc :name "rearm-late" :script "check-rearm-late.sh" :ledger-var "REDTEAM_RL"
             :env '("WAIT=1800") :timeout 6000 :tags '(:contagion :slow)
             :note "DEP-06 Phase 4 recurring windows (strict-lottery-v8, ruled 2026-11-07): a lottery stranded past both scheduled windows re-arms at the first recurring one and is claimed")
+   (make-sc :name "rearm-slow" :script "check-rearm-slow.sh" :ledger-var "REDTEAM_RS"
+            :env '("WAIT=1800") :timeout 4800 :tags '(:contagion :slow)
+            :note "DEP-06 Phase 4 re-arm with both recovery voters answering lottery_rearm_sign after the proposer's wait: their late signatures are kept and the spend still goes out (d5880288, a2d44d7a)")
    (make-sc :name "rotation-drop" :script "check-rotation-drop.sh" :ledger-var "REDTEAM_RD" :timeout 1500
             :note "DEP-11 rotating without a silent member (ruled 2026-11-10): a silent member is dropped and the consenting ones seated")
    (make-sc :name "fraud-rotation" :script "check-fraud-rotation.sh" :ledger-var "REDTEAM_FR" :timeout 1500

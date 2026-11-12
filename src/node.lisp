@@ -101,6 +101,13 @@
   ;; request ids whose (late) answers feed each one.
   (cosign-rounds (make-hash-table :test #'equalp :synchronized t))
   (late-cosign-requests (make-hash-table :test #'equal :synchronized t))
+  ;; DEP-06 Phase 4 re-arm signatures, kept like late cosignatures: request event id -> the
+  ;; sighash it asked about, and sighash hex -> ((voter-xonly . signature) ...) collected so far.
+  ;; A voter's answer can take longer than the 30 s wait (its worker is behind slow dispute work),
+  ;; and every proposer dropped every late answer: d5880288 and a2d44d7a sat at "only 1 of 3 re-arm
+  ;; signatures" while all three voters signed on every pass (signet soak, 2026-11-11).
+  (rearm-late-requests (make-hash-table :test #'equal :synchronized t))
+  (rearm-sigs (make-hash-table :test #'equal :synchronized t))
   ;; DEP-03 "When the set is final": ledger id -> the block its confiscation confirmed in.
   (confiscation-heights (make-hash-table :test #'equal :synchronized t))
   (lock (bt:make-lock "node"))
@@ -1348,6 +1355,8 @@
       ;; An answer to a cosign request after its round's deadline: kept for the retry.
       (let ((data (gethash (w:event-request-id event) (node-late-cosign-requests node))))
         (when data (keep-late-cosignature node data (w:parse-json (ev:event-content event)))))
+      (let ((sh (gethash (w:event-request-id event) (node-rearm-late-requests node))))
+        (when sh (keep-rearm-signature node sh (w:parse-json (ev:event-content event)) :late t)))
       (return-from handle-response nil))
     (progn
       (bt:with-lock-held ((waiter-lock wt))
@@ -5368,7 +5377,25 @@
     (loop for (csv . nil) in (lot::recovery-specs (lot:lottery-recovery-threshold lottery)) for i from 0
           when (>= age csv) collect i)))
 
+(defvar *rearm-spend-memo* (make-hash-table :test #'equalp :synchronized t)
+  "(node-pubkey id txid round tier tip) -> (spend next tier prevouts): REARM-SPEND-FOR's result for one
+   block.  A voter's lottery_rearm_sign handler rebuilt the spend from scratch for every request
+   (grounds, pledges, the cut), behind slow dispute work on the same worker, and answered after the
+   proposer had stopped waiting (signet soak, 2026-11-11).  The voter has usually just built the same
+   spend as a proposer, at the same tip.")
+
 (defun rearm-spend-for (node id-hex tx lottery round height &key tier)
+  "REARM-SPEND-FOR*, remembered for the current block."
+  (let* ((key (list (node-pubkey node) id-hex (btx:tx-txid tx) round tier (height node)))
+         (hit (gethash key *rearm-spend-memo*)))
+    (if hit
+        (values-list hit)
+        (let ((r (multiple-value-list (rearm-spend-for* node id-hex tx lottery round height :tier tier))))
+          (when (> (hash-table-count *rearm-spend-memo*) 512) (clrhash *rearm-spend-memo*))
+          (setf (gethash key *rearm-spend-memo*) r)
+          (values-list r)))))
+
+(defun rearm-spend-for* (node id-hex tx lottery round height &key tier)
   "The recovery spend of the lottery output of TX (LOTTERY, round ROUND, confirmed at HEIGHT) into
    round ROUND+1's lottery, through TIER (default the first open: tier 0) when it is open now:
    (values spend next-lottery tier prevouts), or NIL while the next round cannot be built (window
@@ -5377,44 +5404,80 @@
     (multiple-value-bind (opens closes) (rearm-window node id-hex height (and idx t))
       ;; No window has closed with a non-empty cut yet (the scheduled one, its reopening, or a
       ;; recurring one): nothing is due.
-      (let* ((next (or (rearm-lottery node id-hex (1+ round) opens closes) (return-from rearm-spend-for nil)))
+      (let* ((next (or (rearm-lottery node id-hex (1+ round) opens closes) (return-from rearm-spend-for* nil)))
              (open (rearm-open-tiers lottery height (height node)))
              (tier (if tier (and (member tier open) tier) (first open)))
              (sats (btx:txout-value (first (btx:tx-outputs tx))))
              (feerate (nth-value 6 (disputed-reserves node (find-record node id-hex)))))
-        (unless (and tier (plusp (lot:lottery-recovery-threshold lottery))) (return-from rearm-spend-for nil))
+        (unless (and tier (plusp (lot:lottery-recovery-threshold lottery))) (return-from rearm-spend-for* nil))
         (let ((spend (lot:rearm-spend lottery (btx:tx-txid tx) 0 sats tier (lot:lottery-spk next) :feerate (or feerate 2))))
           (values spend next tier (vector (cons sats (lot:lottery-spk lottery)))))))))
 
+(defvar *rearm-sign-timeout* 30 "Seconds a proposer waits for lottery_rearm_sign answers in one pass.")
+
+(defun keep-rearm-signature (node sighash-hex response &key late)
+  "Keep a lottery_rearm_sign RESPONSE's signature under SIGHASH-HEX when it verifies.  The voter set
+   is checked when the signatures are used (REARM-SIGNATURES), so only the signature is checked here."
+  (let ((res (and response (w:jget response "success") (w:jget response "result"))))
+    (when res
+      (let* ((pk (ignore-errors (up:x-only (hex->bytes (w:jget res "signer")))))
+             (sig (ignore-errors (hex->bytes (w:jget res "signature"))))
+             (sighash (hex->bytes sighash-hex))
+             (table (node-rearm-sigs node)))
+        (when (and pk sig (ignore-errors (schnorr:schnorr-verify pk sighash sig)))
+          (sb-ext:with-locked-hash-table (table)
+            (unless (assoc pk (gethash sighash-hex table) :test #'equalp)
+              (push (cons pk sig) (gethash sighash-hex table))
+              (when late
+                (log! node "late re-arm signature kept (~a held)" (length (gethash sighash-hex table)))))))))))
+
 (defun rearm-signatures (node id-hex lottery spend tier prevouts)
   "The recovery voters' signatures on SPEND through TIER, parallel to the sorted voters (NIL where
-   absent): ours if we are a voter, then lottery_rearm_sign until the tier's threshold is met."
+   absent): ours if we are a voter, those kept from earlier passes (late answers included), then
+   lottery_rearm_sign until the tier's threshold is met."
   (let* ((voters (lot::sorted-keys (lot:lottery-recovery-voters lottery)))
          (th (cdr (nth tier (lot::recovery-specs (lot:lottery-recovery-threshold lottery)))))
          (leaf (nth (lot::recovery-leaf-index lottery tier) (lot:lottery-leaves lottery)))
          (sighash (rot:tier-sighash spend 0 prevouts leaf))
-         (me (up:x-only (node-pubkey node)))
-         (sigs (and (member me voters :test #'equalp) (list (cons me (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))))
-    (when (< (length sigs) th)
-      (dolist (r (send-request node id-hex "lottery_rearm_sign"
-                               (w:json-object "unsigned_tx" (unsigned-tx-hex spend) "tier" tier "sighash" (bytes->hex sighash))
-                               :want (- th (length sigs)) :timeout 30 :successes-only t))
-        (let ((res (w:jget r "result")))
-          (when (and (w:jget r "success") res)
-            (let ((pk (up:x-only (hex->bytes (w:jget res "signer")))) (sig (hex->bytes (w:jget res "signature"))))
-              (when (and (member pk voters :test #'equalp) (schnorr:schnorr-verify pk sighash sig) (not (assoc pk sigs :test #'equalp)))
-                (push (cons pk sig) sigs)))))))
-    (when (< (length sigs) th) (fail "only ~a of ~a re-arm signatures" (length sigs) th))
-    ;; A threshold-1 leaf names only the lowest sorted voter: keep that voter's signature only.
-    (if (= th 1)
-        (let ((low (first voters))) (list (cdr (assoc low sigs :test #'equalp))))
-        (mapcar (lambda (v) (cdr (assoc v sigs :test #'equalp))) voters))))
+         (sh (bytes->hex sighash))
+         (me (up:x-only (node-pubkey node))))
+    (flet ((held ()
+             ;; Kept signatures that are a voter's and verify against this very sighash.
+             (remove-if-not (lambda (c) (and (member (car c) voters :test #'equalp)
+                                             (schnorr:schnorr-verify (car c) sighash (cdr c))))
+                            (gethash sh (node-rearm-sigs node)))))
+      (when (> (hash-table-count (node-rearm-late-requests node)) 4096) (clrhash (node-rearm-late-requests node)))
+      (when (> (hash-table-count (node-rearm-sigs node)) 1024) (clrhash (node-rearm-sigs node)))
+      (when (and (member me voters :test #'equalp) (not (assoc me (held) :test #'equalp)))
+        (sb-ext:with-locked-hash-table ((node-rearm-sigs node))
+          (push (cons me (schnorr:schnorr-sign (node-priv node) sighash (random-aux))) (gethash sh (node-rearm-sigs node)))))
+      (let ((have (length (held))))
+        (when (< have th)
+          (dolist (r (send-request node id-hex "lottery_rearm_sign"
+                                   (w:json-object "unsigned_tx" (unsigned-tx-hex spend) "tier" tier "sighash" sh)
+                                   :want (- th have) :timeout *rearm-sign-timeout* :successes-only t
+                                   :on-publish (lambda (eid) (setf (gethash eid (node-rearm-late-requests node)) sh))))
+            (keep-rearm-signature node sh r))))
+      (let ((sigs (held)))
+        (when (< (length sigs) th) (fail "only ~a of ~a re-arm signatures" (length sigs) th))
+        ;; A threshold-1 leaf names only the lowest sorted voter: keep that voter's signature only.
+        (if (= th 1)
+            (let ((low (first voters))) (list (cdr (assoc low sigs :test #'equalp))))
+            ;; Exactly TH signatures, the lowest sorted voters' that we hold: the spend's fee was
+            ;; sized for a TH-signature witness, and kept answers can exceed it.
+            (let ((n 0))
+              (mapcar (lambda (v) (let ((sig (cdr (assoc v sigs :test #'equalp))))
+                                    (when (and sig (< n th)) (incf n) sig)))
+                      voters)))))))
 
 (defun handle-lottery-rearm-sign (node event params)
   "A recovery voter (DEP-06 Phase 4): sign a re-arm recovery spend only if it is byte for byte the
    one we rebuild from public state, through a tier whose CSV has elapsed."
   (let ((id (w:event-ledger-id event)))
     (unless (find-record node id) (return-from handle-lottery-rearm-sign nil))
+    ;; ADVERSARY :slow-rearm-sign SECONDS — testing only: answer after SECONDS, as a voter whose
+    ;; worker is behind slow dispute work (signet soak 2026-11-11; redteam/check-rearm-slow.sh).
+    (let ((d (getf (node-adversary node) :slow-rearm-sign))) (when (and (realp d) (plusp d)) (sleep d)))
     (handler-case
         (multiple-value-bind (tx lottery round height) (current-lottery node id)
           (unless (and tx lottery height) (fail "no unclaimed lottery output on chain"))

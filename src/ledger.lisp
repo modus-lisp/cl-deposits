@@ -911,11 +911,25 @@
        ;; :tombstoned (a yield ends a round, not the dispute).  Within a round the rule above holds.
        (let ((round (or (f :rearm-round) 1)) (last (or (ledger-arm-round ledger) 1)))
          (cond ((> round last)
-                (unless (member (ledger-dispute-state ledger) '(:disputed :armed :tombstoned))
+                ;; strict-lottery-v8 (:acquire-on-confirm, ruled 2026-11-10): an acquire binds only once
+                ;; its claim confirms, and a claim that confirmed spent the lottery output, so no later
+                ;; round could re-arm it.  A later round's arm on a fork that armed and then published
+                ;; an acquire (back at :normal) therefore follows a claim that never landed, and is
+                ;; valid.  Refused, cld7's phantom acquire kept 751e6951's round 2 from ever arming
+                ;; (signet soak, 2026-11-11).
+                (unless (or (member (ledger-dispute-state ledger) '(:disputed :armed :tombstoned))
+                            (and (eq (ledger-dispute-state ledger) :normal) (ledger-arm-round ledger)
+                                 (ruleset-rule-p (ledger-active-ruleset ledger) :acquire-on-confirm)))
                   (fail :dispute-armed-rearm (format nil "a round-~a arm needs a dispute (state ~(~a~))" round (ledger-dispute-state ledger))))
                 (setf (ledger-dispute-state ledger) :rearming))
                ((< round last)
                 (fail :dispute-armed-rearm (format nil "a round-~a arm after a round-~a arm" round last)))
+               ;; No arm of the current round on a ledger in normal state: one never disputed, or a
+               ;; fork whose DisputeAcquire stands (DEP-06 Phase 4 "takes none"; deposits-rust's
+               ;; DisputeState::Normal refuses DisputeArmed).  Only a later round reopens an acquired
+               ;; fork, under strict-lottery-v8 (above).
+               ((eq (ledger-dispute-state ledger) :normal)
+                (fail :dispute-armed-rearm "an arm needs a dispute (state normal)"))
                ;; a yielded fork takes no further arm of the same round (as deposits-rust: Tombstoned
                ;; allows nothing); only a later round reopens it
                ((eq (ledger-dispute-state ledger) :tombstoned)

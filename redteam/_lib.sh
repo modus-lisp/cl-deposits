@@ -172,11 +172,71 @@ mint_cl() {   # on signet only for the adversarial soak (REDTEAM_MINT=1): new no
   done
   mine 2 >/dev/null; echo "== minted $k fresh cl nodes (cld$((have + 1))..cld$((have + k)))" >&2
 }
+# wake_cl K — start up to K existing, stopped, untainted pool nodes (a key and a data dir already).
+# The signet soak now runs only its operators (2026-11-11); its red-team pool (cld7.., minted cld19..)
+# stays stopped between attack turns, and CLEAN_CL counts only nodes that answer, so every turn
+# minted afresh until the 37 minted slots were gone and turns SKIPped.  Woken nodes are listed in
+# REDTEAM_MINTED_FILE like minted ones, so they are stopped again when the scenario ends.
+wake_cl() {
+  local k=$1 n woke=0 w
+  for n in $(cld_names | sort -t d -k2 -nr); do
+    [ $woke -ge "$k" ] && break
+    tainted "$n" && continue
+    [[ " ${REDTEAM_AVOID:-} " == *" $n "* ]] && continue
+    cld_running "$n" && continue
+    [ -f "$(cld_dir "$n")/node.key" ] || continue
+    [ -n "${REDTEAM_MINTED_FILE:-}" ] && echo "$n" >>"$REDTEAM_MINTED_FILE"
+    start_cld "$n" >&2
+    for w in $(seq 1 60); do cld_ctl "$n" '(:info)' 2>/dev/null | grep -q ":STATUS :OK" && break; sleep 5; done
+    woke=$((woke+1))
+  done
+  [ $woke -gt 0 ] && echo "== woke $woke stopped pool node(s)" >&2
+  return 0
+}
+# recycle_cl K — on signet at the minted-slot cap: give up to K tainted, stopped minted slots
+# (cld19..) a fresh key and an empty data dir, so a slot's taint never ends the adversarial soak.
+# The old dir is kept under $CLD_ROOT/recycled/ (the newest 3 only: an actor replicates ledgers).
+recycle_cl() {
+  local k=$1 n done_=0 d
+  [ "$CLD_CHAIN" = signet ] && [ "${REDTEAM_MINT:-}" = 1 ] || return 1
+  mkdir -p "$CLD_ROOT/recycled"
+  for n in $(cld_names | sort -t d -k2 -n); do
+    [ $done_ -ge "$k" ] && break
+    [ "${n#cld}" -ge 19 ] 2>/dev/null || continue
+    tainted "$n" || continue
+    cld_running "$n" && continue
+    d=$(cld_dir "$n"); [ -d "$d" ] || continue
+    mv "$d" "$CLD_ROOT/recycled/$n-$(date +%s)" && mkdir -p "$d" || continue
+    [ -f "$(cld_dir cld7)/version" ] && cp "$(cld_dir cld7)/version" "$d/version"
+    grep -vx "$n" "$TAINTED" >"$TAINTED.tmp" 2>/dev/null; mv "$TAINTED.tmp" "$TAINTED"
+    # its cached key (pubkey_of) and its recorded ledger (own_ledger: L<i> in $S/env) were the old key's
+    rm -f "$S/.cl-collateral-funded.$n" "$S/pubkey.$n"
+    [ -f "$S/env" ] && { grep -v "^L${n#cld}=" "$S/env" >"$S/env.tmp"; mv "$S/env.tmp" "$S/env"; unset "L${n#cld}"; }
+    echo "== recycled $n (fresh key)" >&2; done_=$((done_+1))
+  done
+  ls -dt "$CLD_ROOT"/recycled/* 2>/dev/null | tail -n +4 | xargs -r rm -rf
+  [ $done_ -gt 0 ]
+}
+fund_cl() {   # fund_cl NODE — collateral coins for an actor that has none yet
+  local n=$1 a j
+  [ -f "$S/.cl-collateral-funded.$n" ] && return 0
+  pubkey_of "$n" >/dev/null
+  a=$(sx "$(cld_ctl "$n" '(:address)')" ":ADDRESS") || return 1
+  for j in 1 2 3 4 5 6 7 8; do wcli sendtoaddress "$a" 0.01 >/dev/null; done
+  touch "$S/.cl-collateral-funded.$n"; mine 2 >/dev/null
+}
 pick() {
-  local pool=($(clean_cl)) i=0 v
+  local pool=($(clean_cl)) i=0 v n
   if [ ${#pool[@]} -lt $# ] && { [ "$CLD_CHAIN" = regtest ] || [ "${REDTEAM_MINT:-}" = 1 ]; }; then
-    mint_cl $(( $# - ${#pool[@]} )) && pool=($(clean_cl))
+    wake_cl $(( $# - ${#pool[@]} )); pool=($(clean_cl))
   fi
+  if [ ${#pool[@]} -lt $# ] && { [ "$CLD_CHAIN" = regtest ] || [ "${REDTEAM_MINT:-}" = 1 ]; }; then
+    if ! mint_cl $(( $# - ${#pool[@]} )); then
+      recycle_cl $(( $# - ${#pool[@]} )) && wake_cl $(( $# - ${#pool[@]} ))
+    fi
+    pool=($(clean_cl))
+  fi
+  for n in "${pool[@]}"; do [ -f "$S/.cl-collateral-funded.$n" ] || fund_cl "$n"; done
   [ ${#pool[@]} -ge $# ] || { echo "SKIP: needs $# clean cl nodes ($*), have ${#pool[@]} (${pool[*]:-none}); add fresh-key nodes (devnet/_common.sh CLD_NODES)"; exit 0; }
   for v in "$@"; do declare -g "$v=${pool[$i]}"; i=$((i+1)); done
   echo "== actors: $(for v in "$@"; do printf '%s=%s ' "$v" "${!v}"; done)"

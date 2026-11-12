@@ -2323,6 +2323,51 @@
                  (setf (fdefinition 'nd::lottery-paid-by) orig-p))))
         (setf (fdefinition 'nd::rearm-window) orig-w (fdefinition 'nd::rearm-lottery) orig-l)))))
 
+;;; DEP-06 Phase 4: a voter's late lottery_rearm_sign answer is kept for the next pass.  On the signet
+;;; soak (2026-11-11) cld4, cld5 and cld6 each signed d5880288's re-arm spend on every pass, but every
+;;; answer came after its proposer's wait and was dropped: "only 1 of 3 re-arm signatures", forever.
+(let* ((ka (tk 61616161616)) (kb (tk 62626262626)) (kc (tk 63636363636))
+       (voters (mapcar (lambda (k) (up:x-only (up:compressed-pubkey k))) (list ka kb kc)))
+       (part (lambda (i) (lot:make-participant :pubkey (up:x-only (up:compressed-pubkey (tk (+ 500 i))))
+                                               :commitment (make-array 20 :element-type '(unsigned-byte 8) :initial-element i)
+                                               :target (format nil "tb1p~a" i))))
+       (l1 (lot:build-lottery (list (funcall part 1) (funcall part 2)) voters 2 :network :regtest))
+       (l2 (lot:build-lottery (list (funcall part 3)) voters 2 :network :regtest))
+       (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (spend (lot:rearm-spend l1 txid 0 50000000 0 (lot:lottery-spk l2) :feerate 2))
+       (prevouts (vector (cons 50000000 (lot:lottery-spk l1))))
+       (leaf (nth (lot::recovery-leaf-index l1 0) (lot:lottery-leaves l1)))
+       (sighash (rot:tier-sighash spend 0 prevouts leaf))
+       (bus (bus:make-mock-bus))
+       (a (nd:make-node :priv ka :bus bus :height-fn (lambda () 900)))
+       (id (make-string 64 :initial-element #\c))
+       (nd::*rearm-sign-timeout* 1))
+  (check "a re-arm pass with no answer in time falls short"
+         (handler-case (progn (nd::rearm-signatures a id l1 spend 0 prevouts) nil) (error () t)))
+  (let ((req (loop for k being the hash-keys of (nd::node-rearm-late-requests a) return k)))
+    (check "the unanswered request is remembered" req)
+    ;; voter B's answer arrives after the wait
+    (nd::handle-event a (w:response-event (w:nostr-keypair kb) req id t
+                                          :result (w:json-object "signer" (u:bytes->hex (up:compressed-pubkey kb))
+                                                                 "signature" (u:bytes->hex (secp256k1-fast.schnorr:schnorr-sign kb sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))))))
+    (let ((sigs (handler-case (nd::rearm-signatures a id l1 spend 0 prevouts) (error () nil))))
+      (check "the next pass uses the late signature and reaches the threshold" (= 2 (count-if #'identity sigs)))
+      (check "the assembled spend verifies"
+             (and sigs (rot:verify-spend (btx:parse-tx (cl-consensus.wire:make-reader
+                                                        (btx:serialize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p t
+                                                                                       :inputs (btx:tx-inputs spend) :outputs (btx:tx-outputs spend)
+                                                                                       :witnesses (list (lot:recovery-witness l1 0 sigs))))))
+                                         0 prevouts)))))
+  ;; a forged late answer (a signature over something else) is not kept
+  (nd::keep-rearm-signature a (u:bytes->hex sighash)
+                            (let ((h (make-hash-table :test #'equal)))
+                              (setf (gethash "success" h) t
+                                    (gethash "result" h) (w:json-object "signer" (u:bytes->hex (up:compressed-pubkey kc))
+                                                                        "signature" (u:bytes->hex (secp256k1-fast.schnorr:schnorr-sign kc txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))))
+                              h))
+  (check "a signature that does not verify is not kept"
+         (not (assoc (third voters) (gethash (u:bytes->hex sighash) (nd::node-rearm-sigs a)) :test #'equalp))))
+
 ;;; DEP-06 Phase 4 step 3 (strict-lottery-v8, ruled 2026-11-07): a round's windows recur while its
 ;;; lottery output is unspent.  Regtest 4a6487ee: round 1's output at 649, nobody revealed, so o = 721,
 ;;; w = 6, and both scheduled windows were long past by 1750.  The next recurring window is (1873, 1879].

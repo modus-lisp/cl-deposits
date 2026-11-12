@@ -38,11 +38,14 @@ up() {
   ( cd "$CLD_SRC" && CL_SOURCE_REGISTRY="$(cld_registry)" \
       "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --non-interactive --eval '(require :asdf)' \
       --eval '(handler-bind ((warning (function muffle-warning))) (asdf:load-system "cl-deposits"))' >/dev/null 2>&1 ) || { echo "cl-deposits does not compile at $CLD_SRC" >&2; exit 1; }
-  local n pids=(); for n in $(cld_names); do start_cld "$n" & pids+=($!); done; wait "${pids[@]}"   # ~40 s each: in parallel (not a bare wait: the relay is a child too)
-  for n in $(cld_names); do cld_running "$n" || { echo "$n did not start" >&2; exit 1; }; done
+  # The REGTEST_CL core nodes only.  Minted actors (cld25..) stay down until a scenario's `pick`
+  # wakes them (redteam/_lib.sh wake_cl): `up` once started all of them, 282 nodes by Nov 12.
+  local core; core=$(cld_names | head -n "${REGTEST_CL:-24}")
+  local n pids=(); for n in $core; do start_cld "$n" & pids+=($!); done; wait "${pids[@]}"   # ~40 s each: in parallel (not a bare wait: the relay is a child too)
+  for n in $core; do cld_running "$n" || { echo "$n did not start" >&2; exit 1; }; done
   for n in $(ref_names); do start_ref "$n" || exit 1; done
   start_ticker
-  for n in $(cld_names); do [ -s "$SOAK/pubkey.$n" ] || cld_pubkey "$n" >"$SOAK/pubkey.$n"; done   # scenarios seat any node
+  for n in $core; do [ -s "$SOAK/pubkey.$n" ] || cld_pubkey "$n" >"$SOAK/pubkey.$n"; done   # scenarios seat any node
   if [ ! -s "$SOAK/deposits.tsv" ]; then
     SOAK_REF_DEPOSITS=${SOAK_REF_DEPOSITS:-2} SOAK_CL_WALLETS=${SOAK_CL_WALLETS:-2} "$CLD_SRC/devnet/soak.sh" setup || exit 1
   fi
