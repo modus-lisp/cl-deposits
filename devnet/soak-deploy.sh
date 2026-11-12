@@ -95,6 +95,10 @@ EOF
 switch() {   # switch NODE FROM TO — write the version file, restart under the lock, confirm from /proc
   local n=$1 from=$2 to=$3 t0; t0=$(date +%s)
   echo "$to" >"$(node_dir "$n")/version"
+  # A stopped node (the red-team pool between attack turns) is not started just to switch it: its
+  # version file is enough, and it starts on that build when a scenario wakes it.  Starting the
+  # whole pool for a deploy undid keeping the signet lean (2026-11-12).
+  if [ "$(live_version "$n")" = down ]; then log "switch $n $from -> $to recorded (stopped)"; return 0; fi
   if restart_node "$n" >>"$D/restart.log" 2>&1 </dev/null && [ "$(live_version "$n")" = "$to" ]; then
     log "switch $n $from -> $to ok ($(( $(date +%s) - t0 ))s)"; return 0
   fi
@@ -125,6 +129,7 @@ run() {   # drive the plan until every node runs its target: the fixed point
       local missed=0
       while IFS=$'\t' read -r n f t at s; do
         [ "$s" = done ] || continue
+        [ "$(live_version "$n")" = down ] && continue   # stopped: it starts on its version file
         if [ "$(live_version "$n")" != "$t" ]; then missed=1; log "fixed point: $n runs $(live_version "$n"), not $t; re-driving"; set_state "$n" retry; fi
       done <"$PLAN"
       if [ "$missed" = 0 ]; then
