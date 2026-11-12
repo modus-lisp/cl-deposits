@@ -186,6 +186,9 @@ wake_cl() {
     cld_running "$n" && continue
     [ -f "$(cld_dir "$n")/node.key" ] || continue
     [ -n "${REDTEAM_MINTED_FILE:-}" ] && echo "$n" >>"$REDTEAM_MINTED_FILE"
+    # Its collateral went to earlier scenarios' pledges: fund it again (pick -> fund_cl).  A woken
+    # cld251 had "0 unpledged", never armed, and rearm-restart saw one participant (2026-11-12).
+    rm -f "$S/.cl-collateral-funded.$n"
     start_cld "$n" >&2
     for w in $(seq 1 60); do cld_ctl "$n" '(:info)' 2>/dev/null | grep -q ":STATUS :OK" && break; sleep 5; done
     woke=$((woke+1))
@@ -238,6 +241,7 @@ pick() {
   fi
   for n in "${pool[@]}"; do [ -f "$S/.cl-collateral-funded.$n" ] || fund_cl "$n"; done
   [ ${#pool[@]} -ge $# ] || { echo "SKIP: needs $# clean cl nodes ($*), have ${#pool[@]} (${pool[*]:-none}); add fresh-key nodes (devnet/_common.sh CLD_NODES)"; exit 0; }
-  for v in "$@"; do declare -g "$v=${pool[$i]}"; i=$((i+1)); done
+  # i again: bash scope is dynamic, and start_cld (via wake_cl) runs its own unlocal `for i` loop.
+  i=0; for v in "$@"; do declare -g "$v=${pool[$i]}"; i=$((i+1)); done
   echo "== actors: $(for v in "$@"; do printf '%s=%s ' "$v" "${!v}"; done)"
 }
