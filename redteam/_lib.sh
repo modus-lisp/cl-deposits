@@ -211,6 +211,10 @@ recycle_cl() {
     d=$(cld_dir "$n"); [ -d "$d" ] || continue
     mv "$d" "$CLD_ROOT/recycled/$n-$(date +%s)" && mkdir -p "$d" || continue
     [ -f "$(cld_dir cld7)/version" ] && cp "$(cld_dir cld7)/version" "$d/version"
+    # The taint stays with the old KEY: the oracle reads adversaries.tsv by key, so proofs against
+    # the burned key stay PASS after the slot's name is clean again (soak-oracle.py; CHAOS.md).
+    old=$(cat "$S/pubkey.$n" 2>/dev/null || awk -v n="$n" '$1==n{print $2}' "$S/names.tsv" 2>/dev/null | tail -1)
+    [ -n "$old" ] && printf 'key\t%s\trecycled %s %s\n' "$old" "$n" "$(date +%FT%T)" >>"$S/adversaries.tsv"
     grep -vx "$n" "$TAINTED" >"$TAINTED.tmp" 2>/dev/null; mv "$TAINTED.tmp" "$TAINTED"
     # its cached key (pubkey_of) and its recorded ledger (own_ledger: L<i> in $S/env) were the old key's
     rm -f "$S/.cl-collateral-funded.$n" "$S/pubkey.$n"
