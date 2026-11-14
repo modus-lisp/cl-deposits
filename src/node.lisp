@@ -654,6 +654,14 @@
   (run-hooks node rec update)
   update)
 
+(defvar *cosign-post-expiry-establishment*
+  (let ((v (uiop:getenv "CLD_REFUSE_POST_EXPIRY_ROTATION"))) (not (and v (plusp (length v)) (not (string= v "0")))))
+  "Member policy, not protocol (DEP-05 §Cosignature Threshold, ruled 2026-11-14: \"we can allow it,
+   but we can't require members to sign\").  T (the default): we cosign, and consent to, a rotation
+   of a quorum past its expiry exactly as we would before it, which rescues an operator that missed
+   its deadline.  NIL (CLD_REFUSE_POST_EXPIRY_ROTATION=1, or the control port's (:policy ...)): we
+   refuse.  Expiry released us; refusing is never a fault.")
+
 (defparameter *cosign-tip-wait-seconds* 10
   "How long a cosigner waits for its tip to reach a proposed height above it (within the tolerance).")
 
@@ -1747,6 +1755,9 @@
                      (lg:cosign-requirement ledger o block-height)
                    (declare (ignore required signers tier operator-alone))
                    (unless allowed (fail "not cosignable at this height")))
+                 (unless (member-cosigns-post-expiry-p block-height (lg:ledger-quorum-expiry ledger)
+                                                       (lg::establishment-p o) *cosign-post-expiry-establishment*)
+                   (fail "member policy: we do not cosign a rotation past quorum_expiry"))
                  (when (eq (op:operation-type o) :quorum-begin) (check-quorum-begin-vault node rec o params block-height))
                  (when (eq (op:operation-type o) :dormancy-accept) (check-dormancy-accept node rec o params))
                  (when (and (eq (op:operation-type o) :dormancy-notice) (op:field o :migration-receiver))
@@ -1823,6 +1834,10 @@
                         (subseq their-id 0 8) (lg:ledger-sequence (record-ledger rec)) want)
                   (fail "history is not this operator's"))))
           (unless (record-fork-p rec) (setf (gethash their-id (node-ledgers node)) rec))
+          ;; Member policy: a seat on a quorum past its expiry is offered, never owed.
+          (let ((e (lg:ledger-quorum-expiry (record-ledger rec))))
+            (unless (member-cosigns-post-expiry-p (height node) e t *cosign-post-expiry-establishment*)
+              (fail "member policy: we do not join a rotation past quorum_expiry ~a" e)))
           (let* ((until (let ((u (w:jget params "membership_until"))) (if (integerp u) u (+ (height node) 4320))))
                  (consent (schnorr:schnorr-sign (node-priv node)
                                                 (sha256 (cat (ascii->bytes "COLLATERAL_CONSENT") operator (ascii->bytes their-id)))
@@ -1940,6 +1955,10 @@
   "A QuorumBegin that rotates a current vault is checked against the unsigned rungs it carries
    (DEP-03 Rotation ordering); one with no current vault (the first, or the first after a
    DisputeAcquire) against the chain."
+  ;; DEP-06 §Race: a confiscation that confirmed first decided it.  No rotation of that vault
+  ;; can be spent, so we never record one (a post-expiry re-establishment races only until then).
+  (when (and (has-quorum-begin-p rec) (not (record-fork-p rec)) (reserves-confiscated-p node rec))
+    (fail "the vault's confiscation confirmed: no rotation of it can be spent"))
   (if (and (has-quorum-begin-p rec) (not (record-fork-p rec)))
       (let ((rungs (mapcar (lambda (h) (btx:parse-tx (bw:make-reader (hex->bytes h))))
                            (coerce (or (w:jget params "rotation_rungs_tx") #()) 'list))))
@@ -2997,6 +3016,25 @@
    (re-establishment) ends it, unless its confiscation already confirmed.  Vector:
    expiry_dispute_ends.json."
   (and (not confiscation-confirmed) (integerp last-valid-seq) (> latest-quorum-begin-seq last-valid-seq)))
+
+(defun expiry-dispute-outcome (armed reestablished confiscation-confirmed)
+  "DEP-06 §Race, a post-expiry rotation (ruled 2026-11-14): (values yield release-pledge) for our
+   quorum_expired dispute.  A re-establishment after its fork point ends it whether or not we
+   armed: we yield and our pledge (arm or none) lapses with no lottery, unless the confiscation
+   confirmed first, when the chain has decided and the dispute runs on.  ARMED never changes the
+   answer; it is in the signature because the reference once yielded only armed disputes.
+   Vector: post_expiry_rotation.json."
+  (declare (ignore armed))
+  (let ((end (and reestablished (not confiscation-confirmed))))
+    (values end end)))
+
+(defun member-cosigns-post-expiry-p (height quorum-expiry establishment policy)
+  "Whether a member signs an op of class ESTABLISHMENT at HEIGHT: before QUORUM-EXPIRY always (the
+   protocol's own checks still apply), past it only an establishment op, and that only by POLICY
+   (*COSIGN-POST-EXPIRY-ESTABLISHMENT*).  Vector: post_expiry_rotation.json."
+  (cond ((or (null quorum-expiry) (< height quorum-expiry)) t)
+        ((not establishment) nil)
+        (t (and policy t))))
 
 (defun arm-on-expiry-dispute-p (anchor-height governing-expiry last-valid-seq latest-quorum-begin-seq)
   "DEP-05: a quorum_expired DisputeEnter is armed on only while its ground stands: its anchor is

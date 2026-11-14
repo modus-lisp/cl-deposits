@@ -62,6 +62,10 @@
          (loop for (k v) on (cdr (member :set form)) by #'cddr
                do (setf (getf (nd:node-adversary node) k) v))
          (ok :adversary (nd:node-adversary node)))
+        (:policy   ; (:policy :post-expiry-rotation t|nil) / (:policy) — member policy (DEP-05, ruled 2026-11-14)
+         (let ((v (member :post-expiry-rotation form)))
+           (when v (setf nd::*cosign-post-expiry-establishment* (and (second v) t))))
+         (ok :post-expiry-rotation nd::*cosign-post-expiry-establishment*))
         (:forge-lock   ; red team: (:forge-lock :ledger L :from DEP :to DEP :msat N) — as operator, lock a
                        ; deposit with NO depositor witness, straight to the cosigners (docs/REDTEAM.md)
          (let* ((rec (rec! node form)) (h (nd:height node))

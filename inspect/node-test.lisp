@@ -2444,4 +2444,23 @@
                (handler-bind ((warning #'muffle-warning)) (setf (fdefinition 'nd::disputed-reserves) orig))))))
     (uiop:delete-directory-tree dir :validate (lambda (p) (search "cld-restart-test-" (namestring p))))))
 
+;;; inspect/vectors/post_expiry_rotation.json, shared with deposits-rust
+;;; (deposits-protocol/tests/vectors/post_expiry_rotation.json): a rotation past expiry is offered,
+;;; never owed (ruled 2026-11-14), and a re-establishment ends our expiry dispute, armed or not.
+(with-gate ("rotation past expiry: member policy and dispute outcome, against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "post_expiry_rotation.json")))))
+    (loop for c across (gethash "cosign" v)
+          for e = (gethash "quorum_expiry" c)
+          do (check-equal (gethash "name" c)
+                          (nd::member-cosigns-post-expiry-p (gethash "block_height" c) (and (integerp e) e)
+                                                            (eq (gethash "establishment" c) t)
+                                                            (eq (gethash "cosign_post_expiry" c) t))
+                          (eq (gethash "cosign" c) t)))
+    (loop for c across (gethash "outcome" v)
+          do (multiple-value-bind (y r) (nd::expiry-dispute-outcome (eq (gethash "armed" c) t)
+                                                                    (eq (gethash "reestablished" c) t)
+                                                                    (eq (gethash "confiscation_confirmed" c) t))
+               (check-equal (format nil "~a: yield" (gethash "name" c)) (and y t) (eq (gethash "yield" c) t))
+               (check-equal (format nil "~a: pledge" (gethash "name" c)) (and r t) (eq (gethash "release_pledge" c) t))))))
+
 (report)

@@ -178,3 +178,32 @@ re-confiscate.
   refuse a QuorumBegin for leaving a member out. cl `lg:seat-consenting` + `:trim-staged`, Rust
   `rotation_seat::seat_consenting` + the auto-refresh drop path, vector `rotation_seat.json`,
   `soak-rotate` drops a silent member within `SOAK_DROP_MARGIN`, regtest `rotation-drop`.
+
+## 11. A rotation past expiry (ruled 2026-11-14: "i think we can allow it, but we can't require members to sign")
+
+- **Asked:** may a quorum rotate after its expiry? Under REVIEW 8 a rotation ends an expiry
+  dispute, and the soak fork reported that cl never cosigns a post-expiry QuorumBegin, so a lapsed
+  ledger could never be saved that way.
+- **What the code actually did:** both implementations already cosigned establishment ops
+  (QuorumAddMember, QuorumRemoveMember, QuorumBegin) past expiry, at the tier's threshold (DEP-05
+  §Lifecycle, DEP-06 §Race). The "not cosignable at this height" refusals on the soak were
+  transfer-locks (op 70), which are rightly refused past expiry. On the live soak H, J and L
+  re-established past expiry (expiries 5855/5881/5874 became 7151/7177/7170, and the rotation
+  rungs confirmed). B, D and F had already been confiscated.
+- **Ruling (2026-11-14):** allowed, never owed, under every ruleset (it judges nothing):
+  - A post-expiry QuorumBegin is valid at its tier's threshold until a confiscation of the vault
+    confirms. Confirmed spends decide the race; mempool spends do not.
+  - No member is obliged to take part. A refusal is never a fault, never grounds for a proof,
+    dispute or arm, and never counts as silence against the member. Its only consequence is DEP-11's:
+    the member is not seated.
+  - When the re-establishment confirms first, every expiry dispute on the ledger ends: each
+    disputant yields, armed or not, and every pledge lapses with no lottery and no loss.
+  - A member never cosigns a QuorumBegin over a vault whose confiscation confirmed.
+  - Implementation policy: cosign by default, with an opt-out (cl `CLD_REFUSE_POST_EXPIRY_ROTATION`
+    or the control port's `(:policy :post-expiry-rotation nil)`; Rust
+    `DEPOSITS_REFUSE_POST_EXPIRY_ROTATION`).
+- **Gap found:** Rust yielded only an armed expiry dispute. An un-armed one stayed open for good
+  (ref2, ref3 and ref7 on J). Rust now yields it too.
+- **Where:** spec DEP-05 §A rotation past expiry is allowed, never owed, and §When a
+  `quorum_expired` dispute ends; DEP-06 §Race, "Confirmed decides; pledges lapse with the loser".
+  Vector `post_expiry_rotation.json`; regtest `rotation-post-expiry` (`rescue`, `confiscated`).

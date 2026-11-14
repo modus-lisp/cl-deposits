@@ -72,6 +72,10 @@
             :note "DEP-06 Phase 4 re-arm with both recovery voters answering lottery_rearm_sign after the proposer's wait: their late signatures are kept and the spend still goes out (d5880288, a2d44d7a)")
    (make-sc :name "rotation-drop" :script "check-rotation-drop.sh" :ledger-var "REDTEAM_RD" :timeout 1500
             :note "DEP-11 rotating without a silent member (ruled 2026-11-10): a silent member is dropped and the consenting ones seated")
+   (make-sc :name "rotation-post-expiry" :script "check-rotation-post-expiry.sh" :args '("rescue") :ledger-var "REDTEAM_PX" :timeout 1800
+            :tags '(:disruptive) :note "DEP-05/06 a rotation past expiry is allowed, never owed (ruled 2026-11-14): rescued with the members that agree, a declining member unpenalised, every expiry dispute yields")
+   (make-sc :name "rotation-post-expiry-confiscated" :script "check-rotation-post-expiry.sh" :args '("confiscated") :ledger-var "REDTEAM_PX" :timeout 2400
+            :tags '(:disruptive) :note "DEP-06 Race: a confiscation that confirmed first; no rotation of the confiscated vault is recorded")
    (make-sc :name "fraud-rotation" :script "check-fraud-rotation.sh" :ledger-var "REDTEAM_FR" :timeout 1500
             :note "DEP-05 deposed operator (strict-lottery-v8, ruled 2026-11-10): a fraud dispute outlives a rotation")
    (make-sc :name "acquire-unconfirmed" :script "check-acquire-unconfirmed.sh" :ledger-var "REDTEAM_AU" :timeout 1200
