@@ -250,6 +250,17 @@ pick() {
   for n in "${pool[@]}"; do [ -f "$S/.cl-collateral-funded.$n" ] || fund_cl "$n"; done
   [ ${#pool[@]} -ge $# ] || { echo "SKIP: needs $# clean cl nodes ($*), have ${#pool[@]} (${pool[*]:-none}); add fresh-key nodes (devnet/_common.sh CLD_NODES)"; exit 0; }
   # i again: bash scope is dynamic, and start_cld (via wake_cl) runs its own unlocal `for i` loop.
+  # A running actor whose loaded code is not its build's current tree restarts on it (by tree hash,
+  # devnet/_common.sh cld_tree_hash; a node with no record restarts too).
+  local stale=() want
+  for n in "${pool[@]:0:$#}"; do
+    want=$(cld_tree_hash "$(cld_src_of "$n")")
+    [ "$(cat "$(cld_dir "$n")/loaded-tree" 2>/dev/null)" = "$want" ] || stale+=("$n")
+  done
+  if [ ${#stale[@]} -gt 0 ]; then
+    echo "== restarting ${stale[*]} on the current tree"
+    for n in "${stale[@]}"; do ( stop_cld "$n" >/dev/null 2>&1; start_cld "$n" >/dev/null ) & done; wait
+  fi
   i=0; for v in "$@"; do declare -g "$v=${pool[$i]}"; i=$((i+1)); done
   echo "== actors: $(for v in "$@"; do printf '%s=%s ' "$v" "${!v}"; done)"
 }

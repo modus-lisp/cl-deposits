@@ -115,6 +115,11 @@ node_dir()     { case "$1" in cld*) echo "$CLD_ROOT/$1";; ref*) echo "$CLD_ROOT/
 node_version() { cat "$(node_dir "$1")/version" 2>/dev/null; }
 cl_build()     { echo "$CL_BUILDS/cl-$CLD_CHAIN-$1"; }
 rust_build()   { echo "$RUST_BUILDS/$1"; }
+# The code a cl build loads: its sources, its system definition and its dependency commits.  A node
+# records it when it starts (loaded-tree), so a running node on an older tree can be told apart
+# from one on the current tree (regtest 2026-11-15: pool nodes left running from earlier code
+# passed scenarios on rules the tree no longer had).
+cld_tree_hash() { local src=${1:-$CLD_SRC}; { cat "$src"/src/*.lisp "$src"/bin/*.lisp "$src"/*.asd 2>/dev/null; git -C "$src" submodule status 2>/dev/null | cut -c2-41; } | sha256sum | cut -c1-16; }
 cld_src_of()   { local v; v=$(node_version "$1"); if [ -n "$v" ]; then cl_build "$v"; else echo "$CLD_SRC"; fi; }
 ref_bin_of()   { local v; v=$(node_version "$1"); if [ -n "$v" ]; then echo "$(rust_build "$v")/deposits-node"; else echo "$REF_NODE_BIN"; fi; }
 live_build()   {   # what a running node actually runs: its cl worktree (the daemon's cwd) or its reference binary's dir
@@ -258,6 +263,7 @@ start_cld() {
       # loader held an 84 MB file as a 4-byte-per-char string.  Three nodes died "Heap
       # exhausted, game over" on the first night.
   # Loading a soaked node's ledgers (~180k updates each) takes minutes before the control port opens.
+  cld_tree_hash "$src" >"$dir/loaded-tree"   # hashed at launch: what the daemon is about to load
   for i in $(seq 1 "${CLD_START_WAIT:-600}"); do (echo >/dev/tcp/127.0.0.1/$(cld_port "$n")) 2>/dev/null && { echo "$n up (control $(cld_port "$n"))"; return 0; }; sleep 1; done
   echo "$n did not come up; see $dir/cld.log" >&2; return 1
 }

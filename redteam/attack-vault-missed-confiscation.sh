@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
 # redteam/attack-vault-missed-confiscation.sh — a confiscation the watcher does not know of.
 #
-# A vault spend is excused if it is a recorded rotation or a confiscation the WATCHER knows
-# (one it disputed in or signed).  On a fresh cl-only ledger (OP, a clean node, operates; cld2..cld6 cosign),
-# cld3 cld4 cld5 cld6 dispute and confiscate (majority 4 of 6).  cld2 never disputes.  Then:
-#   - cld6 (a disputant) must NOT report the confiscation as a vault spend   [PASS condition]
-#   - cld2 (no fork) does report it, naming the honest confiscation signers  [the known limit]
-# The limit's contagion lands on the signers' (honest) ledgers wherever a verifier also lacks the
-# record.  REDTEAM_MC=name forms a fresh ledger per run.
+# A vault spend is excused if it is a recorded rotation or a confiscation the rules rebuild from
+# public state; once it was excused only if the WATCHER knew it (one it disputed in or signed).
+# On a fresh cl-only ledger (OP, a clean node, operates; members C2..C5, D5, D6, OBS), C2..C5
+# cosign a forged lock blind: a real fault, so the dispute has grounds under grounded-arms-v7
+# (2026-11-15: the earlier form disputed with no fraud proof, every arm was ungrounded and nothing
+# ever confiscated). D5 and D6 dispute on its proof and confiscate (the accused are no voters).
+#   - D6 (a disputant) must NOT report the confiscation as a vault spend   [PASS condition]
+#   - OBS either disputed too (it saw the fault), or rebuilds the confiscation from the relay and
+#     excuses it; one that reports it names the honest signers (the old limit).
+# REDTEAM_MC=name forms a fresh ledger per run.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
 WAIT=${WAIT:-600}
-pick OP OBS D3 D4 D5 D6   # clean: a tainted operator's ledger is disputed on sight by OBS too, hiding the limit
-X=$(RESP=${RESP:-5} form_ledger "${REDTEAM_MC:-MC}" $OP "" $OBS $D3 $D4 $D5 $D6) || exit 1
-taint "$OP"   # confiscated below
-echo "== ledger $X: $D3 $D4 $D5 $D6 dispute"
-for n in $D3 $D4 $D5 $D6; do cld_ctl $n "(:dispute-enter :ledger \"$X\" :reason \"redteam missed-confiscation\")" >/dev/null; done
+pick OP OBS C2 C3 C4 C5 D5 D6
+X=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "${REDTEAM_MC:-MC}" $OP "" $C2 $C3 $C4 $C5 $D5 $D6 $OBS) || exit 1
+FROM=$(fresh_deposits "${REDTEAM_MC:-MC}" $OP "$X" 1 | head -1); [ -n "$FROM" ] || fail "no deposit on the ledger"
+trap 'for n in $C2 $C3 $C4 $C5; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null 2>&1; done' EXIT
+for n in $C2 $C3 $C4 $C5; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
+cld_ctl $OP "(:forge-lock :ledger \"$X\" :from \"$FROM\" :to \"$FROM\" :msat 1000000)" >/dev/null
+sleep 10
+for n in $C2 $C3 $C4 $C5; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null; done
+taint "$OP" $C2 $C3 $C4 $C5   # confiscated below
+echo "== ledger $X: the forged lock is proven; $D5 and $D6 dispute"
+for n in $D5 $D6; do cld_ctl $n "(:dispute-enter :ledger \"$X\" :reason \"redteam missed-confiscation\")" >/dev/null; done
+D3=$D5; D4=$D6
 conf=""
 for i in $(seq 1 $((WAIT / 5))); do
-  for n in $D3 $D4 $D5 $D6; do   # any disputant: one that armed late is not in the lottery and never logs it
+  for n in $D5 $D6 $OBS; do   # any disputant: one that armed late is not in the lottery and never logs it
     conf=$(cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "confiscation .* on chain" | grep -F "dispute ${X:0:8}:" | grep -oE '[0-9a-f]{64}' | tail -1)
     [ -n "$conf" ] && break
   done

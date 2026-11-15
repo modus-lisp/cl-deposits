@@ -71,7 +71,7 @@
             :env '("WAIT=1800") :timeout 4800 :tags '(:contagion :slow)
             :note "DEP-06 Phase 4 re-arm with both recovery voters answering lottery_rearm_sign after the proposer's wait: their late signatures are kept and the spend still goes out (d5880288, a2d44d7a)")
    (make-sc :name "rearm-invert" :script "check-rearm-invert.sh" :ledger-var "REDTEAM_RI"
-            :env '("WAIT=1800") :timeout 4800 :tags '(:contagion :slow)
+            :env '("WAIT=3600" "CHECK_TIMEOUT=7000") :timeout 7200 :tags '(:contagion :slow)
             :note "two rule inverters in a re-arm round: a late same-round arm after the close stays in the cut (DEP-06 step 2), and a voter that inverts the arm selection is refused while the honest spend lands")
    (make-sc :name "backdated-arm" :script "check-backdated-arm.sh" :ledger-var "REDTEAM_BA"
             :env '("WAIT=1500") :timeout 3600 :tags '(:contagion :slow)
@@ -135,7 +135,7 @@
    (make-sc :name "vault-rotate-late" :script "attack-vault-rotate-grace.sh" :args '("late")
             :ledger-var "REDTEAM_RG" :timeout 900 :tags '(:contagion) :note "signers remember the rotation; a non-signer reports a late one")
    (make-sc :name "vault-missed-confiscation" :script "attack-vault-missed-confiscation.sh"
-            :ledger-var "REDTEAM_MC" :env '("WAIT=900") :timeout 1500 :tags '(:contagion :slow))
+            :ledger-var "REDTEAM_MC" :env '("WAIT=1500") :timeout 2400 :tags '(:contagion :slow))
    (make-sc :name "withhold-reveal" :script "attack-withhold-reveal.sh" :ledger-var "REDTEAM_W"
             :env '("REFS=" "WAIT=1200") :timeout 5400 :tags '(:contagion :slow))
    (make-sc :name "veto-pledge" :script "attack-veto-pledge.sh" :ledger-var "REDTEAM_VP"

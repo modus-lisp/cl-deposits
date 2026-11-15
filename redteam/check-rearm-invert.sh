@@ -20,11 +20,14 @@ W=$(COLLATERAL_SATS=25000000 RESP=${RESP:-5} form_ledger "$ROW" $OP "" $C2 $C3 $
 FROM=$(fresh_deposits "$ROW" $OP "$W" 1 | head -1); [ -n "$FROM" ] || fail "no deposit on the ledger"
 # The block ticker would race the paced mining below: pause it for the run.
 "$CLD_SRC/devnet/regtest-net.sh" ticker stop
-trap '"$CLD_SRC/devnet/regtest-net.sh" ticker start; for n in $C2 $C3 $C4 $C5; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null 2>&1; done; for n in $H $H2 $H3; do cld_ctl $n "(:adversary :set :yield-win nil :late-rearm nil :invert-arm-selection nil)" >/dev/null 2>&1; done' EXIT
+trap '"$CLD_SRC/devnet/regtest-net.sh" ticker start; for n in $C2 $C3 $C4 $C5; do cld_ctl $n "(:adversary :set :cosign-blind nil)" >/dev/null 2>&1; done; for n in $H $H2 $H3; do cld_ctl $n "(:adversary :set :yield-win nil :late-rearm nil :invert-arm-selection nil :rearm-sign-only nil)" >/dev/null 2>&1; done' EXIT
 
 for n in $H $H2 $H3; do expect "$(cld_ctl $n "(:adversary :set :yield-win t)")"; done
 expect "$(cld_ctl $H2 "(:adversary :set :late-rearm t)")"
 expect "$(cld_ctl $H3 "(:adversary :set :invert-arm-selection t)")"
+# Sequencing: H and H2 sign but do not propose (:rearm-sign-only), so the inverter H3 is the
+# first proposer once H2's late arm exists; H proposes the honest spend after a refusal.
+for n in $H $H2; do expect "$(cld_ctl $n "(:adversary :set :rearm-sign-only t)")"; done
 for n in $C2 $C3 $C4 $C5; do expect "$(cld_ctl $n "(:adversary :set :cosign-blind t)")"; done
 cld_ctl $OP "(:forge-lock :ledger \"$W\" :from \"$FROM\" :to \"$FROM\" :msat 1000000)" >/dev/null
 sleep 10
@@ -77,8 +80,13 @@ echo "== $yielded of 3 participants logged a round-1 yield"
 slow_until $((HC + 142)) 1; slow_until $((HC + 144 + 14)) 15
 echo "== waiting for the re-arm spend of $CONF:0"
 R2=""
+released=""
 for i in $(seq 1 $((WAIT / 5))); do
   if [ -z "$(bcli gettxout "$CONF" 0 true 2>/dev/null | head -1)" ]; then R2=$(spender_of "$CONF" 0); [ -n "$R2" ] && break; fi
+  # Once an honest voter refused the inverter's spend (or after 45 minutes: a busy inverter may see the late arm late), H may propose.
+  if [ -z "$released" ] && { [ "$i" -ge 540 ] || cat "$(cld_dir $H)/node.log" "$(cld_dir $H2)/node.log" | grep -aqE "refused lottery_rearm_sign: (node: )?the re-arm spend is not the one we rebuild"; }; then
+    expect "$(cld_ctl $H "(:adversary :set :rearm-sign-only nil)")"; released=1; echo "== $H may now propose"
+  fi
   [ $((i % 4)) -eq 0 ] && mine 1 >/dev/null
   sleep 5
 done
@@ -90,13 +98,14 @@ echo "== re-arm spend $R2; $H2 late-armed; waiting for round 2's reveals and cla
 CLAIM=""
 for i in $(seq 1 $((WAIT / 5))); do
   if [ -z "$(bcli gettxout "$R2" 0 true 2>/dev/null | head -1)" ]; then CLAIM=$(spender_of "$R2" 0); [ -n "$CLAIM" ] && break; fi
-  [ $((i % 6)) -eq 0 ] && mine 1 >/dev/null
+  # Fast enough to pass round 2's 72-block reveal deadline (a subset claim) within WAIT.
+  [ $((i % 2)) -eq 0 ] && mine 1 >/dev/null
   sleep 5
 done
 [ -n "$CLAIM" ] || fail "round 2's lottery output $R2:0 was not claimed within ${WAIT}s"
 grep -aF "dispute ${W:0:8}: re-arm round 2's lottery on chain; revealed" "$(cld_dir $H2)/node.log" >/dev/null \
   || fail "$H2 is not a round-2 participant: its late arm withdrew it from the closed window"
-refused=$(for n in $H $H2; do grep -aF "refused lottery_rearm_sign: the re-arm spend is not the one we rebuild" "$(cld_dir $n)/node.log" | head -1 | sed "s/^/$n: /"; done)
+refused=$(for n in $H $H2; do grep -aE "refused lottery_rearm_sign: (node: )?the re-arm spend is not the one we rebuild" "$(cld_dir $n)/node.log" | head -1 | sed "s/^/$n: /"; done)
 [ -n "$refused" ] || fail "nobody refused the inverter's spend (did $H3 propose? $(grep -aF "dispute ${W:0:8}: ADVERSARY: inverter" "$(cld_dir $H3)/node.log" | tail -1))"
 for n in $C2 $C3 $C4 $C5 $H $H2 $H3 $OP; do
   if cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND|unauthori[sz]ed spend" | grep -qi "${R2:0:16}"; then

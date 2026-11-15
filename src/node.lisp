@@ -5854,7 +5854,12 @@
                                 (null (set-exclusive-or (ids (pick-round-arms all (1+ round) dwo dwc))
                                                         (ids (inverted-round-arms all (1+ round) dwo dwc))
                                                         :test #'equalp)))))))
-             (note-dispute node id-hex "ADVERSARY: inverter waits for a late arm in round ~a" (1+ round)))
+             (let* ((all (%all-arms node id-hex))
+                    (w (multiple-value-list (rearm-round-window-of node id-hex (1+ round) opens closes))))
+               (note-dispute node id-hex "ADVERSARY: inverter waits for a late arm in round ~a (window ~a..~a; ~a arms of the round: ~{~a~^ ~})"
+                             (1+ round) (second w) (third w) (count (1+ round) all :key #'seventh)
+                             (loop for a in all when (eql (seventh a) (1+ round))
+                                   collect (format nil "~a/~a@~a" (subseq (bytes->hex (first a)) 2 8) (sixth a) (fifth a))))))
             ;; ADVERSARY :rearm-sign-only — testing only: a voter that answers lottery_rearm_sign but
             ;; never proposes, so another implementation's proposer is the one whose spend lands
             ;; (redteam/check-rearm-rust.sh).
