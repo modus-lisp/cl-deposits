@@ -1097,7 +1097,10 @@
     (multiple-value-bind (cur txid vout sats) (disputed-reserves node rec)
       ;; The vault a confiscation (or another rotation) already spent cannot be rotated: every
       ;; member refuses its rungs ("vault outpoint is spent") and the attempt repeats for good.
-      (when (vault-spent-p node txid vout)
+      ;; ADVERSARY :rotate-spent-vault — an operator that asks its quorum to record a rotation of
+      ;; a vault already spent (red team: DEP-06 §Race, members refuse a QuorumBegin over a vault
+      ;; whose confiscation confirmed; regtest rotation-post-expiry-confiscated).
+      (when (and (vault-spent-p node txid vout) (not (getf (node-adversary node) :rotate-spent-vault)))
         (fail "the vault ~a:~a is already spent (confiscated or rotated); not rotating" (bytes->hex txid) vout))
       (let* ((tier-index (rotation-tier-index cur (height node)))
              (tier (nth tier-index (rs:reserves-tiers cur)))

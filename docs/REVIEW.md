@@ -210,6 +210,23 @@ re-confiscate.
 - **Where:** spec DEP-05 §A rotation past expiry is allowed, never owed, and §When a
   `quorum_expired` dispute ends; DEP-06 §Race, "Confirmed decides; pledges lapse with the loser".
   Vector `post_expiry_rotation.json`; regtest `rotation-post-expiry` (`rescue`, `confiscated`).
+- **Known point: an opted-out member still signs the rungs.** The policy gates the cosign of the
+  establishment ops and the consent to a seat. If the rotation is recorded anyway (the other members
+  are a majority), an opted-out member of the spent vault still answers `rotation_sign`, because by
+  then its replica shows the new quorum's expiry. Left as is, because it cannot harm that member:
+  - It signs only rungs it rebuilds byte for byte from a final, recorded `QuorumBegin`, of a vault
+    it is a member of, while that vault is unspent (`handle-rotation-sign`). The spend is therefore
+    always answered by that `QuorumBegin`, and no unauthorised-spend proof (type 7) can stand
+    against a signer.
+  - Signing a rung and a confiscation of the same vault is not equivocation, which is two signed
+    updates at one sequence; the chain settles which spend wins.
+  - It moves none of the member's own funds. The member's collateral is on its own ledger, not in
+    the vault.
+  The only cost is to the member's choice. Its signature can be the one that lets a rotation it
+  declined reach its tier's threshold, which ends its own expiry dispute and its chance at that
+  confiscation's lottery. That's an opportunity cost, not a loss. If it matters, the fix is for
+  `rotation_sign` to read the same policy against the spent vault's expiry (the governing
+  `QuorumBegin`'s), not the replica's.
 
 ## 12. Backdated arms (ruled 2026-11-15: "A for now, but let's write down the scenario in the repo")
 

@@ -12,7 +12,10 @@
 #                 rotation, every member's expiry dispute yielded (W's too) and its pledge lapsed,
 #                 no confiscation, and nobody proved or disputed anything against W.
 #   confiscated : short arm windows (RESP); the confiscation confirms first, then the operator
-#                 tries to rotate.  PASS = no QuorumBegin is recorded over the confiscated vault.
+#                 (red-team :rotate-spent-vault, so it skips its own spent-vault check) asks its
+#                 members to record a rotation of the confiscated vault.  PASS = C1 and C2 each log
+#                 the refusal "the vault's confiscation confirmed: no rotation of it can be spent",
+#                 and no QuorumBegin is recorded.
 # REDTEAM_PX=name forms a fresh ledger per run.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
 ARM=${1:-rescue}; WAIT=${WAIT:-1200}
@@ -96,10 +99,22 @@ case $ARM in
     [ -z "$(bcli gettxout "$VTX" "$VVOUT" false | head -1)" ] || fail "the vault was not spent in ${WAIT}s"
     mine 3 >/dev/null; sleep 20
     BEFORE=$(info $OP | grep -oE ':EXPIRY [0-9]+' | cut -d' ' -f2)
+    # The operator really asks: :rotate-spent-vault skips its own spent-vault check, so its
+    # QuorumBegin over the confiscated vault reaches the members, who must refuse it for that reason.
+    arm :rotate-spent-vault $OP
+    trap 'cld_ctl $W "(:policy :post-expiry-rotation t)" >/dev/null 2>&1; disarm :rotate-spent-vault $OP' EXIT
+    MARK=$(date -u +%FT%T)
     RT=$(rotate); rc=$?
+    disarm :rotate-spent-vault $OP
     AFTER=$(info $OP | grep -oE ':EXPIRY [0-9]+' | cut -d' ' -f2)
     [ $rc = 0 ] && fail "a rotation was recorded over the confiscated vault ($RT)"
     [ "$BEFORE" = "$AFTER" ] || fail "the ledger's expiry moved from $BEFORE to $AFTER: a QuorumBegin was recorded"
-    echo "PASS: the confiscation confirmed first; no rotation of the confiscated vault was recorded.";;
+    refused=""
+    for n in $C1 $C2; do
+      line=$(cld_ctl $n '(:log :n 4000)' | awk -v m="$MARK" '$1 >= m' | grep "refused cosign" | grep -m1 "confiscation confirmed: no rotation of it can be spent")
+      [ -n "$line" ] || fail "$n did not refuse the QuorumBegin for the confiscated vault (its log since $MARK has no such refusal)"
+      echo "   $n: $line"; refused="$refused $n"
+    done
+    echo "PASS: the confiscation confirmed first; the operator's QuorumBegin over the confiscated vault was refused by$refused for that reason, and no rotation was recorded.";;
   *) fail "arm: rescue | confiscated";;
 esac
