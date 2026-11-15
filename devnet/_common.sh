@@ -167,7 +167,8 @@ start_ref() {
   [ -f "$dir/seed.hex" ] || head -c 32 /dev/urandom | xxd -p -c 64 >"$dir/seed.hex"
   local from=$(( $(stat -c %s "$dir/node.log" 2>/dev/null || echo 0) + 1 ))   # the log is ~1 GB: grep only this run's part
   local bin; bin=$(ref_bin_of "$n"); [ -x "$bin" ] || { echo "$n: no build at $bin (version $(node_version "$n"))" >&2; return 1; }
-  ( cd "$dir" && setsid -f nohup env $(ref_env) "$bin" run --network "$CLD_CHAIN" --relay "$RELAY_URL" --esplora "$ESPLORA_URL" \
+  # REF_EXTRA_ENV: testing knobs for this start only (e.g. DEPOSITS_REDTEAM_NO_ARM=1, redteam/check-rearm-mixed.sh)
+  ( cd "$dir" && setsid -f nohup env $(ref_env) ${REF_EXTRA_ENV:-} "$bin" run --network "$CLD_CHAIN" --relay "$RELAY_URL" --esplora "$ESPLORA_URL" \
       --data-dir "$dir" --seed-file "$dir/seed.hex" --name "$n" --admin-bind "127.0.0.1:$(ref_port "$n")" >>"$dir/node.log" 2>&1 </dev/null
     sleep 1; pgrep -nf "deposits-node run .*--data-dir $dir " >"$dir/ref.pid" )
   # A soaked node loads ~180k updates per ledger before it syncs its wallet: minutes, not seconds.

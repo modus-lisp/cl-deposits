@@ -466,6 +466,23 @@
                                 (lg:ledger-error () nil))
                               (eq (gethash "ok" case) t)))))))
 
+;;; inspect/vectors/dispute_armed_round.json: DisputeArmed's rearm_round (TLV 366) on the wire,
+;;; shared with deposits-rust (deposits-protocol/tests/vectors/dispute_armed_round.json).
+(with-gate ("DEP-06 re-arm rounds: DisputeArmed's TLV 366 against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "dispute_armed_round.json")))))
+    (loop for c across (gethash "cases" v)
+          for round = (let ((r (gethash "rearm_round" c))) (and (integerp r) r))
+          for op = (append (list :type :dispute-armed :armed-block 100
+                                 :commitment-hash (make-array 20 :element-type '(unsigned-byte 8) :initial-element #x11)
+                                 :target-reserves "bcrt1qtarget"
+                                 :replacement-collateral-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
+                                 :replacement-collateral-vout 1 :replacement-collateral-amount 50000)
+                           (and round (list :rearm-round round)))
+          for want = (gethash "hex" c)
+          do (check-equal (format nil "~a: encoding" (gethash "name" c)) (u:bytes->hex (op:encode-operation op)) want)
+             (check-equal (format nil "~a: decoded round" (gethash "name" c))
+                          (op:field (op:decode-operation (u:hex->bytes want)) :rearm-round) round))))
+
 ;;; inspect/vectors/cosign_refusal.json: DEP-05 "Deposed operator", shared with deposits-rust
 ;;; (deposits-node/tests/vectors/cosign_refusal.json).
 (with-gate ("DEP-05 deposed operator: cosign refusal against the shared vector")
