@@ -467,7 +467,88 @@
                    (nd::rebuilt-confiscation-p stranger id ctx :spend-height *height* :updates (cons stale relay)))
             (check "and the builder's anchor is the scoped fork point's"
                    (equalp (rot:anchor-of ctx) (nd::dispute-anchor (nd::dispute-view stranger id (nd::dispute-scope (cons stale relay))) id))))
-          ;; DEP-06 §Authorised confiscation: the base ends at the dispute's last fork point.  The
+;; DEP-03 §Arm manifests (ruled 2026-11-15, option A; docs/ADVERSARIAL.md §Backdated arms).
+          ;; A participant signs a round-1 re-arm dated at the confiscation's block, pledging a coin
+          ;; no pledge lookup knows, and publishes it after the spend: every subset of the latest
+          ;; arms then fails to rebuild the spend, while the arm set its signers used still does.
+          ;; Built on a copy of the relay's updates: nothing is published.
+          (clrhash nd::*rebuilt-confiscations*) (clrhash nd::*rebuilt-misses*)
+          (let* ((known (mapcar #'fourth (nd:armers-of b id)))
+                 ;; the vector's pledges: each armer's declared coin, created at block 1 and unspent;
+                 ;; any other coin is unknown (not found)
+                 (judge (nd:make-node :priv (tk 88888888888888888886) :bus bus :height-fn hf
+                                      :pledge-fn (lambda (txid vout from) (declare (ignore from))
+                                                   (let ((k (find-if (lambda (p) (and (equalp (first p) txid) (eql (second p) vout))) known)))
+                                                     (and k (list :created 1 :value-sats (third k) :spend :unspent))))))
+                 (relay (nd::ledger-updates-from-relays judge id))
+                 (manifest (nd::lottery-manifest b id lottery))
+                 (armer (find-if (lambda (m) (equalp (nd:node-pubkey m) (first (first manifest)))) (list b c d)))
+                 (fork (and armer (nd:find-fork armer id (nd:node-pubkey armer))))
+                 (prior (and fork (car (last (nd::record-updates-of fork :dispute-armed)))))
+                 (backdated (and prior
+                                 (let* ((o (op:update-op prior))
+                                        (u (nd::new-update armer fork
+                                                           (list :type :dispute-armed :armed-block *height*
+                                                                 :commitment-hash (op:field o :commitment-hash)
+                                                                 :target-reserves (op:field o :target-reserves)
+                                                                 :replacement-collateral-txid (u:sha256 (u:ascii->bytes "a coin created after E"))
+                                                                 :replacement-collateral-vout 0
+                                                                 :replacement-collateral-amount (op:field o :replacement-collateral-amount))
+                                                           :height *height*)))
+                                   (up:sign-operator u (nd::node-priv armer)) u)))
+                 (after (and backdated (cons backdated relay)))
+                 (view (and after (nd::dispute-view judge id (nd::dispute-scope after) :confiscated-at *height*))))
+            (check "manifest: the confiscation's signer names one arm per participant"
+                   (= (length manifest) (length (lot:lottery-participants lottery))))
+            (check "manifest: the backdated re-arm is built (signed at the confiscation's block)"
+                   (and backdated (= (up:update-block-height backdated) *height*)))
+            (check "manifest: before A, every subset of the latest arms fails to rebuild the confiscation"
+                   (and view (not (nd::rebuild-matches-p view id ctx))))
+            (check "manifest: the arm set its signers used still rebuilds it, backdated arm and all"
+                   (and view (nd::rebuild-matches-p view id ctx :manifest manifest)))
+            (check "manifest: a set that leaves out a participant does not rebuild it (no answer)"
+                   (and view (> (length manifest) 1) (not (nd::rebuild-matches-p view id ctx :manifest (rest manifest)))))
+            ;; Permissionless: a manifest published by a node that signed nothing (a stranger's key)
+            ;; answers for the spend; the judge checks it from public state.
+            (let ((orig (fdefinition 'nd::ruleset-at-fork-point)))
+              (setf (fdefinition 'nd::ruleset-at-fork-point) (lambda (&rest a) (declare (ignore a)) "strict-lottery-v8"))
+              (unwind-protect
+                   (progn
+                     (clrhash nd::*rebuilt-confiscations*) (clrhash nd::*rebuilt-misses*)
+                     (check "manifest: without one, the judge does not excuse the spend after the backdated arm"
+                            (not (nd::rebuilt-confiscation-p judge id ctx :spend-height *height* :updates after)))
+                     (let ((stranger (nd:make-node :priv (tk 77777777777777777771) :bus (bus:make-mock-bus))))
+                       (nd::handle-challenge-answer
+                        judge (w:challenge-answer-event (nd::node-keypair stranger) id (u:bytes->hex (btx:tx-txid ctx)) "" '()
+                                                        :arms (mapcar (lambda (a) (list (u:bytes->hex (first a)) (second a))) manifest))))
+                     (clrhash nd::*rebuilt-confiscations*) (clrhash nd::*rebuilt-misses*)
+                     (check "manifest: a non-signer's published manifest answers for it (permissionless)"
+                            (nd::rebuilt-confiscation-p judge id ctx :spend-height *height* :updates after)))
+                (setf (fdefinition 'nd::ruleset-at-fork-point) orig)))
+            (check "manifest: naming the backdated arm instead does not rebuild it"
+                   (and view (not (nd::rebuild-matches-p view id ctx
+                                                         :manifest (cons (list (first (first manifest)) (up:update-seq backdated)) (rest manifest))))))
+            (when (and backdated (uiop:getenv "CL_DEPOSITS_WRITE_VECTORS"))
+              (let ((out (lambda (tx) (u:bytes->hex (nd::unsigned-bytes tx))))
+                    (armers (sort (copy-list (nd:armers-of b id)) #'u:bytes< :key #'first)))
+                (with-open-file (o "inspect/vectors/confiscation_manifest.txt" :direction :output :if-exists :supersede)
+                  (format o "# DEP-03 §Arm manifests (shared cl-deposits / deposits-rust), generated by cl-deposits~%")
+                  (format o "# (inspect/node-test.lisp).  authorised_confiscation.txt's dispute, plus a participant's round-1~%")
+                  (format o "# re-arm signed at the spend's block and pledging an unknown coin (published after the spend).~%")
+                  (format o "# A case is a spend, the arm manifest it is judged by (armer:seq, comma-separated; - for none:~%")
+                  (format o "# the subsets of the latest arms), and 1 = excused.~%")
+                  (format o "network signet~%ledger ~a~%spend_height ~a~%" id *height*)
+                  (dolist (u after) (format o "update ~a~%" (u:bytes->hex (up:encode-update u))))
+                  (dolist (a armers)
+                    (destructuring-bind (txid vout sats) (fourth a)
+                      (format o "pledge ~a ~a ~a 1~%" (u:bytes->hex txid) vout sats)))
+                  (flet ((m (l) (format nil "~{~a~^,~}" (mapcar (lambda (e) (format nil "~a:~a" (u:bytes->hex (first e)) (second e))) l))))
+                    (format o "case latest_arms 0 - ~a~%" (funcall out ctx))
+                    (format o "case manifest 1 ~a ~a~%" (m manifest) (funcall out ctx))
+                    (format o "case manifest_missing_a_participant 0 ~a ~a~%" (m (rest manifest)) (funcall out ctx))
+                    (format o "case manifest_names_the_backdated_arm 0 ~a ~a~%"
+                            (m (cons (list (first (first manifest)) (up:update-seq backdated)) (rest manifest))) (funcall out ctx)))))))
+                    ;; DEP-06 §Authorised confiscation: the base ends at the dispute's last fork point.  The
           ;; operator's chain may carry on past it with the fault itself (a colluding majority's
           ;; invalid credit): a judge that replayed it failed to rebuild an honest rung and
           ;; challenged it (signet soak, 6056fb38 rung 1, 2026-11-04).  Here the relay shows one of
@@ -2372,11 +2453,12 @@
 ;;; lottery output is unspent.  Regtest 4a6487ee: round 1's output at 649, nobody revealed, so o = 721,
 ;;; w = 6, and both scheduled windows were long past by 1750.  The next recurring window is (1873, 1879].
 (handler-bind ((warning #'muffle-warning))
-  (let ((orig (fdefinition 'nd::rearm-armers)) (orig-a (fdefinition 'nd::armers-of)))
+  (let ((orig (fdefinition 'nd::rearm-armers)) (orig-a (fdefinition 'nd::%all-arms)))
     (setf (fdefinition 'nd::rearm-armers)
           (lambda (n i r o c) (declare (ignore n i r)) (and (< o 1875 (1+ c)) (list :an-armer)))
-          ;; one arm, signed at 1875 (an armer entry's fifth element is its block height)
-          (fdefinition 'nd::armers-of) (lambda (&rest a) (declare (ignore a)) (list (list :k :c :t :x 1875))))
+          ;; one round-2 arm, signed at 1875 (an arm's fifth element is its block height, sixth its
+          ;; sequence, seventh its round)
+          (fdefinition 'nd::%all-arms) (lambda (&rest a) (declare (ignore a)) (list (list :k :c :t :x 1875 7 2))))
     (unwind-protect
          (progn
            (check-equal "past both scheduled windows with no arm, no window has a cut"
@@ -2385,7 +2467,7 @@
                         (multiple-value-list (nd::rearm-round-window-of nil "x" 2 721 727 1880)) '(9 1873 1879))
            (check-equal "while it is still open, no spend is due"
                         (nd::rearm-round-window-of nil "x" 2 721 727 1879) nil))
-      (setf (fdefinition 'nd::rearm-armers) orig (fdefinition 'nd::armers-of) orig-a))))
+      (setf (fdefinition 'nd::rearm-armers) orig (fdefinition 'nd::%all-arms) orig-a))))
 
 ;;; A restarted node and a confiscated ledger (signet soak 2026-11-07, 751e6951).  After a restart
 ;;; cld7 opened a second dispute on the dead vault, rebuilt a confiscation that was not on chain,

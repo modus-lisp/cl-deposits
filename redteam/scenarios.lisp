@@ -70,6 +70,9 @@
    (make-sc :name "rearm-slow" :script "check-rearm-slow.sh" :ledger-var "REDTEAM_RS"
             :env '("WAIT=1800") :timeout 4800 :tags '(:contagion :slow)
             :note "DEP-06 Phase 4 re-arm with both recovery voters answering lottery_rearm_sign after the proposer's wait: their late signatures are kept and the spend still goes out (d5880288, a2d44d7a)")
+   (make-sc :name "rearm-invert" :script "check-rearm-invert.sh" :ledger-var "REDTEAM_RI"
+            :env '("WAIT=1800") :timeout 4800 :tags '(:contagion :slow)
+            :note "two rule inverters in a re-arm round: a late same-round arm after the close stays in the cut (DEP-06 step 2), and a voter that inverts the arm selection is refused while the honest spend lands")
    (make-sc :name "backdated-arm" :script "check-backdated-arm.sh" :ledger-var "REDTEAM_BA"
             :env '("WAIT=1500") :timeout 3600 :tags '(:contagion :slow)
             :note "reproduction (unruled finding): a counted armer's round-1 re-arm signed at the confiscation block after it confirmed, pledging a later coin; a judge judging afresh must still find the confiscation authorised")

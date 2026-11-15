@@ -173,11 +173,15 @@ string is the key file's content)."
                                      "update" update-b64))
                   :tags (list (list "l" spent-ledger-id-hex) (list "d" (subseq spent-ledger-id-hex 0 16)))))
 
-(defun challenge-answer-event (keypair spent-ledger-id-hex txid-hex anchor-hex updates-b64)
-  "Kind 9112: the signed updates (base64 TLV) answering a challenge of the spent ledger's vault."
+(defun challenge-answer-event (keypair spent-ledger-id-hex txid-hex anchor-hex updates-b64 &key arms (round 1))
+  "Kind 9112: the signed updates (base64 TLV) answering a challenge of the spent ledger's vault.
+   ARMS, a list of (armer-pubkey-hex seq): DEP-06 §Arm manifests, the arm set the spend TXID-HEX
+   (a confiscation, ROUND 1, or the re-arm spend into round ROUND) was built from."
   (ev:build-event keypair +kind-challenge-answer+
-                  (json (json-object "challenged_ledger_id" spent-ledger-id-hex "txid" txid-hex "anchor" anchor-hex
-                                     "updates" (coerce updates-b64 'vector)))
+                  (json (apply #'json-object "challenged_ledger_id" spent-ledger-id-hex "txid" txid-hex "anchor" anchor-hex
+                               "updates" (coerce updates-b64 'vector)
+                               (and arms (list "round" round
+                                               "arms" (coerce (loop for (k q) in arms collect (json-object "armer" k "seq" q)) 'vector)))))
                   :tags (list (list "l" spent-ledger-id-hex) (list "d" (subseq spent-ledger-id-hex 0 16)))))
 
 (defun event-member (event) (ev:first-tag-value event "member"))

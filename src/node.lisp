@@ -172,6 +172,8 @@
   (signed-rotations (make-hash-table :test (quote equal) :synchronized t))   ; ledger id hex -> rotation txids we signed
   (inflight-rotations (make-hash-table :test (quote equalp) :synchronized t)) ; rung-0 txid -> (:rungs signed bytes :qb-height h), rebroadcast and bumped until one confirms
   (spend-answers (make-hash-table :test (quote equal) :synchronized t))   ; ledger id hex -> updates answering spend challenges (Kind 9112)
+  ;; DEP-06 §Arm manifests: ledger id hex -> ((round txid-hex arms) ...), arms ((pubkey33 seq) ...)
+  (arm-manifests (make-hash-table :test (quote equal) :synchronized t))
   ;; ledger id hex -> proposed confiscation txs we received, signed or not: a proposal we
   ;; refused (a different view of the cut, a fee we would not pick) may be the one that lands.
   (seen-confiscations (make-hash-table :test (quote equal) :synchronized t))
@@ -2870,7 +2872,12 @@
                (when ps
                  (let ((l (ignore-errors (lot:build-lottery ps voters threshold :network network))))
                    (and l (equalp (lot:lottery-spk l) spk) l))))))
-      (or (try (ignore-errors (lottery-armers node id-hex)))
+      ;; DEP-06 §Arm manifests: the arm sets the confiscation's signers published first; then our
+      ;; cut, then every subset of the latest arms (a judge without a manifest).
+      (or (let ((c (gethash id-hex (node-confiscation-heights node))) (all (%all-arms node id-hex)))
+            (loop for m in (arm-manifests-of node id-hex 1)
+                  thereis (let ((named (manifest-arms all m 1 -1 (or c most-positive-fixnum)))) (and named (try named)))))
+          (try (ignore-errors (lottery-armers node id-hex)))
           (let ((all (sort (copy-list (armers-of node id-hex)) #'bytes< :key #'first)))
             (when (<= (length all) 8)
               (loop for mask from (1- (ash 1 (length all))) downto 1
@@ -3973,6 +3980,69 @@
           for mine = (remove-if-not (lambda (a) (eql (seventh a) round)) counted)
           when mine collect (car (last mine)))))
 
+(defun pick-round-arms (arms round opens closes)
+  "DEP-06 Phase 4 step 2: of ARMS (%all-arms entries), each armer's arm for re-arm round ROUND in
+   the window (OPENS, CLOSES]: the latest (by sequence) of its first +max-arms+ arms that is of
+   ROUND and whose signed block_height lies inside the window.  Arms outside the window, or of
+   other rounds, still count against the bound but never displace an in-window arm: taking the
+   latest counted arm and filtering it by the window after let a later same-round arm signed past
+   the close withdraw its armer from a closed window, or empty the cut (2026-11-15).  Pure;
+   vector rearm_window_arms.json."
+  (let ((by (make-hash-table :test #'equalp)))
+    (dolist (a arms) (push a (gethash (first a) by)))
+    (loop for list being the hash-values of by
+          for counted = (subseq (sort (copy-list list) #'< :key #'sixth) 0 (min +max-arms+ (length list)))
+          for inside = (remove-if-not (lambda (a) (and (eql (seventh a) round) (< opens (fifth a)) (<= (fifth a) closes))) counted)
+          when inside collect (car (last inside)))))
+
+(defun inverted-round-arms (arms round opens closes)
+  "ADVERSARY :invert-arm-selection (testing only, a rule inverter): the rule PICK-ROUND-ARMS
+   replaced, each armer's latest counted arm of ROUND, then kept only if inside (OPENS, CLOSES]."
+  (let ((by (make-hash-table :test #'equalp)))
+    (dolist (a arms) (push a (gethash (first a) by)))
+    (loop for list being the hash-values of by
+          for counted = (subseq (sort (copy-list list) #'< :key #'sixth) 0 (min +max-arms+ (length list)))
+          for mine = (car (last (remove-if-not (lambda (a) (eql (seventh a) round)) counted)))
+          when (and mine (< opens (fifth mine)) (<= (fifth mine) closes)) collect mine)))
+
+;;; DEP-06 §Arm manifests (strict-lottery-v8; ruled 2026-11-15, option A).  A fork's DisputeArmed is
+;;; self-signed, so an armer can publish an arm dated into a window after that window's spend was
+;;; signed or confirmed.  Judges therefore never re-derive "each armer's latest arm" for a spend that
+;;; exists: the spend's signers publish the arms they used, and the spend is honest iff that set of
+;;; arms is valid and rebuilds it byte for byte.
+
+(defun %armer-label (armer) (if (stringp armer) armer (bytes->hex (subseq armer 0 (min 4 (length armer))))))
+
+(defun manifest-arms (arms manifest round opens closes)
+  "The arms MANIFEST names, as ARMS entries (%ALL-ARMS shape: first the armer, fifth the signed
+   height, sixth the sequence, seventh the round), or (values NIL reason) when the manifest is not
+   a valid arm set for ROUND's window (OPENS, CLOSES] (round 1: OPENS -1, CLOSES the confiscation
+   block).  MANIFEST is a list of (armer seq).  Valid: every entry names an arm we hold, no armer
+   twice, each arm among its armer's first +MAX-ARMS+ (by sequence, every round), of ROUND, and
+   signed inside the window.  Omitting an armer is not a fault (signing policy)."
+  (let ((by (make-hash-table :test #'equalp)) (out '()) (seen '()))
+    (dolist (a arms) (push a (gethash (first a) by)))
+    (when (null manifest) (return-from manifest-arms (values nil "empty manifest")))
+    (dolist (m manifest (values (sort out (lambda (x y) (if (stringp x) (string< x y) (bytes< x y))) :key #'first) nil))
+      (destructuring-bind (armer seq) m
+        (when (member armer seen :test #'equalp)
+          (return-from manifest-arms (values nil (format nil "armer ~a named twice" (%armer-label armer)))))
+        (push armer seen)
+        (let* ((counted (let ((l (sort (copy-list (gethash armer by)) #'< :key #'sixth)))
+                          (subseq l 0 (min +max-arms+ (length l)))))
+               (a (find seq (gethash armer by) :key #'sixth)))
+          (cond ((null a) (return-from manifest-arms (values nil (format nil "no arm ~a/~a" (%armer-label armer) seq))))
+                ((not (member a counted)) (return-from manifest-arms (values nil (format nil "arm ~a/~a is past the ~a-arm bound" (%armer-label armer) seq +max-arms+))))
+                ((not (eql (seventh a) round)) (return-from manifest-arms (values nil (format nil "arm ~a/~a is of round ~a" (%armer-label armer) seq (seventh a)))))
+                ((not (and (< opens (fifth a)) (<= (fifth a) closes)))
+                 (return-from manifest-arms (values nil (format nil "arm ~a/~a signed at ~a, outside (~a, ~a]" (%armer-label armer) seq (fifth a) opens closes))))
+                (t (push a out))))))))
+
+(defun round-arms (node arms round opens closes)
+  (if (and node (getf (node-adversary node) :invert-arm-selection))
+      (inverted-round-arms arms round opens closes)
+      (pick-round-arms arms round opens closes)))
+
 (defun %all-arms (node id-hex)
   "Every DisputeArmed on every fork of the ledger, newest first within each fork."
   (loop for fork in (dispute-forks node id-hex)
@@ -4600,6 +4670,8 @@
           (unless (find (btx:tx-txid signed) (gethash id-hex (node-signed-confiscations node)) :key (lambda (e) (btx:tx-txid (car e))) :test #'equalp)
             (push (cons signed lottery) (gethash id-hex (node-signed-confiscations node)))))
         (dolist (fork (forks-of node id-hex)) (setf (record-lottery fork) lottery (record-confiscation fork) (first assembled)))
+        (handler-case (dolist (signed assembled) (publish-arm-manifest node id-hex signed lottery))
+          (error (e) (log! node "arm manifest of ~a: ~a" (subseq id-hex 0 8) e)))
         (values (first assembled) lottery)))))
 
 (defun broadcast (node tx)
@@ -4931,15 +5003,19 @@
                        when u collect (op:field o :reason))))
     (and reasons (every #'expiry-reason-p reasons))))
 
-(defun rebuild-matches-p (view id-hex tx)
+(defun rebuild-matches-p (view id-hex tx &key manifest)
   "TX is byte for byte a confiscation VIEW builds: at TX's tier (a confiscation tier, never the
    tie-breaker), in the dispute's shape, its lottery over the cut of some subset of the arms
    counted as of the confiscation's block, with that subset's snapshot for the obligations (as a
-   proposer that saw only those arms builds it).  Mirrors deposits-rust's rebuild_matching."
+   proposer that saw only those arms builds it).  MANIFEST (DEP-06 §Arm manifests, a list of
+   (pubkey33 seq)): exactly the arms it names, valid as of the confiscation's block, and no other
+   set.  Mirrors deposits-rust's rebuild_matching."
   (let* ((reserves (disputed-reserves view (find-record view id-hex)))
          (tiers (rs:reserves-tiers reserves))
          (ti (position (btx:tx-locktime tx) tiers :key #'rs:tier-locktime))
-         (all (sort (copy-list (grounded-armers view id-hex (armers-of view id-hex :until (gethash id-hex (node-confiscation-heights view)))))
+         (c (gethash id-hex (node-confiscation-heights view)))
+         (named (and manifest (manifest-arms (%all-arms view id-hex) manifest 1 -1 (or c most-positive-fixnum))))
+         (all (sort (copy-list (grounded-armers view id-hex (if manifest named (armers-of view id-hex :until c))))
                     #'bytes< :key #'first))
          (floor-sats (eligibility-floor-sats view id-hex))
          (respectful (view-respectful-p view id-hex))
@@ -4950,8 +5026,9 @@
          (accused (and (lg:ruleset-rule-p ruleset :strict-lottery) (dispute-accused-keys view id-hex)))
          (want (unsigned-bytes tx))
          (tried '()))
-    (when (and ti (not (rs:tier-tie-breaker-p (nth ti tiers))) all (<= (length all) 8))
-      (loop for mask from (1- (ash 1 (length all))) downto 1
+    (when (and ti (not (rs:tier-tie-breaker-p (nth ti tiers))) all
+               (if manifest (= (length all) (length manifest)) (<= (length all) 8)))
+      (loop for mask from (1- (ash 1 (length all))) downto (if manifest (1- (ash 1 (length all))) 1)
             for arms = (loop for a in all for i from 0 when (logbitp i mask) collect a)
             thereis (multiple-value-bind (in out snapshot) (split-armers arms floor-sats (node-pledge-fn view) :tip (height view))
                       (declare (ignore out))
@@ -4999,7 +5076,8 @@
       ;; DisputeEnter a disputant ever made, is excused too: that reading only ever excuses more,
       ;; never convicts more, so it holds under every ruleset (DEP-18).
       (let* ((scoped (dispute-scope updates))
-             (verdict (or (let ((view (and scoped (ignore-errors (dispute-view node id-hex scoped :confiscated-at spend-height)))))
+             (verdict (or (manifest-confiscation-p node id-hex tx scoped spend-height)
+                          (let ((view (and scoped (ignore-errors (dispute-view node id-hex scoped :confiscated-at spend-height)))))
                             (and view (forks-of view id-hex) (ignore-errors (rebuild-matches-p view id-hex tx))))
                           (and (/= (length scoped) (length updates))
                                (let ((view (ignore-errors (dispute-view node id-hex updates :confiscated-at spend-height :every-enter t))))
@@ -5010,6 +5088,20 @@
                    (remhash txid *rebuilt-misses*))
             (setf (gethash txid *rebuilt-misses*) (list (length updates) disputes (get-universal-time))))
         verdict))))
+
+(defun manifest-confiscation-p (node id-hex tx scoped spend-height)
+  "DEP-06 §Arm manifests (strict-lottery-v8): some published arm set for ID-HEX's round 1 is valid
+   as of the confiscation's block and rebuilds TX byte for byte.  Never the latest arm of each
+   armer: an arm signed into the window after the spend (fork updates are not cosigned) cannot
+   unmake it."
+  (let ((view (and scoped (ignore-errors (dispute-view node id-hex scoped :confiscated-at spend-height)))))
+    (and view (forks-of view id-hex)
+         (lg:ruleset-rule-p (ruleset-at-fork-point view id-hex) :strict-lottery)
+         (loop for m in (arm-manifests-of node id-hex 1 :refresh t)
+               thereis (and (ignore-errors (rebuild-matches-p view id-hex tx :manifest m))
+                            (progn (log! node "~a's spend ~a rebuilds from its arm manifest (~a arms)" (subseq id-hex 0 8)
+                                         (subseq (bytes->hex (reverse (btx:tx-txid tx))) 0 16) (length m))
+                                   t))))))
 
 (defun handle-confiscation-sign (node event params)
   "A recovery-quorum member: rebuild the confiscation from public state and sign
@@ -5074,6 +5166,8 @@
                   (push (cons r lottery) (gethash id (node-signed-confiscations node)))))
               (log! node "signed confiscation of ~a proposed by ~a (fee ~a sats)" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8)
                     (- (reduce #'+ prevouts :key #'car) (reduce #'+ (btx:tx-outputs tx) :key #'btx:txout-value)))
+              (handler-case (dolist (r (if proposed-rungs rungs (list proposed))) (publish-arm-manifest node id r lottery))
+                (error (e) (log! node "arm manifest of ~a: ~a" (subseq id 0 8) e)))
               (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
                                                            "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) expected (random-aux)))
                                                            ;; DEP-06: one signature per swept migration output
@@ -5375,7 +5469,7 @@
 (defun rearm-armers (node id-hex round opens closes)
   "Round ROUND's participants: the arms for that round signed inside (OPENS, CLOSES], through the
    same grounds, accused exclusion and eligibility cut as round 1.  (values participants excluded)."
-  (let* ((arms (remove-if-not (lambda (a) (< opens (fifth a) (1+ closes))) (armers-of node id-hex :round round)))
+  (let* ((arms (round-arms node (%all-arms node id-hex) round opens closes))
          (floor-sats (eligibility-floor-sats node id-hex)))
     (multiple-value-bind (grounded ungrounded) (grounded-armers node id-hex arms)
       (multiple-value-bind (grounded accused) (accused-cut grounded (dispute-accused-keys node id-hex))
@@ -5389,9 +5483,9 @@
   ;; The round's arms are read once; the cut (grounds, accused, pledges) runs only for a window
   ;; that holds one.  A lottery stranded for weeks has dozens of closed windows, and this runs on
   ;; every pass (regtest, 2026-11-07: the full cut per window starved a busy node's dispute loop).
-  (let ((arms (armers-of node id-hex :round round)))
+  (let ((arms (%all-arms node id-hex)))
     (lot:rearm-round-window opens (- closes opens) tip
-                            (lambda (o c) (and (find-if (lambda (a) (< o (fifth a) (1+ c))) arms)
+                            (lambda (o c) (and (round-arms node arms round o c)
                                                (rearm-armers node id-hex round o c))))))
 
 (defun rearm-lottery (node id-hex round opens closes &optional (tip (height node)))
@@ -5408,6 +5502,27 @@
                                      voters threshold :network (intern (string-upcase (node-network node)) :keyword))
                   wo wc))))))
 
+(defun manifest-round-lottery (node id-hex round opens closes spend-height spk)
+  "DEP-03 §Arm manifests (DEP-06 Phase 4 step 5): ROUND's lottery from a published arm manifest
+   valid in one of the round's windows (scheduled (OPENS, CLOSES], then its reopening and the
+   recurring ones) that closed by SPEND-HEIGHT, whose lottery pays SPK; NIL if none does."
+  (let ((manifests (arm-manifests-of node id-hex round :refresh t)))
+   (when manifests
+    (let ((arms (%all-arms node id-hex)) (w (- closes opens)))
+    (multiple-value-bind (voters threshold) (ignore-errors (lottery-voters node id-hex))
+     (when voters
+      (loop for m in manifests
+            thereis (loop for j from 0
+                          for (wo wc) = (multiple-value-list (lot:rearm-window-nth opens w j))
+                          while (<= wc spend-height)
+                          thereis (let ((named (manifest-arms arms m round wo wc)))
+                                    (and named
+                                         (let ((l (ignore-errors
+                                                   (lot:build-lottery (loop for (pk c target) in named
+                                                                            collect (lot:make-participant :pubkey (up:x-only pk) :commitment c :target target))
+                                                                      voters threshold :network (intern (string-upcase (node-network node)) :keyword)))))
+                                           (and l (equalp (lot:lottery-spk l) spk) l))))))))))))
+
 (defun lottery-output-height (node tx)
   (let ((info (and (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid tx) 0))))
     (and info (getf info :confirmations) (plusp (getf info :confirmations))
@@ -5421,7 +5536,11 @@
     (when (and r (> (getf r :round) 1))
       (let ((tx (getf r :tx)) (round (getf r :round)))
         (when (and (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid tx) 0))
-          (let ((l (or (getf r :lottery) (rearm-lottery node id-hex round (getf r :opens) (getf r :closes))))
+          (let ((l (or (getf r :lottery)
+                       (and (getf r :height) (getf r :opens)
+                            (manifest-round-lottery node id-hex round (getf r :opens) (getf r :closes) (getf r :height)
+                                                    (btx:txout-script (first (btx:tx-outputs tx)))))
+                       (rearm-lottery node id-hex round (getf r :opens) (getf r :closes))))
                 (h (or (getf r :height) (lottery-output-height node tx))))
             (when (and l (equalp (lot:lottery-spk l) (btx:txout-script (first (btx:tx-outputs tx)))))
               (when (and h (not (getf r :height))) (note-rearm-round node id-hex round tx h))
@@ -5548,7 +5667,6 @@
           ;; signers reach one's threshold (DEP-06 Phase 4, "or a later tier if fewer sign").
           (multiple-value-bind (ours next tier prevouts)
               (rearm-spend-for node id tx lottery round height :tier (let ((tr (w:jget params "tier"))) (and (integerp tr) tr)))
-            (declare (ignore next))
             (unless ours (fail "no re-arm spend is due for ~a's round ~a at tier ~a" (subseq id 0 8) round (w:jget params "tier")))
             (let ((asked (btx:parse-tx (bw:make-reader (hex->bytes (w:jget params "unsigned_tx"))))))
               (unless (and (eql tier (w:jget params "tier"))
@@ -5557,6 +5675,8 @@
               (let* ((leaf (nth (lot::recovery-leaf-index lottery tier) (lot:lottery-leaves lottery)))
                      (sighash (rot:tier-sighash ours 0 prevouts leaf)))
                 (log! node "signed the re-arm spend of ~a's round-~a lottery (tier ~a)" (subseq id 0 8) round tier)
+                (handler-case (publish-arm-manifest node id ours next :round (1+ round))
+                  (error (e) (log! node "arm manifest of ~a: ~a" (subseq id 0 8) e)))
                 (respond node event t :result (w:json-object "signer" (node-pubkey-hex node)
                                                              "signature" (bytes->hex (schnorr:schnorr-sign (node-priv node) sighash (random-aux)))))))))
       (error (e) (log! node "refused lottery_rearm_sign: ~a" e) (respond node event nil :error (princ-to-string e))))))
@@ -5591,7 +5711,12 @@
                        (if (stringp x) (ignore-errors (btx:parse-tx (bw:make-reader (hex->bytes x)))) x))))
             (when (and stx (= 1 (length (btx:tx-inputs stx))) (= 1 (length (btx:tx-outputs stx))))
               (multiple-value-bind (opens closes) (rearm-window node id-hex height (and (revealed-indices node id-hex l) t))
-                (let ((next (rearm-lottery node id-hex (1+ round) opens closes (or (getf spend :height) (height node)))))
+                ;; DEP-03 §Arm manifests: the confirmed spend's output, its set named by a published
+                ;; manifest; re-deriving the window's cut is the fallback.
+                (let ((next (or (and (getf spend :height)
+                                     (manifest-round-lottery node id-hex (1+ round) opens closes (getf spend :height)
+                                                             (btx:txout-script (first (btx:tx-outputs stx)))))
+                                (rearm-lottery node id-hex (1+ round) opens closes (or (getf spend :height) (height node))))))
                   (when (and next (equalp (lot:lottery-spk next) (btx:txout-script (first (btx:tx-outputs stx)))))
                     (note-rearm-round node id-hex (1+ round) stx (getf spend :height) :lottery next :opens opens :closes closes)
                     stx))))))))))
@@ -5600,6 +5725,9 @@
   "Ledger id -> (next-height . gap): a re-arm spend whose signatures fell short is retried after
    GAP blocks, doubling to +REARM-BACKOFF-MAX+.")
 (defparameter +rearm-backoff-max+ 12)
+
+(defvar *late-rearmed* (make-hash-table :test #'equal :synchronized t)
+  "ADVERSARY :late-rearm: the disputes we already late-armed (testing only).")
 
 (defun drive-rearm (node id-hex)
   "One pass of the re-arm round for ID-HEX (DEP-06 Phase 4, strict-lottery-v8): follow a spent
@@ -5652,8 +5780,7 @@
              ;; ADVERSARY :hold-rearm-until H — testing only: arm no re-arm round before block H, as
              ;; a member that was down through the scheduled windows (redteam/check-rearm-late.sh).
              (unless (or (let ((u (getf (node-adversary node) :hold-rearm-until))) (and u (< h u)))
-                         (find-if (lambda (a) (and (equalp (first a) me) (< wo (fifth a) (1+ wc))))
-                                  (armers-of node id-hex :round (1+ round)))
+                         (find me (pick-round-arms (%all-arms node id-hex) (1+ round) wo wc) :key #'first :test #'equalp)
                          (>= (count me (%all-arms node id-hex) :key #'first :test #'equalp) +max-arms+))
                (let ((p (pledge-collateral node id-hex)))
                  (if p
@@ -5662,6 +5789,33 @@
                      (note-dispute node id-hex "lottery round ~a unclaimed; waiting for collateral to arm round ~a" round (1+ round))))))
             ;; A window has closed with a non-empty cut: as a recovery voter, spend the output into
             ;; the next round.
+            ;; ADVERSARY :late-rearm — testing only: once round (1+ ROUND)'s window has closed with our
+            ;; arm in its cut, publish another arm of that round, signed past the close, as an armer
+            ;; trying to withdraw (redteam/check-rearm-invert.sh).  The cut keeps the in-window arm.
+            ((and due (getf (node-adversary node) :late-rearm)
+                  (not (gethash id-hex *late-rearmed*))
+                  (destructuring-bind (&optional dj dwo dwc) (multiple-value-list (rearm-round-window-of node id-hex (1+ round) opens closes))
+                    (and dj (find me (pick-round-arms (%all-arms node id-hex) (1+ round) dwo dwc) :key #'first :test #'equalp))))
+             (let ((p (pledge-collateral node id-hex)))
+               (when p
+                 (arm-dispute node fork :replacement p :round (1+ round))
+                 (setf (gethash id-hex *late-rearmed*) t)
+                 (note-dispute node id-hex "ADVERSARY: late re-arm of round ~a at ~a, after its window closed"
+                               (1+ round) h))))
+            ;; ADVERSARY :invert-arm-selection — testing only: the inverter proposes only once its rule
+            ;; gives a cut the honest one does not (a late arm), so it is the differing spend that is
+            ;; refused (redteam/check-rearm-invert.sh).
+            ((and due (getf (node-adversary node) :invert-arm-selection)
+                  (destructuring-bind (&optional dj dwo dwc) (multiple-value-list (rearm-round-window-of node id-hex (1+ round) opens closes))
+                    (and dj (let ((all (%all-arms node id-hex)))
+                              (null (set-exclusive-or (mapcar #'sixth (pick-round-arms all (1+ round) dwo dwc))
+                                                      (mapcar #'sixth (inverted-round-arms all (1+ round) dwo dwc))))))))
+             (note-dispute node id-hex "ADVERSARY: inverter waits for a late arm in round ~a" (1+ round)))
+            ;; ADVERSARY :rearm-sign-only — testing only: a voter that answers lottery_rearm_sign but
+            ;; never proposes, so another implementation's proposer is the one whose spend lands
+            ;; (redteam/check-rearm-rust.sh).
+            ((and due (getf (node-adversary node) :rearm-sign-only))
+             (note-dispute node id-hex "ADVERSARY: sign-only voter; not proposing round ~a's spend" (1+ round)))
             ((and due
                   (member (up:x-only me) (lot:lottery-recovery-voters lottery) :test #'equalp))
              ;; DEP-06 Phase 4: "through the CSV-144 recovery leaf (or a later tier if fewer sign)".
@@ -5692,6 +5846,8 @@
                                                                                       :witnesses (list w0)))))))
                            (unless (rot:verify-spend signed 0 prevouts) (fail "the re-arm spend does not verify"))
                            (broadcast node signed)
+                           (handler-case (publish-arm-manifest node id-hex signed next :round (1+ round))
+                             (error (e) (log! node "arm manifest of ~a: ~a" (subseq id-hex 0 8) e)))
                            (note-rearm-round node id-hex (1+ round) signed nil :lottery next :opens opens :closes closes)
                            (note-dispute node id-hex "lottery round ~a unclaimed; spent into round ~a's lottery (tier ~a)" round (1+ round) tier)
                            (remhash id-hex *rearm-backoff*)
@@ -6345,6 +6501,10 @@
                                 (forks-of node id))
                        ;; Any holder answers (DEP-06), signer or not: a rung of our own rebuild at any tier.
                        (and (forks-of node id) (rebuilt-rung-p node id txid) (first (forks-of node id))))))
+         ;; DEP-03 §Arm manifests: answering is permissionless.  Any node that holds a manifest
+         ;; of the ledger's round 1 (its own, or one it heard) publishes it; the judge checks it
+         ;; from public state, whoever sent it.
+         (relay-arm-manifests node id txid anchor)
          (cond (answer
                 (log! node "answering the challenge of ~a's spend ~a: its rotation's QuorumBegin (seq ~a)"
                       (subseq id 0 8) (subseq (bytes->hex txid) 0 16) (up:update-seq answer))
@@ -6363,6 +6523,17 @@
                                                                                                             (fork-own-segment f))))
                                                                             :test #'string=))))))))))
 
+(defun relay-arm-manifests (node id-hex txid anchor)
+  "Publish, as Challenge Answers to the challenge of TXID, every round-1 arm manifest we hold of
+   ID-HEX (DEP-03 §Arm manifests: permissionless, checked by the judge).  The number published."
+  (let ((ms (arm-manifests-of node id-hex 1)))
+    (dolist (m ms (length ms))
+      (bus:bus-publish (node-bus node)
+                       (w:challenge-answer-event (node-keypair node) id-hex (bytes->hex txid) (bytes->hex anchor) '()
+                                                 :round 1 :arms (mapcar (lambda (a) (list (bytes->hex (first a)) (second a))) m)))
+      (log! node "answering the challenge of ~a's spend ~a: an arm manifest (~a arms)" (subseq id-hex 0 8)
+            (subseq (bytes->hex txid) 0 16) (length m)))))
+
 (defun rebuilt-rung-p (node id-hex txid)
   "TXID is a rung of the confiscation of ID-HEX we rebuild from what we hold, at any confiscation tier."
   (let ((reserves (ignore-errors (disputed-reserves node (find-record node id-hex)))))
@@ -6373,10 +6544,18 @@
                               (find txid rungs :key #'btx:tx-txid :test #'equalp)))))))
 
 (defun handle-challenge-answer (node event)
-  "Kind 9112: keep the updates answering a challenge, for every later judgement of that ledger's spends."
+  "Kind 9112: keep the updates answering a challenge, for every later judgement of that ledger's
+   spends, and the arm manifest it carries (DEP-06 §Arm manifests)."
   (ignore-errors
    (let* ((c (w:parse-json (ev:event-content event)))
           (id (w:jget c "challenged_ledger_id"))
+          (arms (loop for a in (coerce (or (w:jget c "arms") #()) 'list)
+                      for k = (ignore-errors (hex->bytes (w:jget a "armer")))
+                      for q = (w:jget a "seq")
+                      when (and k (= (length k) 33) (integerp q)) collect (list k q))))
+     (when (and arms (stringp id))
+       (note-arm-manifest node id (or (w:jget c "round") 1) (w:jget c "txid") arms))
+     (let* ((c c) (id id)
           (updates (loop for b in (coerce (or (w:jget c "updates") #()) 'list)
                          for u = (ignore-errors (up:decode-update (base64-decode b)))
                          when (and u (equalp (up:update-ledger-id u) (hex->bytes id))) collect u)))
@@ -6384,7 +6563,55 @@
        (let ((have (gethash id (node-spend-answers node))))
          (dolist (u updates)
            (unless (member (up:chain-hash u) have :key #'up:chain-hash :test #'equalp) (push u have)))
-         (setf (gethash id (node-spend-answers node)) (subseq have 0 (min 64 (length have)))))))))
+         (setf (gethash id (node-spend-answers node)) (subseq have 0 (min 64 (length have))))))))))
+
+(defun note-arm-manifest (node id-hex round txid-hex arms)
+  "Keep a published arm manifest (at most 32 distinct per ledger)."
+  (let* ((e (list round txid-hex (sort (copy-list arms) #'bytes< :key #'first)))
+         (have (gethash id-hex (node-arm-manifests node))))
+    (unless (member e have :test #'equalp)
+      (setf (gethash id-hex (node-arm-manifests node)) (subseq (cons e have) 0 (min 32 (1+ (length have))))))))
+
+(defun arm-manifests-of (node id-hex round &key refresh)
+  "The distinct arm sets published for ID-HEX's ROUND (REFRESH: read the relays' answers first)."
+  (when refresh (ignore-errors (refresh-spend-answers node id-hex)))
+  (remove-duplicates (loop for (r nil arms) in (gethash id-hex (node-arm-manifests node)) when (eql r round) collect arms)
+                     :test #'equalp))
+
+(defun lottery-manifest (node id-hex lottery &key (round 1) until)
+  "The arm set LOTTERY was built from: per participant, the arm (pubkey33 seq) whose key and
+   commitment it carries, among each armer's counted arms of ROUND (signed at or below UNTIL)."
+  (let ((arms (remove-if (lambda (a) (or (not (eql (seventh a) round)) (and until (> (fifth a) until))))
+                         (let ((by (make-hash-table :test #'equalp)))
+                           (dolist (a (%all-arms node id-hex)) (push a (gethash (first a) by)))
+                           (loop for l being the hash-values of by
+                                 append (let ((s (sort (copy-list l) #'< :key #'sixth))) (subseq s 0 (min +max-arms+ (length s)))))))))
+    (loop for p in (lot:lottery-participants lottery)
+          for a = (car (last (sort (remove-if-not (lambda (a) (and (equalp (up:x-only (first a)) (lot:participant-pubkey p))
+                                                                  (equalp (second a) (lot:participant-commitment p))
+                                                                  (equal (third a) (lot:participant-target p))))
+                                                  arms)
+                                   #'< :key #'sixth)))
+          unless a do (return nil)
+          collect (list (first a) (sixth a)))))
+
+(defun publish-arm-manifest (node id-hex tx lottery &key (round 1) until)
+  "DEP-06 §Arm manifests: publish the arm set LOTTERY (in TX, a confiscation or a re-arm spend into
+   ROUND) was built from, as a Challenge Answer (Kind 9112), once per txid; strict-lottery-v8 only."
+  (let ((txid (bytes->hex (btx:tx-txid tx))))
+    (when (and (lg:ruleset-rule-p (ruleset-at-fork-point node id-hex) :strict-lottery)
+               (not (find txid (gethash id-hex (node-arm-manifests node)) :key #'second :test #'equal)))
+      (let ((arms (lottery-manifest node id-hex lottery :round round :until until)))
+        (if (null arms)
+            (log! node "arm manifest of ~a's ~a: no arm set for its lottery" (subseq id-hex 0 8) (subseq txid 0 16))
+            (progn
+              (note-arm-manifest node id-hex round txid arms)
+              (bus:bus-publish (node-bus node)
+                               (w:challenge-answer-event (node-keypair node) id-hex txid (bytes->hex (or (ignore-errors (rot:anchor-of tx)) #()))
+                                                         '() :round round
+                                                         :arms (mapcar (lambda (a) (list (bytes->hex (first a)) (second a))) arms)))
+              (log! node "published the arm manifest of ~a's ~a (round ~a): ~{~a~^ ~}" (subseq id-hex 0 8) (subseq txid 0 16) round
+                    (mapcar (lambda (a) (format nil "~a/~a" (subseq (bytes->hex (first a)) 0 8) (second a))) arms))))))))
 
 (defparameter *vault-spend-grace-blocks* 3
   "A rotation's QuorumBegin may reach us a block or two after the spend confirms, so a

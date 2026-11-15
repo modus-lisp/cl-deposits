@@ -877,4 +877,32 @@
                                         (not (funcall attest (append accused-seeds (subseq honest 0 (1- threshold)))))))))))))))
     (check-equal "every lottery_voters_accused case ran" cases 4)))
 
+;;; inspect/vectors/rearm_window_arms.json: DEP-06 Phase 4 step 2, each armer's arm in a re-arm
+;;; window (the latest in-window arm of its first four), shared with deposits-rust (armers.rs).
+(with-gate ("DEP-06 re-arm windows: each armer's in-window arm against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "rearm_window_arms.json")))))
+    (loop for c across (gethash "cases" v)
+          for arms = (loop for a across (gethash "arms" c)
+                           collect (list (gethash "armer" a) nil nil nil (gethash "height" a) (gethash "seq" a) (gethash "round" a)))
+          for got = (sort (mapcar (lambda (a) (list (first a) (sixth a)))
+                                  (nd::pick-round-arms arms (gethash "round" c) (gethash "opens" c) (gethash "closes" c)))
+                          #'string< :key #'first)
+          for want = (loop for e across (gethash "expect" c) collect (list (gethash "armer" e) (gethash "seq" e)))
+          do (check-equal (format nil "window arms: ~a" (gethash "name" c)) got want))))
+
+;;; inspect/vectors/arm_manifest.json: DEP-06 §Arm manifests, whether a published arm set is valid for a
+;;; round's window, shared with deposits-rust (armers.rs, manifest_arms).
+(with-gate ("DEP-06 arm manifests: a published arm set against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "arm_manifest.json")))))
+    (loop for c across (gethash "cases" v)
+          for arms = (loop for a across (gethash "arms" c)
+                           collect (list (gethash "armer" a) nil nil nil (gethash "height" a) (gethash "seq" a) (gethash "round" a)))
+          for manifest = (loop for e across (gethash "manifest" c) collect (list (gethash "armer" e) (gethash "seq" e)))
+          for (got reason) = (multiple-value-list (nd::manifest-arms arms manifest (gethash "round" c) (gethash "opens" c) (gethash "closes" c)))
+          do (check-equal (format nil "manifest: ~a~@[ (~a)~]" (gethash "name" c) reason) (and got t) (gethash "valid" c))
+             (when got
+               (check-equal (format nil "manifest: ~a names exactly its arms" (gethash "name" c))
+                            (mapcar (lambda (a) (list (first a) (sixth a))) got)
+                            (sort (copy-list manifest) #'string< :key #'first))))))
+
 (report)
