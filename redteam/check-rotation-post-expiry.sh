@@ -50,9 +50,14 @@ TICKER_PAUSED=""
 cleanup() {
   cld_ctl $W "(:policy :post-expiry-rotation t)" >/dev/null 2>&1
   disarm :hold-arm $C1 $W; disarm :rotate-spent-vault $OP
-  [ -n "$TICKER_PAUSED" ] && "$CLD_SRC/devnet/regtest-net.sh" ticker start >/dev/null 2>&1
+  [ -n "$TICKER_PAUSED" ] && ticker_start
 }
 trap cleanup EXIT
+# The ticker is the regtest network's, not ours: restart it outside our process group, which the
+# harness kills when the scenario ends (2026-11-15: a ticker restarted inside it died with it).
+ticker_start() { setsid -f bash -c "cd '$CLD_SRC' && DEVNET=regtest devnet/regtest-net.sh ticker start" >/dev/null 2>&1; sleep 2; }
+# A cl node's own log from time M on (the control port's (:log) reply is not one line per entry).
+cllog() { awk -v m="$2" '$1 >= m' "$CLD_ROOT/$1/node.log"; }
 info() { cld_ctl "$1" "(:info)" | grep -oE "\(:ID \"$X\" :OWNED [^)]*" | head -1; }
 EXP=$(info $OP | grep -oE ':EXPIRY [0-9]+' | cut -d' ' -f2); [ -n "$EXP" ] || fail "no expiry for $X"
 VAULT=$(cld_ctl $OP '(:vaults)' | tr '()' '\n\n' | grep -F "\"$X\"" -A1 | grep -oE '[0-9a-f]{64}:[0-9]+' | tail -1)
@@ -122,11 +127,12 @@ case $ARM in
     echo "== a rung confirmed at $(bcli getblockcount)"
     mine 2 >/dev/null
     disarm :hold-arm $C1 $W
-    "$CLD_SRC/devnet/regtest-net.sh" ticker start >/dev/null; TICKER_PAUSED=""
+    ticker_start; TICKER_PAUSED=""
     for n in $C1 $W $R1; do
       st=""
-      for t in $(seq 1 60); do st=$(fork_state $n); [ "$st" = TOMBSTONED ] && break; sleep 5; done
-      [ "$st" = TOMBSTONED ] || fail "$n's expiry dispute did not yield once the rotation confirmed (state ${st:-none})"
+      # A long-lived pool node runs a slow dispute pass (regtest 2026-11-15: W yielded 5 min on).
+      for t in $(seq 1 180); do st=$(fork_state $n); [ "$st" = TOMBSTONED ] && break; sleep 5; done
+      [ "$st" = TOMBSTONED ] || fail "$n's expiry dispute did not yield within 900 s of the rotation confirming (state ${st:-none})"
       grep -q "$X" "$CLD_ROOT/$n/pledges.sexp" 2>/dev/null && fail "$n still pledges to $X"
       echo "   $n yielded; no pledge left"
     done
@@ -153,7 +159,7 @@ case $ARM in
     sleep 120   # its lottery: reveals follow the confiscation's confirmation
     r1log "$MARK0" | grep "Expiry dispute on ${X:0:16}" | grep -q "published DisputeYield" \
       && fail "$R1 yielded its expiry dispute though the confiscation won: $(r1log "$MARK0" | grep "Expiry dispute on ${X:0:16}" | grep -m1 DisputeYield | cut -c1-200)"
-    cld_ctl $C1 '(:log :n 4000)' | grep "${X:0:8}" | grep -q "quorum re-established" && fail "$C1 yielded on the recorded QuorumBegin"
+    cllog $C1 "$MARK0" | grep "${X:0:8}" | grep -q "quorum re-established" && fail "$C1 yielded on the recorded QuorumBegin"
     rev=$(r1log "$MARK0" | grep -m1 "Published custody-lottery reveal: ledger=${X:0:16}, member=$R1K")
     [ -n "$rev" ] || fail "$R1 published no lottery reveal for $X"
     echo "   $R1: ${rev:0:160}"
@@ -176,7 +182,7 @@ case $ARM in
     AFTER=$(info $OP | grep -oE ':EXPIRY [0-9]+' | cut -d' ' -f2)
     [ $rc = 0 ] && fail "a rotation was recorded over the confiscated vault ($RT)"
     [ "$BEFORE" = "$AFTER" ] || fail "the ledger's expiry moved from $BEFORE to $AFTER: a QuorumBegin was recorded"
-    line=$(cld_ctl $C1 '(:log :n 4000)' | awk -v m="$MARK" '$1 >= m' | grep "refused cosign" | grep -m1 "confiscation confirmed: no rotation of it can be spent")
+    line=$(cllog $C1 "$MARK" | grep "refused cosign" | grep -m1 "confiscation confirmed: no rotation of it can be spent")
     [ -n "$line" ] || fail "$C1 did not refuse the QuorumBegin for the confiscated vault (its log since $MARK has no such refusal)"
     echo "   $C1: $line"
     line=$(r1log "$MARK" | grep -m1 "Refusing cosign: the vault's confiscation confirmed: no rotation of it can be spent")
