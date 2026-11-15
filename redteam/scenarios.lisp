@@ -82,7 +82,9 @@
    (make-sc :name "rotation-drop" :script "check-rotation-drop.sh" :ledger-var "REDTEAM_RD" :timeout 1500
             :note "DEP-11 rotating without a silent member (ruled 2026-11-10): a silent member is dropped and the consenting ones seated")
    (make-sc :name "rotation-post-expiry" :script "check-rotation-post-expiry.sh" :args '("rescue") :ledger-var "REDTEAM_PX" :timeout 1800
-            :tags '(:disruptive) :note "DEP-05/06 a rotation past expiry is allowed, never owed (ruled 2026-11-14): rescued with the members that agree, a declining member unpenalised, every expiry dispute yields")
+            :tags '(:disruptive) :note "DEP-05/06 a rotation past expiry is allowed, never owed (ruled 2026-11-14): the rotation wins (ticker paused, cl members hold their arms); disputes stand until its spend confirms, then yield")
+   (make-sc :name "rotation-post-expiry-race" :script "check-rotation-post-expiry.sh" :args '("race") :ledger-var "REDTEAM_PX" :timeout 2400
+            :tags '(:disruptive) :note "DEP-05 v8 amendment (2026-11-15): the rotation races the confiscation at the default arm window; the confiscation wins and no member yields its stake on the recorded QuorumBegin")
    (make-sc :name "rotation-post-expiry-confiscated" :script "check-rotation-post-expiry.sh" :args '("confiscated") :ledger-var "REDTEAM_PX" :timeout 2400
             :tags '(:disruptive) :note "DEP-06 Race: a confiscation that confirmed first; no rotation of the confiscated vault is recorded")
    (make-sc :name "fraud-rotation" :script "check-fraud-rotation.sh" :ledger-var "REDTEAM_FR" :timeout 1500

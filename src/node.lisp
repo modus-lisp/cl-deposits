@@ -3157,6 +3157,11 @@
                        (t (conclude "lottery claimed by its winner; yielded")))))
               ((and reserves-spent (null conf))
                (note-dispute node id "reserves spent, but not by a confiscation we can rebuild"))
+              ;; ADVERSARY :hold-arm — a member that disputes but does not arm (yet): without its
+              ;; arm it signs no confiscation (red team: regtest rotation-post-expiry, whose
+              ;; rotation-wins arm needs the vault to stay unconfiscated while it re-establishes).
+              ((and (null (fork-op fork :dispute-armed)) (getf (node-adversary node) :hold-arm))
+               (note-dispute node id "disputed; holding our arm (:hold-arm)"))
               ((null (fork-op fork :dispute-armed))
                (let ((p (pledge-collateral node id)))
                  (if p
@@ -5177,7 +5182,10 @@
       (log! node "confiscation_sign for ~a from ~a: we hold no fork, not answering" (subseq id 0 8) (subseq (ev:event-pubkey event) 0 8))
       (return-from handle-confiscation-sign nil))   ; not a disputant: not ours to answer
     (handler-case
-        (let* ((proposed (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (w:jget params "tx_hex") (fail "no unsigned_tx"))))))
+        (let* ((proposed (progn
+                           ;; ADVERSARY :hold-arm — holding our arm, we sign no confiscation either.
+                           (when (getf (node-adversary node) :hold-arm) (fail "holding our arm (:hold-arm)"))
+                           (btx:parse-tx (bw:make-reader (hex->bytes (or (w:jget params "unsigned_tx") (w:jget params "tx_hex") (fail "no unsigned_tx")))))))
                ;; DEP-03: the fee is the rule's and the shape our own dispute's reason, never the proposer's.
                (fee nil)
                (respectful (dispute-respectful-p node id))
