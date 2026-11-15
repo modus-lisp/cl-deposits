@@ -3046,6 +3046,13 @@
         ((not establishment) nil)
         (t (and policy t))))
 
+(defun rung-sign-policy-allows-p (qb-height old-quorum-expiry policy)
+  "REVIEW 11: whether a member signs the rungs of a rotation whose QuorumBegin is at QB-HEIGHT,
+   judged against the SPENT vault's quorum expiry OLD-QUORUM-EXPIRY (the replica before the
+   QuorumBegin), never the new quorum's.  Rungs are establishment: the same opt-out as the
+   cosign.  Vector: post_expiry_rotation.json (its rung_sign cases)."
+  (member-cosigns-post-expiry-p qb-height old-quorum-expiry t policy))
+
 (defun arm-on-expiry-dispute-p (anchor-height governing-expiry last-valid-seq latest-quorum-begin-seq)
   "DEP-05: a quorum_expired DisputeEnter is armed on only while its ground stands: its anchor is
    past the expiry of the QuorumBegin governing at its fork point, and no QuorumBegin since has
@@ -4821,6 +4828,12 @@
               (multiple-value-bind (ok why) (up:verify-cosignatures qu :quorum (mapcar #'lg:member-pubkey signers) :threshold required)
                 (unless ok (fail "the QuorumBegin is not final: ~a" why))))
             (check-not-deposed node view)
+            ;; Member policy (REVIEW 11): an opt-out covers the rungs too, judged against the spent
+            ;; vault's quorum (the replica before the QuorumBegin), never the new one: else our
+            ;; signature could still carry a rotation we declined over its threshold.
+            (let ((old-expiry (lg:ledger-quorum-expiry (record-ledger view))))
+              (unless (rung-sign-policy-allows-p (up:update-block-height qu) old-expiry *cosign-post-expiry-establishment*)
+                (fail "member policy: we do not sign the rungs of a rotation past quorum_expiry ~a" old-expiry)))
             (multiple-value-bind (cur) (disputed-reserves node view)
               (unless (member (node-pubkey node) (rs:reserves-members cur) :test #'equalp) (fail "not a member of the spent vault"))
               (unless (eql tier-index (rung-tier-index cur (btx:tx-locktime (first proposed)) (up:update-block-height qu)))

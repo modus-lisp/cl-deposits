@@ -2543,6 +2543,13 @@
                                                                     (eq (gethash "reestablished" c) t)
                                                                     (eq (gethash "confiscation_confirmed" c) t))
                (check-equal (format nil "~a: yield" (gethash "name" c)) (and y t) (eq (gethash "yield" c) t))
-               (check-equal (format nil "~a: pledge" (gethash "name" c)) (and r t) (eq (gethash "release_pledge" c) t))))))
+               (check-equal (format nil "~a: pledge" (gethash "name" c)) (and r t) (eq (gethash "release_pledge" c) t))))
+    ;; REVIEW 11: the rungs follow the same opt-out, against the spent vault's expiry.
+    (loop for c across (gethash "rung_sign" v)
+          do (check-equal (gethash "name" c)
+                          (and (nd::rung-sign-policy-allows-p (gethash "qb_block_height" c) (gethash "old_quorum_expiry" c)
+                                                              (eq (gethash "cosign_post_expiry" c) t))
+                               t)
+                          (eq (gethash "sign" c) t)))))
 
 (report)
