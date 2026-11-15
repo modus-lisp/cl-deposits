@@ -58,6 +58,13 @@
                      ;; first K (K from an earlier :count), so a flood cannot push a line out of reach
                      (n (or (arg form :tail) (let ((k (arg form :since))) (and k (max 0 (- len k)))) len)))
                 (ok :count len :log (reverse (subseq all 0 (min n len))))))
+        (:backdated-rearm   ; (:backdated-rearm :ledger ID :height H) — testing only: a round-1 re-arm signed at H, published now
+         (let* ((pl (getf (cdr form) :pledge))   ; "txid:vout:sats", else a fresh pledge
+                (parts (and pl (uiop:split-string pl :separator ":")))
+                (u (nd::backdated-rearm node (getf (cdr form) :ledger) (getf (cdr form) :height)
+                                        :replacement (and parts (list (reverse (hex->bytes (first parts)))
+                                                                      (parse-integer (second parts)) (parse-integer (third parts)))))))
+           (ok :seq (up:update-seq u) :height (up:update-block-height u))))
         (:adversary   ; (:adversary :set KEY t|nil ...) / (:adversary) — red team switches, docs/REDTEAM.md
          (loop for (k v) on (cdr (member :set form)) by #'cddr
                do (setf (getf (nd:node-adversary node) k) v))

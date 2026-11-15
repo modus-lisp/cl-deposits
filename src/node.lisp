@@ -3862,6 +3862,29 @@
         (error (e) (log! node "adversary: could not spend our pledge: ~a" e))))
     preimage))
 
+(defun backdated-rearm (node id-hex height &key replacement)
+  "Testing only (redteam/check-backdated-arm.sh; docs/ADVERSARIAL.md §Rule inverters, unruled): a
+   round-1 re-arm on our fork of ID-HEX signed at block HEIGHT (clamped, as every update, to our
+   fork's last height), published now.  The same preimage, so the same commitment, as the fold
+   requires of a same-round re-arm; REPLACEMENT (txid vout sats) is the pledge it declares, else a
+   fresh one.  The update it published."
+  (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork of ~a" (subseq id-hex 0 8))))
+         (preimage (or (record-preimage fork) (lot:derive-preimage (lottery-seed node id-hex 1))))
+         (p (or replacement (pledge-collateral node id-hex) (fail "no collateral to pledge"))))
+    (setf (record-preimage fork) preimage)
+    (let ((u (new-update node fork (%strip-nil-fields
+                                    (list :type :dispute-armed :armed-block height
+                                          :commitment-hash (lot:commitment-of preimage)
+                                          :target-reserves (our-target-address node)
+                                          :replacement-collateral-txid (first p)
+                                          :replacement-collateral-vout (second p)
+                                          :replacement-collateral-amount (third p)))
+                         :height height)))
+      (commit-update node fork u)
+      (log! node "ADVERSARY: backdated round-1 re-arm of ~a at height ~a (tip ~a), pledge ~a:~a"
+            (subseq id-hex 0 8) (up:update-block-height u) (height node) (txid-hex (first p)) (second p))
+      u)))
+
 ;;; DEP-03 §"The dispute": which DisputeEnters are this dispute.  A disputant may hold an older
 ;;; DisputeEnter on a vault the ledger has since rotated away (a dispute gone dormant, or one
 ;;; entered on a proof that did not verify); it is no part of the current one.  Q is the operator's
