@@ -59,7 +59,8 @@
     ("grounded-arms-v7" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
      :grounded-arms)
     ("strict-lottery-v8" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
-     :grounded-arms :strict-lottery :fraud-survives-rotation :acquire-on-confirm))
+     :grounded-arms :strict-lottery :fraud-survives-rotation :acquire-on-confirm
+     :expiry-ends-on-spend))
   "DEP-18: the gated rules each ruleset adds to the intrinsic ones.")
 
 (defun ruleset-rule-p (ruleset rule)

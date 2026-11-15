@@ -225,6 +225,33 @@ re-confiscate.
   `rung_sign_policy_allows` in `process_rotation_sign_request`. Vector `post_expiry_rotation.json`,
   cases `rung_sign`.
 
+- **Amendment (2026-11-15): under v8 only a confirmed re-establishment ends the expiry dispute.**
+  Regtest `rotation-post-expiry` (rescue, default arm window) produced a real race:
+  - 17:58:30: the operator's post-expiry QuorumBegin was recorded.
+  - 17:58:32: ref6 (d40db88) broadcast its confiscation.
+  - 17:59:09: ref6 yielded its armed expiry dispute ("quorum re-established") while its own
+    confiscation was still in the mempool.
+  - 17:59:31: the confiscation confirmed, and the rotation's rungs could never be signed.
+  ref6 gave up its lottery stake in the spend that won. cl's member did not yield. The spec was
+  inconsistent: DEP-05 ended the dispute once the chain *held* a later QuorumBegin, while DEP-06
+  §Race (this item) said the rotation's spend must *confirm*. The coordinator ruled this an
+  application of the standing reading that only confirmed spends decide (acquire-on-confirm,
+  REVIEW 9), so no new user ruling was needed.
+  - Under strict-lottery-v8 (`:expiry-ends-on-spend`, judged at the dispute's fork point), the
+    dispute ends only once some QuorumBegin after its fork point has a rung in a block. A recorded
+    but unspent one leaves the dispute standing: no yield, still armed on, still confiscated.
+  - Earlier rulesets keep the old reading.
+  - This also closes DEP-06's "liveness of a recorded rotation" stall for v8 ledgers.
+  - Where: spec 4efadff (DEP-05, DEP-06 §Race and Limits, DEP-18); cl `expiry-dispute-ended-p` /
+    `arm-on-expiry-dispute-p` (`:on-spend`), `reestablishment-confirmed-p` in `drive-dispute` and
+    `fork-live-p`; Rust `expiry_dispute_ended_under` / `arm_on_expiry_dispute_under`,
+    `ruleset_expiry_ends_on_spend`, `expiry_watch`. Vector `expiry_dispute_ends.json`: 4 `ended`
+    and 2 `arm` ruleset cases.
+  - Still open: Rust's arm decision on another member's expiry DisputeEnter
+    (`validate_dispute_enter_quorum_expired` in `inbound.rs`) still compares the anchor with the
+    ledger's *current* expiry. A recorded but unspent QuorumBegin therefore still stops a reference
+    member arming on a v8 expiry dispute.
+
 ## 12. Backdated arms (ruled 2026-11-15: "A for now, but let's write down the scenario in the repo")
 
 - **Asked:** a fork's `DisputeArmed` is self-signed, so an armer can date an arm inside a window

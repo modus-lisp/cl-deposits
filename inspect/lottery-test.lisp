@@ -334,20 +334,26 @@
 ;;; (deposits-protocol/tests/vectors/expiry_dispute_ends.json).
 (with-gate ("dispute: when a quorum_expired dispute ends, against the shared vector")
   (let ((v (json-simple:parse (uiop:read-file-string (vector-path "expiry_dispute_ends.json")))))
-    (loop for c across (gethash "ended" v)
-          do (check-equal (gethash "name" c)
-                          (and (cl-deposits.node::expiry-dispute-ended-p
-                                (gethash "last_valid_sequence" c) (gethash "latest_quorum_begin_sequence" c)
-                                (gethash "confiscation_confirmed" c))
-                               t)
-                          (gethash "ended" c)))
-    (loop for c across (gethash "arm" v)
-          do (check-equal (gethash "name" c)
-                          (and (cl-deposits.node::arm-on-expiry-dispute-p
-                                (gethash "anchor_block_height" c) (gethash "governing_quorum_expiry" c)
-                                (gethash "last_valid_sequence" c) (gethash "latest_quorum_begin_sequence" c))
-                               t)
-                          (gethash "arm" c)))))
+    ;; strict-lottery-v8 (:expiry-ends-on-spend): the case's ruleset, at the fork point; a case
+    ;; with none is read under a ruleset before v8, where a recorded QuorumBegin ends it.
+    (flet ((on-spend (c) (lg:ruleset-rule-p (let ((r (gethash "ruleset" c))) (and (stringp r) r)) :expiry-ends-on-spend))
+           (spent (c) (multiple-value-bind (x found) (gethash "rotation_spend_confirmed" c) (if found (eq x t) t))))
+      (loop for c across (gethash "ended" v)
+            do (check-equal (gethash "name" c)
+                            (and (cl-deposits.node::expiry-dispute-ended-p
+                                  (gethash "last_valid_sequence" c) (gethash "latest_quorum_begin_sequence" c)
+                                  (eq (gethash "confiscation_confirmed" c) t)
+                                  :on-spend (on-spend c) :rotation-confirmed (spent c))
+                                 t)
+                            (eq (gethash "ended" c) t)))
+      (loop for c across (gethash "arm" v)
+            do (check-equal (gethash "name" c)
+                            (and (cl-deposits.node::arm-on-expiry-dispute-p
+                                  (gethash "anchor_block_height" c) (gethash "governing_quorum_expiry" c)
+                                  (gethash "last_valid_sequence" c) (gethash "latest_quorum_begin_sequence" c)
+                                  :on-spend (on-spend c) :rotation-confirmed (spent c))
+                                 t)
+                            (eq (gethash "arm" c) t))))))
 
 ;;; inspect/vectors/dispute_ground.json, shared with deposits-rust
 ;;; (deposits-protocol/tests/vectors/dispute_ground.json).

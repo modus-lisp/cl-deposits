@@ -3021,11 +3021,44 @@
           (dolist (f (forks-of node id-hex)) (setf (record-confiscation f) tx (record-lottery f) l)))
         (values tx l state)))))
 
-(defun expiry-dispute-ended-p (last-valid-seq latest-quorum-begin-seq confiscation-confirmed)
+(defun expiry-dispute-ended-p (last-valid-seq latest-quorum-begin-seq confiscation-confirmed
+                              &key on-spend (rotation-confirmed t))
   "DEP-05 §\"When a quorum_expired dispute ends\": a QuorumBegin after the dispute's fork point
-   (re-establishment) ends it, unless its confiscation already confirmed.  Vector:
-   expiry_dispute_ends.json."
-  (and (not confiscation-confirmed) (integerp last-valid-seq) (> latest-quorum-begin-seq last-valid-seq)))
+   (re-establishment) ends it, unless its confiscation already confirmed.  ON-SPEND (the
+   :expiry-ends-on-spend rule of strict-lottery-v8, judged at the fork point): only once that
+   re-establishment's spend of the vault confirmed (REESTABLISHMENT-CONFIRMED-P); recorded but
+   unspent, the dispute stands and the race goes on.  Vector: expiry_dispute_ends.json."
+  (and (not confiscation-confirmed) (integerp last-valid-seq) (> latest-quorum-begin-seq last-valid-seq)
+       (or (not on-spend) rotation-confirmed)))
+
+(defun quorum-begin-spend-confirmed-p (node qu)
+  "The vault spend of QuorumBegin update QU is confirmed: some rung of its ladder has a
+   confirmation (getrawtransaction, so a rung whose new vault a later rotation spent still counts).
+   A QuorumBegin with no rotation rungs funds a fresh vault, checked on chain when cosigned: T.
+   Without a way to ask the chain, T (the reading before the rule)."
+  (let* ((o (op:decode-operation (up:update-message qu)))
+         (rungs (and (op:field o :rotation-rungs) (fr:rotation-rungs o))))
+    (or (null rungs) (null (node-tx-confs-fn node))
+        (some (lambda (txid) (rung-confirmed-p node txid)) rungs))))
+
+(defvar *confirmed-rungs* (make-hash-table :test #'equalp) "Rung txids seen confirmed (a confirmation is final enough here).")
+(defvar *unconfirmed-rungs* (make-hash-table :test #'equalp) "Rung txid -> when last seen unconfirmed: asked again after 60 s.")
+
+(defun rung-confirmed-p (node txid)
+  (or (gethash txid *confirmed-rungs*)
+      (let ((seen (gethash txid *unconfirmed-rungs*)))
+        (unless (and seen (< (- (get-universal-time) seen) 60))
+          (let ((c (ignore-errors (funcall (node-tx-confs-fn node) txid))))
+            (if (and c (plusp c))
+                (progn (remhash txid *unconfirmed-rungs*) (setf (gethash txid *confirmed-rungs*) t))
+                (progn (setf (gethash txid *unconfirmed-rungs*) (get-universal-time)) nil)))))))
+
+(defun reestablishment-confirmed-p (node rec last-valid-seq)
+  "Some QuorumBegin of REC after LAST-VALID-SEQ has its vault spend confirmed (strict-lottery-v8,
+   :expiry-ends-on-spend)."
+  (loop for u in (record-updates-of rec :quorum-begin)        ; newest first
+        while (> (up:update-seq u) (or last-valid-seq -1))
+          thereis (quorum-begin-spend-confirmed-p node u)))
 
 (defun expiry-dispute-outcome (armed reestablished confiscation-confirmed)
   "DEP-06 §Race, a post-expiry rotation (ruled 2026-11-14): (values yield release-pledge) for our
@@ -3053,12 +3086,14 @@
    cosign.  Vector: post_expiry_rotation.json (its rung_sign cases)."
   (member-cosigns-post-expiry-p qb-height old-quorum-expiry t policy))
 
-(defun arm-on-expiry-dispute-p (anchor-height governing-expiry last-valid-seq latest-quorum-begin-seq)
+(defun arm-on-expiry-dispute-p (anchor-height governing-expiry last-valid-seq latest-quorum-begin-seq
+                                &key on-spend (rotation-confirmed t))
   "DEP-05: a quorum_expired DisputeEnter is armed on only while its ground stands: its anchor is
    past the expiry of the QuorumBegin governing at its fork point, and no QuorumBegin since has
-   re-established the quorum."
+   re-established the quorum (under ON-SPEND, none whose spend of the vault confirmed)."
   (and (integerp anchor-height) (integerp governing-expiry) (> anchor-height governing-expiry)
-       (not (expiry-dispute-ended-p last-valid-seq latest-quorum-begin-seq nil))))
+       (not (expiry-dispute-ended-p last-valid-seq latest-quorum-begin-seq nil
+                                    :on-spend on-spend :rotation-confirmed rotation-confirmed))))
 
 (defun drive-dispute (node fork)
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (h (height node)))
@@ -3087,9 +3122,18 @@
           (let ((expiry (lg:ledger-quorum-expiry (record-ledger base)))
                 (confirmed (or (assoc (node-pubkey node) (reveals-of node id) :test #'equalp)
                                (and conf (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid conf) 0)))))
+            ;; strict-lottery-v8 (:expiry-ends-on-spend, judged at the fork point, never by the
+            ;; QuorumBegin under judgement): only a re-establishment whose spend of the vault
+            ;; confirmed ends it; recorded but unspent, the race goes on (regtest 2026-11-15:
+            ;; the reference yielded its armed stake while its own confiscation sat in the
+            ;; mempool, and that confiscation then won).
             (when (and (dispute-enter-expiry-p enter enter-op expiry) (not confirmed)
-                       (or (expiry-dispute-ended-p (op:field enter-op :last-valid-sequence) (latest-quorum-begin-seq base) nil)
-                           (and expiry (<= h (+ expiry *expiry-grace-blocks*)))))
+                       (let* ((lvs (op:field enter-op :last-valid-sequence))
+                              (on-spend (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :expiry-ends-on-spend))
+                              (spent (or (not on-spend) (reestablishment-confirmed-p node base lvs))))
+                         (or (expiry-dispute-ended-p lvs (latest-quorum-begin-seq base) nil
+                                                     :on-spend on-spend :rotation-confirmed spent)
+                             (and expiry (<= h (+ expiry *expiry-grace-blocks*)) spent))))
               (conclude "quorum re-established (expiry ~a); yielded" expiry)))
           (let ((reserves-spent (multiple-value-bind (r txid vout) (disputed-reserves node base)
                                   (declare (ignore r))
@@ -3544,7 +3588,12 @@
             ((fork-op fork :dispute-yield) nil)
             ((null enter) t)
             ((null base) t)
-            (t (>= (or (op:field eo :last-valid-sequence) -1) (latest-quorum-begin-seq base)))))))
+            ((>= (or (op:field eo :last-valid-sequence) -1) (latest-quorum-begin-seq base)) t)
+            ;; strict-lottery-v8 (:expiry-ends-on-spend, judged at the fork point): a later
+            ;; QuorumBegin answers an expiry dispute only once its spend of the vault confirmed.
+            (t (and (expiry-reason-p (op:field eo :reason))
+                    (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :expiry-ends-on-spend)
+                    (not (reestablishment-confirmed-p node base (op:field eo :last-valid-sequence)))))))))
 
 (defun live-fork (node id-hex operator33)
   "OPERATOR33's fork of ID-HEX when it is live (fork-live-p), else NIL."
