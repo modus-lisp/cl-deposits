@@ -88,6 +88,35 @@ Nov 2 lapsed-challenge vault-spend proofs.
 | **Hold a quorum hostage by staying silent.** A member that never answers consent requests blocked every rotation of its operator until the quorum expired (soak A, Nov 7, cld2), handing every member a respectful-confiscation path | have | ruled (REVIEW 10, "permissionless means letting people gfy"): DEP-11 §Rotating without a silent member; the operator seats the consenting members from `drop_margin` before expiry. Regtest `rotation-drop`. Idea: a silent *majority* (fewer than three consent): only the expiry cascade remains, by design |
 | **Game the seating order.** The seated set is the current members first, then newcomers, each in consent order (`seat_consenting`); a newcomer cannot displace a current member, but among current members the earliest consents are kept. A member could race its consent to stay seated over a slower honest one | idea | operator policy, not judged; watch for it if seats become valuable |
 
+## Rule inverters
+
+A **rule inverter** deliberately computes the opposite of a rule that every node must compute
+identically (user, 2026-11-15). Most such rules sit behind two guards: a spend or claim that honest
+voters sign only if it is byte for byte the one they rebuild, and a voter threshold. Against
+both, an inverter only builds something nobody else signs, and the honest result lands without it
+(**self-defeating**). An inverse that wins anyway is a finding. The inverters in the harness:
+cl `ADVERSARY :invert-arm-selection` (a voter and proposer on the replaced arm rule) and
+`:late-rearm` (an armer that re-arms after its window closed); regtest `rearm-invert` runs both.
+
+| Rule (DEP-03/06) | Inverse | Guard | Self-defeating? |
+|---|---|---|---|
+| Re-arm arm selection (DEP-06 Phase 4 step 2): each armer's latest arm inside the window, of its first four | latest counted arm, then window-filtered (both implementations until 2026-11-15) | byte-identical spend | Yes for a proposer or voter now (`rearm-invert`: refused, the honest spend lands). **It was not for an armer** under the replaced rule: a later same-round arm signed past the close withdrew it from a closed window or emptied the cut. Fixed in both (cl `pick-round-arms`, Rust `pick_round_arms`; vector `rearm_window_arms.json`) |
+| **Arm `block_height` inside a closed window** (the dating every window rule reads) | sign a same-round arm with a `block_height` inside an already-closed window and publish it late (after some voters signed, or after the spend confirmed) | none: fork updates are not cosigned, so DEP-02's 6-block bound never applies; only "non-decreasing along the armer's own fork" does | **NOT self-defeating (finding, unruled).** The arm is valid and in-window, so voters who rebuild before and after it arrives build different spends, and once the spend has confirmed every node that rebuilds the round afterwards derives a different next lottery and stops following it (a liveness grief; a newcomer can backdate a first arm into the cut the same way). Raised to the coordinator |
+| Accused exclusion (DEP-03 §Lottery): Accused(grounds) are neither participants nor recovery voters (v8) | include the accused as participants or voters | under v8 a confiscation whose lottery includes the accused is not authorised (REVIEW 1); the re-arm spend is byte-identical | Yes under strict-lottery-v8. **No under earlier rulesets**, which accept either reading: a guilty signing majority can confiscate into its own lottery (known; the reason for v8) |
+| Re-arm window j (step 3): the first closed window with a non-empty cut | a later non-empty window | byte-identical spend | Yes |
+| Four-arm bound: an armer's first four arms by sequence count | the last four | byte-identical spend (round 1: the confiscation rebuild) | Yes |
+| Recovery voters: the QuorumBegin governing the fork point, minus the operator (and the accused under v8) | a QuorumBegin past the fork point (e.g. one the operator rotated in afterwards) | byte-identical spend and confiscation | Yes |
+| Recovery tier: the spend's nSequence is the tier's CSV | an earlier tier | consensus (CSV) | Yes |
+| Re-arm fee: `reference_feerate` × the tier's exact vsize | another fee | byte-identical spend | Yes |
+| Eligibility split at the window's close (`split_at`, confiscated_at = close) | at the tip | byte-identical spend | Yes |
+| Grounded arms (v7+): only grounded DisputeEnters' arms count | count ungrounded arms | byte-identical spend and confiscation | Yes |
+| Winner draw: sum of (len − 16) mod n over the revealed set | another winner | full-set leaf: consensus; subset leaf: voters attest only that subset's winner | Yes |
+| Reveal deadline (72 blocks) before a subset claim | attest a subset early | voters attest only past it | Yes |
+| Recovery destination: only the next round's lottery output | anywhere | the voter threshold only (the script does not bind it) | **No if the inverters hold the threshold**: honest voters must not sign, and v8 removes the accused, but colluders the grounds do not accuse still count (CHAOS Nov 5 lead). The trust assumption, not a new finding |
+
+Every "Yes" assumes the honest voters hold the threshold. Any rule can be inverted by voters who
+hold it.
+
 ## Depositor and wallet attacks
 
 | Attack | Status | Notes |
