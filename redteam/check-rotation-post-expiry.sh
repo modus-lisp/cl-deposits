@@ -20,8 +20,18 @@
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
 ARM=${1:-rescue}; WAIT=${WAIT:-1200}
 pick OP C1 C2 W C3
-# Each picked node runs the checkout's code (the policy switch is new).
-for n in $OP $C1 $C2 $W $C3; do cld_running $n || continue; stop_cld $n >/dev/null; start_cld $n >/dev/null & done; wait
+# Each picked node runs the checkout's code (the policy switch and :rotate-spent-vault are new): a
+# pool node may be running, or pinned by its version file to, an older build, so on regtest every
+# actor is unpinned and restarted, and checked from /proc.
+for n in $OP $C1 $C2 $W $C3; do
+  [ "${CLD_CHAIN:-}" = regtest ] && rm -f "$CLD_ROOT/$n/version"
+  ( cld_running $n && stop_cld $n >/dev/null; start_cld $n >/dev/null ) &
+done; wait
+for n in $OP $C1 $C2 $W $C3; do
+  b=$(live_build $n) || fail "$n did not come up"
+  [ "$(cd "$b" && pwd -P)" = "$(cd "$CLD_SRC" && pwd -P)" ] || fail "$n runs $b, not the checkout $CLD_SRC"
+done
+echo "== actors $OP $C1 $C2 $W $C3 restarted on the checkout ($(git -C "$CLD_SRC" rev-parse --short HEAD))"
 [ "$ARM" = confiscated ] && export RESP=${RESP:-5}
 X=$(FORM_EXPIRY=${FORM_EXPIRY:-40} form_ledger "${REDTEAM_PX:-PX$RANDOM}" $OP "" $C1 $C2 $W) || exit 1
 expect "$(cld_ctl $W '(:policy :post-expiry-rotation nil)')" "policy"
