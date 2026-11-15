@@ -182,7 +182,7 @@ case $ARM in
     AFTER=$(info $OP | grep -oE ':EXPIRY [0-9]+' | cut -d' ' -f2)
     [ $rc = 0 ] && fail "a rotation was recorded over the confiscated vault ($RT)"
     [ "$BEFORE" = "$AFTER" ] || fail "the ledger's expiry moved from $BEFORE to $AFTER: a QuorumBegin was recorded"
-    line=$(cllog $C1 "$MARK" | grep "refused cosign" | grep -m1 "confiscation confirmed: no rotation of it can be spent")
+    line=$(cllog $C1 "$MARK" | grep "refused cosign" | grep -m1 "no rotation of it can be spent")
     [ -n "$line" ] || fail "$C1 did not refuse the QuorumBegin for the confiscated vault (its log since $MARK has no such refusal)"
     echo "   $C1: $line"
     line=$(r1log "$MARK" | grep -m1 "Refusing cosign: the vault's confiscation confirmed: no rotation of it can be spent")

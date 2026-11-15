@@ -520,9 +520,11 @@
         (bt:with-lock-held (lock) value)))))
 
 (defun bitcoin-cli-chain-fn (cli)
-  "gettxout -> (:value-sats n :confirmations n), or NIL when spent/unknown."
-  (lambda (txid vout)
-    (let ((out (run-cli cli "gettxout" (txid-hex txid) (princ-to-string vout))))   ; wire bytes -> display hex
+  "gettxout -> (:value-sats n :confirmations n), or NIL when spent/unknown.  INCLUDE-MEMPOOL NIL asks
+   the confirmed UTXO set only (a mempool spend leaves the output there)."
+  (lambda (txid vout &optional (include-mempool t))
+    (let ((out (apply #'run-cli cli "gettxout" (txid-hex txid) (princ-to-string vout)   ; wire bytes -> display hex
+                      (unless include-mempool (list "false")))))
       (when (and (plusp (length out)) (char= (char out 0) #\{))
         (let ((j (js:parse out)))
           (list :value-sats (round (* (gethash "value" j) 100000000))

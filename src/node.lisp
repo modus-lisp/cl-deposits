@@ -1962,8 +1962,15 @@
    DisputeAcquire) against the chain."
   ;; DEP-06 §Race: a confiscation that confirmed first decided it.  No rotation of that vault
   ;; can be spent, so we never record one (a post-expiry re-establishment races only until then).
-  (when (and (has-quorum-begin-p rec) (not (record-fork-p rec)) (reserves-confiscated-p node rec))
-    (fail "the vault's confiscation confirmed: no rotation of it can be spent"))
+  ;; Read from the chain, not from what our dispute pass has noted: that lags the block by a pass
+  ;; (regtest 2026-11-15: a member cosigned the QuorumBegin 9 s before it noted the confiscation).
+  ;; Its rungs are signed only after it is final, so any confirmed spend of the vault is another's.
+  (when (and (has-quorum-begin-p rec) (not (record-fork-p rec)))
+    (when (reserves-confiscated-p node rec)
+      (fail "the vault's confiscation confirmed: no rotation of it can be spent"))
+    (multiple-value-bind (r txid vout) (ignore-errors (disputed-reserves node rec))
+      (when (and r txid (vault-spent-confirmed-p node txid vout))
+        (fail "the vault was spent on chain (a confiscation confirmed): no rotation of it can be spent"))))
   (if (and (has-quorum-begin-p rec) (not (record-fork-p rec)))
       (let ((rungs (mapcar (lambda (h) (btx:parse-tx (bw:make-reader (hex->bytes h))))
                            (coerce (or (w:jget params "rotation_rungs_tx") #()) 'list))))
@@ -1999,6 +2006,14 @@
           (i (and rungs (position txid rungs :test #'equalp))))
      (when i
        (note-rotation-rungs node (first rungs) (loop for k from 0 to i collect (and (= k i) bytes)) (up:update-block-height qu))))))
+
+(defun vault-spent-confirmed-p (node txid vout)
+  "TXID:VOUT is spent by a CONFIRMED transaction: gone from the confirmed UTXO set (a mempool
+   spend leaves it there).  A chain view that takes no mempool switch is asked as it is."
+  (and (node-chain-fn node)
+       (null (ignore-errors
+              (handler-case (funcall (node-chain-fn node) txid vout nil)
+                (program-error () (funcall (node-chain-fn node) txid vout)))))))
 
 (defun vault-spent-p (node txid vout)
   "TXID:VOUT (internal-order bytes), a vault the ledger names, is not unspent in our chain view
