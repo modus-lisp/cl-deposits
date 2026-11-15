@@ -54,6 +54,7 @@ consent() {         # consent LEDGER OPERATOR MEMBER... — a reference member's
 # set, is each member's dispute_response_blocks: the arm window, so a scenario need not mine ~720 blocks.
 form_ledger() {
   local row="$S/redteam-$1" op=$2 rs=${3:-${FORM_RULESET:-}} l prep addr txid vout coll=${COLLATERAL_SATS:-25000000}; shift 3   # DEP-05 floor: >= 20%
+  local m; for m in "$@"; do case $m in ref*) ref_ensure_current "$m";; esac; done   # no reference member on a stale binary
   if [ -f "$row" ]; then cat "$row"; return; fi
   l=$(sx "$(cld_ctl "$op" "(:open-ledger :reserves-id \"genesis:$op:redteam-$(basename "$row"):$RANDOM\" :reserves-msat 25000000000 :collateral-msat 25000000000${OPEN_RULESET:+ :ruleset \"$OPEN_RULESET\"})")" ":LEDGER")
   [ -n "$l" ] || fail "open ledger $(basename "$row")"

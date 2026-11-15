@@ -176,6 +176,7 @@ start_ref() {
   ( cd "$dir" && setsid -f nohup env $(ref_env) ${REF_EXTRA_ENV:-} "$bin" run --network "$CLD_CHAIN" --relay "$RELAY_URL" --esplora "$ESPLORA_URL" \
       --data-dir "$dir" --seed-file "$dir/seed.hex" --name "$n" --admin-bind "127.0.0.1:$(ref_port "$n")" >>"$dir/node.log" 2>&1 </dev/null
     sleep 1; pgrep -nf "deposits-node run .*--data-dir $dir " >"$dir/ref.pid" )
+  sha256sum "$bin" | cut -c1-16 >"$dir/loaded-bin"   # the binary it launched (ref_ensure_current)
   # A soaked node loads ~180k updates per ledger before it syncs its wallet: minutes, not seconds.
   for i in $(seq 1 "${REF_START_WAIT:-600}"); do tail -c +"$from" "$dir/node.log" 2>/dev/null | grep -q 'Wallet synced' && { echo "$n up (admin $(ref_port "$n"))"; return 0; }; ref_running "$n" || break; sleep 1; done
   echo "$n did not come up; see $dir/node.log" >&2; return 1
@@ -193,6 +194,18 @@ ref_begin_quorum() {
   done
   echo "quorum begin on $l did not complete" >&2; return 1
 }
+# A running reference node whose launched binary is not its build's current one restarts on it (by
+# binary sha, recorded at start_ref; a node with no record restarts too).  The cl side is
+# cld_tree_hash / pick.
+ref_ensure_current() {
+  local n=$1 dir want; dir=$(ref_dir "$n")
+  ref_running "$n" || return 0
+  want=$(sha256sum "$(ref_bin_of "$n")" | cut -c1-16)
+  [ "$(cat "$dir/loaded-bin" 2>/dev/null)" = "$want" ] && return 0
+  echo "== restarting $n on its current binary" >&2
+  stop_ref "$n" >/dev/null 2>&1; start_ref "$n" >/dev/null
+}
+
 stop_ref() {   # and wait for it to exit: a start while the old daemon still shuts down saw it "already running"
   local p i; p=$(ref_pid "$1") || return 0; [ -n "$p" ] && kill "$p" 2>/dev/null && echo "$1 stopped"; rm -f "$(ref_dir "$1")/ref.pid"
   [ -n "$p" ] && for i in $(seq 1 60); do kill -0 "$p" 2>/dev/null || return 0; sleep 1; done; [ -n "$p" ] && kill -9 "$p" 2>/dev/null; return 0
