@@ -101,7 +101,7 @@ cl `ADVERSARY :invert-arm-selection` (a voter and proposer on the replaced arm r
 | Rule (DEP-03/06) | Inverse | Guard | Self-defeating? |
 |---|---|---|---|
 | Re-arm arm selection (DEP-06 Phase 4 step 2): each armer's latest arm inside the window, of its first four | latest counted arm, then window-filtered (both implementations until 2026-11-15) | byte-identical spend | Yes for a proposer or voter now (`rearm-invert`: refused, the honest spend lands). **It was not for an armer** under the replaced rule: a later same-round arm signed past the close withdrew it from a closed window or emptied the cut. Fixed in both (cl `pick-round-arms`, Rust `pick_round_arms`; vector `rearm_window_arms.json`) |
-| **Arm `block_height` inside a closed window** (the dating every window rule reads) | sign a same-round arm with a `block_height` inside an already-closed window and publish it late (after some voters signed, or after the spend confirmed) | none: fork updates are not cosigned, so DEP-02's 6-block bound never applies; only "non-decreasing along the armer's own fork" does | **NOT self-defeating (finding, unruled).** The arm is valid and in-window, so voters who rebuild before and after it arrives build different spends, and once the spend has confirmed every node that rebuilds the round afterwards derives a different next lottery and stops following it (a liveness grief; a newcomer can backdate a first arm into the cut the same way). Raised to the coordinator |
+| **Arm `block_height` inside a closed window** (the dating every window rule reads) | sign a same-round arm with a `block_height` inside an already-closed window and publish it late (after some voters signed, or after the spend confirmed) | none: fork updates are not cosigned, so DEP-02's 6-block bound never applies; only "non-decreasing along the armer's own fork" does | **NOT self-defeating: ruled 2026-11-15 (option A, arm manifests); see §Backdated arms below.** The arm is valid and in-window, so voters who rebuild before and after it arrives build different spends, and once the spend has confirmed every node that rebuilds the round afterwards derives a different next lottery and stops following it (a liveness grief; a newcomer can backdate a first arm into the cut the same way). Raised to the coordinator |
 | Accused exclusion (DEP-03 §Lottery): Accused(grounds) are neither participants nor recovery voters (v8) | include the accused as participants or voters | under v8 a confiscation whose lottery includes the accused is not authorised (REVIEW 1); the re-arm spend is byte-identical | Yes under strict-lottery-v8. **No under earlier rulesets**, which accept either reading: a guilty signing majority can confiscate into its own lottery (known; the reason for v8) |
 | Re-arm window j (step 3): the first closed window with a non-empty cut | a later non-empty window | byte-identical spend | Yes |
 | Four-arm bound: an armer's first four arms by sequence count | the last four | byte-identical spend (round 1: the confiscation rebuild) | Yes |
@@ -116,6 +116,113 @@ cl `ADVERSARY :invert-arm-selection` (a voter and proposer on the replaced arm r
 
 Every "Yes" assumes the honest voters hold the threshold. Any rule can be inverted by voters who
 hold it.
+
+## Backdated arms (ruled 2026-11-15: option A, arm manifests)
+
+**What is possible, and why.** A `DisputeArmed` is an update on the armer's own fork. Its author
+signs it and nobody cosigns it. DEP-02's bound on a header's height (within six blocks of the
+cosigner's tip) is a cosigner check, so it never applies to these updates. The fold asks only that
+heights do not decrease along the fork. A same-round re-arm must repeat the commitment and declare
+collateral, but its target and pledge may change. So any armer can sign an arm dated at or below a
+block that has already passed:
+
+- at or below the confiscation block C, for round 1;
+- inside a re-arm window that has already closed, for a later round.
+
+It can then publish that arm after the spend is signed, or after it confirms. Every rule that
+reads "each armer's latest arm" up to a height then gives a later reader a different answer than
+the spend's signers had. Three ways this hurts:
+
+1. **Round 1, the judge (the serious one).**
+   - Judges rebuild a confirmed confiscation from each armer's latest arm at or below C (cl
+     `rebuild-matches-p` over `armers-of :until C`; Rust `rebuild_matching` over
+     `collect_armers_until`). They try every subset, and each subset's E (the highest signed height
+     of its arms) fixes its pledge cut and obligations.
+   - Say a participant publishes, after C, a re-arm dated C that pledges a coin created after E.
+     Every subset containing that armer now excludes it at its own E, and every subset without it
+     builds a different lottery. No subset rebuilds the confirmed bytes.
+   - A judge without a cached verdict then challenges the honest confiscation, and proves against
+     its signers when the challenge lapses: the Nov 4 false-proof chain, started after the fact by
+     one armer. The cached verdict is cl's `*rebuilt-confiscations*`, held in memory only: a
+     restart loses it, and a new or wiped node never had it. Rust re-judges in the same way.
+   - **Reproduced on regtest, 2026-11-15** (`redteam/check-backdated-arm.sh` on `0ee6c1f` plus the
+     testing-only `:backdated-rearm` knob). The scenario is ledger aa5bdc01: OP cld391, C2..C5
+     cosign blind (cld390, cld389, cld388, cld387), H cld386 disputes, and X cld368 and J cld364
+     are honest.
+     - The confiscation c57e78a0 confirmed at 12107, and J first judged it "answered by its
+       anchor".
+     - X then published a round-1 re-arm signed at 12107, pledging a coin created at 12111.
+     - J restarted without its vault-watch state, then logged: "armer 02ad368d excluded … pledge
+       confirmed at 12111, after the snapshot 12107"; "VAULT SPEND CHALLENGED … nothing we hold
+       answers it; challenging (5 signers)"; and after the window "vault spend: 3d42a6c1 signed it;
+       lapsed-challenge proof against its ledger c0573b85" and "4cd8690d signed it; lapsed-challenge
+       proof".
+     - Both are proofs against signers of an honest confiscation. 3d42a6c1 is J itself: it proved
+       against its own ledger.
+2. **Round 1, the landed set, past eight armers.**
+   - Claimers recover the confirmed lottery's participants by trying subsets of the current arms
+     (cl `lottery-paid-by`, Rust `match_landed_set`). The output script binds only keys and
+     commitments, so a changed target or pledge still matches, and so does a backdated newcomer.
+   - Above eight candidates the search does not run, so seven backdated newcomers on a two-armer
+     dispute lose the set. Rust re-derives it on every claim pass; cl keeps the lottery it signed
+     or saw, but a node that never saw it re-derives it too.
+   - Rust unit test `a_backdated_round_1_arm_loses_the_landed_set_only_past_8_armers` (`32bd467`)
+     asserts that behaviour.
+3. **Re-arm rounds, the split.**
+   - The next round's lottery was re-derived from the window's cut (each armer's latest in-window
+     arm). An arm backdated into a closed window, published after some voters signed, leaves
+     voters that rebuilt before it and voters that rebuilt after it with different spends.
+   - Published after the spend confirmed, it leaves every later reader with a different next
+     lottery, so they stop following the round: a liveness grief.
+
+**The ruling (A).** Arms stay self-signed. A spend is judged by the arm set its signers used, not
+by "latest" (DEP-03 §Arm manifests, `strict-lottery-v8` only; frozen rulesets unchanged):
+
+- Signers publish a **manifest**: (armer, sequence) per participant, carried in a Challenge
+  Answer, Kind 9112, as `round` and `arms`.
+- A spend is honest iff some valid manifest rebuilds it byte for byte. Valid means each named arm
+  exists, no armer is named twice, each arm is within its armer's four-arm bound and of the round,
+  and each is signed in the window.
+- A judge without a manifest never proves on a failed rebuild. It challenges, and only a lapse
+  proves. A manifest that does not rebuild the spend is no answer.
+- The set after confirmation, including the next round's lottery, is the manifest's whose lottery
+  pays the confirmed output.
+- A backdated arm can at most delay a spend before it confirms, while voters' views converge.
+
+**What we accept under A.**
+- Before A, leaving out an armer was provable: the judge's rebuild from every arm would not match.
+  Under A it is signing policy. A spend over any valid subset of the arms is honest, so a recovery
+  threshold could quietly exclude an armer it dislikes, and the excluded armer has no proof to
+  publish.
+- Honest signers include every armer they saw by the close, and both implementations do. The guard
+  is the threshold, as for the recovery destination in the table above.
+- An excluded armer loses only its chance at custody. Its pledge is never taken.
+
+**The open future fix (B): make arm timestamps provable.** Two ways:
+- *Cosign arms*, so DEP-02's six-block bound applies. This costs a cosigning round per arm, and
+  the cosigners are the recovery quorum, the parties a dispute already distrusts. A quorum that
+  withholds cosignatures could then keep an armer out, the veto the self-signed arm was meant to
+  avoid.
+- *Anchor arms* on chain or in a timestamping service, so an arm counts only from its anchor's
+  block. This costs a transaction (or an external dependency) per arm, and adds latency inside a
+  six-block window.
+
+Either way, "each armer's latest arm" becomes safe to re-derive, and omission becomes provable
+again. Not scheduled.
+
+**After A, the same regtest** (`backdated-arm`, flipped to expect no challenge and no proof;
+ledger 4ae05a84):
+- The confiscation e05b97a4 confirmed at 12247.
+- X published a round-1 re-arm signed at 12247, pledging a coin created at 12251.
+- The restarted judge J logged "4ae05a84's spend e05b97a4d603a127 rebuilds from its arm manifest
+  (2 arms)" and "answered by its anchor". It raised no challenge and made no proof.
+
+Unit evidence:
+- cl `inspect/node-test.lisp`: the latest-arms rebuild fails after the backdated arm, and the
+  manifest rebuilds it. A manifest missing a participant, or naming the backdated arm, does not.
+  A manifest published by a node that signed nothing answers for the spend (permissionless).
+- Shared vectors: `arm_manifest.json` (11 cases of arm-set validity, including the newcomer and
+  the nine-armer case) and `confiscation_manifest.txt` (the rebuild), both run by cl and Rust.
 
 ## Depositor and wallet attacks
 

@@ -210,3 +210,21 @@ re-confiscate.
 - **Where:** spec DEP-05 §A rotation past expiry is allowed, never owed, and §When a
   `quorum_expired` dispute ends; DEP-06 §Race, "Confirmed decides; pledges lapse with the loser".
   Vector `post_expiry_rotation.json`; regtest `rotation-post-expiry` (`rescue`, `confiscated`).
+
+## 12. Backdated arms (ruled 2026-11-15: "A for now, but let's write down the scenario in the repo")
+
+- **Asked:** a fork's `DisputeArmed` is self-signed, so an armer can date an arm inside a window
+  that has closed (round 1: at or below the confiscation block) and publish it after the spend.
+  Every rebuild through "each armer's latest arm" then changes. The options were:
+  - (A) judge a spend by the arm set its signers used;
+  - (B) make arm timestamps provable, by cosigning or anchoring arms;
+  - (C) leave it.
+- **Ruling (2026-11-15):** A for now; B recorded as the open future fix.
+  - Under `strict-lottery-v8` signers publish arm manifests, and judges are existential over
+    valid manifests.
+  - Omission of an armer is signing policy, not a provable fault. That is the accepted cost.
+  - The next round's lottery is the confirmed output's.
+- **Where:** docs/ADVERSARIAL.md §Backdated arms (the scenario, its evidence, what A accepts, B's
+  costs); spec DEP-03 §Arm manifests, DEP-06 §Authorised confiscation, §Spend challenge and Phase 4
+  step 5. Vector `arm_manifest.json`; regtest `backdated-arm`.
+
