@@ -161,8 +161,11 @@ re-confiscate.
   Under v8 a later round's arm is now valid on such a fork. The reasoning: a confirmed claim spends the
   lottery output, so if a later round exists, the acquire never bound (DEP-06 spec 129b983, cl
   d637db8, vector `dispute_rearm.json`). This applies an existing ruling, so it needs no new one.
-  Rust has no re-arm rounds in its fold at all (no TLV 366; Tombstoned takes nothing): the round-fold
-  cases stay cl-only in the vector until it does.
+  Rust now folds re-arm rounds too (TLV 366 `rearm_round` on DisputeArmed; a later round from Disputed,
+  Armed or Tombstoned, or from Normal on an armed acquire-on-confirm fork; a lower round refused), so
+  `dispute_rearm.json` (13 cases) and the TLV vector `dispute_armed_round.json` run in both, not cl-only.
+  Lead, unruled: spec step 2 takes "each armer's latest [arm] there" (in the window); both
+  implementations take the round's latest counted arm and then filter by window.
 
 ## 10. soak-rotate keeps a stuck member in the plan (ruled 2026-11-10: "permissionless means letting people gfy")
 
