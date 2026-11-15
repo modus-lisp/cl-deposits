@@ -36,7 +36,31 @@ register_pool() {   # every cl node that is not a soak operator, as a red-team p
   done
 }
 ai=0
+# resolve_pending_lotteries — a turn whose lottery was still unclaimed at its end (PENDING) is followed
+# here, through re-arm rounds (DEP-06 Phase 4): PASS once any honest node logs a round's win, FAIL past
+# LOTTERY_BOUND (default 48 h).  Rows: $SOAK/lottery-pending.tsv "TIME ATTACK LEDGER CONFISCATION";
+# resolved ones are listed in $SOAK/lottery-resolved.tsv and get a row in attack-outcomes.tsv.
+resolve_pending_lotteries() {
+  local pend="$SOAK/lottery-pending.tsv" done="$SOAK/lottery-resolved.tsv" t a e c now won
+  [ -f "$pend" ] || return 0; touch "$done"; now=$(date +%s)
+  while read -r t a e c; do
+    [ -n "$e" ] || continue; grep -qF " $e " "$done" && continue
+    won=$(grep -lE "dispute ${e:0:8}: (lottery|re-arm round [0-9]+): won" "$CLD_ROOT"/cld*/node.log 2>/dev/null | head -1)
+    [ -n "$won" ] || won=$(grep -lF "won the lottery for ledger ${e:0:16}" "$CLD_ROOT"/ref*/node.log 2>/dev/null | head -1)
+    if [ -n "$won" ]; then
+      echo "$now $a PASS:lottery-claimed-late $(( now - t ))" >>"$SOAK/attack-outcomes.tsv"
+      echo "$now $e PASS $(basename "$(dirname "$won")")" >>"$done"
+      echo "$(date +%FT%T) $a on ${e:0:16}: lottery claimed after re-arm ($(basename "$(dirname "$won")")): PASS"
+    elif [ $(( now - t )) -gt "${LOTTERY_BOUND:-172800}" ]; then
+      echo "$now $a FAIL:lottery-unclaimed $(( now - t ))" >>"$SOAK/attack-outcomes.tsv"
+      echo "$now $e FAIL -" >>"$done"
+      echo "$(date +%FT%T) $a on ${e:0:16}: lottery still unclaimed after $(( (now - t) / 3600 )) h: FAIL"
+    fi
+  done <"$pend"
+}
+
 while true; do
+  resolve_pending_lotteries
   sleep "$EVERY"
   [ -e "$SOAK/attackers.pause" ] && { echo "$(date +%FT%T) paused"; continue; }
   a=${ATTACKS[$((ai % ${#ATTACKS[@]}))]}; ai=$((ai+1))
@@ -47,8 +71,9 @@ while true; do
   echo "$(date +%FT%T) running $a"
   up_before=" $(for n in $(cld_names); do cld_running "$n" && echo "$n"; done | tr '\n' ' ') "
   ( export REDTEAM_V="V$(date +%s)" DEVNET=signet REDTEAM_ON_SIGNET=1 REDTEAM_MINT=1 REDTEAM_AVOID="$SOAK_OPS" REFS="${ATTACK_REFS-ref6 ref7}"
+    export ATTACK_NAME="$a"
     timeout --kill-after=60 5400 bash "$CLD_SRC/redteam/$script.sh" $arg ) >"$out" 2>&1
-  rc=$?; v=$(grep -oE '^(PASS|FAIL|SKIP|INVALID)[^ ]*' "$out" | tail -1)
+  rc=$?; v=$(grep -oE '^(PASS|FAIL|SKIP|INVALID|PENDING)[^ ]*' "$out" | tail -1)
   source "$(dirname "$0")/_common.sh"   # CLD_NODES again: it counts the nodes minted during the run
   "$CLD_SRC/devnet/soak.sh" names >/dev/null 2>&1; register_pool   # nodes minted during the run
   # Then stop the actors this run started (picked or minted), once their keys are registered: each is
@@ -58,5 +83,5 @@ while true; do
     cld_running "$n" && stop_cld "$n" >/dev/null 2>&1 && echo "$(date +%FT%T)   stopped actor $n"
   done
   echo "$(date +%s) $a ${v:-none} $(( $(date +%s) - t ))" >>"$SOAK/attack-outcomes.tsv"   # the oracle's per-attack table
-  echo "$(date +%FT%T) $a: ${v:-no verdict} (exit $rc, $(( $(date +%s) - t ))s)  $(grep -E '^(PASS|FAIL|SKIP)' "$out" | tail -1 | cut -c1-160)"
+  echo "$(date +%FT%T) $a: ${v:-no verdict} (exit $rc, $(( $(date +%s) - t ))s)  $(grep -E '^(PASS|FAIL|SKIP|PENDING)' "$out" | tail -1 | cut -c1-160)"
 done

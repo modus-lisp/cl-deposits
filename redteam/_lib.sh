@@ -184,13 +184,15 @@ wake_cl() {
     tainted "$n" && continue
     [[ " ${REDTEAM_AVOID:-} " == *" $n "* ]] && continue
     cld_running "$n" && continue
-    [ -f "$(cld_dir "$n")/node.key" ] || continue
+    # A recycled slot (recycle_cl) is an empty dir with a fresh-key marker: it starts with a new key.
+    [ -f "$(cld_dir "$n")/node.key" ] || [ -f "$(cld_dir "$n")/recycled" ] || continue
     [ -n "${REDTEAM_MINTED_FILE:-}" ] && echo "$n" >>"$REDTEAM_MINTED_FILE"
     # Its collateral went to earlier scenarios' pledges: fund it again (pick -> fund_cl).  A woken
     # cld251 had "0 unpledged", never armed, and rearm-restart saw one participant (2026-11-12).
     rm -f "$S/.cl-collateral-funded.$n"
     start_cld "$n" >&2
     for w in $(seq 1 60); do cld_ctl "$n" '(:info)' 2>/dev/null | grep -q ":STATUS :OK" && break; sleep 5; done
+    rm -f "$(cld_dir "$n")/recycled"
     woke=$((woke+1))
   done
   [ $woke -gt 0 ] && echo "== woke $woke stopped pool node(s)" >&2
@@ -209,7 +211,9 @@ recycle_cl() {
     tainted "$n" || continue
     cld_running "$n" && continue
     d=$(cld_dir "$n"); [ -d "$d" ] || continue
-    mv "$d" "$CLD_ROOT/recycled/$n-$(date +%s)" && mkdir -p "$d" || continue
+    # Until 2026-11-14 the emptied slot had no node.key, so wake_cl never started it and every turn
+    # that recycled still SKIPped "needs 6 clean cl nodes, have 3" (oracle: 2 MISS, now moot).
+    mv "$d" "$CLD_ROOT/recycled/$n-$(date +%s)" && mkdir -p "$d" && touch "$d/recycled" || continue
     [ -f "$(cld_dir cld7)/version" ] && cp "$(cld_dir cld7)/version" "$d/version"
     # The taint stays with the old KEY: the oracle reads adversaries.tsv by key, so proofs against
     # the burned key stay PASS after the slot's name is clean again (soak-oracle.py; CHAOS.md).

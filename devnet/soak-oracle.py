@@ -174,8 +174,17 @@ def judge(events, world, now=None):
             counts["ALARM"] += 1
             verdicts.append((e["created_at"], "ALARM", False,
                              f"challenge of honest {world.lname(led)}'s spend {txid[:12]} by {world.who(e['pubkey'])} lapsed unanswered"))
+    # A turn that SKIPped or was INVALID (its precondition did not arise: no actors, no ledger) ran no
+    # attack, so its scheduled row is no MISS.  soak-attackers.sh writes the row at the turn's start
+    # and the outcome at its end (end time, name, verdict, seconds taken).
+    moot_turns = [(float(r[0]) - float(r[3]), r[1]) for r in world.outcomes
+                  if len(r) >= 4 and r[2].startswith(("SKIP", "INVALID"))]
+    counts["skipped"] = 0
     for t, attack, led, acc, window in world.attacks:
         t, window = float(t), float(window)
+        if led == "-" and any(name == attack and t - 5 <= start <= t + 120 for start, name in moot_turns):
+            counts["skipped"] += 1
+            continue
         hit = any(typ != "QuorumExpired" and e["created_at"] >= t - 60 and e["created_at"] <= t + window
                   and (led.lower() == "-" or led2.lower().startswith(led.lower()))
                   and (xonly(acc2).startswith(xonly(acc)) if acc != "-"
@@ -187,13 +196,15 @@ def judge(events, world, now=None):
     per = {}
     for r in world.outcomes:
         ok = r[2].startswith("PASS")
-        moot = r[2].startswith(("INVALID", "SKIP"))   # the scenario's precondition did not arise: no verdict
+        # The scenario's precondition did not arise (no verdict), or its lottery is still being followed
+        # through re-arm rounds (PENDING: a later PASS or FAIL row settles it).
+        moot = r[2].startswith(("INVALID", "SKIP", "PENDING"))
         a = per.setdefault(r[1], [0, 0, 0])
         if moot:
             a[2] += 1
         else:
             a[0] += ok; a[1] += 1
-        if not ok:
+        if not ok and not r[2].startswith("PENDING"):
             verdicts.append((float(r[0]), "ATTACK", False, f"{r[1]}: scenario verdict {r[2]}"))
     counts["attacks"] = per
     return verdicts, counts
@@ -201,7 +212,7 @@ def judge(events, world, now=None):
 
 def summary_line(counts):
     line = ("oracle: PASS {PASS}  MISS {MISS}  ALARM {ALARM} ({resolved} resolved)  expiry {EXPIRY}  challenges {challenged}"
-            " (answered {answered}, pending {pending})").format(**counts)
+            " (answered {answered}, pending {pending})  skipped {skipped}").format(**counts)
     per = counts.get("attacks") or {}
     if per:
         line += "  attacks " + " ".join(f"{a}={p}/{n}" + (f"+{m}moot" if m else "") for a, (p, n, m) in sorted(per.items()))

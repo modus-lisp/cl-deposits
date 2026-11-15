@@ -85,7 +85,8 @@ for i in $(seq 1 $((WAIT / 10))); do
     echo "== vault spent (${spent:-?}) after $((i * 10)) s"
   fi
   if [ -n "$spent" ]; then
-    claim=$(for n in $M1 $M2 $M3 $H; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${E:0:8}: lottery: won" | head -1 | sed "s/^/$n: /"; done)
+    # Round 1's claim, or a later re-arm round's (DEP-06 Phase 4: an unclaimed lottery re-arms).
+    claim=$(for n in $M1 $M2 $M3 $H; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "dispute ${E:0:8}: (lottery|re-arm round [0-9]+): won" | head -1 | sed "s/^/$n: /"; done)
     [ -n "$claim" ] && break
     tail -c 3000000 "$(ref_dir ${REFS%% *})/node.log" 2>/dev/null | grep -F "${E:0:16}" | grep -qiE "won the lottery|claim(ed)? .*custody|DisputeAcquire" && { claim="${REFS%% *}: reference"; break; }
   fi
@@ -99,6 +100,18 @@ echo "== detection: ${proven:-none}"
 for n in $M1 $M2 $M3 $H; do
   cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND" | grep -qF "${E:0:8}" && fail "$n took the confiscation of $E for a theft"
 done
-[ -n "$claim" ] || fail "$E's vault was confiscated but no member claimed the lottery within ${WAIT}s"
-[ "$(printf '%s\n' "$claim" | grep -c 'lottery: won')" -le 1 ] || fail "more than one member won the lottery"
+if [ -z "$claim" ]; then
+  # DEP-06 Phase 4 (strict-lottery-v8): an unclaimed lottery re-arms, and a round takes at least the
+  # CSV-144 recovery leaf: hours on the signet, past this turn.  The soak's attackers loop follows
+  # it (devnet/soak-attackers.sh resolve_pending_lotteries) and records PASS once any round is
+  # claimed, FAIL past LOTTERY_BOUND.  382f5293 was re-armed and won in round 2 (Nov 14), after
+  # its turn had reported FAIL.
+  if [ -n "${S:-}" ] && [ -n "${ATTACK_NAME:-}" ]; then
+    echo "$(date +%s) $ATTACK_NAME $E ${spent:-?}" >>"$S/lottery-pending.tsv"
+    echo "PENDING: $OP's $FAULT on $E was detected and its vault confiscated (${spent:-?}); its lottery is unclaimed after ${WAIT}s and is followed through re-arm rounds"
+    exit 0
+  fi
+  fail "$E's vault was confiscated but no member claimed the lottery within ${WAIT}s"
+fi
+[ "$(printf '%s\n' "$claim" | grep -cE ': won')" -le 1 ] || fail "more than one member won the lottery"
 echo "PASS: $OP's $FAULT on $E was detected, its vault confiscated ($spent) and the lottery claimed (${claim%%:*})."
