@@ -269,3 +269,27 @@ re-confiscate.
   costs); spec DEP-03 §Arm manifests, DEP-06 §Authorised confiscation, §Spend challenge and Phase 4
   step 5. Vector `arm_manifest.json`; regtest `backdated-arm`.
 
+
+## 13. A rotation recorded below its rungs' answer floor (found 2026-11-19; fixed cl f28a49f, rust answer-floor, spec 0373ba0)
+
+**Decision taken, for review: it is a duty on every ruleset, not a v8 rule.**  Nothing in it changes
+what a validator accepts: the `QuorumBegin` C recorded was valid under DEP-05, and the judge's answer
+rule (DEP-06 §Spend challenge 1) was already the rule.  What was missing was the obligation that
+keeps the two consistent: an operator records a rotating `QuorumBegin` only with cosignatures by the
+rungs' tier reaching that tier's threshold, and a member signs rungs only for such a one.  Gating it
+on v8 would have left every older vault able to repeat C.  If you want it ruleset-gated anyway, the
+only change is where the cl/Rust checks read their switch.
+
+**What happened.**  Signet ledger C (8b19a178): a post-expiry rescue was planned at vault tier 0
+(5 of 8, the operator among them) just before tier 1 opened at 8285, and its `QuorumBegin` (seq
+361569) recorded at 8287 with the 3 cosignatures the lifecycle then asks.  The rung (2653505d) spent
+tier 0, where an answer needs 4.  The operator's own vault watch challenged its rotation and answered
+itself with a `QuorumBegin` no judge could accept; the window lapsed and, once its relay read
+worked again, it proved all five rung signers (six false oracle ALARMs, none acted on).
+
+**Also decided here:** a node never presents a proof against its own key (DEP-06): a judgement that
+calls our own signature theft is our judge's fault.  Both implementations log it loudly instead.
+
+**Still open:** the answer path (Kind 9112) publishes a `QuorumBegin` without asking whether it meets
+the floor, so an operator can "answer" with something every judge rejects.  Harmless once the floor
+is enforced at recording, and left as it is; an answerer could warn.

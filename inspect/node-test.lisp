@@ -2598,7 +2598,7 @@
 (with-gate ("rotation answer floor: the signet C rescue, as recorded, answers nothing (vector)")
   (let* ((v (json-simple:parse (uiop:read-file-string (vector-path "rotation_answer_floor.json"))))
          (e (gethash "expect" v))
-         (b64 (lambda (k) (up:decode-update (cl-base64:base64-string-to-usb8-array (gethash k v)))))
+         (b64 (lambda (k) (up:decode-update (hx (gethash (concatenate (quote string) k "_hex") v)))))
          (ups (list (funcall b64 "ledger_open") (funcall b64 "governing_quorum_begin") (funcall b64 "answer_quorum_begin")))
          (ans (third ups))
          (spend (btx:parse-tx (cl-consensus.wire:make-reader (hx (gethash "spend_tx_hex" v)))))
