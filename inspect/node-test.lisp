@@ -2590,4 +2590,85 @@
   (check-equal "least recently driven first, within the slots"
                (nd::drive-schedule '(("p" nil 30 nil) ("q" nil 10 nil) ("r" nil 20 nil)) 2 0) '("q" "r")))
 
+;;; DEP-06 rotation answer floor.  Signet soak, ledger C (8b19a178): a rescue planned at vault tier 0
+;;; just before tier 1 opened (8285) was recorded at 8287 with the minority DEP-05 asks there (3),
+;;; while its rung still spent tier 0 (5 of 8, a judge needs 4 cosignatures).  No judge accepts that
+;;; QuorumBegin as the answer; the operator challenged its own rotation, and the lapsed challenge
+;;; proved all five signers (2026-11-19).
+(with-gate ("rotation answer floor: the signet C rescue, as recorded, answers nothing (vector)")
+  (let* ((v (json-simple:parse (uiop:read-file-string (vector-path "rotation_answer_floor.json"))))
+         (e (gethash "expect" v))
+         (b64 (lambda (k) (up:decode-update (cl-base64:base64-string-to-usb8-array (gethash k v)))))
+         (ups (list (funcall b64 "ledger_open") (funcall b64 "governing_quorum_begin") (funcall b64 "answer_quorum_begin")))
+         (ans (third ups))
+         (spend (btx:parse-tx (cl-consensus.wire:make-reader (hx (gethash "spend_tx_hex" v)))))
+         (reserves (fr:spent-vault ups (gethash "governing_seq" e)))
+         (stack (first (btx:tx-witnesses spend)))
+         (ti (position (nth (- (length stack) 2) stack) (rs:reserves-leaves reserves) :test #'equalp)))
+    (check-equal "the rung spent the tier the vector names" ti (gethash "tier_index" e))
+    (check-equal "that tier's threshold" (rs:tier-threshold (nth ti (rs:reserves-tiers reserves))) (gethash "tier_threshold" e))
+    (multiple-value-bind (keys need) (fr:answer-cosign-need reserves ti)
+      (check-equal "its keys" (length keys) (gethash "tier_keys" e))
+      (check-equal "cosignatures a judge needs (the operator's counts)" need (gethash "needed_cosignatures" e))
+      (check-equal "cosignatures the QuorumBegin carries by them" (fr:tier-cosignatures ans keys) (gethash "tier_cosignatures" e)))
+    (check "it is otherwise the answer: anchor, operator, rung, operator signature"
+           (and (equalp (up:update-prev-hash ans) (rot:anchor-of spend))
+                (member (btx:tx-txid spend) (fr:rotation-rungs (op:update-op ans)) :test #'equalp)
+                (up:verify-operator-signature ans)))
+    (check-equal "and no judge accepts it" (and (fr:rotation-answer (list ans) (rot:anchor-of spend) (btx:tx-txid spend) reserves ti) t)
+                 (gethash "answers" e))
+    (check "at a tier whose floor its cosignatures reach (tier 1), it would"
+           (let ((t1 1)) (>= (fr:tier-cosignatures ans (fr:answer-cosign-need reserves t1)) (nth-value 1 (fr:answer-cosign-need reserves t1)))))))
+
+(with-gate ("rotation answer floor: a rotation planned at tier 0 and recorded past tier 1's opening")
+  (flet ((setup (salt)
+           (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*)) (sent (list nil))
+                  (a (nd:make-node :priv (tk (+ 11111111111111119000 salt)) :bus bus :height-fn hf
+                                   :broadcast-fn (lambda (bytes) (push (btx:tx-txid (btx:parse-tx (cl-consensus.wire:make-reader bytes))) (car sent)) t)))
+                  (b (nd:make-node :priv (tk (+ 22222222222222229000 salt)) :bus bus :height-fn hf))
+                  (c (nd:make-node :priv (tk (+ 33333333333333339000 salt)) :bus bus :height-fn hf))
+                  (d (nd:make-node :priv (tk (+ 44444444444444449000 salt)) :bus bus :height-fn hf))
+                  (la (nd:open-ledger a :reserves-id (format nil "genesis:floor~a" salt) :reserves 15600000 :collateral 23400000)))
+             (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+               (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 2000))
+             (nd:begin-quorum a la :funding-txid (u:sha256 (hx (format nil "f1f00~a" salt))) :funding-vout 0 :amount-msats 15600000
+                                   :collateral-msats 23400000 :expiry-blocks 100)
+             (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 2000))
+             (list a b c d la sent))))
+    ;; Operator arm: the floor refuses to record it; nothing is signed or broadcast.
+    (destructuring-bind (a b c d la sent) (setup 1)
+      (declare (ignore b))
+      (let* ((expiry (lg:ledger-quorum-expiry (nd:record-ledger la)))
+             (open1 (+ expiry lg::+tier-1-offset+)) (seq0 nil))
+        (let ((*height* (1- open1)))
+          (nd:rotate-vault a la :timeout 5)
+          (check-equal "planned at tier 0, just before tier 1 opens" (getf (getf (nd:pending-rotation a la) :plan) :tier-index) 0))
+        (let ((*height* (+ open1 2)))
+          (check-equal "recorded past the opening, the ledger asks for the minority" (lg:lifecycle-tier (nd:record-ledger la) *height*) :tier1)
+          (setf (nd::node-adversary c) (list :refuse-cosign t) (nd::node-adversary d) (list :refuse-cosign t))
+          (setf seq0 (lg:ledger-sequence (nd:record-ledger la)))
+          (check-signals "a QuorumBegin below tier 0's floor is not recorded" nd:node-error (nd:begin-quorum a la))
+          (check-equal "nothing was recorded" (lg:ledger-sequence (nd:record-ledger la)) seq0)
+          (check "nothing was broadcast" (null (car sent)))
+          (check "the rotation is still pending, unrecorded (the next pass re-plans)"
+                 (let ((r (nd:pending-rotation a la))) (and r (null (getf r :qb-seq)))))
+          (check-equal "re-planned now, it spends tier 1" (progn (nd:rotate-vault a la :timeout 5)
+                                                                 (getf (getf (nd:pending-rotation a la) :plan) :tier-index))
+                       1))))
+    ;; Member arm: an operator that skips the floor records it; the members' rung gate refuses.
+    (destructuring-bind (a b c d la sent) (setup 2)
+      (let* ((expiry (lg:ledger-quorum-expiry (nd:record-ledger la)))
+             (open1 (+ expiry lg::+tier-1-offset+)))
+        (let ((*height* (1- open1))) (nd:rotate-vault a la :timeout 5))
+        (let ((*height* (+ open1 2)))
+          (setf (nd::node-adversary c) (list :refuse-cosign t) (nd::node-adversary d) (list :refuse-cosign t)
+                (nd::node-adversary a) (list :skip-answer-floor t))
+          (multiple-value-bind (u r rtxid) (nd:begin-quorum a la)
+            (declare (ignore r))
+            (check "the adversary records it at DEP-05's minority" (and u (eq (op:update-type u) :quorum-begin)))
+            (check "no rung is signed past the members' gate" (null rtxid))
+            (check "nothing was broadcast" (null (car sent)))
+            (check "a member says why"
+                   (some (lambda (m) (some (lambda (l) (search "no judge can answer" l)) (nd:node-log m))) (list b c d)))))))))
+
 (report)

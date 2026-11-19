@@ -20,7 +20,7 @@
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
            #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers #:proof-accused-keys
-           #:rotation-rungs #:rotation-answer #:spend-window #:challenge-op #:spent-vault
+           #:rotation-rungs #:rotation-answer #:answer-cosign-need #:tier-cosignatures #:spend-window #:challenge-op #:spent-vault
            #:unhonoured-obligation-proof #:verify-unhonoured-obligation #:make-uncredited-offer-proof))
 (in-package #:cl-deposits.fraud)
 
@@ -478,26 +478,39 @@
    include TXID, and whose signatures by keys of the tier TIER-INDEX (the tier the spend's witness
    uses) reach its threshold: valid cosignatures over it, and the operator's own signature when
    the operator's key is one of the tier's."
+  (let ((operator (rs:reserves-operator reserves)))
+    (multiple-value-bind (keys needed) (answer-cosign-need reserves tier-index)
+      (find-if (lambda (u)
+                 (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
+                   (and o (eq (op:operation-type o) :quorum-begin)
+                        (equalp (up:update-prev-hash u) anchor)
+                        (equalp (up:update-operator-id u) operator)
+                        (member txid (rotation-rungs o) :test #'equalp)
+                        (up:verify-operator-signature u)
+                        (>= (tier-cosignatures u keys) needed))))
+               updates))))
+
+(defun answer-cosign-need (reserves tier-index)
+  "(values keys needed): the x-only keys of RESERVES' tier TIER-INDEX and how many valid
+   cosignatures by them a QuorumBegin must carry to answer a spend at that tier
+   (ROTATION-ANSWER).  The operator's own signature counts when its key is the tier's; the
+   operator's solo tier needs none.  The operator records a rotating QuorumBegin only at or above
+   this floor, and a member signs rungs only for one that reaches it, because a rotation recorded
+   below it is a spend no judge can answer: signet soak 2026-11-16, C's post-expiry rescue was
+   recorded with 3 cosignatures where tier 0 (5 of 8, the operator among them) needs 4; its rung
+   was signed by 5 and confirmed, the operator's own vault watch challenged it, and the lapsed
+   challenge became proofs against all five signers (2026-11-19)."
   (let* ((tier (nth tier-index (rs:reserves-tiers reserves)))
-         (keys (rs:tier-keys tier))
-         ;; the operator's solo tier: its own signature on the QuorumBegin is the authority
-         (operator (rs:reserves-operator reserves))
-         ;; the operator's own signature on the QuorumBegin counts when its key is the tier's
-         (needed (cond ((and (= (rs:tier-threshold tier) 1) (rs:tier-tie-breaker-p tier)) 0)
-                       ((member (up:x-only operator) keys :test #'equalp) (1- (rs:tier-threshold tier)))
-                       (t (rs:tier-threshold tier)))))
-    (find-if (lambda (u)
-               (let ((o (ignore-errors (op:decode-operation (up:update-message u)))))
-                 (and o (eq (op:operation-type o) :quorum-begin)
-                      (equalp (up:update-prev-hash u) anchor)
-                      (equalp (up:update-operator-id u) operator)
-                      (member txid (rotation-rungs o) :test #'equalp)
-                      (up:verify-operator-signature u)
-                      (>= (count-if (lambda (c) (and (member (up:x-only (up:cosig-pubkey c)) keys :test #'equalp)
-                                                     (up:verify-cosignature u c)))
-                                    (remove-duplicates (up:update-cosignatures u) :key #'up:cosig-pubkey :test #'equalp))
-                          needed))))
-             updates)))
+         (keys (rs:tier-keys tier)))
+    (values keys
+            (cond ((and (= (rs:tier-threshold tier) 1) (rs:tier-tie-breaker-p tier)) 0)
+                  ((member (up:x-only (rs:reserves-operator reserves)) keys :test #'equalp) (1- (rs:tier-threshold tier)))
+                  (t (rs:tier-threshold tier))))))
+
+(defun tier-cosignatures (update keys)
+  "How many distinct, valid cosignatures on UPDATE are by KEYS (x-only)."
+  (count-if (lambda (c) (and (member (up:x-only (up:cosig-pubkey c)) keys :test #'equalp) (up:verify-cosignature update c)))
+            (remove-duplicates (up:update-cosignatures update) :key #'up:cosig-pubkey :test #'equalp)))
 
 (defun challenge-op (update)
   "UPDATE's QuorumChallenge operation, when it is one and its operator's signature verifies."

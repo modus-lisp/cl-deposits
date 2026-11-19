@@ -800,10 +800,12 @@
     (end-cosign-round node update)
     update))
 
-(defun append-operation (node rec op &key (height (height node)) op-fn)
+(defun append-operation (node rec op &key (height (height node)) op-fn tier-floor)
   "The operator's one entry point: chain OP onto REC's ledger with whatever
    cosignatures DEP-05 requires at HEIGHT.  With OP-FN, OP is (funcall OP-FN tip-chain-hash),
-   built under the append lock on the tip it extends (a rotation's anchor, DEP-03)."
+   built under the append lock on the tip it extends (a rotation's anchor, DEP-03).  TIER-FLOOR
+   (keys . need): also NEED valid cosignatures by KEYS, or nothing is recorded (a rotating
+   QuorumBegin answers its rungs only at the spent tier's floor, FR:ANSWER-COSIGN-NEED)."
   (unless (record-owned-p rec) (fail "not our ledger"))
   ;; Serialised per ledger, cosign round included: the control socket (a
   ;; rotation's QuorumAddMember) and the worker (a wallet's transfer) both
@@ -851,7 +853,17 @@
             (when (> required (count-if-not (lambda (m) (member (lg:member-pubkey m) disputing :test #'equalp)) signers))
               (fail "ledger disputed: ~a of ~a members forked it; ~a cosignatures are out of reach (custody follows the dispute)"
                     (length disputing) (length signers) required)))
-          (solicit-cosignatures node rec update signers required)))
+          (solicit-cosignatures node rec update signers required))
+        (when (and tier-floor (plusp (cdr tier-floor)))
+          (let ((have (fr:tier-cosignatures update (car tier-floor))))
+            (when (< have (cdr tier-floor))
+              ;; The members not yet in: ask for the rest, then judge again.
+              (ignore-errors (solicit-cosignatures node rec update signers
+                                                   (+ (length (up:update-cosignatures update)) (- (cdr tier-floor) have))))
+              (let ((have (fr:tier-cosignatures update (car tier-floor))))
+                (when (< have (cdr tier-floor))
+                  (fail "~a: ~a of the ~a cosignatures by the spent vault's tier that answer its rungs (DEP-06); not recording a rotation no judge could answer"
+                        (op:operation-type op) have (cdr tier-floor))))))))
       (commit-update node rec update))))
 
 (defun open-ledger (node &key reserves-id (genesis-block (height node)) (reserves 0) (collateral 0)
@@ -1312,7 +1324,18 @@
                                             :splice-in-amount (* 1000 (third sp))))
                              (when rungs (list :rotation-rungs (apply #'cat (mapcar #'btx:tx-txid rungs))))))
                    op))))
-      (let ((update (append-operation node rec nil :op-fn #'build-op)))
+      (let ((update (append-operation node rec nil :op-fn #'build-op
+                                      ;; DEP-06: the QuorumBegin is the answer to a challenge of its rungs;
+                                      ;; recorded below the spent tier's floor, nothing answers them.
+                                      ;; ADVERSARY :skip-answer-floor — an operator that records the
+                                      ;; QuorumBegin at DEP-05's requirement alone, as before 2026-11-19
+                                      ;; (red team: the members' rung gate is what must stop it).
+                                      :tier-floor (when (and rotation (not (getf (node-adversary node) :skip-answer-floor)))
+                                                    (let* ((plan (getf rotation :plan))
+                                                           (cur (fr:spent-vault (spent-vault-updates rec) (getf plan :governing-seq))))
+                                                      (when cur
+                                                        (multiple-value-bind (keys need) (fr:answer-cosign-need cur (getf plan :tier-index))
+                                                          (cons keys need))))))))
         (setf (record-reserves rec) reserves (record-pinned rec) nil)
         (if (null rotation)
             (values update reserves nil)
@@ -1705,6 +1728,9 @@
          (seq (w:jget params "sequence_number")))
     (cond
       ((or (null rec) (record-owned-p rec)) nil)      ; not a ledger we replicate
+      ;; FAULT :refuse-cosign — a member that cosigns nothing (a member declining past expiry,
+      ;; one at a time: the answer-floor gate needs fewer cosigners than DEP-05 alone requires).
+      ((getf (node-adversary node) :refuse-cosign) nil)
       ;; Only a member (or a staged member, for the QuorumBegin that promotes it) answers.
       ((not (let ((l (record-ledger rec)))
               (or (member (node-pubkey node) (lg:ledger-quorum-members l) :key #'lg:member-pubkey :test #'equalp)
@@ -4961,7 +4987,16 @@
             (multiple-value-bind (cur) (disputed-reserves node view)
               (unless (member (node-pubkey node) (rs:reserves-members cur) :test #'equalp) (fail "not a member of the spent vault"))
               (unless (eql tier-index (rung-tier-index cur (btx:tx-locktime (first proposed)) (up:update-block-height qu)))
-                (fail "tier_index is not the rungs' tier")))
+                (fail "tier_index is not the rungs' tier"))
+              ;; DEP-06: this QuorumBegin is the only answer to a challenge of these rungs.  Final
+              ;; under DEP-05 is not enough when the spent tier's floor is higher (past expiry the
+              ;; lifecycle requirement drops; the vault's tier does not): signet C, 2026-11-16, was
+              ;; signed by five over a QuorumBegin no judge accepts, and they were all proved.
+              (multiple-value-bind (keys need) (fr:answer-cosign-need cur tier-index)
+                (let ((have (fr:tier-cosignatures qu keys)))
+                  (when (< have need)
+                    (fail "the QuorumBegin carries ~a of the ~a cosignatures by the spent vault's tier that answer its rungs (DEP-06): signing would be a spend no judge can answer"
+                          have need)))))
             (multiple-value-bind (ours prevouts cur splice)
                 (expected-ladder node view o (up:update-block-height qu) (up:update-prev-hash qu) tier-index)
               (unless (and ours (= (length ours) (length proposed))
@@ -7081,6 +7116,15 @@
                      (when (or (eq (getf e :form) :unanchored) lapse)
                        (dolist (xh (getf e :signers))
                          (let ((x (hex->bytes xh)))
+                          ;; Never a proof against our own key: we know our own signatures were not a
+                          ;; theft, so a judgement that says so is our judge's error (signet soak,
+                          ;; 2026-11-19: C's operator proved itself and its four co-signers over an
+                          ;; honest rescue it had broadcast).  Said loudly; the others are judged on.
+                          (if (equalp x (up:x-only (node-pubkey node)))
+                              (unless (member "self" (getf e :published) :test #'string=)
+                                (log! node "VAULT SPEND JUDGEMENT DISAGREES WITH OUR OWN CONDUCT: ~a's spend ~a is one we signed; no proof against ourselves"
+                                      (subseq (getf e :id) 0 8) (subseq (txid-hex (btx:tx-txid tx)) 0 16))
+                                (push "self" (getf e :published)) (setf changed t))
                            ;; x-only key; the operated ledgers are advertised under the full key, either parity
                            (dolist (full (list (cat (octets 2) x) (cat (octets 3) x)))
                              (multiple-value-bind (targets ok) (ledgers-operated-by node full :strict t)
@@ -7094,7 +7138,7 @@
                                                             full (hex->bytes target) (hex->bytes (getf e :id)) (getf e :qb) tx prevouts bh
                                                             :challenge-update cu :lapse-block-hash lapse))
                                      (push pk (getf e :published))
-                                     (setf changed t)))))))))
+                                     (setf changed t))))))))))
                      (when (and complete (or (eq (getf e :form) :unanchored) lapse)
                                 (> h (+ (or (getf e :height) 0) *vault-spend-publish-blocks*)))
                        (setf (getf e :done) t changed t))
