@@ -2734,4 +2734,69 @@
             (check "a member says why"
                    (some (lambda (m) (some (lambda (l) (search "no judge can answer" l)) (nd:node-log m))) (list b c d)))))))))
 
+
+(with-gate ("nodes: a confiscation rebuild that finds nothing is not repeated until the arms change")
+  ;; regtest 1119-185830: cld364's spent-vault forks each spent 4-13 s rebuilding (every shape x
+  ;; tier x armer subset) on a node's first passes.  A miss on a spent vault is final for the arms
+  ;; it was built from, and is redone only when a new arm or arm manifest arrives.
+  (let* ((n (nd:make-node :priv (tk 66666666666666666666) :bus (bus:make-mock-bus) :height-fn (lambda () 100)
+                          :chain-fn (lambda (txid vout) (declare (ignore txid vout)) nil)))   ; every outpoint spent
+         (id "cd34ef5600000000000000000000000000000000000000000000000000000000")
+         (arms (list (list (tk 1) nil nil nil 90 7 1)))
+         (rebuilds 0))
+    (sb-int:encapsulate 'nd::rebuild-confiscation-on-chain 'count (lambda (f node id-hex) (declare (ignore f node id-hex)) (incf rebuilds) nil))
+    (sb-int:encapsulate 'nd::disputed-reserves 'stub (lambda (f node rec) (declare (ignore f node rec)) (values nil (make-array 32 :initial-element 1) 0)))
+    (sb-int:encapsulate 'nd::%all-arms 'stub (lambda (f node id-hex) (declare (ignore f node id-hex)) arms))
+    (unwind-protect
+         (progn
+           (nd::confiscated-lottery n id) (nd::confiscated-lottery n id) (nd::confiscated-lottery n id)
+           (check-equal "three passes over a spent vault that rebuilds to nothing: one rebuild" rebuilds 1)
+           (push (list (tk 2) nil nil nil 95 9 1) arms)
+           (nd::confiscated-lottery n id) (nd::confiscated-lottery n id)
+           (check-equal "a new arm (a higher sequence): rebuilt once more" rebuilds 2)
+           (push (list 1 (list :arms)) (gethash id (nd::node-arm-manifests n)))
+           (nd::confiscated-lottery n id)
+           (check-equal "a new arm manifest: rebuilt once more" rebuilds 3)
+           (nd::confiscated-lottery n id)
+           (check-equal "and then not again" rebuilds 3)
+           (let ((other "ef56000000000000000000000000000000000000000000000000000000000000"))
+             (nd::confiscated-lottery n other)
+             (check-equal "the miss is per ledger" rebuilds 4)))
+      (sb-int:unencapsulate 'nd::rebuild-confiscation-on-chain 'count)
+      (sb-int:unencapsulate 'nd::disputed-reserves 'stub)
+      (sb-int:unencapsulate 'nd::%all-arms 'stub))))
+
+(with-gate ("nodes: tables more than one thread writes are synchronized")
+  ;; Unlocked concurrent PUTHASH is undefined in SBCL.  Drive slots, the expiry watch, the worker
+  ;; lanes and control requests share these.
+  (let ((n (nd:make-node :priv (tk 77777777777777777777) :bus (bus:make-mock-bus) :height-fn (lambda () 100))))
+    (dolist (acc (list #'nd::node-pending #'nd::node-seen #'nd::node-reveals #'nd::node-invoices #'nd::node-dispute-notes
+                       #'nd::node-ledgers #'nd::node-pledges #'nd::node-signed-confiscations #'nd::node-seen-confiscations
+                       #'nd::node-known-confiscations #'nd::node-arm-manifests #'nd::node-rearms #'nd::node-confiscation-heights))
+      (check (format nil "~(~a~) is synchronized" (sb-kernel:%fun-name acc)) (sb-ext:hash-table-synchronized-p (funcall acc n))))
+    (check "the rung caches are synchronized" (and (sb-ext:hash-table-synchronized-p nd::*confirmed-rungs*)
+                                                   (sb-ext:hash-table-synchronized-p nd::*unconfirmed-rungs*)))))
+
+(with-gate ("nodes: a drive in flight past the stall limit says where it is, once")
+  ;; regtest 1119-194245: cld364's drive slots were all busy for 12 minutes, finished no drive, and
+  ;; nothing said what they were waiting on.  :drive-stats lists every drive in flight with its
+  ;; step; one in flight over *DRIVE-STALL-SECONDS* logs its own thread's backtrace, once.
+  (let* ((n (nd:make-node :priv (tk 88888888888888888888) :bus (bus:make-mock-bus) :height-fn (lambda () 100)))
+         (fork (nd::make-record :id-hex "9a8b7c6d00000000000000000000000000000000000000000000000000000000"))
+         (gate (bt:make-semaphore)) (nd::*drive-stall-seconds* 1)
+         (th (bt:make-thread (lambda () (nd::drive-timed n fork (lambda () (nd::dstep :fork-lottery (bt:wait-on-semaphore gate :timeout 20)))))
+                             :name "drive-dispute")))
+    (sleep 0.3)
+    (let ((in (nd::drive-inflight n)))
+      (check-equal "the running drive is listed with its step" (mapcar (lambda (r) (list (first r) (third r) (fourth r))) in)
+                   '(("9a8b7c6d" :fork-lottery "drive-dispute"))))
+    (sleep 1.8)
+    (nd::log-stalled-drives n) (sleep 0.5) (nd::log-stalled-drives n) (sleep 0.5)
+    (let ((lines (remove-if-not (lambda (l) (search "drive in flight" l)) (nd:node-log n))))
+      (check-equal "logged once" (length lines) 1)
+      (check "with its step and its own backtrace (the wait it is in)"
+             (and lines (search "in step FORK-LOTTERY" (first lines)) (search "WAIT-ON-SEMAPHORE" (string-upcase (first lines))))))
+    (bt:signal-semaphore gate) (bt:join-thread th)
+    (check "a finished drive is no longer listed" (null (nd::drive-inflight n)))))
+
 (report)

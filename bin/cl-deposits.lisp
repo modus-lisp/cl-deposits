@@ -13,6 +13,26 @@
 (let* ((dir (uiop:ensure-directory-pathname (or (env "CLD_DIR") (error "set CLD_DIR"))))
        (keyfile (merge-pathnames "node.key" dir)))
   (ensure-directories-exist dir)
+;; Last words.  Under --non-interactive an unhandled condition in ANY thread (a STORAGE-CONDITION
+;; is not an ERROR, so the drive slots' HANDLER-CASE does not see one) prints to stderr and exits
+;; the process; stderr is cld.log, which the next start used to truncate (regtest 1119-185830:
+;; cld364 died at 19:02:29 with three drive slots unwound and nothing left to say why).  This
+;; appends the time, thread, condition and a backtrace to death.log beside node.log, then hands
+;; over to the hook it replaced, so the process still exits exactly as before.
+(let ((previous sb-ext:*invoke-debugger-hook*) (file (merge-pathnames "death.log" dir)))
+  (setf sb-ext:*invoke-debugger-hook*
+        (lambda (condition hook)
+          (ignore-errors
+           (with-open-file (s file :direction :output :if-exists :append :if-does-not-exist :create)
+             (let ((*print-length* 20) (*print-level* 6))
+               (format s "~&=== ~a pid ~a thread ~s~%~s: ~a~%"
+                       (multiple-value-bind (sec min hr d mo y) (decode-universal-time (get-universal-time) 0)
+                         (format nil "~d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0dZ" y mo d hr min sec))
+                       (sb-posix:getpid) (sb-thread:thread-name sb-thread:*current-thread*)
+                       (type-of condition) (ignore-errors (princ-to-string condition)))
+               (ignore-errors (sb-debug:print-backtrace :stream s :count 60))
+               (finish-output s))))
+          (when previous (funcall previous condition hook)))))
   (unless (probe-file keyfile) (cl-deposits.wire:write-new-key-file keyfile))
   (let* ((priv (cl-deposits.wire:read-key-file keyfile))   ; fixed; MAKE-NODE takes an even-Y copy
          (relays (uiop:split-string (env "CLD_RELAYS" "ws://127.0.0.1:7777") :separator ","))

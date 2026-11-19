@@ -96,7 +96,7 @@
 (defstruct (node (:constructor %make-node))
   priv pubkey pubkey-hex keypair bus network
   (ledgers (make-hash-table :test #'equal :synchronized t))    ; ledger id hex -> record (both lanes add records)
-  (pending (make-hash-table :test #'equal))    ; request event id -> waiter
+  (pending (make-hash-table :test #'equal :synchronized t))    ; request event id -> waiter
   ;; DEP-05 §Cosign Rounds: cosign_data -> cosign-round, kept past the deadline, and the
   ;; request ids whose (late) answers feed each one.
   (cosign-rounds (make-hash-table :test #'equalp :synchronized t))
@@ -127,7 +127,7 @@
   ;; mutate disjoint records.
   (fast-inbox '()) (fast-lock (bt:make-lock "cosign-inbox")) (fast-cv (bt:make-condition-variable)) (fast-worker nil)
   (subscription nil)                           ; our bus handler, so STOP-NODE can remove it
-  (seen (make-hash-table :test #'equal)) (seen-order '())   ; event ids already handled (relays redeliver)
+  (seen (make-hash-table :test #'equal :synchronized t)) (seen-order '())   ; event ids already handled (relays redeliver)
   (not-ours (make-hash-table :test #'equal :synchronized t))   ; ledger id -> retry-after, for refollow-if-member
   (loading nil)                                ; T until LOAD-DATA-DIR has run: the worker lanes wait
   (ln nil)                                     ; a cl-deposits.lightning backend, or NIL
@@ -135,7 +135,7 @@
   (broadcasts '())                             ; what we would have broadcast (newest first)
   (height-of-block nil)                        ; (lambda (hash32)) -> height or NIL (fraud-proof anchors)
   (block-hash-fn nil)                          ; (lambda (height)) -> hash32 or NIL (TransferFail anchors)
-  (reveals (make-hash-table :test #'equal))    ; ledger id hex -> alist (member-pubkey33 . preimage)
+  (reveals (make-hash-table :test #'equal :synchronized t))    ; ledger id hex -> alist (member-pubkey33 . preimage)
   ;; DEP-06 Phase 4 (re-arm, provisional): ledger id hex -> the re-arm rounds whose lottery
   ;; output we have seen on chain, newest first: plists (:round r :tx tx :height h).
   (rearms (make-hash-table :test #'equal :synchronized t))
@@ -143,7 +143,7 @@
   (ignore-actions '())                         ; testing: wallet actions the operator silently drops
   (adversary '())                              ; red team (docs/REDTEAM.md): plist of misbehaviours this node performs on purpose
   (hooks '())                                  ; (lambda (rec update op)) called after every accepted/committed update
-  (invoices (make-hash-table :test #'equalp))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
+  (invoices (make-hash-table :test #'equalp :synchronized t))  ; payment hash -> plist (:rec :deposit-id :amount :bolt11)
   ;; Payment ids a pay_invoice handler is polling right now; SETTLE-PENDING-PAYMENTS
   ;; leaves those to the handler so a lock is never settled twice.
   (ln-polling (make-hash-table :test #'equalp :synchronized t))
@@ -151,7 +151,7 @@
   (pledge-fn nil)                              ; (lambda (txid vout scan-from)) -> plist :created :value-sats :spend (DEP-03 cut), or NIL
   (utxos-fn nil)                               ; (lambda (address)) -> list of plists :txid :vout :sats :confirmations
   (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
-  (dispute-notes (make-hash-table :test #'equal))   ; ledger id -> the last dispute-driver state we logged
+  (dispute-notes (make-hash-table :test #'equal :synchronized t))   ; ledger id -> the last dispute-driver state we logged
   (parent nil)                                 ; a DISPUTE-VIEW's node: whose records judge an arm's grounds
   (grounds-verdicts (make-hash-table :test #'equalp :synchronized t)) ; DisputeEnter chain hash -> (verdict . why)
   (refused (make-hash-table :test #'equal :synchronized t))   ; ledger id -> seq whose update the rules rejected
@@ -203,7 +203,7 @@
 (defun extra-actions (node)
   "Actions registered by roles layered on the node (couriers), addressed to us by p tag."
   (or (get (intern (node-pubkey-hex node) :keyword) 'actions)
-      (setf (get (intern (node-pubkey-hex node) :keyword) 'actions) (make-hash-table :test #'equal))))
+      (setf (get (intern (node-pubkey-hex node) :keyword) 'actions) (make-hash-table :test #'equal :synchronized t))))
 (defun run-hooks (node rec update)
   (let ((o (op:decode-operation (up:update-message update))))
     (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
@@ -2862,8 +2862,17 @@
 
 (defconstant +max-arms+ 4 "Arms that count per armer: the first and up to three re-arms (DEP-03).")
 
-(defvar *rebuild-misses* (make-hash-table :test #'equalp))
+(defvar *rebuild-misses* (make-hash-table :test #'equalp)
+  "(node pubkey . ledger id) -> the REBUILD-MISS-STAMP at which rebuilding its spent vault's
+   confiscation found nothing.")
 (defvar *rebuild-misses-lock* (bt:make-lock "rebuild-misses"))
+
+(defun rebuild-miss-stamp (node id-hex)
+  "What a confiscation rebuild of ID-HEX is built from, beyond the chain: its arms (the highest
+   arm sequence on any fork) and the arm manifests published for it.  A recorded miss is reused
+   only while this is unchanged."
+  (list (loop for a in (%all-arms node id-hex) maximize (or (sixth a) 0))
+        (length (gethash id-hex (node-arm-manifests node)))))
 
 (defun note-confiscation-height (node id-hex info)
   "INFO is the chain-fn's view of a confiscation's lottery output: once confirmed, remember
@@ -2891,19 +2900,20 @@
     ;; chain walk per obligation, on every pass.
     (unless (or (gethash id-hex (node-signed-confiscations node))
                 (gethash id-hex (node-seen-confiscations node))
-                (let ((until (bt:with-lock-held (*rebuild-misses-lock*) (gethash (cons (node-pubkey node) id-hex) *rebuild-misses*))))
-                  (and until (< (height node) until))))
+                (equal (rebuild-miss-stamp node id-hex)
+                       (bt:with-lock-held (*rebuild-misses-lock*) (gethash (cons (node-pubkey node) id-hex) *rebuild-misses*))))
       (let ((built (rebuild-confiscation-on-chain node id-hex)))
         (if built
             (values (first built) (second built) :pending)
             ;; Spent vault, no pending lottery it rebuilds to (claimed, or not a confiscation):
-            ;; final, since nothing can spend that vault again, so the shape x tier x subset
-            ;; search is not repeated (until a restart).
+            ;; nothing can spend that vault again, so the shape x tier x subset search (4-13 s on
+            ;; regtest cld364) is not repeated until the arms it is built from change: a new arm
+            ;; or arm manifest can make a confiscation rebuildable that was not (REBUILD-MISS-STAMP).
             (when (multiple-value-bind (r txid vout) (disputed-reserves node (find-record node id-hex))
                     (declare (ignore r))
                     (not (funcall (node-chain-fn node) txid vout)))
               (bt:with-lock-held (*rebuild-misses-lock*)
-                (setf (gethash (cons (node-pubkey node) id-hex) *rebuild-misses*) most-positive-fixnum))
+                (setf (gethash (cons (node-pubkey node) id-hex) *rebuild-misses*) (rebuild-miss-stamp node id-hex)))
               nil))))))
 
 (defun lottery-paid-by (node id-hex spk)
@@ -3082,8 +3092,8 @@
     (or (null rungs) (null (node-tx-confs-fn node))
         (some (lambda (txid) (rung-confirmed-p node txid)) rungs))))
 
-(defvar *confirmed-rungs* (make-hash-table :test #'equalp) "Rung txids seen confirmed (a confirmation is final enough here).")
-(defvar *unconfirmed-rungs* (make-hash-table :test #'equalp) "Rung txid -> when last seen unconfirmed: asked again after 60 s.")
+(defvar *confirmed-rungs* (make-hash-table :test #'equalp :synchronized t) "Rung txids seen confirmed (a confirmation is final enough here).")
+(defvar *unconfirmed-rungs* (make-hash-table :test #'equalp :synchronized t) "Rung txid -> when last seen unconfirmed: asked again after 60 s.")
 
 (defun rung-confirmed-p (node txid)
   (or (gethash txid *confirmed-rungs*)
@@ -3157,6 +3167,7 @@
   "Time BODY as drive step NAME into *DRIVE-STEPS* (a no-op outside a drive)."
   (let ((t0 (gensym "T0")))
     `(let ((,t0 (get-internal-real-time)))
+       (when *drive-current* (setf (cddr *drive-current*) ,name))   ; :drive-stats :inflight shows it
        (unwind-protect (progn ,@body)
          (when *drive-steps*
            (let ((cell (or (assoc ,name (cdr *drive-steps*))
@@ -3170,11 +3181,60 @@
           (loop for (name ms . n) in (sort (copy-list steps) #'> :key #'second)
                 when (>= ms 5) collect (format nil "~(~a~) ~ams~:[~;x~a~]" name ms (> n 1) n))))
 
+(defvar *drive-current* nil "Inside a drive: this thread's (id start-time . current step), listed in *DRIVE-INFLIGHT-STEPS*.")
+(defvar *drive-serial* 0)
+(defvar *drive-inflight-steps* (make-hash-table :test #'equalp :synchronized t)
+  "(node pubkey . drive serial) -> (thread fork-id start-universal-time . step): what every running
+   drive is doing now.  Keyed by a serial, not the thread: EQUALP hashes a thread by its slots, and
+   one that finished hashed elsewhere, so its entry could not be removed.
+   regtest 1119-194245: cld364's slots were all busy for 12 minutes and finished no drive, and
+   nothing could say where they were.")
+
+(defun drive-inflight (node)
+  "Every drive of NODE running now: (fork-id8 seconds step thread-name), longest first."
+  (let ((pk (node-pubkey node)) (now (get-universal-time)))
+    (sort (loop for k being the hash-keys of *drive-inflight-steps* using (hash-value tv)
+                for thread = (car tv) for v = (cdr tv)
+                when (equalp (car k) pk)
+                  collect (list (subseq (first v) 0 8) (- now (second v)) (cddr v) (bt:thread-name thread)))
+          #'> :key #'second)))
+
+(defparameter *drive-stall-seconds* 120 "A drive in flight this long has its thread's backtrace logged, once.")
+(defvar *drive-stall-dumped* (make-hash-table :test #'equalp :synchronized t)
+  "*DRIVE-INFLIGHT-STEPS* keys whose backtrace was logged.")
+
+(defun log-stalled-drives (node)
+  "Every drive of NODE in flight over *DRIVE-STALL-SECONDS*: log, once per drive, where its thread
+   is (its fork, step, and a backtrace taken inside it by INTERRUPT-THREAD), so a stall names the
+   lock or call it waits on (regtest 1119-194245: three slots busy 12 minutes, no drive finished)."
+  (let ((pk (node-pubkey node)) (now (get-universal-time)))
+    (loop for k being the hash-keys of *drive-inflight-steps* using (hash-value tv)
+          for thread = (car tv) for v = (cdr tv)
+          when (and (equalp (car k) pk) (> (- now (second v)) *drive-stall-seconds*)
+                    (not (gethash k *drive-stall-dumped*)))
+            do (setf (gethash k *drive-stall-dumped*) t)
+               (let ((id (subseq (first v) 0 8)) (secs (- now (second v))) (step (cddr v)))
+                 (ignore-errors
+                  (sb-thread:interrupt-thread
+                   thread
+                   (lambda ()
+                     (ignore-errors
+                      (log! node "dispute ~a: drive in flight ~a s, in step ~a, on ~a; backtrace: ~{~a~^ | ~}" id secs step
+                            (bt:thread-name thread)
+                            (uiop:split-string (string-trim '(#\Newline)
+                                                            (with-output-to-string (s) (let ((*print-length* 10) (*print-level* 4))
+                                                                                         (sb-debug:print-backtrace :stream s :count 40))))
+                                               :separator '(#\Newline)))))))))))
+
 (defun drive-timed (node fork thunk)
   "Run THUNK (a drive of FORK) timing it and its DSTEPs; log a slow one with its breakdown and
    the note it left, and add both into *DRIVE-STATS* (the :drive-stats control request)."
-  (let* ((*drive-steps* (list :steps)) (t0 (get-internal-real-time)) (id (record-id-hex fork)))
+  (let* ((*drive-steps* (list :steps)) (t0 (get-internal-real-time)) (id (record-id-hex fork))
+         (*drive-current* (list* id (get-universal-time) :start))
+         (key (cons (node-pubkey node) (bt:with-lock-held (*drive-stats-lock*) (incf *drive-serial*)))))
+    (setf (gethash key *drive-inflight-steps*) (cons (bt:current-thread) *drive-current*))
     (unwind-protect (funcall thunk)
+      (remhash key *drive-inflight-steps*) (remhash key *drive-stall-dumped*)
       (let ((ms (ms-since t0)) (pk (node-pubkey node)))
         (bt:with-lock-held (*drive-stats-lock*)
           (loop for (name sms . n) in (cons (list* :drive ms 1) (cdr *drive-steps*))
@@ -3448,6 +3508,7 @@
   (let ((forks (loop for r being the hash-values of (node-ledgers node)
                      when (and (record-fork-p r) (record-owned-p r)) collect r))
         (pk (node-pubkey node)))
+    (when parallel (ignore-errors (log-stalled-drives node)))
     (if (not parallel)
         (dolist (rec forks)
           (bt:with-lock-held ((drive-lock node rec))
