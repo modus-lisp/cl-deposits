@@ -4994,7 +4994,10 @@
               ;; signed by five over a QuorumBegin no judge accepts, and they were all proved.
               (multiple-value-bind (keys need) (fr:answer-cosign-need cur tier-index)
                 (let ((have (fr:tier-cosignatures qu keys)))
-                  (when (< have need)
+                  ;; ADVERSARY :sign-below-floor — a member that signs the rungs anyway (red team:
+                  ;; redteam/check-rotation-recorded-threshold.sh needs such a spend on chain to
+                  ;; judge; DEP-05 still forbids it).
+                  (when (and (< have need) (not (getf (node-adversary node) :sign-below-floor)))
                     (fail "the QuorumBegin carries ~a of the ~a cosignatures by the spent vault's tier that answer its rungs (DEP-06): signing would be a spend no judge can answer"
                           have need)))))
             (multiple-value-bind (ours prevouts cur splice)
@@ -6636,7 +6639,14 @@
         (*judged-spend* (if prevouts (cons tx (coerce prevouts 'list)) *judged-spend*)))
     (when anchor
       (let ((updates (spend-answer-updates node id-hex gseq anchor)))
-        (or (fr:rotation-answer updates anchor (btx:tx-txid tx) reserves tier-index)
+        (or (let ((ans (fr:rotation-answer updates anchor (btx:tx-txid tx) reserves tier-index)))
+              (when ans
+                (multiple-value-bind (keys need) (fr:answer-cosign-need reserves tier-index)
+                  (when (< (fr:tier-cosignatures ans keys) need)
+                    (log! node "vault spend ~a of ~a: answered by rotation seq ~a at the ledger's recorded threshold, below the tier floor (~a of ~a; strict-lottery-v8)"
+                          (subseq (txid-hex (btx:tx-txid tx)) 0 16) (subseq id-hex 0 8) (up:update-seq ans)
+                          (fr:tier-cosignatures ans keys) need))))
+              ans)
             ;; A rung of a confiscation we signed: we checked it byte for byte against our own rebuild
             ;; before signing (HANDLE-CONFISCATION-SIGN), so we never challenge it.  A rebuild from the
             ;; relay later can miss (arms it has not delivered, a cut it judges otherwise): Nov 4 soak,
