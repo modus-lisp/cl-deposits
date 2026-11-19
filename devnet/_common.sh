@@ -264,10 +264,13 @@ start_cld() {
   (echo >/dev/tcp/127.0.0.1/$(cld_port "$n")) 2>/dev/null && { echo "$n: control port $(cld_port "$n") already bound by another process; stop_cld first" >&2; return 1; }
   local lnenv=(); [ "$n" = cld1 ] && lnenv=("CLD_LN_CONTROL=$CLD_LN_CONTROL")
   local src; src=$(cld_src_of "$n"); [ -f "$src/bin/cl-deposits.lisp" ] || { echo "$n: no build at $src (version $(node_version "$n"))" >&2; return 1; }
+  # Appended, not truncated: a node that died leaves its stderr (the unhandled condition) for the
+  # next start to keep (regtest 1119-185830: cld364's last words were overwritten twice).
+  echo "=== $(date -u +%FT%TZ) start_cld $n from $src" >>"$dir/cld.log"
   ( cd "$src" && exec setsid -f nohup env CLD_DIR="$dir" CLD_RELAYS="$RELAY_URL" CLD_CONTROL_PORT="$(cld_port "$n")" CLD_NETWORK=$CLD_CHAIN \
       CLD_BITCOIN_CLI="$BCLI" CLD_MIN_CONFS=1 "${lnenv[@]}" \
       CL_SOURCE_REGISTRY="$(cld_registry "$src")" \
-      "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --dynamic-space-size "${CLD_HEAP_MB:-32768}" --non-interactive --load bin/cl-deposits.lisp >"$dir/cld.log" 2>&1 ) </dev/null >/dev/null 2>&1
+      "${CLD_SBCL:-/usr/bin/sbcl}" --noinform --dynamic-space-size "${CLD_HEAP_MB:-32768}" --non-interactive --load bin/cl-deposits.lisp >>"$dir/cld.log" 2>&1 ) </dev/null >/dev/null 2>&1
       # setsid -f: the node is its own session leader, reparented to init, and no wrapper
       # shell survives as its parent.  A surviving wrapper carried its caller's argv, so
       # every node the chaos loop restarted showed up as another "soak-chaos.sh" in pgrep,
