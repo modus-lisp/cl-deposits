@@ -19,7 +19,9 @@ source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/en
 pick OP C1 C2 C3 C4
 R1=${R1:-ref6}
 RV=$(live_version $R1); echo "== reference member $R1 runs $RV"
-[ -z "${RUST_EXPECT:-}" ] || [ "$RV" = "$RUST_EXPECT" ] || fail "$R1 runs $RV, not $RUST_EXPECT"
+# R1 must judge by the ruling (deposits-rust with the recorded-threshold answer): RUST_EXPECT names it.
+[ -n "${RUST_EXPECT:-}" ] || fail "set RUST_EXPECT to the deposits-rust build R1 must run (one with the recorded-threshold answer)"
+[ "$RV" = "$RUST_EXPECT" ] || fail "$R1 runs $RV, not $RUST_EXPECT"
 X=$(FORM_EXPIRY=${FORM_EXPIRY:-30} form_ledger "${REDTEAM_RT:-RT$RANDOM}" $OP "" $C1 $C2 $C3 $C4 $R1) || exit 1
 TICKER_PAUSED=""
 ticker_start() { setsid -f bash -c "cd '$CLD_SRC' && DEVNET=regtest devnet/regtest-net.sh ticker start" >/dev/null 2>&1; sleep 2; }
@@ -57,7 +59,11 @@ for i in 1 2 3; do r=$(CLD_CTL_TIMEOUT=180 cld_ctl $OP "(:begin-quorum :ledger \
 expect "$r" "begin-quorum"
 mine 1 >/dev/null; sleep 5
 [ -z "$(bcli gettxout "$VTX" "$VVOUT" false | head -1)" ] || fail "the old vault $VAULT is unspent after a block"
-SP=$(bcli gettxspendingprevout "[{\"txid\":\"$VTX\",\"vout\":$VVOUT}]" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0].get("spendingtxid",""))')
+# The rung is in a block by now, and gettxspendingprevout sees only the mempool: find it in the tip.
+SP=$(bcli getblock "$(bcli getbestblockhash)" 2 | python3 -c 'import json,sys
+b=json.load(sys.stdin); t,v=sys.argv[1],int(sys.argv[2])
+print(next((x["txid"] for x in b["tx"] for i in x["vin"] if i.get("txid")==t and i.get("vout")==v),""))' "$VTX" "$VVOUT")
+[ -n "$SP" ] || fail "no transaction in the tip spends the old vault $VAULT"
 echo "== rung ${SP:0:16} confirmed at $(bcli getblockcount)"
 mine 2 >/dev/null
 disarm :hold-arm $C1 $C2 $C3 $C4; ticker_start; TICKER_PAUSED=""
