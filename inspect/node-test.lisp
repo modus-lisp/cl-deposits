@@ -2590,6 +2590,35 @@
   (check-equal "least recently driven first, within the slots"
                (nd::drive-schedule '(("p" nil 30 nil) ("q" nil 10 nil) ("r" nil 20 nil)) 2 0) '("q" "r")))
 
+(with-gate ("nodes: a dispute drive is timed, per step, and a slow one says where it went")
+  ;; regtest 1119-111730: cld364 carried ~60 live disputes against 3 drive slots and left one
+  ;; undriven 897 s, and nothing recorded how long a drive took or in which step.
+  (let* ((n (nd:make-node :priv (tk 55555555555555555555) :bus (bus:make-mock-bus) :height-fn (lambda () 100)))
+         (fork (nd::make-record :id-hex "ab12cd34ef560000000000000000000000000000000000000000000000000000"))
+         (nd::*drive-log-ms* 50))
+    (nd::drive-timed n fork (lambda ()
+                              (nd::dstep :fork-lottery (sleep 0.08))
+                              (nd::dstep :chain-conf (sleep 0.01))
+                              (nd::dstep :chain-conf (sleep 0.01))
+                              (setf (gethash (nd:record-id-hex fork) (nd::node-dispute-notes n)) "armed; waiting")))
+    (let ((line (find-if (lambda (l) (search "drive took" l)) (nd::node-log n)))
+          (stats (nd::drive-stats n)))
+      (check "a slow drive logs one line" line)
+      (check "the line names the dispute, the slowest step first, and the note it left"
+             (and line (search "dispute ab12cd34: drive took" line) (search "[fork_lottery" (substitute #\_ #\- line))
+                  (search "chain-conf" line) (search "x2" line) (search "-> armed; waiting" line)))
+      (check "the slowest step comes first" (and line (< (search "fork-lottery" line) (search "chain-conf" line))))
+      (check-equal "stats: the drive and both steps, slowest total first"
+                   (mapcar #'first stats) '(:drive :fork-lottery :chain-conf))
+      (check-equal "stats count calls" (mapcar #'third stats) '(1 1 2))
+      (check "the drive's total covers its steps" (>= (second (first stats)) (+ (second (second stats)) (second (third stats))))))
+    ;; Under the threshold: counted, not logged.
+    (setf (nd::node-log n) nil)
+    (nd::drive-timed n fork (lambda () (nd::dstep :bump nil)))
+    (check "a fast drive logs nothing" (notany (lambda (l) (search "drive took" l)) (nd::node-log n)))
+    (check-equal "but is counted" (third (assoc :drive (nd::drive-stats n))) 2)
+    (check "a step outside a drive is a no-op" (eq (nd::dstep :x 7) 7))))
+
 ;;; DEP-06 rotation answer floor.  Signet soak, ledger C (8b19a178): a rescue planned at vault tier 0
 ;;; just before tier 1 opened (8285) was recorded at 8287 with the minority DEP-05 asks there (3),
 ;;; while its rung still spent tier 0 (5 of 8, a judge needs 4 cosignatures).  No judge accepts that
