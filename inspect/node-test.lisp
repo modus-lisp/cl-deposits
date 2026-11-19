@@ -2552,4 +2552,42 @@
                                t)
                           (eq (gethash "sign" c) t)))))
 
+(with-gate ("nodes: the dispute watch drives every live fork (no starvation)")
+  ;; regtest rotation-post-expiry, 2026-11-19: a pool node held 8 live forks against 3 drive
+  ;; slots, three of them re-proposing a confiscation (20 s of signature timeout a pass); in
+  ;; hash order those re-took every freed slot and the rescue dispute behind them went 28
+  ;; minutes undriven.  Simulated passes: the slow forks' drives span two passes.
+  (labels ((simulate (passes lru)
+             ;; -> hash id -> list of passes the fork was started in
+             (let* ((ids '("a" "b" "c" "d" "e" "f" "g" "h")) (slow '("a" "b" "c"))
+                    (last (make-hash-table :test #'equal)) (busy-until (make-hash-table :test #'equal))
+                    (started (make-hash-table :test #'equal)))
+               (loop for p from 1 to passes
+                     do (let* ((inflight (loop for id in ids when (> (gethash id busy-until 0) p) collect id))
+                               (rows (loop for id in ids
+                                           collect (list id nil (and lru (gethash id last)) (and (member id inflight :test #'equal) t))))
+                               (start (nd::drive-schedule rows (- 3 (length inflight)) 1)))
+                          (dolist (id start)
+                            (setf (gethash id last) p
+                                  (gethash id busy-until) (+ p (if (member id slow :test #'equal) 2 1)))
+                            (push p (gethash id started)))))
+               started))
+           (max-gap (started passes)
+             (loop for id in '("a" "b" "c" "d" "e" "f" "g" "h")
+                   maximize (let ((ps (sort (copy-list (gethash id started)) #'<)))
+                              (if (null ps) passes
+                                  (loop for (x y) on (append (list 0) ps (list (1+ passes))) while y maximize (- y x)))))))
+    (let ((new (simulate 30 t)) (old (simulate 30 nil)))
+      (check "every live fork is driven" (every (lambda (id) (gethash id new)) '("a" "b" "c" "d" "e" "f" "g" "h")))
+      (check "no live fork waits more than 4 passes" (<= (max-gap new 30) 4))
+      ;; The control: the same workload in table order starves the forks behind the slow ones.
+      (check "control: table order never drives h" (null (gethash "h" old)))
+      (check "control: table order never drives d" (null (gethash "d" old)))))
+  (check-equal "a fork in flight takes no slot"
+               (nd::drive-schedule '(("x" nil nil t) ("y" nil 5 nil) ("z" nil nil nil)) 3 1) '("z" "y"))
+  (check-equal "live before dormant, dormant capped at its slot"
+               (nd::drive-schedule '(("d1" t nil nil) ("d2" t nil nil) ("l1" nil 9 nil)) 3 1) '("l1" "d1"))
+  (check-equal "least recently driven first, within the slots"
+               (nd::drive-schedule '(("p" nil 30 nil) ("q" nil 10 nil) ("r" nil 20 nil)) 2 0) '("q" "r")))
+
 (report)

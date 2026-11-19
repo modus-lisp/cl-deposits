@@ -3110,7 +3110,13 @@
        (not (expiry-dispute-ended-p last-valid-seq latest-quorum-begin-seq nil
                                     :on-spend on-spend :rotation-confirmed rotation-confirmed))))
 
+(defvar *drive-threads-lock* (bt:make-lock "drive-threads"))
+(defvar *drive-last* (make-hash-table :test #'equalp)
+  "(node pubkey . fork id) -> universal time its last drive started (DRIVE-DISPUTE stamps it).")
+
 (defun drive-dispute (node fork)
+  (bt:with-lock-held (*drive-threads-lock*)   ; DRIVE-SCHEDULE: least recently driven first
+    (setf (gethash (cons (node-pubkey node) (record-id-hex fork)) *drive-last*) (get-universal-time)))
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (h (height node)))
     (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
       (unless (and base enter)
@@ -3261,7 +3267,6 @@
    bitcoin-cli together (load 139, members missing their cosign windows).")
 (defvar *drive-threads* (make-hash-table :test #'equalp)
   "node pubkey -> live forks being driven; (:dormant . pubkey) -> dormant ones")
-(defvar *drive-threads-lock* (bt:make-lock "drive-threads"))
 
 (defun dormant-dispute-p (node fork)
   "A fork the last pass found finished or stuck on a vault already spent: driven after the
@@ -3271,25 +3276,76 @@
                   (search "reserves spent, but not by a confiscation" note)
                   (search "yielded" note)))))
 
+(defvar *drive-inflight* (make-hash-table :test #'equalp)
+  "(node pubkey . fork id) -> T while a watch thread is driving it.")
+(defvar *drive-waiting* (make-hash-table :test #'equalp)
+  "(node pubkey . fork id) -> (since . warned): a live fork the watch skipped for want of a slot.")
+(defparameter *drive-starved-warn-seconds* 600
+  "A live fork left undriven this long is logged once (a deadline can pass unseen).")
+
+(defun drive-schedule (forks live-free dormant-free)
+  "The forks a watch pass starts: FORKS is a list of (id dormant last inflight), LAST the
+   universal time of the fork's last drive or NIL.  A fork already being driven takes no
+   slot.  Live forks before dormant ones, each the least recently driven first (never driven
+   before all), LIVE-FREE live and DORMANT-FREE dormant slots.  In hash order instead, the
+   forks at the head of the table re-took every freed slot while the ones behind them were
+   never driven: a pool node with eight live forks (three re-proposing a confiscation, 20 s
+   of signature timeout a pass) left its rescue dispute undriven 28 minutes after the
+   rotation it had to yield to confirmed (regtest rotation-post-expiry, 2026-11-19)."
+  (let ((candidates (stable-sort (remove-if #'fourth forks)
+                                 (lambda (a b)
+                                   (let ((da (second a)) (db (second b)))
+                                     (if (eq (not da) (not db))
+                                         (< (or (third a) 0) (or (third b) 0))
+                                         (not da)))))))
+    (loop for c in candidates
+          when (if (second c) (plusp dormant-free) (plusp live-free))
+            collect (first c)
+            and do (if (second c) (decf dormant-free) (decf live-free)))))
+
 (defun drive-disputes (node &key parallel)
   "Drive every dispute fork we own.  PARALLEL (the once-a-minute watch): up to
-   *max-drive-threads* forks at once, live disputes first, skipping a fork whose previous
-   drive is still running.  Driven in turn, a pass over old forks (a fruitless
-   confiscation rebuild took minutes each) held a live dispute back 16 minutes, past the
-   time its members had to reveal (check-obligations, regtest 2026-10-14)."
-  (let ((forks (stable-sort (loop for r being the hash-values of (node-ledgers node)
-                                  when (and (record-fork-p r) (record-owned-p r)) collect r)
-                            (lambda (a b) (and (not (dormant-dispute-p node a)) (dormant-dispute-p node b))))))
-    (dolist (rec forks)
-      (if parallel
-          ;; Dormant forks share one slot, so live disputes always have the rest: three slow
-          ;; dormant drives once held every slot while a live dispute's members never got to
-          ;; reveal (check-obligations, regtest 2026-10-14).
-          (let* ((lock (drive-lock node rec)) (rec rec) (dormant (dormant-dispute-p node rec))
-                 (key (if dormant (cons :dormant (node-pubkey node)) (node-pubkey node))))
-            (when (bt:with-lock-held (*drive-threads-lock*)
-                    (when (< (gethash key *drive-threads* 0) (if dormant 1 *max-drive-threads*))
-                      (incf (gethash key *drive-threads* 0))))
+   *max-drive-threads* forks at once, live disputes first and the least recently driven
+   first (DRIVE-SCHEDULE), skipping a fork whose previous drive is still running.  Driven
+   in turn, a pass over old forks (a fruitless confiscation rebuild took minutes each) held
+   a live dispute back 16 minutes, past the time its members had to reveal
+   (check-obligations, regtest 2026-10-14)."
+  (let ((forks (loop for r being the hash-values of (node-ledgers node)
+                     when (and (record-fork-p r) (record-owned-p r)) collect r))
+        (pk (node-pubkey node)))
+    (if (not parallel)
+        (dolist (rec forks)
+          (bt:with-lock-held ((drive-lock node rec))
+            (handler-case (drive-dispute node rec)
+              (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))))
+        ;; Dormant forks share one slot, so live disputes always have the rest: three slow
+        ;; dormant drives once held every slot while a live dispute's members never got to
+        ;; reveal (check-obligations, regtest 2026-10-14).
+        (let* ((by-id (make-hash-table :test #'equal)) (now (get-universal-time)) start)
+          (bt:with-lock-held (*drive-threads-lock*)
+            (let ((rows (loop for r in forks
+                              for id = (record-id-hex r) for k = (cons pk id)
+                              do (setf (gethash id by-id) r)
+                              collect (list id (dormant-dispute-p node r) (gethash k *drive-last*) (gethash k *drive-inflight*)))))
+              (setf start (drive-schedule rows (- *max-drive-threads* (gethash pk *drive-threads* 0))
+                                          (- 1 (gethash (cons :dormant pk) *drive-threads* 0))))
+              (dolist (row rows)
+                (let ((k (cons pk (first row))))
+                  (cond ((member (first row) start :test #'equal) (remhash k *drive-waiting*))
+                        ((or (second row) (fourth row)) nil)   ; dormant, or its drive is running
+                        (t (let ((w (or (gethash k *drive-waiting*) (setf (gethash k *drive-waiting*) (cons now nil)))))
+                             (when (and (not (cdr w)) (> (- now (car w)) *drive-starved-warn-seconds*))
+                               (setf (cdr w) t)
+                               (log! node "dispute ~a: not driven for ~a s, every drive slot busy"
+                                     (subseq (first row) 0 8) (- now (car w)))))))))
+              (setf start (loop for id in start
+                                for key = (if (second (assoc id rows :test #'equal)) (cons :dormant pk) pk)
+                                do (setf (gethash (cons pk id) *drive-inflight*) t)
+                                   (incf (gethash key *drive-threads* 0))
+                                collect (cons id key)))))
+          (loop for (id . key) in start
+                do
+            (let* ((rec (gethash id by-id)) (lock (drive-lock node rec)) (k (cons pk id)) (key key))
               ;; The thread takes the fork's lock itself (a mutex is released by its owner).
               (bt:make-thread (lambda ()
                                 (unwind-protect
@@ -3297,11 +3353,10 @@
                                        (unwind-protect (handler-case (drive-dispute node rec)
                                                          (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))
                                          (bt:release-lock lock)))
-                                  (bt:with-lock-held (*drive-threads-lock*) (decf (gethash key *drive-threads*)))))
-                              :name "drive-dispute")))
-          (bt:with-lock-held ((drive-lock node rec))
-            (handler-case (drive-dispute node rec)
-              (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e))))))
+                                  (bt:with-lock-held (*drive-threads-lock*)
+                                    (remhash k *drive-inflight*)
+                                    (decf (gethash key *drive-threads*)))))
+                              :name "drive-dispute")))))
     (drive-rearms node)))
 
 (defvar *drive-dispute-async* nil
