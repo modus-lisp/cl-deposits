@@ -26,6 +26,8 @@ die() { echo "soak-deploy: $*" >&2; exit 1; }
 dur() { case "$1" in *h) echo $(( ${1%h} * 3600 ));; *m) echo $(( ${1%m} * 60 ));; *s) echo "${1%s}";; *) echo "$1";; esac; }
 short() { git -C "$1" rev-parse --short=7 "$2" 2>/dev/null || die "no commit $2 in $1"; }
 target_of() { case "$1" in cld*) echo "$CLV";; ref*) echo "$RSV";; esac; }
+cld_or_ref_up() {   # the node answers: a cl control port, or a ref process that is alive
+  case "$1" in cld*) (echo >/dev/tcp/127.0.0.1/$(cld_port "$1")) 2>/dev/null;; *) [ "$(live_version "$1")" != down ];; esac; }
 have_build() { case "$1" in cld*) [ -f "$(cl_build "$2")/bin/cl-deposits.lisp" ];; ref*) [ -x "$(rust_build "$2")/deposits-node" ];; esac; }
 
 prepare() {   # prepare CL-SHA RUST-SHA — immutable builds, side by side
@@ -99,7 +101,13 @@ switch() {   # switch NODE FROM TO — write the version file, restart under the
   # version file is enough, and it starts on that build when a scenario wakes it.  Starting the
   # whole pool for a deploy undid keeping the signet lean (2026-11-12).
   if [ "$(live_version "$n")" = down ]; then log "switch $n $from -> $to recorded (stopped)"; return 0; fi
-  if restart_node "$n" >>"$D/restart.log" 2>&1 </dev/null && [ "$(live_version "$n")" = "$to" ]; then
+  # Success is what runs, per /proc: a cl node can outlast start_cld's port wait while still loading
+  # its ledgers and come up on the target anyway (2026-11-19: three such "failures" rolled cld2 back
+  # to 844a7fa, the build that proves against its own key).  So wait out a slow start before judging.
+  restart_node "$n" >>"$D/restart.log" 2>&1 </dev/null
+  local w; for w in $(seq 1 "${DEPLOY_CONFIRM_WAIT:-1200}"); do
+    [ "$(live_version "$n")" = "$to" ] && cld_or_ref_up "$n" && break; sleep 1; done
+  if [ "$(live_version "$n")" = "$to" ]; then
     log "switch $n $from -> $to ok ($(( $(date +%s) - t0 ))s)"; return 0
   fi
   log "switch $n $from -> $to FAILED (running $(live_version "$n")); see $D/restart.log"; return 1
