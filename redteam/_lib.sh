@@ -240,27 +240,32 @@ fund_cl() {   # fund_cl NODE — collateral coins for an actor that has none yet
   touch "$S/.cl-collateral-funded.$n"; mine 2 >/dev/null
 }
 pick() {
-  local pool=($(clean_cl)) i=0 v n
-  if [ ${#pool[@]} -lt $# ] && { [ "$CLD_CHAIN" = regtest ] || [ "${REDTEAM_MINT:-}" = 1 ]; }; then
-    wake_cl $(( $# - ${#pool[@]} )); pool=($(clean_cl))
+  # PICK_<ROLE>=cldN binds ROLE to that node whatever its taint (an aged, loaded holder on
+  # purpose: redteam/check-drive-load.sh); the other roles come from the clean pool as before.
+  local forced=" " f v n i=0 need=0 sel=()
+  for v in "$@"; do f="PICK_$v"; if [ -n "${!f:-}" ]; then forced+="${!f} "; else need=$((need+1)); fi; done
+  local pool=($(clean_cl | while read -r n; do [[ "$forced" == *" $n "* ]] || echo "$n"; done))
+  if [ ${#pool[@]} -lt $need ] && { [ "$CLD_CHAIN" = regtest ] || [ "${REDTEAM_MINT:-}" = 1 ]; }; then
+    wake_cl $(( need - ${#pool[@]} )); pool=($(clean_cl | while read -r n; do [[ "$forced" == *" $n "* ]] || echo "$n"; done))
   fi
-  if [ ${#pool[@]} -lt $# ] && { [ "$CLD_CHAIN" = regtest ] || [ "${REDTEAM_MINT:-}" = 1 ]; }; then
-    if ! mint_cl $(( $# - ${#pool[@]} )); then
-      recycle_cl $(( $# - ${#pool[@]} )) && wake_cl $(( $# - ${#pool[@]} ))
+  if [ ${#pool[@]} -lt $need ] && { [ "$CLD_CHAIN" = regtest ] || [ "${REDTEAM_MINT:-}" = 1 ]; }; then
+    if ! mint_cl $(( need - ${#pool[@]} )); then
+      recycle_cl $(( need - ${#pool[@]} )) && wake_cl $(( need - ${#pool[@]} ))
     fi
-    pool=($(clean_cl))
+    pool=($(clean_cl | while read -r n; do [[ "$forced" == *" $n "* ]] || echo "$n"; done))
   fi
-  for n in "${pool[@]}"; do [ -f "$S/.cl-collateral-funded.$n" ] || fund_cl "$n"; done
-  [ ${#pool[@]} -ge $# ] || { echo "SKIP: needs $# clean cl nodes ($*), have ${#pool[@]} (${pool[*]:-none}); add fresh-key nodes (devnet/_common.sh CLD_NODES)"; exit 0; }
+  [ ${#pool[@]} -ge $need ] || { echo "SKIP: needs $need clean cl nodes ($*), have ${#pool[@]} (${pool[*]:-none}); add fresh-key nodes (devnet/_common.sh CLD_NODES)"; exit 0; }
   # i again: bash scope is dynamic, and start_cld (via wake_cl) runs its own unlocal `for i` loop.
+  i=0; for v in "$@"; do f="PICK_$v"; if [ -n "${!f:-}" ]; then sel+=("${!f}"); else sel+=("${pool[$i]}"); i=$((i+1)); fi; done
+  for n in "${sel[@]}"; do [ -f "$S/.cl-collateral-funded.$n" ] || fund_cl "$n"; done
   # A running actor whose loaded code is not its build's current tree restarts on it (by tree hash,
-  # devnet/_common.sh cld_tree_hash; a node with no record restarts too).
+  # devnet/_common.sh cld_tree_hash; a node with no record, or down, restarts too).
   local stale=()
-  for n in "${pool[@]:0:$#}"; do cld_running "$n" && ! cld_stale "$n" || stale+=("$n"); done
+  for n in "${sel[@]}"; do cld_running "$n" && ! cld_stale "$n" || stale+=("$n"); done
   if [ ${#stale[@]} -gt 0 ]; then
     echo "== restarting ${stale[*]} on the current tree"
     for n in "${stale[@]}"; do ( stop_cld "$n" >/dev/null 2>&1; start_cld "$n" >/dev/null ) & done; wait
   fi
-  i=0; for v in "$@"; do declare -g "$v=${pool[$i]}"; i=$((i+1)); done
+  i=0; for v in "$@"; do declare -g "$v=${sel[$i]}"; i=$((i+1)); done
   echo "== actors: $(for v in "$@"; do printf '%s=%s ' "$v" "${!v}"; done)"
 }

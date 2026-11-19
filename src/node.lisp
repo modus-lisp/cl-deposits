@@ -3140,26 +3140,82 @@
 (defvar *drive-last* (make-hash-table :test #'equalp)
   "(node pubkey . fork id) -> universal time its last drive started (DRIVE-DISPUTE stamps it).")
 
+(defvar *drive-steps* nil
+  "Inside a drive: an alist step -> (ms . calls) of its timed steps (DSTEP), NIL outside one.")
+(defparameter *drive-log-ms* 1000
+  "A dispute drive taking at least this long logs its duration and the steps it spent it in
+   (DRIVE-TIMED).  The numbers the throughput work schedules by: a node with ~60 live disputes
+   left one undriven 897 s with every slot busy (regtest 1119-111730, cld364).")
+(defvar *drive-stats* (make-hash-table :test #'equalp)
+  "(node pubkey . step) -> (total-ms . calls) over the process's life, :drive the whole drive.")
+(defvar *drive-stats-lock* (bt:make-lock "drive-stats"))
+
+(defun ms-since (t0)
+  (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second))
+
+(defmacro dstep (name &body body)
+  "Time BODY as drive step NAME into *DRIVE-STEPS* (a no-op outside a drive)."
+  (let ((t0 (gensym "T0")))
+    `(let ((,t0 (get-internal-real-time)))
+       (unwind-protect (progn ,@body)
+         (when *drive-steps*
+           (let ((cell (or (assoc ,name (cdr *drive-steps*))
+                           (car (push (list* ,name 0 0) (cdr *drive-steps*))))))
+             (incf (second cell) (ms-since ,t0))
+             (incf (cddr cell))))))))
+
+(defun drive-step-summary (steps)
+  "STEPS as \"name ms[xN] ...\", slowest first; steps under 5 ms left out."
+  (format nil "~{~a~^ ~}"
+          (loop for (name ms . n) in (sort (copy-list steps) #'> :key #'second)
+                when (>= ms 5) collect (format nil "~(~a~) ~ams~:[~;x~a~]" name ms (> n 1) n))))
+
+(defun drive-timed (node fork thunk)
+  "Run THUNK (a drive of FORK) timing it and its DSTEPs; log a slow one with its breakdown and
+   the note it left, and add both into *DRIVE-STATS* (the :drive-stats control request)."
+  (let* ((*drive-steps* (list :steps)) (t0 (get-internal-real-time)) (id (record-id-hex fork)))
+    (unwind-protect (funcall thunk)
+      (let ((ms (ms-since t0)) (pk (node-pubkey node)))
+        (bt:with-lock-held (*drive-stats-lock*)
+          (loop for (name sms . n) in (cons (list* :drive ms 1) (cdr *drive-steps*))
+                for cell = (or (gethash (cons pk name) *drive-stats*) (setf (gethash (cons pk name) *drive-stats*) (cons 0 0)))
+                do (incf (car cell) sms) (incf (cdr cell) n)))
+        (when (>= ms *drive-log-ms*)
+          (log! node "dispute ~a: drive took ~a ms [~a] -> ~a" (subseq id 0 8) ms
+                (drive-step-summary (cdr *drive-steps*)) (gethash id (node-dispute-notes node))))))))
+
+(defun drive-stats (node)
+  "This node's drive totals: a list of (step total-ms calls mean-ms), slowest total first."
+  (let ((pk (node-pubkey node)))
+    (bt:with-lock-held (*drive-stats-lock*)
+      (sort (loop for (k . (ms . n)) in (alexandria:hash-table-alist *drive-stats*)
+                  when (equalp (car k) pk) collect (list (cdr k) ms n (if (plusp n) (round ms n) 0)))
+            #'> :key #'second))))
+
 (defun drive-dispute (node fork)
+  "Drive FORK one step (%DRIVE-DISPUTE), timed (DRIVE-TIMED)."
+  (drive-timed node fork (lambda () (%drive-dispute node fork))))
+
+(defun %drive-dispute (node fork)
   (bt:with-lock-held (*drive-threads-lock*)   ; DRIVE-SCHEDULE: least recently driven first
     (setf (gethash (cons (node-pubkey node) (record-id-hex fork)) *drive-last*) (get-universal-time)))
   (let* ((id (record-id-hex fork)) (base (find-record node id)) (h (height node)))
     (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
       (unless (and base enter)
-        (return-from drive-dispute
+        (return-from %drive-dispute
           (note-dispute node id "not driven: ~:[no replica of the ledger~;no DisputeEnter of ours on the fork~]" base)))
       (flet ((conclude (fmt &rest args)
-               (commit-update node fork (new-update node fork (list :type :dispute-yield)))
+               (dstep :yield (commit-update node fork (new-update node fork (list :type :dispute-yield))))
                (release-pledges node id)
-               (return-from drive-dispute (apply #'note-dispute node id fmt args))))
+               (return-from %drive-dispute (apply #'note-dispute node id fmt args))))
         (when (find-if (lambda (r) (> (getf r :round) 1)) (rearm-rounds node id))
-          (return-from drive-dispute (note-dispute node id "in a re-arm round (DRIVE-REARM)")))
+          (return-from %drive-dispute (note-dispute node id "in a re-arm round (DRIVE-REARM)")))
         (when (or (fork-op fork :dispute-acquire) (fork-op fork :dispute-yield))
           (when (and (loop for v being the hash-values of (node-pledges node) thereis (equal v id))
                      (not (rearm-rounds node id)))
             (release-pledges node id))
-          (return-from drive-dispute (note-dispute node id "concluded")))
-        (multiple-value-bind (conf lottery lstate) (fork-lottery node id)
+          (return-from %drive-dispute (note-dispute node id "concluded")))
+        (multiple-value-bind (conf lottery lstate) (dstep :fork-lottery (fork-lottery node id))
           ;; DEP-05 §"When a quorum_expired dispute ends": a QuorumBegin after the dispute's
           ;; fork point answers its ground, unless its confiscation already confirmed.  Judged
           ;; from the ledger, not the tip: the re-established quorum may itself have expired
@@ -3168,7 +3224,7 @@
           ;; ones).  A dispute opened on a stale replica, its quorum live now, ends too.
           (let ((expiry (lg:ledger-quorum-expiry (record-ledger base)))
                 (confirmed (or (assoc (node-pubkey node) (reveals-of node id) :test #'equalp)
-                               (and conf (node-chain-fn node) (funcall (node-chain-fn node) (btx:tx-txid conf) 0)))))
+                               (and conf (node-chain-fn node) (dstep :chain-conf (funcall (node-chain-fn node) (btx:tx-txid conf) 0))))))
             ;; strict-lottery-v8 (:expiry-ends-on-spend, judged at the fork point, never by the
             ;; QuorumBegin under judgement): only a re-establishment whose spend of the vault
             ;; confirmed ends it; recorded but unspent, the race goes on (regtest 2026-11-15:
@@ -3177,18 +3233,19 @@
             (when (and (dispute-enter-expiry-p enter enter-op expiry) (not confirmed)
                        (let* ((lvs (op:field enter-op :last-valid-sequence))
                               (on-spend (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :expiry-ends-on-spend))
-                              (spent (or (not on-spend) (reestablishment-confirmed-p node base lvs))))
+                              (spent (or (not on-spend) (dstep :reestablished (reestablishment-confirmed-p node base lvs)))))
                          (or (expiry-dispute-ended-p lvs (latest-quorum-begin-seq base) nil
                                                      :on-spend on-spend :rotation-confirmed spent)
                              (and expiry (<= h (+ expiry *expiry-grace-blocks*)) spent))))
               (conclude "quorum re-established (expiry ~a); yielded" expiry)))
-          (let ((reserves-spent (multiple-value-bind (r txid vout) (disputed-reserves node base)
+          (let ((reserves-spent (dstep :reserves-spent
+                                (multiple-value-bind (r txid vout) (disputed-reserves node base)
                                   (declare (ignore r))
-                                  (and (node-chain-fn node) (null (funcall (node-chain-fn node) txid vout))))))
+                                  (and (node-chain-fn node) (null (funcall (node-chain-fn node) txid vout)))))))
             (cond
               ;; Nothing left to confiscate (a stranded rotation spent it): arming
               ;; would only tie up a pledge.
-              ((and reserves-spent (null conf) (lottery-output-spent-p node id))
+              ((and reserves-spent (null conf) (dstep :lottery-spent (lottery-output-spent-p node id)))
                ;; A confiscation we know confirmed, and its lottery output is spent: claimed (a
                ;; re-arm spend is DRIVE-REARM's, above).  Not being able to rebuild the lottery
                ;; proves nothing (751e6951's fellows concluded on that, and it stranded).
@@ -3197,7 +3254,7 @@
                ;; took it for a claim in the pass before it confirmed, yielded, and so never
                ;; revealed round 2 (regtest, 2026-11-10: cld193 on 3151f272).
                (let ((r1 (find 1 (rearm-rounds node id) :key (lambda (r) (getf r :round)))))
-                 (cond ((and r1 (follow-rearm-spend node id r1))
+                 (cond ((and r1 (dstep :follow-rearm (follow-rearm-spend node id r1)))
                         (note-dispute node id "lottery round 1 spent into round 2's lottery"))
                        ((and r1 (not (lottery-spend-confirmed-p node r1)))
                         (note-dispute node id "lottery output spent in the mempool; judging it once it confirms"))
@@ -3210,9 +3267,9 @@
               ((and (null (fork-op fork :dispute-armed)) (getf (node-adversary node) :hold-arm))
                (note-dispute node id "disputed; holding our arm (:hold-arm)"))
               ((null (fork-op fork :dispute-armed))
-               (let ((p (pledge-collateral node id)))
+               (let ((p (dstep :pledge (pledge-collateral node id))))
                  (if p
-                     (progn (arm-dispute node fork :replacement p)
+                     (progn (dstep :arm (arm-dispute node fork :replacement p))
                             (note-dispute node id "armed, pledging ~a:~a (~a sats)" (txid-hex (first p)) (second p) (third p)))
                      (note-dispute node id "waiting for collateral (~a sats)" (required-replacement-sats base)))))
               ;; DEP-03: our pledge stopped passing the eligibility cut (spent, or never
@@ -3223,20 +3280,20 @@
                     (< (count (node-pubkey node) (%all-arms node id) :key #'first :test #'equalp) +max-arms+)
                     (let ((ours (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp)))
                       (and ours (fourth ours) (node-pledge-fn node)
-                           (pledge-failure (node-pledge-fn node) (fourth ours) (height node) 0 nil))))
+                           (dstep :pledge-check (pledge-failure (node-pledge-fn node) (fourth ours) (height node) 0 nil)))))
                (remhash (outpoint-key (first (fourth (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp)))
                                       (second (fourth (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp))))
                         (node-pledges node))
-               (let ((p (pledge-collateral node id)))
+               (let ((p (dstep :pledge (pledge-collateral node id))))
                  (if p
-                     (progn (arm-dispute node fork :replacement p)
+                     (progn (dstep :arm (arm-dispute node fork :replacement p))
                             (note-dispute node id "re-armed: our pledge no longer counted; now pledging ~a:~a" (txid-hex (first p)) (second p)))
                      (note-dispute node id "our pledge no longer counts; waiting for collateral to re-arm"))))
               ((eq lstate :pending)
                ;; DEP-03 §Confiscation ladder: until a rung confirms, push the one the schedule names.
-               (let ((i (bump-confiscation node id)))
+               (let ((i (dstep :bump (bump-confiscation node id))))
                  (when (and i (plusp i)) (note-dispute node id "confiscation unconfirmed; broadcast rung ~a" i)))
-               (cond ((< (confiscation-depth node conf) +reveal-depth+)
+               (cond ((< (dstep :conf-depth (confiscation-depth node conf)) +reveal-depth+)
                       ;; DEP-06 Phase 3: reveal once a rung confirms, and deep enough that a reorg
                       ;; cannot swap in a competing confiscation over another cut of the arms.  A
                       ;; preimage published while the rung sat in the mempool let any proposer grind
@@ -3250,29 +3307,29 @@
                       ;; the last revealer holds the funds hostage; DEP-06 §Phase 4).
                       (if (getf (node-adversary node) :withhold-reveal)
                           (note-dispute node id "ADVERSARY: confiscation ~a on chain; withholding our reveal" (txid-hex (btx:tx-txid conf)))
-                          (progn (publish-reveal node id)
+                          (progn (dstep :reveal (publish-reveal node id))
                                  (note-dispute node id "confiscation ~a on chain; revealed" (txid-hex (btx:tx-txid conf))))))
                      ((and (< (length (revealed-indices node id lottery)) (length (lot:lottery-participants lottery)))
                            (not (reveal-deadline-passed-p node conf)))
                       (note-dispute node id "~a of ~a revealed; the reveal deadline is ~a blocks after the confiscation"
                                     (length (revealed-indices node id lottery)) (length (lot:lottery-participants lottery)) lot:+reveal-csv+))
-                     (t (handler-case (let ((outcome (claim-or-yield node id :confiscation-txid (btx:tx-txid conf))))
+                     (t (handler-case (let ((outcome (dstep :claim (claim-or-yield node id :confiscation-txid (btx:tx-txid conf)))))
                                         (release-pledges node id)
                                         (note-dispute node id "lottery: ~(~a~)" outcome))
                           (error (e) (note-dispute node id "waiting to claim: ~a" e))))))
               ;; Our assembled confiscation fell out of the mempool: push the rung the schedule
               ;; names again rather than gathering signatures anew.
-              ((let ((i (bump-confiscation node id)))
+              ((let ((i (dstep :bump (bump-confiscation node id))))
                  (when i (note-dispute node id "confiscation not in the mempool; rebroadcast rung ~a" i) t)))
               (t
-               (let* ((closes (dispute-arm-closes node base))
+               (let* ((closes (dstep :arm-closes (dispute-arm-closes node base)))
                       (armers (sort (mapcar #'first (armers-of node id)) #'bytes<))
                       (q (dispute-lottery-n base (dispute-last-valid-seq node id))) (k (length armers)))
                  (cond ((< k 1) (note-dispute node id "armed; waiting for an armer"))
                        ((< h closes) (note-dispute node id "armed; arm window closes at ~a" closes))
                        ((or (equalp (first armers) (node-pubkey node)) (>= h (+ closes *proposer-grace-blocks*)))
                         (handler-case
-                            (let ((tx (confiscate node id :respectful (expiry-reason-p (op:field enter-op :reason)))))
+                            (let ((tx (dstep :confiscate (confiscate node id :respectful (expiry-reason-p (op:field enter-op :reason))))))
                               (note-dispute node id "proposed confiscation ~a~@[ with ~a of ~a armed~]" (txid-hex (btx:tx-txid tx))
                                             (and (< k q) k) q))
                           (error (e) (note-dispute node id "confiscation not yet: ~a" e))))
@@ -3329,13 +3386,65 @@
             collect (first c)
             and do (if (second c) (decf dormant-free) (decf live-free)))))
 
+(defvar *drive-queues* (make-hash-table :test #'equalp)
+  "node pubkey -> live forks (id . record) waiting for a drive slot, in DRIVE-SCHEDULE
+   order; (:dormant . pubkey) -> dormant ones.  Each watch pass replaces both.")
+(defvar *drive-fn* 'drive-dispute "What a drive slot runs on a fork (tests time it).")
+
+(defun in-rearm-round-p (node id)
+  "Round 2 or later: DRIVE-REARM drives it, and DRIVE-DISPUTE would only say so."
+  (find-if (lambda (r) (> (getf r :round) 1)) (rearm-rounds node id)))
+
+(defun drive-worker (node pk key)
+  "One drive slot: drive the forks queued under KEY, one after another, until none is left.
+   Runs with KEY's slot already counted in *DRIVE-THREADS*; gives it back on exit."
+  (unwind-protect
+       (loop
+         (destructuring-bind (&optional id . rec)
+             (bt:with-lock-held (*drive-threads-lock*)
+               (loop for e = (pop (gethash key *drive-queues*))
+                     while e
+                     unless (gethash (cons pk (car e)) *drive-inflight*)
+                       do (setf (gethash (cons pk (car e)) *drive-inflight*) t)
+                          (remhash (cons pk (car e)) *drive-waiting*)
+                          (return e)))
+           (unless id (return))
+           (let ((lock (drive-lock node rec)))
+             (unwind-protect
+                  ;; The slot takes the fork's lock itself (a mutex is released by its owner);
+                  ;; a fork DRIVE-DISPUTE-NOW holds is skipped, not waited on.
+                  (when (bt:acquire-lock lock nil)
+                    (unwind-protect (handler-case (funcall *drive-fn* node rec)
+                                      (error (e) (note-dispute node id "error: ~a" e)))
+                      (bt:release-lock lock)))
+               (bt:with-lock-held (*drive-threads-lock*)
+                 (remhash (cons pk id) *drive-inflight*))))))
+    (bt:with-lock-held (*drive-threads-lock*)
+      (decf (gethash key *drive-threads*)))))
+
+(defun drive-load (node)
+  "(values owned live waiting): the forks we own, those a watch pass queues for a live slot (not
+   dormant, not in a re-arm round), and of those the ones no slot has started since the pass."
+  (let ((owned 0) (live 0) (pk (node-pubkey node)))
+    (loop for r being the hash-values of (node-ledgers node)
+          when (and (record-fork-p r) (record-owned-p r))
+            do (incf owned)
+               (unless (or (dormant-dispute-p node r) (in-rearm-round-p node (record-id-hex r))) (incf live)))
+    (values owned live (bt:with-lock-held (*drive-threads-lock*) (length (gethash pk *drive-queues*))))))
+
 (defun drive-disputes (node &key parallel)
-  "Drive every dispute fork we own.  PARALLEL (the once-a-minute watch): up to
-   *max-drive-threads* forks at once, live disputes first and the least recently driven
-   first (DRIVE-SCHEDULE), skipping a fork whose previous drive is still running.  Driven
-   in turn, a pass over old forks (a fruitless confiscation rebuild took minutes each) held
-   a live dispute back 16 minutes, past the time its members had to reveal
-   (check-obligations, regtest 2026-10-14)."
+  "Drive every dispute fork we own.  PARALLEL (the once-a-minute watch): *MAX-DRIVE-THREADS*
+   slots for live forks and one for dormant ones, each slot draining a queue in
+   DRIVE-SCHEDULE order (live first, least recently driven first) and taking the next fork
+   the moment its drive ends.  A fork whose drive is still running is not queued, and one in
+   a re-arm round is DRIVE-REARM's.
+     Started once per pass, the slots capped the watch at three drives A MINUTE however short
+   the drives were: cld364, holding ~60 live forks (most of them a millisecond to drive),
+   drove each one every ~20 minutes, and left a rescue dispute undriven 897 s after the
+   rotation it had to yield to confirmed (regtest 1119-111730, rotation-post-expiry,
+   rearm-yield and rearm-rust).  Driven in turn instead, a pass over old forks (a fruitless
+   confiscation rebuild took minutes each) held a live dispute back 16 minutes, past the
+   time its members had to reveal (check-obligations, regtest 2026-10-14)."
   (let ((forks (loop for r being the hash-values of (node-ledgers node)
                      when (and (record-fork-p r) (record-owned-p r)) collect r))
         (pk (node-pubkey node)))
@@ -3347,42 +3456,37 @@
         ;; Dormant forks share one slot, so live disputes always have the rest: three slow
         ;; dormant drives once held every slot while a live dispute's members never got to
         ;; reveal (check-obligations, regtest 2026-10-14).
-        (let* ((by-id (make-hash-table :test #'equal)) (now (get-universal-time)) start)
+        (let* ((by-id (make-hash-table :test #'equal)) (now (get-universal-time)) (dk (cons :dormant pk)) spawn)
           (bt:with-lock-held (*drive-threads-lock*)
-            (let ((rows (loop for r in forks
-                              for id = (record-id-hex r) for k = (cons pk id)
-                              do (setf (gethash id by-id) r)
-                              collect (list id (dormant-dispute-p node r) (gethash k *drive-last*) (gethash k *drive-inflight*)))))
-              (setf start (drive-schedule rows (- *max-drive-threads* (gethash pk *drive-threads* 0))
-                                          (- 1 (gethash (cons :dormant pk) *drive-threads* 0))))
+            (let* ((rows (loop for r in forks
+                               for id = (record-id-hex r) for k = (cons pk id)
+                               do (setf (gethash id by-id) r)
+                               unless (in-rearm-round-p node id)
+                                 collect (list id (dormant-dispute-p node r) (gethash k *drive-last*) (gethash k *drive-inflight*))))
+                   (order (drive-schedule rows most-positive-fixnum most-positive-fixnum)))
+              (flet ((queue (dormant)
+                       (loop for id in order
+                             when (eq dormant (and (second (assoc id rows :test #'equal)) t))
+                               collect (cons id (gethash id by-id)))))
+                (setf (gethash pk *drive-queues*) (queue nil)
+                      (gethash dk *drive-queues*) (queue t)))
+              ;; A live fork left undriven this long is logged once per wait (a deadline can pass
+              ;; unseen).  Measured from its last drive, or from when the watch first saw it.
               (dolist (row rows)
                 (let ((k (cons pk (first row))))
-                  (cond ((member (first row) start :test #'equal) (remhash k *drive-waiting*))
-                        ((or (second row) (fourth row)) nil)   ; dormant, or its drive is running
-                        (t (let ((w (or (gethash k *drive-waiting*) (setf (gethash k *drive-waiting*) (cons now nil)))))
-                             (when (and (not (cdr w)) (> (- now (car w)) *drive-starved-warn-seconds*))
-                               (setf (cdr w) t)
-                               (log! node "dispute ~a: not driven for ~a s, every drive slot busy"
-                                     (subseq (first row) 0 8) (- now (car w)))))))))
-              (setf start (loop for id in start
-                                for key = (if (second (assoc id rows :test #'equal)) (cons :dormant pk) pk)
-                                do (setf (gethash (cons pk id) *drive-inflight*) t)
-                                   (incf (gethash key *drive-threads* 0))
-                                collect (cons id key)))))
-          (loop for (id . key) in start
-                do
-            (let* ((rec (gethash id by-id)) (lock (drive-lock node rec)) (k (cons pk id)) (key key))
-              ;; The thread takes the fork's lock itself (a mutex is released by its owner).
-              (bt:make-thread (lambda ()
-                                (unwind-protect
-                                     (when (bt:acquire-lock lock nil)
-                                       (unwind-protect (handler-case (drive-dispute node rec)
-                                                         (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))
-                                         (bt:release-lock lock)))
-                                  (bt:with-lock-held (*drive-threads-lock*)
-                                    (remhash k *drive-inflight*)
-                                    (decf (gethash key *drive-threads*)))))
-                              :name "drive-dispute")))))
+                  (unless (or (second row) (fourth row))
+                    (let ((w (or (gethash k *drive-waiting*) (setf (gethash k *drive-waiting*) (cons (or (third row) now) nil)))))
+                      (when (and (not (cdr w)) (> (- now (car w)) *drive-starved-warn-seconds*))
+                        (setf (cdr w) t)
+                        (log! node "dispute ~a: not driven for ~a s, every drive slot busy"
+                              (subseq (first row) 0 8) (- now (car w))))))))
+              (loop for (key cap) in (list (list pk *max-drive-threads*) (list dk 1))
+                    for n = (min (- cap (gethash key *drive-threads* 0)) (length (gethash key *drive-queues*)))
+                    do (loop repeat (max n 0)
+                             do (incf (gethash key *drive-threads* 0)) (push key spawn)))))
+          (dolist (key spawn)
+            (let ((key key))
+              (bt:make-thread (lambda () (drive-worker node pk key)) :name "drive-dispute")))))
     (drive-rearms node)))
 
 (defvar *drive-dispute-async* nil
