@@ -79,6 +79,9 @@
    (make-sc :name "rearm-mixed" :script "check-rearm-mixed.sh" :ledger-var "REDTEAM_RM"
             :env '("WAIT=1800" "CHECK_TIMEOUT=5000") :timeout 5400 :tags '(:contagion :slow)
             :note "DEP-06 Phase 4 re-arm whose tier-0 recovery spend needs a reference voter's signature: deposits-rust answers lottery_rearm_sign (cl proposes, Rust signs)")
+   (make-sc :name "rearm-rust" :script "check-rearm-rust.sh" :ledger-var "REDTEAM_RR2"
+            :env '("WAIT=1800" "CHECK_TIMEOUT=5000") :timeout 5400 :tags '(:contagion :slow)
+            :note "DEP-06 Phase 4 re-arm driven end to end by deposits-rust: R arms round 2, proposes and assembles the tier-0 recovery spend (cl H only signs), and reveals and claims round 2")
    (make-sc :name "rotation-drop" :script "check-rotation-drop.sh" :ledger-var "REDTEAM_RD" :timeout 1500
             :note "DEP-11 rotating without a silent member (ruled 2026-11-10): a silent member is dropped and the consenting ones seated")
    (make-sc :name "rotation-post-expiry" :script "check-rotation-post-expiry.sh" :args '("rescue") :ledger-var "REDTEAM_PX" :timeout 1800
