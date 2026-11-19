@@ -911,4 +911,20 @@
                             (mapcar (lambda (a) (list (first a) (sixth a))) got)
                             (sort (copy-list manifest) #'string< :key #'first))))))
 
+;;; inspect/vectors/pledge_pick.json: DEP-03, the coin a member pledges in a DisputeArmed, shared with
+;;; deposits-rust (dispute.rs, pick_pledge).
+(with-gate ("DEP-03 pledge pick: the coin pledged against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "pledge_pick.json")))) (n 0))
+    (loop for c across (gethash "cases" v)
+          for utxos = (loop for u across (gethash "utxos" c)
+                            collect (list :key (gethash "outpoint" u) :sats (gethash "sats" u)
+                                          :confirmations (gethash "confirmations" u)))
+          for own = (let ((o (gethash "own" c))) (and (stringp o) o))
+          for want = (let ((e (gethash "expect" c))) (and (stringp e) e))
+          for got = (nd::pick-pledge utxos (gethash "need" c) (gethash "min_confs" c) own
+                                     (coerce (gethash "taken" c) 'list))
+          do (incf n)
+             (check-equal (format nil "pledge: ~a" (gethash "name" c)) (getf got :key) want))
+    (check-equal "every pledge_pick case ran" n 9)))
+
 (report)

@@ -6204,6 +6204,21 @@
     (broadcast node signed)
     (values (btx:tx-txid signed) 0 (- total fee))))
 
+(defun pick-pledge (utxos need min-confs own taken)
+  "The coin to pledge as replacement collateral (DEP-03 §Replacement collateral declaration), from
+   UTXOS (plists :key \"txid:vout\" :sats :confirmations): OWN (this dispute's earlier pledge) while it
+   is unspent; else the smallest confirmed coin (at least MIN-CONFS, at least 1) covering NEED that no
+   other live arm of ours pledges (TAKEN, a list of keys), ties to the smaller key; else NIL.  A coin
+   pledged to two disputes is spent by whichever claim lands first and strands the other (regtest
+   rearm-rust, 2026-11-19, deposits-rust).  Vector: pledge_pick.json."
+  (or (and own (find own utxos :key (lambda (u) (getf u :key)) :test #'equal))
+      (first (sort (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 min-confs))
+                                               (member (getf u :key) taken :test #'equal)
+                                               (< (getf u :sats) need)))
+                              (copy-list utxos))
+                   (lambda (a b) (or (< (getf a :sats) (getf b :sats))
+                                     (and (= (getf a :sats) (getf b :sats)) (string< (getf a :key) (getf b :key)))))))))
+
 (defun pledge-collateral (node id-hex)
   "A confirmed UTXO of ours, pledged to ID-HEX, covering its required replacement
    collateral: (txid vout sats), or NIL.  When no single UTXO is large enough but
@@ -6224,13 +6239,14 @@
                                           for o = (op:update-op u)
                                           when (op:field o :replacement-collateral-txid)
                                             collect (outpoint-key (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)))))
-           (free (remove-if (lambda (u) (let ((k (outpoint-key (getf u :txid) (getf u :vout))))
-                                          (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
-                                              (gethash k (node-pledges node)) (member k declared :test #'equal))))
-                            utxos))
-           (fits (sort (remove-if (lambda (u) (< (getf u :sats) need)) free) #'< :key (lambda (u) (getf u :sats)))))
-      (cond (fits
-             (let ((u (first fits)))
+           (keyed (loop for u in utxos collect (list* :key (outpoint-key (getf u :txid) (getf u :vout)) u)))
+           (taken (append declared (loop for k being the hash-keys of (node-pledges node) collect k)))
+           (free (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
+                                            (member (getf u :key) taken :test #'equal)))
+                            keyed))
+           (pick (pick-pledge keyed need (node-min-confs node) nil taken)))
+      (cond (pick
+             (let ((u pick))
                (setf (gethash (outpoint-key (getf u :txid) (getf u :vout)) (node-pledges node)) id-hex)
                (save-pledges node)
                (list (getf u :txid) (getf u :vout) (getf u :sats))))
