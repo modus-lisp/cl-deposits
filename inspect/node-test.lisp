@@ -2658,30 +2658,61 @@
 ;;; while its rung still spent tier 0 (5 of 8, a judge needs 4 cosignatures).  No judge accepts that
 ;;; QuorumBegin as the answer; the operator challenged its own rotation, and the lapsed challenge
 ;;; proved all five signers (2026-11-19).
-(with-gate ("rotation answer floor: the signet C rescue, as recorded, answers nothing (vector)")
+(with-gate ("rotation answer: the signet C rescue answers by the ledger's threshold at its recorded height, not by the tier floor (vector)")
+  ;; Ruled 2026-11-19 (strict-lottery-v8 :recorded-threshold-answer): a rotating QuorumBegin that
+  ;; met the ledger's own DEP-05 requirement where it was recorded answers the spend of its rung,
+  ;; even below the spent tier's floor; one cosignature short of that requirement, it does not.
   (let* ((v (json-simple:parse (uiop:read-file-string (vector-path "rotation_answer_floor.json"))))
          (e (gethash "expect" v))
-         (b64 (lambda (k) (up:decode-update (hx (gethash (concatenate (quote string) k "_hex") v)))))
-         (ups (list (funcall b64 "ledger_open") (funcall b64 "governing_quorum_begin") (funcall b64 "answer_quorum_begin")))
+         (dec (lambda (k) (up:decode-update (hx (gethash (concatenate (quote string) k "_hex") v)))))
+         (ups (list (funcall dec "ledger_open") (funcall dec "governing_quorum_begin") (funcall dec "answer_quorum_begin")))
          (ans (third ups))
          (spend (btx:parse-tx (cl-consensus.wire:make-reader (hx (gethash "spend_tx_hex" v)))))
          (reserves (fr:spent-vault ups (gethash "governing_seq" e)))
+         (members (mapcar #'up:x-only (rs:reserves-members reserves)))
          (stack (first (btx:tx-witnesses spend)))
-         (ti (position (nth (- (length stack) 2) stack) (rs:reserves-leaves reserves) :test #'equalp)))
+         (ti (position (nth (- (length stack) 2) stack) (rs:reserves-leaves reserves) :test #'equalp))
+         (anchor (rot:anchor-of spend)) (txid (btx:tx-txid spend)))
     (check-equal "the rung spent the tier the vector names" ti (gethash "tier_index" e))
     (check-equal "that tier's threshold" (rs:tier-threshold (nth ti (rs:reserves-tiers reserves))) (gethash "tier_threshold" e))
+    (check-equal "the governing QuorumBegin's ruleset" (rs:reserves-ruleset reserves) (gethash "governing_ruleset" e))
+    (check-equal "the answer's ruleset" (op:field (op:update-op ans) :protocol-version) (gethash "answer_ruleset" e))
     (multiple-value-bind (keys need) (fr:answer-cosign-need reserves ti)
       (check-equal "its keys" (length keys) (gethash "tier_keys" e))
-      (check-equal "cosignatures a judge needs (the operator's counts)" need (gethash "needed_cosignatures" e))
-      (check-equal "cosignatures the QuorumBegin carries by them" (fr:tier-cosignatures ans keys) (gethash "tier_cosignatures" e)))
+      (check-equal "cosignatures the tier floor needs (the operator's counts)" need (gethash "needed_cosignatures" e))
+      (check-equal "cosignatures the QuorumBegin carries by them" (fr:tier-cosignatures ans keys) (gethash "tier_cosignatures" e))
+      (check-equal "so by the tier floor it does not answer" (>= (fr:tier-cosignatures ans keys) need) (gethash "answers_by_tier_floor" e)))
     (check "it is otherwise the answer: anchor, operator, rung, operator signature"
-           (and (equalp (up:update-prev-hash ans) (rot:anchor-of spend))
-                (member (btx:tx-txid spend) (fr:rotation-rungs (op:update-op ans)) :test #'equalp)
+           (and (equalp (up:update-prev-hash ans) anchor)
+                (member txid (fr:rotation-rungs (op:update-op ans)) :test #'equalp)
                 (up:verify-operator-signature ans)))
-    (check-equal "and no judge accepts it" (and (fr:rotation-answer (list ans) (rot:anchor-of spend) (btx:tx-txid spend) reserves ti) t)
-                 (gethash "answers" e))
-    (check "at a tier whose floor its cosignatures reach (tier 1), it would"
-           (let ((t1 1)) (>= (fr:tier-cosignatures ans (fr:answer-cosign-need reserves t1)) (nth-value 1 (fr:answer-cosign-need reserves t1)))))))
+    (let ((h (up:update-block-height ans)))
+      (check-equal "recorded at the vector's height" h (gethash "answer_block_height" e))
+      (check-equal "in lifecycle tier 1 of the governing quorum"
+                   (string-downcase (symbol-name (lg:lifecycle-tier-at (rs:reserves-quorum-expiry reserves) h)))
+                   (gethash "recorded_lifecycle_tier" e))
+      (check-equal "where the ledger required" (lg:establishment-requirement (length members) :tier1) (gethash "recorded_threshold" e)))
+    (check-equal "cosignatures by the governing quorum's members" (fr:tier-cosignatures ans members) (gethash "member_cosignatures" e))
+    (check-equal "so a judge accepts it as the answer" (and (fr:rotation-answer (list ans) anchor txid reserves ti) t) (gethash "answers" e))
+    ;; The negative: C's operations re-signed with test keys (C's own update cannot lose a
+    ;; cosignature and keep its operator signature, which commits to them).
+    (let* ((syn (gethash "synthetic" v)) (se (gethash "expect" syn))
+           (sd (lambda (k) (up:decode-update (hx (gethash (concatenate (quote string) k "_hex") syn)))))
+           (sups (list (funcall sd "ledger_open") (funcall sd "governing_quorum_begin")))
+           (sres (fr:spent-vault sups (gethash "governing_seq" e)))
+           (smembers (mapcar #'up:x-only (rs:reserves-members sres)))
+           (a3 (funcall sd "answer3")) (a2 (funcall sd "answer2")))
+      (check "both synthetic answers carry a valid operator signature"
+             (and (up:verify-operator-signature a3) (up:verify-operator-signature a2)))
+      (check-equal "the synthetic floor is C's" (nth-value 1 (fr:answer-cosign-need sres ti)) (gethash "tier_floor_needed" se))
+      (check-equal "with the 3 cosignatures the ledger required" (fr:tier-cosignatures a3 smembers) (gethash "answer3_member_cosignatures" se))
+      (check-equal "it answers" (and (fr:rotation-answer (list a3) anchor txid sres ti) t) (gethash "answer3_answers" se))
+      (check-equal "with 2" (fr:tier-cosignatures a2 smembers) (gethash "answer2_member_cosignatures" se))
+      (check-equal "one cosignature below the recorded threshold, it answers nothing"
+                   (and (fr:rotation-answer (list a2) anchor txid sres ti) t) (gethash "answer2_answers" se)))
+    (check "the rule is strict-lottery-v8's alone"
+           (and (lg:ruleset-rule-p "strict-lottery-v8" :recorded-threshold-answer)
+                (not (lg:ruleset-rule-p "grounded-arms-v7" :recorded-threshold-answer))))))
 
 (with-gate ("rotation answer floor: a rotation planned at tier 0 and recorded past tier 1's opening")
   (flet ((setup (salt)

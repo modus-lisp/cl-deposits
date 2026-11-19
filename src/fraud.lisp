@@ -20,7 +20,7 @@
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
            #:make-unauthorized-vault-spend-proof #:verify-unauthorized-vault-spend #:vault-spend-signers #:proof-accused-keys
-           #:rotation-rungs #:rotation-answer #:answer-cosign-need #:tier-cosignatures #:spend-window #:challenge-op #:spent-vault
+           #:rotation-rungs #:rotation-answer #:recorded-threshold-met-p #:answer-cosign-need #:tier-cosignatures #:spend-window #:challenge-op #:spent-vault
            #:unhonoured-obligation-proof #:verify-unhonoured-obligation #:make-uncredited-offer-proof))
 (in-package #:cl-deposits.fraud)
 
@@ -475,9 +475,7 @@
 (defun rotation-answer (updates anchor txid reserves tier-index)
   "The update among UPDATES that answers an anchored spend of RESERVES' vault as a rotation, or
    NIL: a QuorumBegin whose previous_hash is ANCHOR, signed by RESERVES' operator, whose rungs
-   include TXID, and whose signatures by keys of the tier TIER-INDEX (the tier the spend's witness
-   uses) reach its threshold: valid cosignatures over it, and the operator's own signature when
-   the operator's key is one of the tier's."
+   include TXID, and that carries enough cosignatures (ROTATION-COSIGNED-P)."
   (let ((operator (rs:reserves-operator reserves)))
     (multiple-value-bind (keys needed) (answer-cosign-need reserves tier-index)
       (find-if (lambda (u)
@@ -487,8 +485,33 @@
                         (equalp (up:update-operator-id u) operator)
                         (member txid (rotation-rungs o) :test #'equalp)
                         (up:verify-operator-signature u)
-                        (>= (tier-cosignatures u keys) needed))))
+                        (or (>= (tier-cosignatures u keys) needed)
+                            (recorded-threshold-met-p u o reserves)))))
                updates))))
+
+(defun recorded-threshold-met-p (update op reserves)
+  "DEP-06 §Spend challenge, strict-lottery-v8 :recorded-threshold-answer (ruled 2026-11-19):
+   a rotating QuorumBegin that names a ruleset with that rule also answers when its valid
+   cosignatures by the governing quorum's members (RESERVES') reach what the ledger itself
+   required of it at the height it was recorded (its signed header's block height): DEP-05's
+   establishment requirement in the lifecycle tier of that height (LG:ESTABLISHMENT-REQUIREMENT,
+   the same rule COSIGN-REQUIREMENT applied when the ledger accepted it).  The spent tier's
+   floor (ANSWER-COSIGN-NEED) is what the operator must reach before recording, and still is;
+   this is for rotations recorded below it before that floor was enforced, so a final rescue
+   stops drawing proofs against the members who signed its rung (signet C, 2653505d).  It
+   cannot be used to answer with fewer than the ledger demanded: a QuorumBegin with fewer
+   cosignatures than that was never final, and naming strict-lottery-v8 does not lower the
+   count.  Requires a signed header (no height, no tier) and a ruleset the ledger tiers by."
+  (let ((height (up:update-block-height update))
+        (members (mapcar #'up:x-only (rs:reserves-members reserves))))
+    (and (lg:ruleset-rule-p (op:field op :protocol-version) :recorded-threshold-answer)
+         (plusp height) members
+         (>= (tier-cosignatures update members)
+             (lg:establishment-requirement
+              (length members)
+              (if (member (rs:reserves-ruleset reserves) lg:+rulesets+ :test #'string=)
+                  (lg:lifecycle-tier-at (rs:reserves-quorum-expiry reserves) height)
+                  :tier0))))))
 
 (defun answer-cosign-need (reserves tier-index)
   "(values keys needed): the x-only keys of RESERVES' tier TIER-INDEX and how many valid

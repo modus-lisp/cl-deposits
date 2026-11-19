@@ -30,7 +30,7 @@
            #:deposit-opened-at-block #:deposit-last-activity-block #:deposit-last-received-block #:*block-height*
            #:collateral-floor-bps #:collateral-meets-floor-p #:quorum-expiry-ceiling #:planned-quorum-expiry #:quorum-expiry-ok-p #:+min-collateral-bps-floor+ #:quorum-member #:member-pubkey #:member-ledger-id #:member-membership-until #:member-dispute-response-blocks
            #:apply-operation #:apply-update #:total-obligations #:find-deposit
-           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:seat-consenting #:lottery-admissible-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:proposed-ruleset #:member-declaration #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:establishment-p #:replay #:copy-ledger #:encode-state #:decode-state #:state-digest
+           #:majority-threshold #:+valid-quorum-sizes+ #:+rulesets+ #:+supported-rulesets+ #:+current-ruleset+ #:ruleset-rule-p #:seat-consenting #:lottery-admissible-p #:signed-header-applies-p #:born-expired-p #:collateral-below-floor-p #:+ruleset-rules+ #:reserves-family #:seat-verdict #:upgrade-verdict #:planned-ruleset #:proposed-ruleset #:member-declaration #:member-supported-rulesets #:cosign-requirement #:lifecycle-tier #:lifecycle-tier-at #:establishment-requirement #:establishment-p #:replay #:copy-ledger #:encode-state #:decode-state #:state-digest
            #:speculate #:fill-balance-commitments #:commitment-targets))
 (in-package #:cl-deposits.ledger)
 
@@ -60,7 +60,7 @@
      :grounded-arms)
     ("strict-lottery-v8" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
      :grounded-arms :strict-lottery :fraud-survives-rotation :acquire-on-confirm
-     :expiry-ends-on-spend))
+     :expiry-ends-on-spend :recorded-threshold-answer))
   "DEP-18: the gated rules each ruleset adds to the intrinsic ones.")
 
 (defun ruleset-rule-p (ruleset rule)
@@ -1156,7 +1156,11 @@
     (and (or (null c) (<= expiry c)) (> expiry block-height))))
 
 (defun lifecycle-tier (ledger height)
-  (let ((expiry (ledger-quorum-expiry ledger)))
+  (lifecycle-tier-at (ledger-quorum-expiry ledger) height))
+
+(defun lifecycle-tier-at (expiry height)
+  "DEP-05 lifecycle tier at HEIGHT of a quorum whose quorum_expiry is EXPIRY (NIL: none)."
+  (progn
     (cond ((null expiry) :tier0)
           ((< height expiry) :tier0)
           ((< height (+ expiry +tier-1-offset+)) :tier0-post-expiry)
@@ -1175,16 +1179,23 @@
                         (t nil))))
     (when (null signers)
       (return-from cosign-requirement (values 0 '() :tier0 nil t)))
-    (let* ((n (length signers)) (majority (majority-threshold n)) (minority (max 1 (1- (ceiling n 2))))
-           (tier (if (member (ledger-active-ruleset ledger) +rulesets+ :test #'string=)
-                     (lifecycle-tier ledger height)
-                     :tier0)))
-      (cond ((eq tier :tier0) (values majority signers tier nil t))
+    (let ((tier (if (member (ledger-active-ruleset ledger) +rulesets+ :test #'string=)
+                    (lifecycle-tier ledger height)
+                    :tier0)))
+      (cond ((eq tier :tier0) (values (majority-threshold (length signers)) signers tier nil t))
             ((not (establishment-p op)) (values 0 signers tier nil nil))
-            ((eq tier :tier0-post-expiry) (values majority signers tier nil t))
-            ((eq tier :tier1) (values minority signers tier nil t))
-            ((eq tier :tier2) (values 1 signers tier nil t))
-            (t (values 0 signers tier t t))))))
+            (t (values (establishment-requirement (length signers) tier) signers tier (eq tier :tier3) t))))))
+
+(defun establishment-requirement (n tier)
+  "DEP-05: the cosignatures, of a quorum of N, an establishment (a QuorumBegin among them)
+   needs in lifecycle TIER: a majority until tier 1, then the minority, then one, then none
+   (the operator alone).  COSIGN-REQUIREMENT applies it; ROTATION-ANSWER re-derives it for a
+   rotation recorded in the past (DEP-06, strict-lottery-v8 :recorded-threshold-answer)."
+  (ecase tier
+    ((:tier0 :tier0-post-expiry) (majority-threshold n))
+    (:tier1 (max 1 (1- (ceiling n 2))))
+    (:tier2 1)
+    (:tier3 0)))
 
 (defun replay (updates)
   "A fresh ledger folded from UPDATES in order."

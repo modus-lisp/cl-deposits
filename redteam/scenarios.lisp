@@ -88,6 +88,8 @@
             :tags '(:disruptive) :note "DEP-05/06 a rotation past expiry is allowed, never owed (ruled 2026-11-14): the rotation wins (ticker paused, cl members hold their arms); disputes stand until its spend confirms, then yield")
    (make-sc :name "drive-load" :script "check-drive-load.sh" :ledger-var "REDTEAM_PX" :timeout 2400
             :tags '(:disruptive :slow) :note "an aged holder (cld364, ~60 dispute forks) still yields within 900 s of a confirmed re-establishment and leaves no dispute undriven (regtest 1119-111730)")
+   (make-sc :name "rotation-recorded-threshold" :script "check-rotation-recorded-threshold.sh" :ledger-var "REDTEAM_RT" :timeout 2400
+            :tags '(:disruptive) :note "DEP-06 strict-lottery-v8 (ruled 2026-11-19): a rotation recorded at the ledger's own threshold, below its rungs' tier floor, answers the spend of its rung; signet C's shape on regtest, judged by cl and deposits-rust")
    (make-sc :name "rotation-post-expiry-race" :script "check-rotation-post-expiry.sh" :args '("race") :ledger-var "REDTEAM_PX" :timeout 2400
             :tags '(:disruptive) :note "DEP-05 v8 amendment (2026-11-15): the rotation races the confiscation at the default arm window; the confiscation wins and no member yields its stake on the recorded QuorumBegin")
    (make-sc :name "rotation-post-expiry-confiscated" :script "check-rotation-post-expiry.sh" :args '("confiscated") :ledger-var "REDTEAM_PX" :timeout 2400

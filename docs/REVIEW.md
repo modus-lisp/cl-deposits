@@ -293,3 +293,36 @@ calls our own signature theft is our judge's fault.  Both implementations log it
 **Still open:** the answer path (Kind 9112) publishes a `QuorumBegin` without asking whether it meets
 the floor, so an operator can "answer" with something every judge rejects.  Harmless once the floor
 is enforced at recording, and left as it is; an answerer could warn.
+
+## 14. A rotation already recorded below the answer floor (ruled 2026-11-19: option 1, under strict-lottery-v8)
+
+**The ruling.**  Legacy rescues like C's stop drawing proofs: a rotating `QuorumBegin` answers a
+vault-spend challenge of its rungs when its cosignatures met **the ledger's own threshold at the
+height it was recorded**, even below the spent tier's floor.  The operator-side floor of item 13
+stays, so no new such rotation is recorded; this changes only how the old ones are judged.
+
+**Which ruleset gates it — decided here, for review:** the ruleset the **answering** `QuorumBegin`
+names, not the spent vault's.  C's governing `QuorumBegin` (seq 326490) names `grounded-arms-v7`;
+its rescue (seq 361569) names `strict-lottery-v8`.  Gated on the spent vault, the ruling would not
+reach the very rescue it was made for.  It is safe to gate on the answer: the relaxed rule still
+asks exactly the count without which the ledger would not have accepted the `QuorumBegin` (DEP-05
+§Lifecycle's establishment requirement in the lifecycle tier of its `block_height`, against the
+governing quorum's expiry and size), so a minority below that threshold cannot meet it by naming v8.
+
+**The numbers, from the signet updates (vector `rotation_answer_floor.json`):** recorded at 8287 =
+tier 1 of a 7-member quorum whose expiry is 7565 (tier 1 from 8285); the ledger required 3 member
+cosignatures and the `QuorumBegin` carries 3, so it answers 2653505d.  The negative cannot be cut
+from C's own update (the operator's signature commits to its cosignatures), so the vector's
+`synthetic` case re-signs C's operations with test keys: 3 member cosignatures answer, 2 do not.  By the tier floor alone it still needs 4 of
+the tier-0 keys and has 3.
+
+**Implemented:** cl `fr:recorded-threshold-met-p` (v8 rule `:recorded-threshold-answer`,
+`lg:establishment-requirement` / `lg:lifecycle-tier-at` now shared with `cosign-requirement`); Rust
+`vault_spend::recorded_threshold_met` (`types::ruleset_recorded_threshold_answer`,
+`cosign_threshold::establishment_requirement`); spec DEP-06 §Spend challenge "Recorded-threshold
+answer", DEP-05 §Cosignature Threshold, DEP-18 §strict-lottery-v8.
+
+**Left as it was:** a member still refuses to sign rungs below the tier floor and says "no judge can
+answer"; that stays true of every judge that is not v8-aware, and the floor is what the operator
+records at anyway.  Proofs already published against C's signers stay published; the oracle rows for
+them stay resolved.
