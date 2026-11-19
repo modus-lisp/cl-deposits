@@ -206,6 +206,11 @@ ref_ensure_current() {
   stop_ref "$n" >/dev/null 2>&1; start_ref "$n" >/dev/null
 }
 
+# The cl twin: a running actor whose loaded code is not its build's current tree restarts on it
+# (by tree hash, cld_tree_hash; start_cld records it in loaded-tree; a node with no record restarts too).
+cld_stale()          { cld_running "$1" || return 1; [ "$(cat "$(cld_dir "$1")/loaded-tree" 2>/dev/null)" != "$(cld_tree_hash "$(cld_src_of "$1")")" ]; }
+cld_ensure_current() { cld_stale "$1" || return 0; echo "== restarting $1 on its current tree" >&2; stop_cld "$1" >/dev/null 2>&1; start_cld "$1" >/dev/null; }
+
 stop_ref() {   # and wait for it to exit: a start while the old daemon still shuts down saw it "already running"
   local p i; p=$(ref_pid "$1") || return 0; [ -n "$p" ] && kill "$p" 2>/dev/null && echo "$1 stopped"; rm -f "$(ref_dir "$1")/ref.pid"
   [ -n "$p" ] && for i in $(seq 1 60); do kill -0 "$p" 2>/dev/null || return 0; sleep 1; done; [ -n "$p" ] && kill -9 "$p" 2>/dev/null; return 0

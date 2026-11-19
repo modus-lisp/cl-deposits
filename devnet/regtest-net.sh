@@ -18,14 +18,24 @@ source "$(dirname "$0")/_common.sh"
 SOAK="$CLD_ROOT/soak"
 ticker_pid() { cat "$CLD_ROOT/ticker.pid" 2>/dev/null; }
 start_ticker() {
-  local p; p=$(ticker_pid) && kill -0 "$p" 2>/dev/null && return 0
+  local p i; p=$(ticker_pid) && kill -0 "$p" 2>/dev/null && return 0
+  # In its OWN SESSION (setsid -f), never as a child of the caller: the scenarios restart it from
+  # their EXIT traps, and run-all.sh kills a scenario's whole process group when it ends, so a
+  # ticker forked there died with it and regtest stopped mining (found down 2026-11-19, last
+  # collateral pass the evening before).  The loop records its own pid (ticker-loop below).
+  rm -f "$CLD_ROOT/ticker.pid"
+  setsid -f "$CLD_SRC/devnet/regtest-net.sh" ticker-loop </dev/null >/dev/null 2>&1
+  for i in $(seq 1 50); do p=$(ticker_pid) && kill -0 "$p" 2>/dev/null && return 0; sleep 0.1; done
+  echo "ticker did not start" >&2; return 1
+}
+ticker_loop() {
   # Disputes pledge replacement collateral and red-team runs leave many open: every
   # REGTEST_COLLATERAL_EVERY blocks, refill any node that ran short (soak.sh collateral).
-  ( i=0; while sleep "${REGTEST_BLOCK_EVERY:-10}"; do
-      mine 1 2>/dev/null; i=$((i+1))
-      [ $((i % ${REGTEST_COLLATERAL_EVERY:-12})) -eq 0 ] && "$CLD_SRC/devnet/soak.sh" collateral >>"$CLD_ROOT/collateral.log" 2>&1
-    done ) >/dev/null 2>&1 &
-  echo $! >"$CLD_ROOT/ticker.pid"
+  echo $$ >"$CLD_ROOT/ticker.pid"
+  local i=0; while sleep "${REGTEST_BLOCK_EVERY:-10}"; do
+    mine 1 2>/dev/null; i=$((i+1))
+    [ $((i % ${REGTEST_COLLATERAL_EVERY:-12})) -eq 0 ] && "$CLD_SRC/devnet/soak.sh" collateral >>"$CLD_ROOT/collateral.log" 2>&1
+  done
 }
 up() {
   mkdir -p "$CLD_ROOT" "$SOAK"
@@ -69,6 +79,7 @@ case "${1:-}" in
   ticker) case "${2:-}" in   # ticker start|stop: a scenario that must hold a transaction in the mempool pauses it
             stop) p=$(ticker_pid) && kill "$p" 2>/dev/null; rm -f "$CLD_ROOT/ticker.pid";;
             *) start_ticker;; esac;;
+  ticker-loop) ticker_loop;;   # start_ticker's detached body; not for direct use
   reset) down; case "$CLD_ROOT" in /mnt/lisp/regtest-devnet*|/tmp/*) rm -rf "$CLD_ROOT"; echo "reset $CLD_ROOT";; *) echo "refusing to delete $CLD_ROOT" >&2; exit 1;; esac;;
   *) sed -n '2,15p' "$0"; exit 2;;
 esac
