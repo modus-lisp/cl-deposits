@@ -3422,6 +3422,16 @@
     (bt:with-lock-held (*drive-threads-lock*)
       (decf (gethash key *drive-threads*)))))
 
+(defun drive-load (node)
+  "(values owned live waiting): the forks we own, those a watch pass queues for a live slot (not
+   dormant, not in a re-arm round), and of those the ones no slot has started since the pass."
+  (let ((owned 0) (live 0) (pk (node-pubkey node)))
+    (loop for r being the hash-values of (node-ledgers node)
+          when (and (record-fork-p r) (record-owned-p r))
+            do (incf owned)
+               (unless (or (dormant-dispute-p node r) (in-rearm-round-p node (record-id-hex r))) (incf live)))
+    (values owned live (bt:with-lock-held (*drive-threads-lock*) (length (gethash pk *drive-queues*))))))
+
 (defun drive-disputes (node &key parallel)
   "Drive every dispute fork we own.  PARALLEL (the once-a-minute watch): *MAX-DRIVE-THREADS*
    slots for live forks and one for dormant ones, each slot draining a queue in
