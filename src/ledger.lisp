@@ -1058,7 +1058,14 @@
          (push (cons (f :nonce) (f :expiry)) (deposit-seen-nonces d))
          (%unlock d (getf e :amount))
          (remhash (f :exit-request-id) (ledger-pending-exits ledger))))
-      (:dispute-yield (setf (ledger-dispute-state ledger) :tombstoned))
+      ;; DEP-05 "When a quorum_expired dispute ends" / DEP-06 "Losers yield": a disputed (un-armed)
+      ;; or armed fork yields; one never disputed, already yielded, or acquired does not.  It took a
+      ;; yield in every state, where deposits-rust took one only when armed (vector
+      ;; dispute_yield_states.json).
+      (:dispute-yield
+       (unless (member (ledger-dispute-state ledger) '(:disputed :armed))
+         (fail :dispute-yield (format nil "a yield needs a disputed or armed fork (state ~(~a~))" (ledger-dispute-state ledger))))
+       (setf (ledger-dispute-state ledger) :tombstoned))
       (:transfer-lock
        (let* ((d (find-deposit ledger (f :source-deposit-id)))
               (total (+ (f :amount) (f :fee))))

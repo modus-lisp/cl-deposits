@@ -1134,9 +1134,10 @@
     (let ((*height* (+ (lg:ledger-quorum-expiry (nd:record-ledger la)) 4)))
       (check-equal "b opens an expiry dispute" (nd:dispute-expired-quorums b :grace 3) (list id))
       (let ((expiry-fork (nd:find-fork b id (nd:node-pubkey b))))
-        (check "it is un-armed and live" (and (nd::unarmed-expiry-fork-p expiry-fork) (nd:live-fork b id (nd:node-pubkey b))))
-        (check "it does not block a punitive proof" (null (nd::blocking-fork b id t)))
-        (check "it still blocks a second expiry dispute" (nd::blocking-fork b id nil)))
+        ;; Only master's own API here, so this gate runs (and fails) on an unpatched tree.
+        (check "it is un-armed and live"
+               (and (nd::fork-op expiry-fork :dispute-enter) (not (nd::fork-op expiry-fork :dispute-armed))
+                    (nd:live-fork b id (nd:node-pubkey b)))))
       ;; The operator equivocates at its tip.
       (let* ((tip (first (nd:record-history la)))
              (mk (lambda (tag)
@@ -1155,6 +1156,9 @@
         (check "c holds b's punitive DisputeEnter"
                (let ((f (nd:find-fork c id (nd:node-pubkey b))))
                  (and f (equal (op:field (nth-value 1 (nd::fork-op f :dispute-enter)) :reason) "equivocation"))))
+        (check "the predicate: an un-armed expiry fork blocks an expiry proof, not a punitive one"
+               (let ((f (nd:find-fork b id (nd:node-pubkey b))))
+                 (and (not (nd::unarmed-expiry-fork-p f)) (nd::blocking-fork b id t))))
         (check "and b's expiry dispute was yielded on the relay"
                (some (lambda (e) (let ((u (ignore-errors (w:event->update e))))
                                    (and u (equalp (up:update-operator-id u) (nd:node-pubkey b))
