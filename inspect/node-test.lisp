@@ -602,7 +602,38 @@
               (check "everyone replicates the winner's DisputeAcquire"
                      (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey winner)))) (and f (equalp (lg:ledger-operator-key (nd:record-ledger f)) (nd:node-pubkey winner))))) (list b c d)))
               (check "the deposed operator sees custody moved to the winner"
-                     (equalp (nd::custody-moved-to a la) (nd:node-pubkey winner))))))))))
+                     (equalp (nd::custody-moved-to a la) (nd:node-pubkey winner)))
+              ;; DEP-06, strict-lottery-v8: the acquire binds only because its claim spends THIS
+              ;; dispute's lottery outpoint.  Judged by the deposed operator from the chain: the
+              ;; real confiscation and claim bind; the same confirmed claim whose input leads to a
+              ;; confiscation of another vault (regtest 1120-090836's shape) does not.
+              (let* ((wf (nd:find-fork a id (nd:node-pubkey winner)))
+                     (chain (lambda (txs) (lambda (txid) (let ((tx (find txid txs :key #'btx:tx-txid :test #'equalp)))
+                                                           (and tx (values tx 6))))))
+                     (elsewhere (btx:make-tx :version 2 :locktime 0
+                                             :inputs (list (btx:make-txin :prev-hash (u:sha256 (hx "0e15e")) :prev-index 0
+                                                                          :script (make-array 0 :element-type '(unsigned-byte 8))
+                                                                          :sequence #xfffffffd))
+                                             :outputs (btx:tx-outputs ctx)))
+                     (saved (nd::node-tx-fn a)))
+                (unwind-protect
+                     (progn
+                       (clrhash nd::*acquire-verdicts*) (clrhash nd::*unconfirmed-claims*)
+                       (setf (nd::node-tx-fn a) (funcall chain (list ctx claim)))
+                       (check "v8: the winner's acquire binds: its claim spends this dispute's lottery outpoint"
+                              (nd::acquire-confirmed-p a wf))
+                       (clrhash nd::*acquire-verdicts*)
+                       (setf (nd::node-tx-fn a)
+                             (lambda (txid) (if (equalp txid (btx:tx-txid ctx)) (values elsewhere 6) (funcall (funcall chain (list claim)) txid))))
+                       (check "v8: the same confirmed claim does not bind when its lottery is another vault's"
+                              (not (nd::acquire-confirmed-p a wf)))
+                       (check-equal "  ... and the verdict is final" (hash-table-count nd::*acquire-verdicts*) 1)
+                       (clrhash nd::*acquire-verdicts*)
+                       (setf (nd::node-tx-fn a) (lambda (txid) (if (equalp txid (btx:tx-txid claim)) (values claim 0) (funcall (funcall chain (list ctx)) txid))))
+                       (check "v8: an unconfirmed claim does not bind (and is asked again later)"
+                              (and (not (nd::acquire-confirmed-p a wf)) (zerop (hash-table-count nd::*acquire-verdicts*)))))
+                  (clrhash nd::*acquire-verdicts*) (clrhash nd::*unconfirmed-claims*)
+                  (setf (nd::node-tx-fn a) saved))))))))))
 
 
 

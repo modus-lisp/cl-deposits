@@ -51,6 +51,7 @@ anyone is zero. Each one is a finding.
 | One node's bitcoind lagging behind the others | idea | Judging needs to tolerate a different tip |
 | Two writers on one checkout: a docs commit made with `-a` in a checkout whose submodules were stale rolled four dependency pins back (55a567f, fixed in a4f871b) | idea (process) | A gate or pre-commit check that refuses a commit moving a submodule pin backwards |
 | Signet difficulty climb | have (by accident) | Mining one block a minute raises difficulty 4x every 2016 blocks; reset when it hurts |
+| Two disputes whose lotteries share a script and a value (k=1 rounds with one sole armer and the same voters, so the same leaf and address): a claim of one is a confirmed spend "at" the other's address | have (vector) | Seen in regtest rearm-rust 1120-090836: ref7 was round 2's sole armer of both 70b0abb3 and a606a4ca (49,998,956 sats each). a606a4ca's acquire named 21910507, a claim of 70b0abb3's round-2 output 46a66b12:0, and confirm-only binding read a606a4ca's custody as moved while its own output 1d89bd45:0 stayed unspent. **Fixed (branch lottery-outpoint):** lotteries are found by outpoint, and an acquire binds only if its claim spends its own dispute's lottery outpoint (`acquire_binding.json`, the case judged for both disputes) |
 
 ## Scale and time
 

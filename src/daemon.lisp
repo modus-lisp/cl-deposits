@@ -19,7 +19,7 @@
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:js #:json-simple) (#:fr #:cl-deposits.fraud))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
-           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn #:bitcoin-cli-feerate-fn #:bitcoin-cli-tx-confs-fn))
+           #:bitcoin-cli-broadcast-fn #:bitcoin-cli-tx-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn #:bitcoin-cli-feerate-fn #:bitcoin-cli-tx-confs-fn))
 (in-package #:cl-deposits.daemon)
 
 (defun arg (form key &optional default) (getf (cdr form) key default))
@@ -543,6 +543,18 @@
       (when (and (plusp (length out)) (char= (char out 0) #\{))
         (let ((c (gethash "confirmations" (js:parse out))))
           (if (integerp c) c 0))))))
+
+(defun bitcoin-cli-tx-fn (cli)
+  "txid (wire bytes) -> (values the parsed transaction, its confirmations (0 in the mempool)), or
+   NIL when bitcoind does not know it (getrawtransaction through -txindex).  Judges a
+   DisputeAcquire's claim (DEP-06, ND::JUDGE-ACQUIRE)."
+  (lambda (txid)
+    (let ((out (run-cli cli "getrawtransaction" (txid-hex txid) "true")))
+      (when (and (plusp (length out)) (char= (char out 0) #\{))
+        (let* ((j (js:parse out)) (hex (gethash "hex" j)) (c (gethash "confirmations" j)))
+          (when (stringp hex)
+            (values (cl-consensus.tx:parse-tx (cl-consensus.wire:make-reader (hex->bytes hex)))
+                    (if (integerp c) c 0))))))))
 
 (defun bitcoin-cli-broadcast-fn (cli)
   "sendrawtransaction; signals with bitcoind's reason when it refuses (callers log it)."
