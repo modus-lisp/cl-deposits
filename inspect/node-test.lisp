@@ -2836,18 +2836,155 @@
   ;; theft 407 s late, and a dispute waited a whole pass between drives.
   (let* ((n (nd:make-node :priv (tk 99999999999999999999) :bus (bus:make-mock-bus) :height-fn (lambda () 100)))
          (nd::*watch-log-ms* 0))
-    (sb-int:encapsulate 'nd::drive-vault-watch 'slow (lambda (f node) (sleep 0.25) (funcall f node)))
+    (sb-int:encapsulate 'nd::drive-obligation-watch 'slow (lambda (f node) (sleep 0.25) (funcall f node)))
     (unwind-protect (progn (nd::watch-pass n) (nd::watch-pass n))
-      (sb-int:unencapsulate 'nd::drive-vault-watch 'slow))
+      (sb-int:unencapsulate 'nd::drive-obligation-watch 'slow))
     (let ((st (nd::watch-stats n)))
       (check-equal "two passes counted" (getf st :passes) 2)
-      (check-equal "every step of the pass, in order" (mapcar #'car (getf st :last-steps))
-                   '(:dispute-expired :drive-disputes :drive-rearms :dereliction :vault-watch :migration-watch :obligation-watch :rotation-rebroadcast))
-      (check "the slow step is measured" (>= (cdr (assoc :vault-watch (getf st :last-steps))) 240))
-      (check-equal "totals add both passes" (cddr (assoc :vault-watch (getf st :totals))) 2)
+      (check-equal "every step of the pass, in order (the vault watch has its own thread)" (mapcar #'car (getf st :last-steps))
+                   '(:dispute-expired :drive-disputes :drive-rearms :dereliction :migration-watch :obligation-watch :rotation-rebroadcast))
+      (check "the slow step is measured" (>= (cdr (assoc :obligation-watch (getf st :last-steps))) 240))
+      (check-equal "totals add both passes" (cddr (assoc :obligation-watch (getf st :totals))) 2)
       (check "no step is shown running between passes" (null (getf st :current))))
     (let ((line (find-if (lambda (l) (search "watch pass took" l)) (nd:node-log n))))
       (check "a pass over the limit logs its breakdown, slowest step first"
-             (and line (search "[vault-watch 0." line))))))
+             (and line (search "[obligation-watch 0." line))))))
+
+
+(with-gate ("nodes: the vault watch runs on its own thread, while a watch pass is stuck in DRIVE-REARMS")
+  ;; regtest 1120-063204 (40cb3c4): cld364's first watch pass after a restart spent 20 minutes in
+  ;; DRIVE-REARMS before the vault watch's turn, and a theft went unreported for the 300 s it had.
+  (let* ((n (nd:make-node :priv (tk 88888888888888888888) :bus (bus:make-mock-bus) :height-fn (lambda () 100)))
+         (gate (bt:make-semaphore)) (vaults 0))
+    (sb-int:encapsulate 'nd::drive-rearms 'stuck (lambda (f node) (bt:wait-on-semaphore gate) (funcall f node)))
+    (sb-int:encapsulate 'nd::drive-vault-watch 'count (lambda (f node) (incf vaults) (funcall f node)))
+    (multiple-value-bind (expiry vault) (nd:start-expiry-watch n :interval 0.05 :vault-interval 0.05)
+      (unwind-protect
+           (progn
+             (loop repeat 200 until (>= vaults 3) do (sleep 0.05))
+             (let ((w (nd::watch-stats n)))
+               (check "a watch pass is stuck in DRIVE-REARMS" (eq (first (getf w :current)) :drive-rearms))
+               (check-equal "and no watch pass has completed" (getf w :passes) nil))
+             (check "the vault watch ran meanwhile, more than once" (>= vaults 3))
+             (check "and its own stats count it" (>= (getf (nd::vault-watch-stats n) :passes) 3)))
+        (bt:destroy-thread vault) (bt:destroy-thread expiry)
+        (bt:signal-semaphore gate :count 10)
+        (sb-int:unencapsulate 'nd::drive-rearms 'stuck)
+        (sb-int:unencapsulate 'nd::drive-vault-watch 'count)))))
+
+
+(with-gate ("nodes: a re-arm round's lottery output is followed incrementally, reorg-safe, and concluded once a claim is deep")
+  ;; regtest 1120-055242: FOLLOW-REARM-SPEND rescanned from the round's lottery height to the tip on
+  ;; every watch pass for every fork whose output a claim had spent (cld364: 867,503 blocks a pass;
+  ;; one pass spent 1112 s and more in DRIVE-REARMS, and its vault watch never ran).
+  (let* ((tip 150) (hashes (make-hash-table)) (spends '()) (scanned 0)
+         (hash-of (lambda (h) (or (gethash h hashes) (setf (gethash h hashes) (u:sha256 (coerce (list (mod h 256) (floor h 256) 1) '(vector (unsigned-byte 8))))))))
+         (lot-tx (btx:finalize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p nil
+                              :inputs (list (btx:make-txin :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7) :prev-index 0 :script (u:octets) :sequence #xfffffffd))
+                              :outputs (list (btx:make-txout :value 5000 :script (u:hex->bytes "5120aa00000000000000000000000000000000000000000000000000000000000000"))))))
+         (claim (btx:finalize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p nil
+                             :inputs (list (btx:make-txin :prev-hash (btx:tx-txid lot-tx) :prev-index 0 :script (u:octets) :sequence #xfffffffd))
+                             :outputs (list (btx:make-txout :value 3000 :script (u:hex->bytes "5120bb00000000000000000000000000000000000000000000000000000000000000"))
+                                            (btx:make-txout :value 1000 :script (u:hex->bytes "5120cc00000000000000000000000000000000000000000000000000000000000000"))))))
+         (n (nd:make-node :priv (tk 12121212121212121212) :bus (bus:make-mock-bus) :height-fn (lambda () tip)
+                          :block-hash-fn (lambda (h) (funcall hash-of h))
+                          :spender-fn (lambda (from to outpoints)
+                                        (declare (ignore outpoints))
+                                        (incf scanned (max 0 (1+ (- to from))))
+                                        (loop for (h . tx) in spends when (<= from h to)
+                                              collect (list :txid (btx:tx-txid lot-tx) :vout 0 :tx (u:bytes->hex (btx:serialize-tx tx)) :height h)))))
+         (r (list :round 1 :tx lot-tx :height 100 :lottery :a-lottery))
+         (pass (lambda (id) (setf scanned 0)
+                 ;; A re-arm-shaped spend goes on to derive the next round, which needs a real
+                 ;; LOTTERY; the follow state is recorded before that, and is what is checked here.
+                 (ignore-errors (nd::follow-rearm-spend n id r)) scanned))
+         (a "a1a1a1a1000000000000000000000000000000000000000000000000000000000") (b "b2b2b2b2000000000000000000000000000000000000000000000000000000000"))
+    (check-equal "the first pass scans from the lottery height to the tip" (funcall pass a) 51)
+    (check-equal "the next pass, same tip: nothing" (funcall pass a) 0)
+    (setf tip 152)
+    (check-equal "two new blocks: two blocks" (funcall pass a) 2)
+    (push (cons 153 claim) spends) (setf tip 153)
+    (funcall pass a)
+    (setf tip 154)
+    (check-equal "a claim one confirmation deep: scanned again from its own height" (funcall pass a) 2)
+    (setf tip 155)
+    (funcall pass a)
+    (setf tip 170)
+    (check-equal "three confirmations deep: concluded, never scanned again" (funcall pass a) 0)
+    ;; A reorganisation removes the claim before it is deep.
+    (setf spends '() tip 150 (gethash 153 hashes) nil)
+    (funcall pass b) (push (cons 151 claim) spends) (setf tip 152) (funcall pass b)
+    (setf spends '()) (remhash 151 hashes) (remhash 152 hashes) (setf tip 153)
+    (funcall pass b)
+    (check "the reorganised-out claim is forgotten, not concluded" (not (getf (gethash (nd::rearm-follow-key n b 1 lot-tx) nd::*rearm-follow*) :concluded)))
+    (check-equal "and the next pass rescans from the lottery height" (funcall pass b) 54)
+    ;; A reorganisation under what was scanned (the block at scanned-to changes): from the lottery height.
+    (setf tip 160) (funcall pass b) (setf (gethash 160 hashes) (u:sha256 (coerce '(9 9 9) '(vector (unsigned-byte 8)))))
+    (check-equal "the block at scanned-to changed: rescanned from the lottery height" (funcall pass b) 61)
+    ;; A re-arm-shaped spend (one in, one out) is never concluded here: the next round may not be
+    ;; registrable yet (its arms or manifest still arriving), so it is followed again, from its height.
+    (let ((c "c3c3c3c3000000000000000000000000000000000000000000000000000000000")
+          (rearm (btx:finalize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p nil
+                                               :inputs (list (btx:make-txin :prev-hash (btx:tx-txid lot-tx) :prev-index 0 :script (u:octets) :sequence #xfffffffd))
+                                               :outputs (list (btx:make-txout :value 4000 :script (u:hex->bytes "5120dd00000000000000000000000000000000000000000000000000000000000000")))))))
+      (setf spends (list (cons 161 rearm)) tip 170)
+      (funcall pass c)
+      (check "a deep re-arm spend whose next round did not register is not concluded"
+             (not (getf (gethash (nd::rearm-follow-key n c 1 lot-tx) nd::*rearm-follow*) :concluded)))
+      (check-equal "and is scanned again from its own height" (funcall pass c) 10))))
+
+
+(with-gate ("nodes: the re-arm follow state survives a restart, and a stale one falls back to a full scan")
+  ;; regtest 1120-063204 (40cb3c4): with the follow state in memory only, cld364's first watch pass
+  ;; after a restart was back in DRIVE-REARMS for 462 s and more, rescanning every claimed fork.
+  (let* ((dir (uiop:ensure-directory-pathname (format nil "/tmp/cld-follow-~a/" (random 1000000000))))
+         (tip 150) (hashes (make-hash-table)) (spends '()) (scanned 0)
+         (hash-of (lambda (h) (or (gethash h hashes) (setf (gethash h hashes) (u:sha256 (coerce (list (mod h 256) (floor h 256) 2) '(vector (unsigned-byte 8))))))))
+         (lot-tx (btx:finalize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p nil
+                              :inputs (list (btx:make-txin :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9) :prev-index 0 :script (u:octets) :sequence #xfffffffd))
+                              :outputs (list (btx:make-txout :value 5000 :script (u:hex->bytes "5120ee00000000000000000000000000000000000000000000000000000000000000"))))))
+         (claim (btx:finalize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p nil
+                             :inputs (list (btx:make-txin :prev-hash (btx:tx-txid lot-tx) :prev-index 0 :script (u:octets) :sequence #xfffffffd))
+                             :outputs (list (btx:make-txout :value 3000 :script (u:hex->bytes "5120bb00000000000000000000000000000000000000000000000000000000000000"))
+                                            (btx:make-txout :value 1000 :script (u:hex->bytes "5120cc00000000000000000000000000000000000000000000000000000000000000"))))))
+         (mk (lambda () (nd:make-node :priv (tk 13131313131313131313) :bus (bus:make-mock-bus) :height-fn (lambda () tip) :data-dir dir
+                                     :block-hash-fn (lambda (h) (funcall hash-of h))
+                                     :spender-fn (lambda (from to outpoints)
+                                                   (declare (ignore outpoints))
+                                                   (incf scanned (max 0 (1+ (- to from))))
+                                                   (loop for (h . tx) in spends when (<= from h to)
+                                                         collect (list :txid (btx:tx-txid lot-tx) :vout 0 :tx (u:bytes->hex (btx:serialize-tx tx)) :height h))))))
+         (n (funcall mk))
+         (r (list :round 1 :tx lot-tx :height 100 :lottery :a-lottery))
+         (forget (lambda (node) (loop for k in (loop for k being the hash-keys of nd::*rearm-follow* collect k)
+                                      when (equalp (first k) (nd:node-pubkey node)) do (remhash k nd::*rearm-follow*))))
+         (pass (lambda (node id) (setf scanned 0) (ignore-errors (nd::follow-rearm-spend node id r)) scanned))
+         (a "a4a4a4a4000000000000000000000000000000000000000000000000000000000")
+         (b "b5b5b5b5000000000000000000000000000000000000000000000000000000000"))
+    (unwind-protect
+         (progn
+           (funcall pass n a) (funcall pass n b)
+           (push (cons 155 claim) spends)
+           (setf tip 160) (funcall pass n a)
+           (check "fork A's claim is concluded" (getf (gethash (nd::rearm-follow-key n a 1 lot-tx) nd::*rearm-follow*) :concluded))
+           (setf spends '())
+           (funcall pass n b)
+           (check "the state is on disk" (probe-file (merge-pathnames "rearm-follow.sexp" dir)))
+           ;; A restart: the in-memory state is gone; a fresh node reloads it from its data dir.
+           (funcall forget n)
+           (let ((n2 (funcall mk)))
+             (nd::load-rearm-follow n2)
+             (check-equal "after a restart, an open round resumes where it stopped" (funcall pass n2 b) 0)
+             (setf tip 163)
+             (check-equal "a concluded round is not scanned at all, three blocks later" (funcall pass n2 a) 0)
+             (check-equal "and the open one scans just the three new blocks" (funcall pass n2 b) 3)
+             ;; A reorganisation while it was down: the block at scanned-to is not the one recorded.
+             (funcall forget n2)
+             (setf (gethash 163 hashes) (u:sha256 (coerce '(7 7 7) '(vector (unsigned-byte 8)))))
+             (let ((n3 (funcall mk)))
+               (nd::load-rearm-follow n3)
+               (check-equal "a stale scanned-to (its block replaced) rescans from the lottery height" (funcall pass n3 b) 64))))
+      (funcall forget n)
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
 (report)

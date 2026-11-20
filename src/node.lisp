@@ -3601,7 +3601,7 @@
       (wstep :drive-disputes (lambda () (drive-disputes node :parallel t :rearms nil)))
       (wstep :drive-rearms (lambda () (drive-rearms node)))
       (wstep :dereliction (lambda () (drive-dereliction node)))
-      (wstep :vault-watch (lambda () (drive-vault-watch node)))
+      ;; The vault watch is not a step: VAULT-WATCH-PASS runs it on its own thread.
       (wstep :migration-watch (lambda () (drive-migration-watch node)))
       (wstep :obligation-watch (lambda () (drive-obligation-watch node)))
       (wstep :rotation-rebroadcast (lambda () (drive-rotation-rebroadcast node))))
@@ -3626,9 +3626,44 @@
     (append (alexandria:remove-from-plist st :current)
             (let ((c (getf st :current))) (and c (list :current (list (car c) (- (get-universal-time) (cdr c)))))))))
 
-(defun start-expiry-watch (node &key (interval 60))
-  (bt:make-thread (lambda () (loop (sleep interval) (watch-pass node)))
-                  :name "cld-expiry"))
+(defvar *vault-watch-stats* (make-hash-table :test #'equalp :synchronized t)
+  "node pubkey -> plist :passes :last-ms :max-ms :current-since (universal time, while a pass runs).")
+
+(defvar *vault-watch-locks* (make-hash-table :test #'equalp :synchronized t))
+
+(defun vault-watch-pass (node)
+  "One timed DRIVE-VAULT-WATCH, never two at once for a node (its thread and the :vault-watch
+   control command).  It has its own thread, not a step of WATCH-PASS: regtest 1120-063204 (40cb3c4)
+   had cld364's first pass after a restart spend 20 minutes in DRIVE-REARMS before the vault
+   watch's turn, and a theft went unreported for the 300 s it had (the re-arm follow cache is in
+   memory, so a restart pays the whole first scan again).  A theft proof must not wait on that."
+  (let* ((pk (node-pubkey node))
+         (lock (sb-ext:with-locked-hash-table (*vault-watch-locks*)
+                 (or (gethash pk *vault-watch-locks*)
+                     (setf (gethash pk *vault-watch-locks*) (bt:make-lock "vault-watch")))))
+         (t0 (get-internal-real-time)))
+    (bt:with-lock-held (lock)
+      (setf (getf (gethash pk *vault-watch-stats*) :current-since) (get-universal-time))
+      (unwind-protect (drive-vault-watch node)
+        (let ((st (alexandria:remove-from-plist (gethash pk *vault-watch-stats*) :current-since))
+              (ms (ms-since t0)))
+          (setf (getf st :passes) (1+ (or (getf st :passes) 0)) (getf st :last-ms) ms
+                (getf st :max-ms) (max ms (or (getf st :max-ms) 0)))
+          (setf (gethash pk *vault-watch-stats*) st))))))
+
+(defun vault-watch-stats (node)
+  (let ((st (gethash (node-pubkey node) *vault-watch-stats*)))
+    (append (alexandria:remove-from-plist st :current-since)
+            (let ((c (getf st :current-since))) (and c (list :current (- (get-universal-time) c)))))))
+
+(defun start-expiry-watch (node &key (interval 60) (vault-interval 30))
+  "Start the expiry watch (WATCH-PASS every INTERVAL s) and the vault watch (VAULT-WATCH-PASS every
+   VAULT-INTERVAL s) on threads of their own; return (values expiry-thread vault-thread)."
+  (let ((vault (bt:make-thread (lambda () (loop (sleep vault-interval) (ignore-errors (vault-watch-pass node))))
+                               :name "cld-vault-watch")))
+    (values (bt:make-thread (lambda () (loop (sleep interval) (watch-pass node)))
+                            :name "cld-expiry")
+            vault)))
 
 (defun start-invoice-poller (node &key (interval 3))
   (bt:make-thread (lambda () (loop (sleep interval)
@@ -6078,24 +6113,124 @@
     (or (not (and (node-spender-fn node) height))
         (and (ignore-errors (funcall (node-spender-fn node) height (height node) (list (cons (btx:tx-txid tx) 0)))) t))))
 
+(defparameter +rearm-concluded-depth+ +reveal-depth+
+  "Confirmations a spend of a round's lottery output needs before the round is concluded and no
+   longer followed: the depth the node treats as safe from a reorganisation (+REVEAL-DEPTH+), or the
+   node's MIN-CONFS if that is deeper.")
+
+(defvar *rearm-follow* (make-hash-table :test #'equalp :synchronized t)
+  "(node pubkey, ledger id, round) -> plist :scanned-to H :hash B (the block hash at H when it was
+   scanned) :spend-height S (a spend of the output seen, not yet deep enough) :concluded T.
+   regtest 1120-055242: FOLLOW-REARM-SPEND rescanned every block from the round's lottery height to
+   the tip, a getblock with prevouts apiece, on every watch pass, for every fork whose output a
+   claim had spent (a claim registers no next round, so nothing remembered it): cld364's 94 rounds
+   summed to 867,503 blocks a pass, and one pass spent 1112 s and more in DRIVE-REARMS.")
+
+(defun rearm-follow-key (node id-hex round tx)
+  "(node pubkey, ledger, round, the round's lottery txid): the lottery outpoint is in the key, so
+   a round re-registered over a different output (a reorganised re-arm) starts its own scan."
+  (list (node-pubkey node) id-hex round (txid-hex (btx:tx-txid tx))))
+
+(defun rearm-follow-file (node) (and (node-data-dir node) (merge-pathnames "rearm-follow.sexp" (node-data-dir node))))
+
+(defvar *rearm-follow-save-lock* (bt:make-lock "rearm-follow-save"))
+
+(defun save-rearm-follow (node)
+  "Persist NODE's re-arm follow state (write beside, rename), so a restart resumes each scan where
+   it stopped instead of rescanning every claimed fork from its lottery height.  A stale entry is
+   safe: the block hash at scanned-to is checked before it is used (REARM-FOLLOW-FROM)."
+  (let ((f (rearm-follow-file node)) (pk (node-pubkey node)))
+    (when f
+      (bt:with-lock-held (*rearm-follow-save-lock*)
+        (ensure-directories-exist f)
+        (let ((tmp (make-pathname :type "tmp" :defaults f))
+              (entries (sb-ext:with-locked-hash-table (*rearm-follow*)
+                         (loop for k being the hash-keys of *rearm-follow* using (hash-value v)
+                               when (equalp (first k) pk)
+                                 collect (cons (rest k)
+                                               (let ((h (getf v :hash)))
+                                                 (if (vectorp h) (list* :hash (bytes->hex h) (alexandria:remove-from-plist v :hash)) v)))))))
+          (with-open-file (out tmp :direction :output :if-exists :supersede)
+            (with-standard-io-syntax (let ((*print-readably* nil)) (prin1 entries out))))
+          (uiop:rename-file-overwriting-target tmp f))))))
+
+(defun load-rearm-follow (node)
+  (let ((f (rearm-follow-file node)) (pk (node-pubkey node)))
+    (when (and f (probe-file f))
+      (dolist (e (ignore-errors (with-open-file (in f) (with-standard-io-syntax (read in)))))
+        (ignore-errors
+         (let* ((v (cdr e)) (h (getf v :hash)))
+           (setf (gethash (cons pk (car e)) *rearm-follow*)
+                 (if (stringp h) (list* :hash (hex->bytes h) (alexandria:remove-from-plist v :hash)) v))))))))
+
+(defun rearm-follow-from (node key lottery-height)
+  "Where FOLLOW-REARM-SPEND scans from for KEY: :CONCLUDED once a spend of the output is buried
+   +REARM-CONCLUDED-DEPTH+ deep; else the height of a spend seen but not yet that deep; else the
+   block after the last one scanned, if its hash is unchanged; else LOTTERY-HEIGHT (first scan,
+   a restart, or a reorganisation under what was scanned)."
+  (let ((e (gethash key *rearm-follow*)))
+    (cond ((null e) lottery-height)
+          ((getf e :concluded) :concluded)
+          ((getf e :spend-height) (max lottery-height (getf e :spend-height)))
+          ((and (getf e :scanned-to) (getf e :hash) (node-block-hash-fn node)
+                (equalp (ignore-errors (funcall (node-block-hash-fn node) (getf e :scanned-to))) (getf e :hash)))
+           (max lottery-height (1+ (getf e :scanned-to))))
+          (t (remhash key *rearm-follow*) lottery-height))))
+
+(defun rearm-follow-note (node key tip spend)
+  "%REARM-FOLLOW-NOTE, persisted when it changed anything."
+  (let ((before (gethash key *rearm-follow*)))
+    (%rearm-follow-note node key tip spend)
+    (unless (equalp before (gethash key *rearm-follow*)) (ignore-errors (save-rearm-follow node)))))
+
+(defun %rearm-follow-note (node key tip spend)
+  "Record a FOLLOW-REARM-SPEND scan up to TIP that found SPEND (or NIL).  Only a spend that is not
+   a re-arm spend (one input, one output: a claim) concludes the round, and only once it is
+   +REARM-CONCLUDED-DEPTH+ deep; a re-arm spend is followed again every pass until the next round
+   is registered (its arms or manifest may still be on their way), but scanned from its own height."
+  (let* ((stx (and spend (let ((x (getf spend :tx))) (if (stringp x) (ignore-errors (btx:parse-tx (bw:make-reader (hex->bytes x)))) x))))
+         (rearm-shape (and stx (= 1 (length (btx:tx-inputs stx))) (= 1 (length (btx:tx-outputs stx)))))
+         (sh (and spend (getf spend :height)))
+         (prior (gethash key *rearm-follow*)))
+    (cond ((and sh (not rearm-shape) (>= (1+ (- tip sh)) (max +rearm-concluded-depth+ (or (node-min-confs node) 1))))
+           (setf (gethash key *rearm-follow*) (list :concluded t)))
+          (sh (setf (gethash key *rearm-follow*) (list :spend-height sh)))
+          ;; A spend we had seen is gone from where it was (reorganised out): start over.
+          ((getf prior :spend-height) (remhash key *rearm-follow*))
+          ((node-block-hash-fn node)
+           (let ((hash (ignore-errors (funcall (node-block-hash-fn node) tip))))
+             (if hash
+                 (setf (gethash key *rearm-follow*) (list :scanned-to tip :hash hash))
+                 (remhash key *rearm-follow*))))
+          (t (remhash key *rearm-follow*)))))
+
 (defun follow-rearm-spend (node id-hex r)
   "If the lottery output of round R (a NOTE-REARM-ROUND plist with its lottery and height) was
    spent into the next round's lottery, register that round.  Returns the spend or NIL."
   (let* ((tx (getf r :tx)) (round (getf r :round)) (height (getf r :height))
+         (key (and tx (rearm-follow-key node id-hex round tx)))
+         ;; A concluded round needs nothing below, not even its lottery rebuilt (LOTTERY-PAID-BY
+         ;; tries subsets of the armers, and a restart would pay that for every claimed fork).
+         (concluded (and key (getf (gethash key *rearm-follow*) :concluded)))
          ;; LOAD-REARMS keeps no lottery: after a restart, rebuild the one whose output TX pays.
          (spk (btx:txout-script (first (btx:tx-outputs tx))))
          (l (or (getf r :lottery)
-                (let ((x (if (= round 1)
+                (let ((x (if concluded nil (if (= round 1)
                              (lottery-paid-by node id-hex spk)
-                             (and (getf r :opens) (getf r :closes) (rearm-lottery node id-hex round (getf r :opens) (getf r :closes))))))
+                             (and (getf r :opens) (getf r :closes) (rearm-lottery node id-hex round (getf r :opens) (getf r :closes)))))))
                   (and x (equalp (lot:lottery-spk x) spk) x)))))
+    (when concluded (return-from follow-rearm-spend nil))
     (when (and (node-spender-fn node) height l)
+      (let* ((tip (height node))
+             (from (rearm-follow-from node key height)))
+        (when (eq from :concluded) (return-from follow-rearm-spend nil))
       (let ((spend (find-if (lambda (s) (equalp (getf s :txid) (btx:tx-txid tx)))
                             ;; Outpoints are (txid . vout), and a spend's :tx is its hex.  This
                             ;; once passed (txid 0) and read :tx as parsed, so a voter that did
                             ;; not broadcast the spend itself never followed it into the next
                             ;; round (regtest, 2026-11-07: cld28 on 75395b59 and 7c4d6b2a).
-                            (ignore-errors (funcall (node-spender-fn node) height (height node) (list (cons (btx:tx-txid tx) 0)))))))
+                            (ignore-errors (funcall (node-spender-fn node) from tip (list (cons (btx:tx-txid tx) 0)))))))
+        (rearm-follow-note node key tip spend)
         (when spend
           (let ((stx (let ((x (getf spend :tx)))
                        (if (stringp x) (ignore-errors (btx:parse-tx (bw:make-reader (hex->bytes x)))) x))))
@@ -6109,7 +6244,7 @@
                                 (rearm-lottery node id-hex (1+ round) opens closes (or (getf spend :height) (height node))))))
                   (when (and next (equalp (lot:lottery-spk next) (btx:txout-script (first (btx:tx-outputs stx)))))
                     (note-rearm-round node id-hex (1+ round) stx (getf spend :height) :lottery next :opens opens :closes closes)
-                    stx))))))))))
+                    stx)))))))))))
 
 (defvar *rearm-backoff* (make-hash-table :test #'equal :synchronized t)
   "Ledger id -> (next-height . gap): a re-arm spend whose signatures fell short is retried after
@@ -7754,6 +7889,7 @@
   (load-known-confiscations node)
   (load-confirmed-lotteries node)
   (load-vault-watch node)
+  (load-rearm-follow node)
   (let* ((dir (node-data-dir node))
          (log-lock (bt:make-lock "load-log"))
          (files (directory (merge-pathnames "ledger_*.json" dir))))
