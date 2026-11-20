@@ -102,7 +102,7 @@
          (ok :watch (loop for id being the hash-keys of (nd::node-derelict-watch node) collect (subseq id 0 16))
              :reported (loop for k being the hash-keys of (nd::node-reported-derelict node) collect k)))
         (:vault-watch   ; run the unauthorised-vault-spend watch now, errors and all
-         (nd:drive-vault-watch node)
+         (nd::vault-watch-pass node)
          (ok :reported (loop for k being the hash-keys of (nd::node-reported-vault-spend node) collect (subseq k 0 16))
              :scanned-to (nd::node-vault-scanned node)))
         (:threads   ; a backtrace of every thread, for a node that is busy and silent
@@ -139,7 +139,7 @@
         (:drive-stats   ; per-step dispute drive totals since start: (step total-ms calls mean-ms)
          (multiple-value-bind (owned live queued) (nd::drive-load node)
            (ok :owned owned :live live :queued queued :inflight (nd::drive-inflight node) :steps (nd::drive-stats node)
-               :watch (nd::watch-stats node))))
+               :watch (nd::watch-stats node) :vault-watch (nd::vault-watch-stats node))))
         (:vaults
          ;; Every vault each owned base ledger's QuorumBegins named, oldest first, as
          ;; "txid:vout" (display order): the rotation check proves each but the last spent.
