@@ -866,6 +866,19 @@
         (check-equal "member b disputes the expired quorum" (nd:check-expired-quorums b) (list id))
         (check "the QuorumExpired proof made c and d fork too"
                (every (lambda (m) (nd:find-fork m id (nd:node-pubkey m))) (list c d)))
+        ;; DEP-06 §Enter (signet 2026-11-19, deposits-rust ref4 on 5effb9e8): the accused operator
+        ;; received the same proof and must open no fork of its own ledger and sign nothing.
+        (let ((signed (length (nd:record-history la)))
+              (proof (fr:make-quorum-expired-proof (nd:node-pubkey a) (u:hex->bytes id) (make-array 32) expiry)))
+          (check "the operator, which received that proof too, opened no fork of its own ledger"
+                 (null (nd::find-fork a id (nd:node-pubkey a))))
+          (nd::handle-operator-fraud a proof)
+          (check "the proof against itself, handled again, opens none" (null (nd::find-fork a id (nd:node-pubkey a))))
+          (check "enter-dispute on a ledger it operates refuses, whatever the caller"
+                 (null (nd:enter-dispute a la (lg:ledger-sequence (nd:record-ledger la)) :reason "quorum_expired"
+                                                                                       :fraud-proof proof)))
+          (check "and leaves no fork" (null (nd::find-fork a id (nd:node-pubkey a))))
+          (check-equal "and signs nothing on its own chain" (length (nd:record-history la)) signed))
         (check "respectful proof type" (fr:respectful-p (fr:make-quorum-expired-proof (nd:node-pubkey a) (u:hex->bytes id) (make-array 32) expiry)))
         ;; Run the lottery through (respectful: obligations to the lottery, change back to the operator).
         (dolist (m (list b c d)) (nd:arm-dispute m (nd:find-fork m id (nd:node-pubkey m)) :replacement (list (u:sha256 (nd:node-pubkey m)) 0 10000000)))
@@ -2986,5 +2999,32 @@
                (check-equal "a stale scanned-to (its block replaced) rescans from the lottery height" (funcall pass n3 b) 64))))
       (funcall forget n)
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
+;;; inspect/vectors/self_dispute.json (shared with deposits-rust, deposits-node/tests/vectors):
+;;; DEP-06 §Enter.  A node enters a dispute on a verified proof only when the proof accuses the
+;;; ledger's current operator and the node is neither that operator nor the accused; entering
+;;; signs exactly one update, its DisputeEnter.
+(with-gate ("self-dispute: an operator never disputes its own ledger (shared vector)")
+  (let* ((v (json-simple:parse (uiop:read-file-string (vector-path "self_dispute.json"))))
+         (keys (make-hash-table :test #'equal))
+         (key (lambda (name)
+                (and (stringp name)
+                     (or (gethash name keys)
+                         (setf (gethash name keys)
+                               (let ((b (make-array 33 :element-type '(unsigned-byte 8)
+                                                       :initial-element (1+ (hash-table-count keys)))))
+                                 (setf (aref b 0) 2) b))))))
+         (n 0))
+    (loop for case across (gethash "proof_cases" v)
+          for us = (funcall key (gethash "us" case))
+          for operator = (funcall key (gethash "operator" case))
+          for accused = (funcall key (gethash "accused" case))
+          for dispute = (and (null (nd::self-dispute-refusal us accused operator))
+                             operator (equalp accused operator))
+          for expect = (gethash "expect" case)
+          do (incf n)
+             (check-equal (format nil "~a: disputes" (gethash "name" case)) (and dispute t) (eq (gethash "dispute" expect) t))
+             (check-equal (format nil "~a: signatures" (gethash "name" case)) (if dispute 1 0) (gethash "signatures" expect)))
+    (check-equal "every proof case ran" n 9)))
 
 (report)

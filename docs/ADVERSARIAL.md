@@ -45,6 +45,7 @@ Nov 2 lapsed-challenge vault-spend proofs.
 |---|---|---|
 | Invalid credit; forged lock (honest and colluding arms) | have | `attack1-invalid-credit.sh`, `attack-forge-lock.sh` |
 | Equivocation; rollback depth | have | `member-equivocate.lisp`, `attack-rollback-depth.sh` |
+| An operator disputes its own ledger: on a proof against itself it opens a fork and signs a `DisputeEnter` at the fork point's next sequence, then keeps signing its chain | have (found live; a rule since DEP-06 §Enter "The accused never disputes itself") | Not an attack on anyone else: it hands every member an Equivocation proof against itself, signed by its own key at one sequence, whenever a member holds both updates. A republished fork is enough: Rust ref4 on 5effb9e8 (signet Nov 19–20, CHAOS.md), proved by four members the morning after. Gates: `self_dispute.json` (both), Rust `self_dispute_vector` / `no_permitted_dispute_makes_us_equivocate` / `fork_fate_vector`, cl nodes "respectful dispute on quorum expiry" (the operator opens no fork and signs nothing). A live arm would point a member's QuorumExpired proof at an attacker operator with a pre-fix binary and check the oracle scores the Equivocation as a PASS |
 | Censorship / held funds | have | `attack-censor-hold.sh` |
 | Unanchored vault spend; forged anchor | have | `attack-vault-spend.sh`, `attack-vault-anchored.sh` |
 | Recovery-tier spend outside any rotation or dispute | have | `attack-vault-recovery-tier.sh` |
