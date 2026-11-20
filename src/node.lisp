@@ -6605,8 +6605,18 @@
                                           for o = (op:update-op u)
                                           when (op:field o :replacement-collateral-txid)
                                             collect (outpoint-key (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)))))
+           ;; So is a claim of ours (output 0 of every DisputeAcquire's claim_txid): it pays our
+           ;; own address, as our coins do, but it is a ledger's custody until rotated into its
+           ;; vault, and selecting by script would pledge (or consolidate) it for another
+           ;; dispute (the select-by-script hazard of deposits-rust's claim, 1120-090836).
+           (custody (loop for r being the hash-values of (node-ledgers node)
+                          when (and (record-fork-p r) (record-owned-p r))
+                            append (loop for u in (fork-own-updates r :dispute-acquire)
+                                         for o = (op:update-op u)
+                                         when (op:field o :claim-txid)
+                                           collect (outpoint-key (op:field o :claim-txid) 0))))
            (keyed (loop for u in utxos collect (list* :key (outpoint-key (getf u :txid) (getf u :vout)) u)))
-           (taken (append declared (loop for k being the hash-keys of (node-pledges node) collect k)))
+           (taken (append declared custody (loop for k being the hash-keys of (node-pledges node) collect k)))
            (free (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
                                             (member (getf u :key) taken :test #'equal)))
                             keyed))

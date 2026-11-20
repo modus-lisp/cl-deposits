@@ -1243,7 +1243,15 @@
         (let ((acquired (count-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-acquire)) (list b c d)))
               (yielded (count-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-yield)) (list b c d))))
           (check-equal "one winner claimed, the others yielded" (list acquired yielded) '(1 2)))
-        (check "every pledge released" (every (lambda (m) (zerop (hash-table-count (nd:node-pledges m)))) (list b c d)))))))
+        (check "every pledge released" (every (lambda (m) (zerop (hash-table-count (nd:node-pledges m)))) (list b c d)))
+        ;; The winner's claim pays its own key-path address, where its coins are; until it is
+        ;; rotated into a vault it is this ledger's custody, never a pledge for another dispute.
+        (let* ((w (find-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-acquire)) (list b c d)))
+               (claim (op:field (nth-value 1 (nd::fork-op (nd:find-fork w id (nd:node-pubkey w)) :dispute-acquire)) :claim-txid)))
+          (check "the claim output is unspent at the winner's own address"
+                 (equalp (cdr (gethash (cons (coerce claim 'list) 0) chain)) (lot:key-path-spk (up:x-only (nd:node-pubkey w)))))
+          (check-equal "and is never pledged to another dispute" (nd:pledge-collateral w (nd::node-member-ledger-hex w)) nil)
+          (check "nor consolidated away" (gethash (cons (coerce claim 'list) 0) chain)))))))
 
 (with-gate ("withheld reveal: past the deadline the revealer claims its subset leaf, attested; never the operator")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
