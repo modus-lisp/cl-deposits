@@ -642,9 +642,55 @@
       (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) height)))
       (sha256 (ascii->bytes (format nil "deposits: no chain view at height ~a" height)))))
 
+;;; WRITE-AHEAD.  Every update we sign is durable on our disk before any relay sees it, so a node
+;;; killed at any point comes back knowing every update of ours that may be out there, and never
+;;; signs a second one at that sequence.  Publishing before saving (the order until 2026-11-20)
+;;; left a window, kill between the publish and the save, in which the update was on the relays and
+;;; not on our disk; the rerun then signed another at the same sequence under a later header.  The
+;;; PENDING file closes the other side: an update saved and not yet published is republished, as
+;;; the saved bytes, by the next boot (PUBLISH-PENDING).  COMMIT-UPDATE is the only place an update
+;;; of ours is signed (EQUIVOCATE, testing only, aside), so the rule lives here.
+
+(defvar *before-publish-hook* nil
+  "Testing: called with NODE REC UPDATE after the write-ahead save and before the publish; a
+   non-local exit from it is a node killed in that window.")
+
+(defun pending-path (node rec)
+  (merge-pathnames (format nil "pending_~a.b64" (pathname-name (record-file-name rec))) (node-data-dir node)))
+
+(defun write-ahead (node rec update)
+  "Make UPDATE (already applied and recorded on REC) durable before it is published: the pending
+   file naming it, then the record itself, written now even inside a deferred-save block.
+   Returns the pending path, or NIL with no data dir."
+  (when (node-data-dir node)
+    (ensure-directories-exist (node-data-dir node))
+    (let ((pending (pending-path node rec)))
+      (with-open-file (out pending :direction :output :if-exists :supersede :external-format :latin-1)
+        (write-string (base64-encode (up:encode-update update)) out))
+      (let ((*deferred-saves* nil)) (save-record node rec))
+      pending)))
+
+(defun publish-pending (node)
+  "Boot: publish, as the saved bytes, every update of ours that was saved and never published (a
+   node killed between WRITE-AHEAD and the publish).  A pending update the record does not hold
+   was never saved, so never published: it is dropped, and nothing of ours left this node."
+  (when (node-data-dir node)
+    (dolist (f (directory (merge-pathnames "pending_*.b64" (node-data-dir node))))
+      (handler-case
+          (let* ((u (up:decode-update (base64-decode (string-trim '(#\Newline #\Return #\Space) (uiop:read-file-string f :external-format :latin-1)))))
+                 (id (bytes->hex (up:update-ledger-id u)))
+                 (held (some (lambda (rec) (and rec (equalp (ignore-errors (up:encode-update (record-update-at rec (up:update-seq u))))
+                                                            (up:encode-update u))))
+                             (list (find-record node id) (find-fork node id (node-pubkey node))))))
+            (cond (held (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) u))
+                        (log! node "published saved update ~a seq ~a (killed before its publish)" (subseq id 0 8) (up:update-seq u)))
+                  (t (log! node "dropped pending ~a seq ~a: never saved, so never published" (subseq id 0 8) (up:update-seq u))))
+            (delete-file f))
+        (error (e) (log! node "pending ~a: ~a" (file-namestring f) e))))))
+
 (defun commit-update (node rec update)
-  "Operator-sign, apply, record, publish, persist.  The update's cosignatures
-   must already be in place."
+  "Operator-sign, apply, record, persist, publish (WRITE-AHEAD: saved before any relay sees it).
+   The update's cosignatures must already be in place."
   (up:sign-operator update (node-priv node))
   (handler-case (lg:apply-update (record-ledger rec) update)       ; signals ledger-error if invalid
     (lg:ledger-error (e)
@@ -658,8 +704,10 @@
       (setf (lg:ledger-sequence (record-ledger rec)) (up:update-seq update)
             (lg:ledger-chain-tip (record-ledger rec)) (up:chain-hash update))))
   (record-push rec update)
-  (setf (record-last-event-id rec) (ev:event-id (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) update))))
-  (save-record node rec)
+  (let ((pending (write-ahead node rec update)))
+    (when *before-publish-hook* (funcall *before-publish-hook* node rec update))
+    (setf (record-last-event-id rec) (ev:event-id (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) update))))
+    (when pending (ignore-errors (delete-file pending))))
   (run-hooks node rec update)
   update)
 
@@ -8313,4 +8361,5 @@
              (id (loop for k being the hash-keys of (node-ledgers node) when (and (>= (length k) 16) (string= prefix (subseq k 0 16))) return k)))
         (when id (handler-case (load-rearms node id f) (error (e) (funcall log-fn "could not load ~a: ~a" f e))))))
     (handler-case (load-pledges node) (error (e) (funcall log-fn "could not load pledges: ~a" e)))
+    (publish-pending node)
     node))
