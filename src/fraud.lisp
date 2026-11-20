@@ -192,11 +192,13 @@
   (let ((key (operator-at history seq prefix-ledger-fn)))
     (or (eq key :genesis) (and key (string= (bytes->hex key) accused-hex)))))
 
-(defun verify-equivocation (proof history)
+(defun verify-equivocation (proof history &key (prefix-ledger-fn #'lg:replay))
   "Two updates, same ledger / sequence / operator, both validly signed, different
    content, and both bound to the ledger through HISTORY (its chain): a pair of
    the operator's honest updates from two of its ledgers, one relabelled, is not
-   an equivocation."
+   an equivocation.  PREFIX-LEDGER-FN builds the ledger the operator is read from, as
+   for VERIFY-NON-CONFORMING-UPDATE: a node passes its checkpointed one, so judging an
+   equivocation at seq 432510 is not a replay of 432510 updates from genesis."
   (handler-case
       (let* ((a (up:decode-update (hex->bytes (e proof :update-a-hex))))
              (b (up:decode-update (hex->bytes (e proof :update-b-hex))))
@@ -208,7 +210,7 @@
               ((not (string= (bytes->hex (up:update-ledger-id a)) (getf proof :ledger-id))) (values nil "ledger id mismatch"))
               ((equalp (up:content-hash a) (up:content-hash b)) (values nil "same content: not an equivocation"))
               ((not (and (up:verify-operator-signature a) (up:verify-operator-signature b))) (values nil "a signature does not verify"))
-              ((not (accused-operates-p (getf proof :accused) history (up:update-seq a)))
+              ((not (accused-operates-p (getf proof :accused) history (up:update-seq a) prefix-ledger-fn))
                (values nil "the accused does not operate the ledger at that sequence"))
               ((not (update-binds-to-ledger-p a (up:update-ledger-id a) bound))
                (values nil "update_a follows no update of this ledger: nothing binds it here (ledger_id is unsigned)"))
@@ -961,7 +963,7 @@
 
 (defun verify-proof (proof &key history height-of-block (prefix-ledger-fn #'lg:replay))
   (case (getf proof :type)
-    (:equivocation (verify-equivocation proof history))
+    (:equivocation (verify-equivocation proof history :prefix-ledger-fn prefix-ledger-fn))
     (:quorum-expired (verify-quorum-expired proof history height-of-block))
     (:non-conforming-update (verify-non-conforming-update proof history :prefix-ledger-fn prefix-ledger-fn))
     (:dispute-dereliction (values nil "dereliction needs the defrauded ledger: verify-dispute-dereliction"))

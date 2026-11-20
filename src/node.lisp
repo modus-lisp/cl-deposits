@@ -3943,6 +3943,24 @@
   "OPERATOR33's fork of ID-HEX when it is live (fork-live-p), else NIL."
   (let ((f (find-fork node id-hex operator33))) (and f (fork-live-p node f) f)))
 
+(defun unarmed-expiry-fork-p (fork)
+  "FORK entered on a lapsed quorum (quorum_expired) and has neither armed, yielded nor acquired.
+   Its DisputeEnter does not act on any fraud proof (FR::ACTED-ON-P counts a non-expiry
+   DisputeEnter or a DisputeArmed), so it must never stand in for a punitive dispute."
+  (multiple-value-bind (u o) (fork-op fork :dispute-enter)
+    (and u (expiry-reason-p (op:field o :reason))
+         (not (fork-op fork :dispute-armed)) (not (fork-op fork :dispute-yield))
+         (not (fork-op fork :dispute-acquire)))))
+
+(defun blocking-fork (node id-hex punitive)
+  "Our live fork of ID-HEX that already answers a new proof, else NIL.  For a PUNITIVE proof an
+   un-armed expiry fork does not: deposits-rust ref7 (signet, 2026-11-20) let its un-armed
+   quorum_expired fork of 5effb9e8 absorb a self-detected Equivocation, signed no punitive
+   DisputeEnter, and was proved derelict.  Here the same fork made HANDLE-OPERATOR-FRAUD skip the
+   proof outright."
+  (let ((f (live-fork node id-hex (node-pubkey node))))
+    (and f (not (and punitive (unarmed-expiry-fork-p f))) f)))
+
 (defun retire-fork (node fork)
   "Drop a fork that is no longer live so a new dispute can open in its place; what it knew of
    a confiscation is kept (note-confiscation persists it)."
@@ -4136,6 +4154,18 @@
       (return-from enter-dispute nil)))
   (let ((stale (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and stale (not (fork-live-p node stale))) (retire-fork node stale)))
+  ;; A punitive dispute is never absorbed by an un-armed expiry fork (BLOCKING-FORK), and one key
+  ;; holds one fork per ledger here, so the expiry dispute stands down for it: yielded (DEP-05
+  ;; §"When a quorum_expired dispute ends" and DEP-06 §Race have an un-armed disputant yield) and
+  ;; retired, and the punitive one forks at its own base.  Whatever the expiry dispute could take,
+  ;; the punitive one takes too.
+  (let ((expiry (find-fork node (record-id-hex rec) (node-pubkey node))))
+    (when (and expiry (null anchor-block-height) (not (expiry-reason-p reason))
+               (unarmed-expiry-fork-p expiry))
+      (commit-update node expiry (new-update node expiry (list :type :dispute-yield)))
+      (release-pledges node (record-id-hex rec))
+      (note-dispute node (record-id-hex rec) "un-armed expiry dispute yielded for a punitive one (~a)" reason)
+      (retire-fork node expiry)))
   ;; One DisputeEnter per dispute: a live fork that already entered keeps the grounds it entered
   ;; on (a second, groundless one would be its latest and lose them, DEP-03 §Grounded arms).
   (let ((live (find-fork node (record-id-hex rec) (node-pubkey node))))
@@ -6687,7 +6717,7 @@
     (when (and (not (record-owned-p rec)) (not (record-fork-p rec))
                (equalp (up:update-prev-hash update) (lg:ledger-chain-tip ledger))
                (> (up:update-seq update) (lg:ledger-sequence ledger))
-               (not (live-fork node id (node-pubkey node))))
+               (not (blocking-fork node id t)))
       (log! node "NON-CONFORMING cosigned update on ~a at seq ~a: ~a" (subseq id 0 8) (up:update-seq update) condition)
       (let ((proof (fr:make-non-conforming-update-proof (up:update-operator-id update) (up:update-ledger-id update) update)))
         ;; A proof is what every verifier will judge, so judge it first as they will: from a
@@ -6704,7 +6734,7 @@
         (broadcast-fraud node proof)
         (broadcast-cosigner-contagion node rec update)
         (when (and (member (node-pubkey node) (lg:ledger-quorum-members ledger) :key #'lg:member-pubkey :test #'equalp)
-                   (not (live-fork node id (node-pubkey node))))   ; the proof may have looped back and forked us already
+                   (not (blocking-fork node id t)))   ; the proof may have looped back and forked us already
           ;; DEP-19 §6: our DisputeEnter cites the proof; watch co-members who ignore it.
           (watch-derelicts node id proof
                            (enter-dispute node rec (lg:ledger-sequence ledger) :reason "non_conforming_update"
@@ -6769,7 +6799,7 @@
                                   (not (string= (record-id-hex rec) (getf (getf proof :evidence) :fault-ledger-id)))
                                   (equalp (lg:ledger-operator-key (record-ledger rec)) accused)
                                   (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
-                                  (not (live-fork node (record-id-hex rec) (node-pubkey node))))
+                                  (not (blocking-fork node (record-id-hex rec) t)))
                           collect rec)))
     (when targets
       (let* ((fault (up:decode-update (hex->bytes (getf (getf proof :evidence) :fault-update-hex))))
@@ -7587,7 +7617,7 @@
                                   (not (string= (record-id-hex rec) spent-id))
                                   (equalp (lg:ledger-operator-key (record-ledger rec)) accused)
                                   (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
-                                  (not (live-fork node (record-id-hex rec) (node-pubkey node))))
+                                  (not (blocking-fork node (record-id-hex rec) t)))
                           collect rec)))
     (when targets
       (multiple-value-bind (ok why) (vault-spend-proof-verdict node proof)
@@ -7694,7 +7724,7 @@
       (return-from handle-operator-fraud nil))
     (when (and rec (not (record-owned-p rec))
                (member (node-pubkey node) (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
-               (not (live-fork node id (node-pubkey node))))
+               (not (blocking-fork node id (not (eq (getf proof :type) :quorum-expired)))))
       (multiple-value-bind (ok why)
           (let ((hob (or (node-height-of-block node)
                          ;; no chain view: trust our own tip for the anchor

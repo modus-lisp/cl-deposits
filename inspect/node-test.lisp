@@ -1118,6 +1118,49 @@
             (check "c sees b's new DisputeEnter on a fresh fork (its stale copy retired)"
                    (let ((f (nd:find-fork c id (nd:node-pubkey b)))) (and f (null (nd::fork-op f :dispute-yield)))))))))))
 
+;; deposits-rust ref7 (signet, 2026-11-20): an un-armed quorum_expired fork of 5effb9e8 absorbed a
+;; self-detected Equivocation, so ref7 signed no punitive DisputeEnter and cld4 proved it derelict.
+;; Here the same fork made HANDLE-OPERATOR-FRAUD skip the proof (it was "live").
+(with-gate ("a punitive proof is not absorbed by an un-armed expiry dispute")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv (tk 11111111111111111197) :bus bus :height-fn hf))
+         (b (nd:make-node :priv (tk 22222222222222222297) :bus bus :height-fn hf))
+         (c (nd:make-node :priv (tk 33333333333333333397) :bus bus :height-fn hf))
+         (d (nd:make-node :priv (tk 44444444444444444497) :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:pf" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d9f")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
+    (let ((*height* (+ (lg:ledger-quorum-expiry (nd:record-ledger la)) 4)))
+      (check-equal "b opens an expiry dispute" (nd:dispute-expired-quorums b :grace 3) (list id))
+      (let ((expiry-fork (nd:find-fork b id (nd:node-pubkey b))))
+        (check "it is un-armed and live" (and (nd::unarmed-expiry-fork-p expiry-fork) (nd:live-fork b id (nd:node-pubkey b))))
+        (check "it does not block a punitive proof" (null (nd::blocking-fork b id t)))
+        (check "it still blocks a second expiry dispute" (nd::blocking-fork b id nil)))
+      ;; The operator equivocates at its tip.
+      (let* ((tip (first (nd:record-history la)))
+             (mk (lambda (tag)
+                   (let ((u (up:make-signed-update :operator-id (nd:node-pubkey a) :ledger-id (u:hex->bytes id)
+                                                   :seq (1+ (up:update-seq tip)) :prev-hash (up:chain-hash tip) :block-height *height*
+                                                   :message (op:encode-operation (list :type :deposit-close :deposit-id (subseq (u:sha256 (hx tag)) 0 16))))))
+                     (up:sign-operator u (nd::node-priv a)) u)))
+             (proof (fr:make-equivocation-proof (nd:node-pubkey a) (u:hex->bytes id) (funcall mk "01") (funcall mk "02"))))
+        (nd::handle-operator-fraud b proof)
+        (let ((f (nd:find-fork b id (nd:node-pubkey b))))
+          (multiple-value-bind (u o) (nd::fork-op f :dispute-enter)
+            (check-equal "b entered a punitive dispute" (op:field o :reason) "equivocation")
+            (check "citing the proof" (equalp (op:field o :fraud-proof-hash) (fr:proof-hash proof)))
+            (check "which counts as acting on it (DEP-19 §6)" (fr::acted-on-p u (nd:node-pubkey b) (u:hex->bytes id)))
+            (check "on a live fork" (nd:fork-live-p b f))))
+        (check "c holds b's punitive DisputeEnter"
+               (let ((f (nd:find-fork c id (nd:node-pubkey b))))
+                 (and f (equal (op:field (nth-value 1 (nd::fork-op f :dispute-enter)) :reason) "equivocation"))))
+        (check "and b's expiry dispute was yielded on the relay"
+               (some (lambda (e) (let ((u (ignore-errors (w:event->update e))))
+                                   (and u (equalp (up:update-operator-id u) (nd:node-pubkey b))
+                                        (eq (ignore-errors (op:update-type u)) :dispute-yield))))
+                     (bus:mock-bus-events bus)))))))
+
 (with-gate ("confiscation signs the tier open at the height: a minority past expiry + 720")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (a (nd:make-node :priv (tk 11111111111111111111) :bus bus :height-fn hf))
