@@ -162,6 +162,9 @@
   (reported-vault-spend (make-hash-table :test (quote equal) :synchronized t))
   (migrations-watched (make-hash-table :test (quote equal) :synchronized t)) ; "ledger:seq" -> (:height h :hash b) | :done
   (obligation-proofs (make-hash-table :test (quote equal) :synchronized t))  ; ledger id hex -> verified offer-evidence proof JSON texts
+  ;; ledger id hex -> proofs we could not judge yet: our replica was behind the sequence they
+  ;; rest on (JUDGE-LATER-P).  Each a plist (:hash :proof :content :needs :at).
+  (parked-proofs (make-hash-table :test (quote equal) :synchronized t))
   ;; ledger id hex -> txids of confiscations we saw confirmed.  Kept apart from the forks: a fork
   ;; forgets its confiscation once the lottery output is spent (the winner's claim), and the vault
   ;; watch must still excuse it.  Persisted in confiscations.txt.
@@ -3597,6 +3600,7 @@
                  (setf (gethash pk *watch-stats*) (list* :current (cons name (get-universal-time)) (alexandria:remove-from-plist st :current))))
                (ignore-errors (funcall fn))
                (push (cons name (ms-since s0)) steps))))
+      (wstep :parked-proofs (lambda () (rejudge-parked-proofs node)))
       (wstep :dispute-expired (lambda () (dispute-expired-quorums node)))
       (wstep :drive-disputes (lambda () (drive-disputes node :parallel t :rearms nil)))
       (wstep :drive-rearms (lambda () (drive-rearms node)))
@@ -6622,7 +6626,8 @@
         (multiple-value-bind (ok why) (fr:verify-non-conforming-cosignature
                                         proof prefix :prefix-ledger-fn (prefix-ledger-fn (find-record node (getf (getf proof :evidence) :fault-ledger-id))))
           (if (not ok)
-              (log! node "contagion proof against ~a rejected: ~a" (subseq (getf proof :accused) 0 8) why)
+              (unless (judge-later-p node proof why)
+                (log! node "contagion proof against ~a rejected: ~a" (subseq (getf proof :accused) 0 8) why))
               (dolist (rec targets)
                 (log! node "contagion: ~a cosigned a non-conforming update on ~a; disputing its ledger ~a"
                       (subseq (getf proof :accused) 0 8) (subseq (getf (getf proof :evidence) :fault-ledger-id) 0 8) (subseq (record-id-hex rec) 0 8))
@@ -7437,7 +7442,8 @@
     (when targets
       (multiple-value-bind (ok why) (vault-spend-proof-verdict node proof)
           (if (not ok)
-              (log! node "vault-spend proof against ~a rejected: ~a" (subseq (getf proof :accused) 0 8) why)
+              (unless (judge-later-p node proof why)
+                (log! node "vault-spend proof against ~a rejected: ~a" (subseq (getf proof :accused) 0 8) why))
               (dolist (rec targets)
                 (log! node "contagion: ~a signed an unauthorised spend of ~a's vault; disputing its ledger ~a"
                       (subseq (getf proof :accused) 0 8) (subseq spent-id 0 8) (subseq (record-id-hex rec) 0 8))
@@ -7453,10 +7459,107 @@
   (when (getf (node-adversary node) :ignore-fraud) (return-from handle-fraud nil))
   (let ((proof (fr:json->broadcast (w:parse-json (ev:event-content event))))
         (*received-broadcast* (ev:event-content event)))
-    (case (getf proof :type)
-      (:non-conforming-cosignature (handle-cosigner-fraud node proof))
-      (:unauthorized-vault-spend (handle-vault-spend-fraud node proof))
-      (t (handle-operator-fraud node proof)))))
+    (dispatch-fraud node proof)))
+
+(defun dispatch-fraud (node proof)
+  (case (getf proof :type)
+    (:non-conforming-cosignature (handle-cosigner-fraud node proof))
+    (:unauthorized-vault-spend (handle-vault-spend-fraud node proof))
+    (t (handle-operator-fraud node proof))))
+
+;;; ---------------------------------------------------------------------------
+;;; Proofs we cannot judge YET.  Regtest 1120-075609 (2026-11-20T08:02:51Z): the reference
+;;; member ref7, 3 s behind ledger 7341c3d1 at seq 4, got four NonConformingUpdate proofs whose
+;;; fault is at seq 9, refused each for good ("follows an update that is not in this ledger's
+;;; history"), caught up milliseconds later and never judged them again: no fork, no arm.  This
+;;; daemon did the same ("fraud proof rejected" with the replica behind).  A member briefly
+;;; behind must not lose its standing, and delivering a proof ahead of its updates must not be a
+;;; way to silence one.  So a proof that fails while our replica of a ledger it rests on is
+;;; behind (FR:PROOF-HISTORY-NEEDS) is caught up and judged again at once, or parked until the
+;;; replica gets there: at most *PARKED-PROOFS-PER-LEDGER* per accused ledger, each for
+;;; *PARKED-PROOF-TTL* seconds, re-judged by the watch pass.
+
+(defparameter *parked-proof-ttl* 3600)
+(defparameter *parked-proofs-per-ledger* 32)
+(defvar *rejudging* nil "True while a parked or caught-up proof is being judged again.")
+
+(defun replica-tip (node id)
+  (let ((r (find-record node id))) (and r (record-p r) (lg:ledger-sequence (record-ledger r)))))
+
+(defun proof-unmet-needs (node needs)
+  "NEEDS our replicas have not reached, among the ledgers we hold.  A ledger we hold no replica
+   of has no bearing on the verdict here: its verifiers read the relay pool (FAULT-PREFIX)."
+  (remove-if-not (lambda (n) (replica-tip node (car n)))
+                 (fr:unmet-history-needs needs (lambda (id) (replica-tip node id)))))
+
+(defun proof-need-tips (node needs) (mapcar (lambda (n) (or (replica-tip node (car n)) -1)) needs))
+
+(defun proof-shortfall (node needs)
+  (reduce #'max (mapcar (lambda (n) (max 0 (- (cdr n) (or (replica-tip node (car n)) 0)))) needs)
+          :initial-value 0))
+
+(defun park-proof (node proof needs &optional (now (get-universal-time)))
+  "Park PROOF under its accused ledger.  Returns :parked, :already-parked, :parked-displacing
+   (the set was full and PROOF reaches less far than the one it displaced) or :full."
+  (let* ((id (getf proof :ledger-id)) (hash (fr:proof-hash proof))
+         (set (remove-if (lambda (p) (>= (- now (getf p :at)) *parked-proof-ttl*))
+                         (gethash id (node-parked-proofs node))))
+         (entry (list :hash hash :proof proof :content *received-broadcast* :needs needs :at now
+                      :tips (proof-need-tips node needs))))
+    (flet ((done (set outcome) (setf (gethash id (node-parked-proofs node)) set) outcome))
+      (cond ((find hash set :key (lambda (p) (getf p :hash)) :test #'equalp) (done set :already-parked))
+            ((< (length set) *parked-proofs-per-ledger*) (done (cons entry set) :parked))
+            (t (let ((worst (reduce (lambda (a b) (if (>= (proof-shortfall node (getf a :needs))
+                                                          (proof-shortfall node (getf b :needs)))
+                                                      a b))
+                                    set)))
+                 (if (> (proof-shortfall node (getf worst :needs)) (proof-shortfall node needs))
+                     (done (cons entry (remove worst set)) :parked-displacing)
+                     (done set :full))))))))
+
+(defun judge-later-p (node proof why)
+  "PROOF failed verification for WHY.  When our replica of a ledger it rests on is behind, catch
+   up and judge it again, or park it: true, and the caller reports no rejection.  NIL when every
+   need is met (the proof is invalid)."
+  (let* ((needs (fr:proof-history-needs proof)) (unmet (proof-unmet-needs node needs)))
+    (when unmet
+      (dolist (n unmet)
+        (let ((r (find-record node (car n)))) (when r (ignore-errors (catch-up-to node r (cdr n))))))
+      (let ((still (proof-unmet-needs node needs)) (id (getf proof :ledger-id)))
+        (cond ((and (null still) (not *rejudging*))
+               (log! node "fraud proof ~a on ~a: our replica was behind (~a); caught up, judging again"
+                     (getf proof :type) (subseq id 0 8) why)
+               (let ((*rejudging* t)) (dispatch-fraud node proof)))
+              (t (let ((n (first (or still unmet))))
+                   (log! node "fraud proof ~a on ~a not judgeable yet: it needs seq ~a of ~a, our replica is at ~a; ~(~a~)"
+                         (getf proof :type) (subseq id 0 8) (cdr n) (subseq (car n) 0 8)
+                         (replica-tip node (car n)) (park-proof node proof needs)))))
+        t))))
+
+(defun rejudge-parked-proofs (node &optional (now (get-universal-time)))
+  "Drop expired parked proofs and judge again every one whose needs our replicas now meet, or
+   whose replicas have advanced since it was last judged: the needs are an upper bound (a fault
+   that SKIPS, signed at T+2 onto T, needs T, not T+1).  An advanced one stays parked, so its
+   expiry runs from when it was first parked.  Returns how many were judged."
+  (let ((ready '()) (expired 0))
+    (loop for id in (loop for k being the hash-keys of (node-parked-proofs node) collect k)
+          do (let ((keep '()))
+               (dolist (p (gethash id (node-parked-proofs node)))
+                 (let ((tips (proof-need-tips node (getf p :needs))))
+                   (cond ((>= (- now (getf p :at)) *parked-proof-ttl*) (incf expired))
+                         ((null (proof-unmet-needs node (getf p :needs))) (push p ready))
+                         ((some #'> tips (getf p :tips))
+                          (setf (getf p :tips) tips) (push p ready) (push p keep))
+                         (t (push p keep)))))
+               (if keep (setf (gethash id (node-parked-proofs node)) (nreverse keep))
+                   (remhash id (node-parked-proofs node)))))
+    (when (plusp expired)
+      (log! node "dropped ~a parked fraud proof(s) unjudged: our replica did not catch up in ~a s" expired *parked-proof-ttl*))
+    (dolist (p ready (length ready))
+      (log! node "judging parked fraud proof ~a on ~a again: our replica has caught up"
+            (getf (getf p :proof) :type) (subseq (getf (getf p :proof) :ledger-id) 0 8))
+      (let ((*received-broadcast* (getf p :content)) (*rejudging* t))
+        (ignore-errors (dispatch-fraud node (getf p :proof)))))))
 
 (defun offer-proof-p (proof)
   (and (eq (getf proof :type) :uncredited-onchain-payment) (not (fr::e proof :source-qb-update))))
@@ -7520,7 +7623,8 @@
                                    :height-of-block (or (node-height-of-block node) (lambda (h) (declare (ignore h)) (height node))))
           (if ok
               (dispute-new-operator node chain proof)
-              (log! node "unhonoured-obligation proof on ~a rejected: ~a" (subseq id 0 8) why))))
+              (unless (judge-later-p node proof why)
+                (log! node "unhonoured-obligation proof on ~a rejected: ~a" (subseq id 0 8) why)))))
       (return-from handle-operator-fraud nil))
     ;; Already disputing (another proof came first): an offer proof is still owed at confiscation.
     (when (and rec (not (record-owned-p rec)) (offer-proof-p proof) (live-fork node id (node-pubkey node)))
@@ -7560,7 +7664,8 @@
                                          :fraud-proof-hash (fr:proof-hash proof) :fraud-proof proof)))
                 (unless (member (getf proof :type) '(:dispute-dereliction :quorum-expired))
                   (watch-derelicts node id proof fork))))
-            (log! node "fraud proof rejected: ~a" why))))))
+            (unless (judge-later-p node proof why)
+              (log! node "fraud proof rejected: ~a" why)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Persistence: the fixture format — a JSON array of base64 updates, oldest first.
