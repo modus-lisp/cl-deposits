@@ -87,6 +87,26 @@
                   (check-equal "every fork replicated after the restart" (mapcar (lambda (m) (length (nd:forks-of m id))) (list b c d)) '(3 3 3))
                   (check "preimages re-derived from the node key"
                          (every (lambda (m) (nd:record-preimage (nd:find-fork m id (nd:node-pubkey m)))) (list b c d)))
+                  ;; DEP-06: fresh per dispute and per round.  The recovered preimage is the
+                  ;; fork-bound one, not the ledger-only v1 seed every dispute of a ledger reused.
+                  (check "the recovered preimage is the fork-bound seed's, and opens the arm's commitment"
+                         (every (lambda (m) (let* ((f (nd:find-fork m id (nd:node-pubkey m)))
+                                                   (armed (op:update-op (nd::fork-op f :dispute-armed))))
+                                              (and (equalp (nd:record-preimage f) (lot:derive-preimage (nd:lottery-seed m f 1)))
+                                                   (equalp (lot:commitment-of (nd:record-preimage f)) (op:field armed :commitment-hash))
+                                                   (not (equalp (nd:record-preimage f) (lot:derive-preimage (nd::lottery-seed-v1 m id 1)))))))
+                                (list b c d)))
+                  (let* ((f (nd:find-fork b id (nd:node-pubkey b))) (priv (nd::node-priv b)))
+                    (multiple-value-bind (lvs point) (nd::fork-identity f)
+                      (let ((seed (nd::fork-lottery-seed priv id lvs point 1)))
+                        (check-equal "the seed is the fork's: its DisputeEnter's last_valid_sequence"
+                                     lvs (op:field (op:update-op (nd::fork-op f :dispute-enter)) :last-valid-sequence))
+                        (check "a dispute of the same ledger at another fork point draws a fresh seed"
+                               (not (equalp seed (nd::fork-lottery-seed priv id (1+ lvs) point 1))))
+                        (check "a different fork at the same sequence (another chain) draws a fresh seed"
+                               (not (equalp seed (nd::fork-lottery-seed priv id lvs (u:sha256 point) 1))))
+                        (check "a re-arm round draws a fresh seed"
+                               (not (equalp seed (nd::fork-lottery-seed priv id lvs point 2)))))))
                   (check-equal "armers visible after the restart" (mapcar (lambda (m) (length (nd:armers-of m id))) (list b c d)) '(3 3 3))
                   ;; --- Confiscation, then restart before revealing.
                   (multiple-value-bind (ctx lottery)

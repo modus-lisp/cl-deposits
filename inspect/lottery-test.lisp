@@ -927,4 +927,55 @@
              (check-equal (format nil "pledge: ~a" (gethash "name" c)) (getf got :key) want))
     (check-equal "every pledge_pick case ran" n 9)))
 
+;;; inspect/vectors/acquire_binding.json: DEP-06 "An acquire binds once its claim confirms", shared
+;;; with deposits-rust (deposits-node/tests/vectors/acquire_binding.json): a DisputeAcquire binds iff
+;;; its claim is confirmed AND spends the dispute's lottery outpoint.  Txids are display hex.
+(defun ab-view (c)
+  "The vector case C's transactions as a judge's TX-FN: wire txid -> (values tx confirmed-p)."
+  (let ((txs (make-hash-table :test #'equalp)))
+    (loop for x across (gethash "txs" c)
+          do (setf (gethash (u:txid-bytes (gethash "txid" x)) txs)
+                   (list (btx:make-tx :version 2 :locktime 0
+                                      :inputs (loop for i across (gethash "inputs" x)
+                                                    collect (btx:make-txin :prev-hash (u:txid-bytes (gethash "txid" i))
+                                                                           :prev-index (gethash "vout" i)
+                                                                           :script (make-array 0 :element-type '(unsigned-byte 8))
+                                                                           :sequence (gethash "sequence" i)))
+                                      :outputs (loop repeat (gethash "outputs" x)
+                                                     collect (btx:make-txout :value 1000 :script (make-array 0 :element-type '(unsigned-byte 8)))))
+                         (eq (gethash "confirmed" x) t))))
+    (lambda (txid) (let ((e (gethash txid txs))) (and e (values (first e) (second e)))))))
+
+(defun ab-judge (c)
+  (cl-deposits.node::judge-acquire (ab-view c)
+                                   (loop for v across (gethash "vaults" c)
+                                         collect (list (u:txid-bytes (gethash "txid" v)) (gethash "vout" v)))
+                                   (u:txid-bytes (gethash "claim_txid" c))))
+
+(with-gate ("DEP-06 acquire binding: a claim binds only at its dispute's lottery outpoint (shared vector)")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "acquire_binding.json")))) (n 0))
+    (check-equal "tier CSVs agree" (coerce (gethash "tier_csvs" v) 'list) cl-deposits.node::+rearm-tier-csvs+)
+    (check-equal "max rounds agree" (gethash "max_rounds" v) cl-deposits.node::+acquire-max-rounds+)
+    (loop for c across (gethash "cases" v)
+          for got = (ab-judge c)
+          do (incf n)
+             (check-equal (gethash "name" c) (string-downcase (symbol-name got)) (gethash "reason" c))
+             (check-equal (format nil "binds: ~a" (gethash "name" c)) (eq got :binds) (eq (gethash "binds" c) t)))
+    (check "every acquire_binding case ran" (>= n 13))))
+
+;;; The incident itself: a606a4ca's acquire named 21910507, confirmed, which spent 70b0abb3's round-2
+;;; output 46a66b12:0.  Confirmation alone (the old rule) bound it.
+(with-gate ("DEP-06 acquire binding: a606a4ca's acquire naming 21910507 does not bind")
+  (let* ((v (json-simple:parse (uiop:read-file-string (vector-path "acquire_binding.json"))))
+         (c (find-if (lambda (c) (search "1120-090836" (gethash "name" c))) (gethash "cases" v)))
+         (claim "21910507ef3364bc74d898f339b19c293d49abcd478b99168c907d02de3b3711"))
+    (check "the incident case is in the vector" c)
+    (check-equal "it names 21910507" (gethash "claim_txid" c) claim)
+    (multiple-value-bind (tx confirmed) (funcall (ab-view c) (u:txid-bytes claim))
+      (check "the claim is confirmed: the old rule bound it" confirmed)
+      (check-equal "it spent 46a66b12:0"
+                   (list (u:txid-hex (btx:txin-prev-hash (first (btx:tx-inputs tx)))) (btx:txin-prev-index (first (btx:tx-inputs tx))))
+                   (list "46a66b127e0e3afd04f2e4399681128399caab6d6133320c7d02d3569f5c3c79" 0)))
+    (check-equal "judged for a606a4ca's vault: not its lottery" (ab-judge c) :not-this-lottery)))
+
 (report)

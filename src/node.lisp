@@ -157,6 +157,7 @@
   (refused (make-hash-table :test #'equal :synchronized t))   ; ledger id -> seq whose update the rules rejected
   (spender-fn nil)                             ; (lambda (from to outpoints)) -> spend plists (:txid :vout :tx :prevouts :block-hash :height)
   (tx-confs-fn nil)                            ; (lambda (txid)) -> confirmations (0 in the mempool), or NIL when unknown
+  (tx-fn nil)                                  ; (lambda (txid)) -> (values parsed-tx confirmations), or NIL when unknown
   (feerate-fn nil)                             ; (lambda (height)) -> block feerate (DEP-03 Reference feerate)
   (vault-scanned nil)                          ; the last block height scanned for vault spends
   (reported-vault-spend (make-hash-table :test (quote equal) :synchronized t))
@@ -212,14 +213,14 @@
   (let ((o (op:decode-operation (up:update-message update))))
     (dolist (h (node-hooks node)) (handler-case (funcall h rec update o) (error (e) (log! node "hook: ~a" e))))))
 
-(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn pledge-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn feerate-fn tx-confs-fn)
+(defun make-node (&key priv bus (network "signet") height-fn data-dir chain-fn pledge-fn spender-fn utxos-fn (min-confs 1) ln relays broadcast-fn height-of-block block-hash-fn feerate-fn tx-confs-fn tx-fn)
   (let* ((priv (w:even-y-privkey priv))     ; a pooled copy this node owns
          (pub (up:compressed-pubkey priv))
          (node (gossamer:own (%make-node :priv priv :pubkey pub :pubkey-hex (bytes->hex pub)
                            :keypair (w:nostr-keypair priv) :bus bus :network network
                            :height-fn (or height-fn (lambda () 0)) :data-dir data-dir
                            :chain-fn chain-fn :pledge-fn pledge-fn :spender-fn spender-fn :utxos-fn utxos-fn :min-confs min-confs :ln ln :relays relays
-                           :feerate-fn feerate-fn :tx-confs-fn tx-confs-fn
+                           :feerate-fn feerate-fn :tx-confs-fn tx-confs-fn :tx-fn tx-fn
                            :broadcast-fn broadcast-fn :height-of-block height-of-block :block-hash-fn block-hash-fn
                            ;; We subscribe below, before the caller loads the data dir.  A
                            ;; cosign request handled then found no record, took the ledger
@@ -4012,31 +4013,97 @@
                   (acquire-binds-p node f))
           return (op:field o :new-custodian)))
 
-(defvar *confirmed-claims* (make-hash-table :test #'equalp :synchronized t)
-  "Claim txids we have seen confirmed: a confirmation is not re-read.")
+;;; DEP-06 "An acquire binds once its claim confirms" (strict-lottery-v8): a DisputeAcquire binds iff
+;;; its claim_txid is confirmed AND its input 0 spends the dispute's current lottery outpoint.
+;;; Confirmation alone bound a606a4ca's acquire naming 21910507, a confirmed claim of 70b0abb3's
+;;; round-2 output 46a66b12:0 (same script, same value; regtest rearm-rust 1120-090836), and lets
+;;; any armer name any confirmed transaction.  Shared vector inspect/vectors/acquire_binding.json.
+
+(defparameter +rearm-tier-csvs+ '(144 1008 4032 8064)
+  "The recovery tiers' CSVs: a re-arm spend's one input carries one (DEP-06 Phase 4 step 4); a
+   claim's input 0 carries #xfffffffd or the reveal CSV (DEP-03).")
+(defparameter +acquire-max-rounds+ 8 "Rounds followed back from a claim.")
+
+(defun rearm-shaped-p (tx)
+  "One input, one output, the input's nSequence a recovery tier's CSV."
+  (and (= 1 (length (btx:tx-inputs tx))) (= 1 (length (btx:tx-outputs tx)))
+       (member (btx:txin-sequence (elt (btx:tx-inputs tx) 0)) +rearm-tier-csvs+)
+       t))
+
+(defun judge-acquire (tx-fn vaults claim)
+  "Whether the acquire naming CLAIM (txid, wire bytes) binds for the dispute that confiscated the
+   vault VAULTS names: (txid vout) for every rung of its QuorumBegin's fee ladder (DEP-03), any of
+   which may have confirmed.  TX-FN: txid -> (values tx confirmed-p), or NIL when unknown.
+   :BINDS, :UNCONFIRMED (asked again later), :NOT-A-CLAIM (a re-arm spend), :NOT-THIS-LOTTERY."
+  (multiple-value-bind (ctx confirmed) (funcall tx-fn claim)
+    (cond ((not (and ctx confirmed)) :unconfirmed)
+          ((rearm-shaped-p ctx) :not-a-claim)
+          ((zerop (length (btx:tx-inputs ctx))) :not-this-lottery)
+          (t (let ((in (elt (btx:tx-inputs ctx) 0)))
+               (loop with txid = (btx:txin-prev-hash in) and vout = (btx:txin-prev-index in)
+                     repeat (1+ +acquire-max-rounds+)
+                     do (unless (zerop vout) (return :not-this-lottery))
+                        (multiple-value-bind (tx conf) (funcall tx-fn txid)
+                          (unless tx (return :unconfirmed))
+                          (when (some (lambda (i) (member (list (btx:txin-prev-hash i) (btx:txin-prev-index i))
+                                                          vaults :test #'equalp))
+                                      (coerce (btx:tx-inputs tx) 'list))
+                            (return :binds))
+                          (unless (and conf (rearm-shaped-p tx)) (return :not-this-lottery))
+                          (let ((i (elt (btx:tx-inputs tx) 0)))
+                            (setf txid (btx:txin-prev-hash i) vout (btx:txin-prev-index i))))
+                     finally (return :not-this-lottery)))))))
+
+(defun fork-acquire-vaults (fork u)
+  "The vault the DisputeAcquire U on FORK is judged against: every rung's vault outpoint of the
+   latest QuorumBegin before it not authored by the acquirer (it rotates only after acquiring)."
+  (let ((q (record-latest fork :quorum-begin :below (up:update-seq u)
+                          :test (lambda (q) (not (equalp (up:update-operator-id q) (up:update-operator-id u)))))))
+    (and q (let ((o (op:update-op q)))
+             (mapcar (lambda (r) (list r (op:field o :new-outpoint-vout))) (fr:rotation-rungs o))))))
+
+(defvar *acquire-verdicts* (make-hash-table :test #'equalp :synchronized t)
+  "(claim-txid vault-rung-0) -> a final verdict: never re-read.")
 (defvar *unconfirmed-claims* (make-hash-table :test #'equalp :synchronized t)
-  "Claim txid -> when we last found it unconfirmed: asked again after a minute, not on every
-   co-sign check (a phantom acquire's claim never confirms, and every check paid a
+  "(claim-txid vault-rung-0) -> when we last judged it :UNCONFIRMED: asked again after a minute,
+   not on every co-sign check (a phantom acquire's claim never confirms, and every check paid a
    getrawtransaction, which waits on the txindex).")
 
 (defun acquire-confirmed-p (node fork)
-  "FORK carries a DisputeAcquire whose claim_txid is confirmed on chain (DEP-06, strict-lottery-v8:
-   an acquire binds once its claim confirms).  Without a way to ask the chain, T: the acquire as
-   published, the reading before the rule."
+  "FORK carries a DisputeAcquire that binds: its claim_txid confirmed AND spending its dispute's
+   lottery outpoint (JUDGE-ACQUIRE).  With no TX-FN, the confirmation alone (TX-CONFS-FN); with
+   neither, T: the acquire as published, the reading before the rule."
   (multiple-value-bind (u o) (fork-op fork :dispute-acquire)
-    (declare (ignore u))
     (and o
          (let ((txid (op:field o :claim-txid)))
-           (or (null (node-tx-confs-fn node))
-               (and txid (gethash txid *confirmed-claims*))
-               (let ((seen (and txid (gethash txid *unconfirmed-claims*))))
-                 (unless (and seen (< (- (get-universal-time) seen) 60))
-                   (let ((c (ignore-errors (funcall (node-tx-confs-fn node) txid))))
-                     (if (and c (plusp c))
-                         (progn (remhash txid *unconfirmed-claims*)
-                                (setf (gethash txid *confirmed-claims*) t))
-                         (progn (when txid (setf (gethash txid *unconfirmed-claims*) (get-universal-time)))
-                                nil))))))))))
+           (cond
+             ((node-tx-fn node)
+              (let* ((vaults (and txid (fork-acquire-vaults fork u)))
+                     (key (and vaults (list txid (first (first vaults))))))
+                (when key
+                  (let ((v (gethash key *acquire-verdicts*)))
+                    (if v
+                        (eq v :binds)
+                        (let ((seen (gethash key *unconfirmed-claims*)))
+                          (unless (and seen (< (- (get-universal-time) seen) 60))
+                            (let ((v (or (ignore-errors
+                                          (judge-acquire (lambda (t1)
+                                                           (multiple-value-bind (tx confs) (funcall (node-tx-fn node) t1)
+                                                             (and tx (values tx (and confs (plusp confs))))))
+                                                         vaults txid))
+                                         :unconfirmed)))
+                              (if (eq v :unconfirmed)
+                                  (progn (setf (gethash key *unconfirmed-claims*) (get-universal-time)) nil)
+                                  (progn (remhash key *unconfirmed-claims*)
+                                         (unless (eq v :binds)
+                                           (log! node "DisputeAcquire on ~a: claim ~a does not bind (~(~a~))"
+                                                 (subseq (record-id-hex fork) 0 8) (txid-hex txid) v))
+                                         (setf (gethash key *acquire-verdicts*) v)
+                                         (eq v :binds)))))))))))
+             ((node-tx-confs-fn node)
+              (let ((c (and txid (ignore-errors (funcall (node-tx-confs-fn node) txid)))))
+                (and c (plusp c))))
+             (t t))))))
 
 (defun cosign-refusal (own members qb-seq disputes &key ruleset)
   "DEP-05 \"Deposed operator\": a reason string when member OWN of MEMBERS must refuse to
@@ -4197,15 +4264,46 @@
   (cl-consensus.encoding:segwit-encode (rs:hrp-for (intern (string-upcase (node-network node)) :keyword)) 1
                                        (subseq (lot:key-path-spk (up:x-only (node-pubkey node))) 2)))
 
-(defun lottery-seed (node id-hex &optional (round 1))
-  "Our lottery seed for a dispute on ID-HEX, derived from the node key so a
-   restarted node recovers the preimage it committed to."
+(defun fork-identity (fork)
+  "The dispute FORK is: (values last-valid-sequence fork-point-hash) from our own DisputeEnter on
+   it, the hash being that update's previous_hash, the chain hash of the update at the fork point.
+   Read from the fork's own updates, so a restarted node has it before its base is loaded.  With
+   no DisputeEnter, the fork point and zeros."
+  (multiple-value-bind (u o) (fork-op fork :dispute-enter)
+    (if u
+        (values (or (op:field o :last-valid-sequence) (record-fork-seq fork)) (up:update-prev-hash u))
+        (values (or (record-fork-seq fork) 0) (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))))
+
+(defun lottery-seed (node fork &optional (round 1))
+  "Our lottery seed for the dispute FORK is, derived from the node key so a restarted node
+   recovers the preimage it committed to.  DEP-06: fresh per dispute and per round.  It binds the
+   fork's identity (FORK-IDENTITY); the v1 seed bound only the ledger, so every dispute of one
+   ledger reused one preimage, and a preimage revealed in one dispute was known before the next
+   one's arms closed."
+  (multiple-value-bind (lvs point) (fork-identity fork)
+    (fork-lottery-seed (node-priv node) (record-id-hex fork) lvs point round)))
+
+(defun fork-lottery-seed (priv id-hex lvs point round)
+  "sha256(\"deposits/cl/lottery-seed/v2\" || PRIV || ledger id || LVS (8 BE) || POINT || ROUND (4 BE))."
+  (let ((out (make-array 32 :element-type '(unsigned-byte 8))))
+    (natrium:with-sha256 (c)
+      (natrium:sha256-update c (ascii->bytes "deposits/cl/lottery-seed/v2"))
+      (natrium:sha256-update c priv)          ; streamed: never concatenated
+      (natrium:sha256-update c (hex->bytes id-hex))
+      (natrium:sha256-update c (int->be lvs 8))
+      (natrium:sha256-update c point)
+      (natrium:sha256-update c (int->be round 4))
+      (natrium:sha256-final-into c out))
+    out))
+
+(defun lottery-seed-v1 (node id-hex &optional (round 1))
+  "The seed builds before the fork-bound LOTTERY-SEED armed with: only to recover, after a restart,
+   the preimage of a fork armed by such a build.  Never used to arm."
   (let ((out (make-array 32 :element-type '(unsigned-byte 8))))
     (natrium:with-sha256 (c)
       (natrium:sha256-update c (ascii->bytes "deposits/cl/lottery-seed/v1"))
-      (natrium:sha256-update c (node-priv node))          ; streamed: never concatenated
+      (natrium:sha256-update c (node-priv node))
       (natrium:sha256-update c (hex->bytes id-hex))
-      ;; DEP-06 Phase 4: a re-arm round commits a fresh preimage; round 1's seed is unchanged
       (when (> round 1) (natrium:sha256-update c (ascii->bytes (format nil "/rearm-round/~d" round))))
       (natrium:sha256-final-into c out))
     out))
@@ -4275,7 +4373,7 @@
 (defun arm-dispute (node fork &key seed replacement (round 1))
   "Commit to our lottery preimage on our fork.  REPLACEMENT is (txid vout sats) or NIL.  ROUND > 1:
    an arm for that re-arm round (DEP-06 Phase 4), with its own preimage."
-  (let ((preimage (lot:derive-preimage (or seed (lottery-seed node (record-id-hex fork) round)))))
+  (let ((preimage (lot:derive-preimage (or seed (lottery-seed node fork round)))))
     (when replacement (await-pledge-height node replacement))
     ;; DEP-06 §Confiscation obligations: record a dangling migration before arming.
     (handler-case (record-obligations node fork)
@@ -4306,7 +4404,7 @@
    requires of a same-round re-arm; REPLACEMENT (txid vout sats) is the pledge it declares, else a
    fresh one.  The update it published."
   (let* ((fork (or (find-fork node id-hex (node-pubkey node)) (fail "no fork of ~a" (subseq id-hex 0 8))))
-         (preimage (or (record-preimage fork) (lot:derive-preimage (lottery-seed node id-hex 1))))
+         (preimage (or (record-preimage fork) (lot:derive-preimage (lottery-seed node fork 1))))
          (p (or replacement (pledge-collateral node id-hex) (fail "no collateral to pledge"))))
     (setf (record-preimage fork) preimage)
     (let ((u (new-update node fork (%strip-nil-fields
@@ -5416,7 +5514,7 @@
                                     (setf (aref k 0) 2) (loop for i from 1 below 33 do (setf (aref k i) (random 256))) k)
                           :network (node-network node) :height-fn (node-height-fn node) :chain-fn (node-chain-fn node)
                           :pledge-fn (node-pledge-fn node) :spender-fn (node-spender-fn node) :feerate-fn (node-feerate-fn node)
-                          :tx-confs-fn (node-tx-confs-fn node)
+                          :tx-confs-fn (node-tx-confs-fn node) :tx-fn (node-tx-fn node)
                           :height-of-block (node-height-of-block node) :block-hash-fn (node-block-hash-fn node)
                           :parent node))
            (top (first base))
@@ -6612,8 +6710,18 @@
                                           for o = (op:update-op u)
                                           when (op:field o :replacement-collateral-txid)
                                             collect (outpoint-key (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)))))
+           ;; So is a claim of ours (output 0 of every DisputeAcquire's claim_txid): it pays our
+           ;; own address, as our coins do, but it is a ledger's custody until rotated into its
+           ;; vault, and selecting by script would pledge (or consolidate) it for another
+           ;; dispute (the select-by-script hazard of deposits-rust's claim, 1120-090836).
+           (custody (loop for r being the hash-values of (node-ledgers node)
+                          when (and (record-fork-p r) (record-owned-p r))
+                            append (loop for u in (fork-own-updates r :dispute-acquire)
+                                         for o = (op:update-op u)
+                                         when (op:field o :claim-txid)
+                                           collect (outpoint-key (op:field o :claim-txid) 0))))
            (keyed (loop for u in utxos collect (list* :key (outpoint-key (getf u :txid) (getf u :vout)) u)))
-           (taken (append declared (loop for k being the hash-keys of (node-pledges node) collect k)))
+           (taken (append declared custody (loop for k being the hash-keys of (node-pledges node) collect k)))
            (free (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
                                             (member (getf u :key) taken :test #'equal)))
                             keyed))
@@ -8020,8 +8128,13 @@
       (let ((armed (first (fork-own-updates rec :dispute-armed))))   ; the latest arm
         (when armed
           (let* ((aop (op:decode-operation (up:update-message armed)))
-                 (preimage (lot:derive-preimage (lottery-seed node id-hex (or (op:field aop :rearm-round) 1)))))
-            (if (equalp (lot:commitment-of preimage) (op:field aop :commitment-hash))
+                 (round (or (op:field aop :rearm-round) 1))
+                 (preimage (find (op:field aop :commitment-hash)
+                                 (list (lot:derive-preimage (lottery-seed node rec round))
+                                       ;; armed by a build before the fork-bound seed
+                                       (lot:derive-preimage (lottery-seed-v1 node id-hex round)))
+                                 :key #'lot:commitment-of :test #'equalp)))
+            (if preimage
                 (setf (record-preimage rec) preimage)
                 (log! node "fork ~a: armed with a preimage we cannot re-derive" (subseq id-hex 0 8)))))))
     rec))
