@@ -2830,4 +2830,24 @@
     (bt:signal-semaphore gate) (bt:join-thread th)
     (check "a finished drive is no longer listed" (null (nd::drive-inflight n)))))
 
+
+(with-gate ("nodes: a watch pass is timed per step, and a long one says where it went")
+  ;; regtest 1119-214607: cld364's once-a-minute watch pass took 7-15 minutes; its vault watch saw a
+  ;; theft 407 s late, and a dispute waited a whole pass between drives.
+  (let* ((n (nd:make-node :priv (tk 99999999999999999999) :bus (bus:make-mock-bus) :height-fn (lambda () 100)))
+         (nd::*watch-log-ms* 0))
+    (sb-int:encapsulate 'nd::drive-vault-watch 'slow (lambda (f node) (sleep 0.25) (funcall f node)))
+    (unwind-protect (progn (nd::watch-pass n) (nd::watch-pass n))
+      (sb-int:unencapsulate 'nd::drive-vault-watch 'slow))
+    (let ((st (nd::watch-stats n)))
+      (check-equal "two passes counted" (getf st :passes) 2)
+      (check-equal "every step of the pass, in order" (mapcar #'car (getf st :last-steps))
+                   '(:dispute-expired :drive-disputes :drive-rearms :dereliction :vault-watch :migration-watch :obligation-watch :rotation-rebroadcast))
+      (check "the slow step is measured" (>= (cdr (assoc :vault-watch (getf st :last-steps))) 240))
+      (check-equal "totals add both passes" (cddr (assoc :vault-watch (getf st :totals))) 2)
+      (check "no step is shown running between passes" (null (getf st :current))))
+    (let ((line (find-if (lambda (l) (search "watch pass took" l)) (nd:node-log n))))
+      (check "a pass over the limit logs its breakdown, slowest step first"
+             (and line (search "[vault-watch 0." line))))))
+
 (report)

@@ -8,7 +8,7 @@
 # default cld364): it requires at least DRIVE_LOAD_MIN (40) owned forks on it, then runs
 # rotation-post-expiry's rescue arm with the holder as W (PICK_W), whose deadline is W's expiry
 # dispute yielding within 900 s of the rotation confirming.
-#   PASS = that check passes AND the holder logged no "not driven for N s, every drive slot busy"
+#   PASS = that check passes AND the holder logged no "dispute X: not driven for N s (...)"
 #          while it ran.  Reports the holder's :drive-stats before and after, its slowest drives.
 #   SKIP = the holder carries fewer than DRIVE_LOAD_MIN forks: the load this measures is absent.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"
@@ -24,7 +24,7 @@ echo "== holder $H: $owned owned forks, $live live"
 M=$(date -u +%FT%T)
 PICK_W=$H REDTEAM_PX=${REDTEAM_PX:-DL$RANDOM} "$(dirname "$0")/check-rotation-post-expiry.sh" rescue; rc=$?
 log() { sed 's/\x1b\[[0-9;]*m//g' "$CLD_ROOT/$H/node.log" | awk -v m="$M" '$1 >= m'; }
-starved=$(log | grep -c "every drive slot busy")
+starved=$(log | grep -cE "dispute [0-9a-f]{8}: not driven for [0-9]+ s")
 worst=$(log | grep -oE "not driven for [0-9]+ s" | awk '{print $4}' | sort -n | tail -1)
 echo "== $H while the check ran: $starved 'not driven' warnings${worst:+, worst ${worst} s}"
 echo "== $H slowest drives:"; log | grep -oE "dispute [0-9a-f]{8}: drive took [0-9]+ ms.*" | sort -t' ' -k5 -nr | head -5 | sed 's/^/   /'

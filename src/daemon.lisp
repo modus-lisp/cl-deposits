@@ -138,7 +138,8 @@
                :ledger-hash (bytes->hex (rs:reserves-ledger-hash r)))))
         (:drive-stats   ; per-step dispute drive totals since start: (step total-ms calls mean-ms)
          (multiple-value-bind (owned live queued) (nd::drive-load node)
-           (ok :owned owned :live live :queued queued :inflight (nd::drive-inflight node) :steps (nd::drive-stats node))))
+           (ok :owned owned :live live :queued queued :inflight (nd::drive-inflight node) :steps (nd::drive-stats node)
+               :watch (nd::watch-stats node))))
         (:vaults
          ;; Every vault each owned base ledger's QuorumBegins named, oldest first, as
          ;; "txid:vout" (display order): the rotation check proves each but the last spent.
