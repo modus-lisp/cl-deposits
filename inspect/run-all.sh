@@ -32,7 +32,7 @@ compile_gate () {
 }
 echo "== cl-deposits offline gate suite =="
 run_gate compile compile_gate
-lisp_gate vectors inspect/update-test.lisp inspect/operation-test.lisp inspect/dep17-test.lisp inspect/dep16-test.lisp inspect/descriptor-test.lisp inspect/reserves-test.lisp inspect/rotation-test.lisp inspect/commitment-test.lisp inspect/lottery-test.lisp
+lisp_gate vectors inspect/update-test.lisp inspect/operation-test.lisp inspect/history-needs-test.lisp inspect/dep17-test.lisp inspect/dep16-test.lisp inspect/descriptor-test.lisp inspect/reserves-test.lisp inspect/rotation-test.lisp inspect/commitment-test.lisp inspect/lottery-test.lisp
 lisp_gate nodes   inspect/update-test.lisp inspect/operation-test.lisp inspect/index-test.lisp inspect/node-test.lisp
 lisp_gate property inspect/update-test.lisp inspect/operation-test.lisp inspect/property-test.lisp
 lisp_gate chaos    inspect/chaos-test.lisp

@@ -165,6 +165,7 @@
   ;; ledger id hex -> proofs we could not judge yet: our replica was behind the sequence they
   ;; rest on (JUDGE-LATER-P).  Each a plist (:hash :proof :content :needs :at).
   (parked-proofs (make-hash-table :test (quote equal) :synchronized t))
+  (proof-catch-ups (make-hash-table :test (quote equal) :synchronized t)) ; ledger id hex -> catch-up thread (KICK-PROOF-CATCH-UP)
   ;; ledger id hex -> txids of confiscations we saw confirmed.  Kept apart from the forks: a fork
   ;; forgets its confiscation once the lottery output is spent (the winner's claim), and the vault
   ;; watch must still excuse it.  Persisted in confiscations.txt.
@@ -270,7 +271,9 @@
                    (loop until (node-inbox node) do (bt:condition-wait (node-inbox-cv node) (node-inbox-lock node)))
                    (setf (node-busy node) t)
                    (pop (node-inbox node)))))
-      (unwind-protect (handle-event node event) (setf (node-busy node) nil)))))
+      ;; A function is work queued for this lane (KICK-PROOF-CATCH-UP's re-judge).
+      (unwind-protect (if (functionp event) (ignore-errors (funcall event)) (handle-event node event))
+        (setf (node-busy node) nil)))))
 
 (defun cosign-request-event-p (event)
   (and (= (ev:event-kind event) w:+kind-request+) (equal (w:event-action event) "cosign_update")))
@@ -7475,22 +7478,21 @@
 ;;; daemon did the same ("fraud proof rejected" with the replica behind).  A member briefly
 ;;; behind must not lose its standing, and delivering a proof ahead of its updates must not be a
 ;;; way to silence one.  So a proof that fails while our replica of a ledger it rests on is
-;;; behind (FR:PROOF-HISTORY-NEEDS) is caught up and judged again at once, or parked until the
-;;; replica gets there: at most *PARKED-PROOFS-PER-LEDGER* per accused ledger, each for
+;;; behind (FR:PROOF-HISTORY-NEEDS) is parked while that ledger is caught up off the worker, and
+;;; judged again once the replica gets there: at most *PARKED-PROOFS-PER-LEDGER* per accused ledger, each for
 ;;; *PARKED-PROOF-TTL* seconds, re-judged by the watch pass.
 
 (defparameter *parked-proof-ttl* 3600)
 (defparameter *parked-proofs-per-ledger* 32)
-(defvar *rejudging* nil "True while a parked or caught-up proof is being judged again.")
 
 (defun replica-tip (node id)
   (let ((r (find-record node id))) (and r (record-p r) (lg:ledger-sequence (record-ledger r)))))
 
 (defun proof-unmet-needs (node needs)
-  "NEEDS our replicas have not reached, among the ledgers we hold.  A ledger we hold no replica
-   of has no bearing on the verdict here: its verifiers read the relay pool (FAULT-PREFIX)."
-  (remove-if-not (lambda (n) (replica-tip node (car n)))
-                 (fr:unmet-history-needs needs (lambda (id) (replica-tip node id)))))
+  "NEEDS our replicas have not reached.  A ledger we hold no replica of has met none of its needs
+   (DEP-06 vector proof_history_needs.json, as the reference): such a proof is parked and expires
+   unless we come to hold that ledger."
+  (fr:unmet-history-needs needs (lambda (id) (replica-tip node id))))
 
 (defun proof-need-tips (node needs) (mapcar (lambda (n) (or (replica-tip node (car n)) -1)) needs))
 
@@ -7518,23 +7520,37 @@
                      (done set :full))))))))
 
 (defun judge-later-p (node proof why)
-  "PROOF failed verification for WHY.  When our replica of a ledger it rests on is behind, catch
-   up and judge it again, or park it: true, and the caller reports no rejection.  NIL when every
-   need is met (the proof is invalid)."
+  "PROOF failed verification for WHY.  When our replica of a ledger it rests on is behind, park
+   it and start a catch-up of that ledger (KICK-PROOF-CATCH-UP): true, and the caller reports no
+   rejection.  NIL when every need is met (the proof is invalid).  Nothing here waits on a relay:
+   fraud proofs are handled on the main worker, which also answers consent requests, and a
+   catch-up is a 5 s fetch per 200-sequence window for as many windows as the replica is behind."
   (let* ((needs (fr:proof-history-needs proof)) (unmet (proof-unmet-needs node needs)))
-    (when unmet
-      (dolist (n unmet)
-        (let ((r (find-record node (car n)))) (when r (ignore-errors (catch-up-to node r (cdr n))))))
-      (let ((still (proof-unmet-needs node needs)) (id (getf proof :ledger-id)))
-        (cond ((and (null still) (not *rejudging*))
-               (log! node "fraud proof ~a on ~a: our replica was behind (~a); caught up, judging again"
-                     (getf proof :type) (subseq id 0 8) why)
-               (let ((*rejudging* t)) (dispatch-fraud node proof)))
-              (t (let ((n (first (or still unmet))))
-                   (log! node "fraud proof ~a on ~a not judgeable yet: it needs seq ~a of ~a, our replica is at ~a; ~(~a~)"
-                         (getf proof :type) (subseq id 0 8) (cdr n) (subseq (car n) 0 8)
-                         (replica-tip node (car n)) (park-proof node proof needs)))))
-        t))))
+    (when (eq (fr:proof-verdict needs (lambda (id) (replica-tip node id)) nil) :park)
+      (let ((n (first unmet)) (id (getf proof :ledger-id)))
+        (log! node "fraud proof ~a on ~a not judgeable yet (~a): it needs seq ~a of ~a, our replica is at ~a; ~(~a~), catching up"
+              (getf proof :type) (subseq id 0 8) why (cdr n) (subseq (car n) 0 8)
+              (replica-tip node (car n)) (park-proof node proof needs)))
+      (dolist (n unmet) (when (find-record node (car n)) (kick-proof-catch-up node (car n) (cdr n))))
+      t)))
+
+(defun kick-proof-catch-up (node id seq)
+  "Catch our replica of ID up to SEQ on a thread of its own (one per ledger at a time), then have
+   the parked proofs judged again: on the main worker when the node runs one, else on that thread.
+   Returns the thread, or NIL when one is already running for ID."
+  (let ((running (gethash id (node-proof-catch-ups node))))
+    (unless (and running (bt:thread-alive-p running))
+      (setf (gethash id (node-proof-catch-ups node))
+            (bt:make-thread
+             (lambda ()
+               (unwind-protect
+                    (let ((r (find-record node id)))
+                      (when r (ignore-errors (catch-up-to node r seq)))
+                      (if (node-worker node)
+                          (enqueue node (lambda () (rejudge-parked-proofs node)))
+                          (ignore-errors (rejudge-parked-proofs node))))
+                 (remhash id (node-proof-catch-ups node))))
+             :name "cld-proof-catch-up")))))
 
 (defun rejudge-parked-proofs (node &optional (now (get-universal-time)))
   "Drop expired parked proofs and judge again every one whose needs our replicas now meet, or
@@ -7558,7 +7574,7 @@
     (dolist (p ready (length ready))
       (log! node "judging parked fraud proof ~a on ~a again: our replica has caught up"
             (getf (getf p :proof) :type) (subseq (getf (getf p :proof) :ledger-id) 0 8))
-      (let ((*received-broadcast* (getf p :content)) (*rejudging* t))
+      (let ((*received-broadcast* (getf p :content)))
         (ignore-errors (dispatch-fraud node (getf p :proof)))))))
 
 (defun offer-proof-p (proof)

@@ -15,7 +15,7 @@
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire) (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
-           #:proof->json #:json->proof #:requires-embedding-p #:entry-permitted-p #:dispute-fork-point #:proof-history-needs #:unmet-history-needs #:broadcast->json #:json->broadcast #:make-equivocation-proof
+           #:proof->json #:json->proof #:requires-embedding-p #:entry-permitted-p #:dispute-fork-point #:proof-history-needs #:unmet-history-needs #:proof-verdict #:broadcast->json #:json->broadcast #:make-equivocation-proof
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:uncredited-migration-proof #:latest-migration #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
@@ -1069,6 +1069,15 @@
   "The NEEDS (PROOF-HISTORY-NEEDS) our replicas have not reached; TIP-OF maps a ledger id to our
    replica's tip sequence, NIL when we hold none."
   (remove-if (lambda (n) (let ((tip (funcall tip-of (car n)))) (and tip (>= tip (cdr n))))) needs))
+
+(defun proof-verdict (needs tip-of verifies)
+  "DEP-06 (Judging a proof): :judge when the proof VERIFIES (act on it); :park when it failed
+   while one of NEEDS is unmet (hold it, catch up, judge it again: it MUST NOT be treated as
+   invalid); :refuse when it failed with every need met.  The reference's proof_verdict.
+   Vector: proof_history_needs.json."
+  (cond (verifies :judge)
+        ((unmet-history-needs needs tip-of) :park)
+        (t :refuse)))
 
 (defun entry-permitted-p (type embedding)
   "DEP-06 (Entering a dispute): whether the rule lets a member enter a dispute on a proof of TYPE

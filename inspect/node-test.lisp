@@ -2850,6 +2850,11 @@
       (check "a pass over the limit logs its breakdown, slowest step first"
              (and line (search "[vault-watch 0." line))))))
 
+;; A relay that answers every fetch after 2 s (the catch-up a parked proof starts must not run on
+;; the handler's thread).
+(defclass slow-relay (bus:mock-bus) ())
+(defmethod bus:bus-fetch :before ((b slow-relay) filter) (declare (ignore filter)) (sleep 2))
+
 (with-gate ("a proof we cannot judge YET is parked, not refused (regtest 1120-075609)")
   ;; ref7 held seq 0-4 of 7341c3d1 when four NonConformingUpdate proofs of a seq-9 fault arrived;
   ;; it refused each for good and never judged them again once it caught up.  A member that is
@@ -2887,6 +2892,10 @@
              (catch-up (lambda (n) (setf (gethash id (nd:node-ledgers n))
                                          (nd::make-record :id-hex id :ledger (lg:replay history) :history (reverse history)))))
              (parked (lambda (n) (length (gethash id (nd::node-parked-proofs n)))))
+             ;; the catch-up a parked proof starts runs on a thread of its own: wait for it
+             (settle (lambda (n) (loop repeat 200 until (zerop (hash-table-count (nd::node-proof-catch-ups n)))
+                                       do (sleep 0.05))
+                       (zerop (hash-table-count (nd::node-proof-catch-ups n)))))
              (logged (lambda (n what) (some (lambda (l) (search what l)) (nd::node-log n)))))
         (check "the fault is behind our replica's tip" (< qb-seq (1- (up:update-seq bad))))
         (check-equal "the proof needs the update before its fault" (fr:proof-history-needs proof)
@@ -2895,25 +2904,32 @@
         ;; Behind, with no relay to catch up from: parked, not refused.
         (let ((n (funcall behind (bus:make-mock-bus))))
           (nd::handle-operator-fraud n proof)
+          (check "behind: the catch-up ends" (funcall settle n))
           (check "behind: no dispute yet" (null (nd:find-fork n id (nd:node-pubkey n))))
           (check-equal "behind: the proof is parked" (funcall parked n) 1)
           (check "behind: it is not refused" (not (funcall logged n "fraud proof rejected")))
           (check "behind: the log says why" (funcall logged n "not judgeable yet"))
-          (nd::handle-operator-fraud n proof)
+          (nd::handle-operator-fraud n proof) (funcall settle n)
           (check-equal "the same proof again parks nothing new" (funcall parked n) 1)
           (check-equal "no progress: nothing to judge" (nd::rejudge-parked-proofs n) 0)
           (funcall catch-up n)
           (check-equal "caught up: the watch judges it again" (nd::rejudge-parked-proofs n) 1)
           (check "caught up: we dispute" (and (nd:find-fork n id (nd:node-pubkey n)) t))
           (check-equal "caught up: nothing left parked" (funcall parked n) 0))
-        ;; Behind, but the relays hold the updates: caught up and judged at once.
-        (let ((n (funcall behind bus)))
+        ;; Behind, and the relays hold the updates but answer slowly (2 s a fetch): the handler
+        ;; returns at once, the catch-up runs off it, and the proof is judged when it lands.
+        (let* ((slow (make-instance 'slow-relay))
+               (n (progn (setf (bus::mock-bus-events slow) (bus::mock-bus-events bus)) (funcall behind slow)))
+               (t0 (get-internal-real-time)))
           (nd::handle-operator-fraud n proof)
-          (check "behind with a relay: caught up and disputed at once" (and (nd:find-fork n id (nd:node-pubkey n)) t))
+          (check "behind with a slow relay: the handler does not wait for the catch-up"
+                 (< (- (get-internal-real-time) t0) (* 1/2 internal-time-units-per-second)))
+          (check "behind with a slow relay: the catch-up ends" (funcall settle n))
+          (check "behind with a relay: caught up and disputed, no watch pass needed" (and (nd:find-fork n id (nd:node-pubkey n)) t))
           (check-equal "behind with a relay: nothing parked" (funcall parked n) 0))
         ;; A parked proof expires.
         (let ((n (funcall behind (bus:make-mock-bus))))
-          (nd::handle-operator-fraud n proof)
+          (nd::handle-operator-fraud n proof) (funcall settle n)
           (nd::rejudge-parked-proofs n (+ (get-universal-time) nd::*parked-proof-ttl*))
           (check-equal "a parked proof expires unjudged" (funcall parked n) 0)
           (check "and that is logged" (funcall logged n "unjudged")))
@@ -2929,7 +2945,7 @@
         ;; Every need met and it still fails: refused, as before.
         (let ((n (funcall behind (bus:make-mock-bus))))
           (funcall catch-up n)
-          (nd::handle-operator-fraud n honest)
+          (nd::handle-operator-fraud n honest) (funcall settle n)
           (check "caught up, an honest update is no proof: refused" (funcall logged n "fraud proof rejected"))
           (check-equal "and not parked" (funcall parked n) 0))))))
 
