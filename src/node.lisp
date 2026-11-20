@@ -7129,8 +7129,7 @@
                         (t (loop for u in (record-history base) while (> (up:update-seq u) gseq) collect u))))
          ;; FAULT :blind-relay (a ledger id prefix): we read none of that ledger's updates on the
          ;; relay, only our replica and published answers (redteam/check-rotation-lag.sh)
-         (blind (let ((p (getf (node-adversary node) :blind-relay)))
-                  (and (stringp p) (>= (length id-hex) (length p)) (string-equal p (subseq id-hex 0 (length p))))))
+         (blind (relay-blind-p node id-hex))
          (relay (and (not blind)
                      (if k
                          (ledger-updates-from-relays node id-hex :from (1+ k) :to (1+ k))
@@ -7194,8 +7193,7 @@
   "DEP-06 §Spend challenge: whether we can read the places answers to a challenge of ID-HEX's spend
    go: the relays (they hold the spent ledger at its governing QuorumBegin GSEQ) and our own store.
    A judge that cannot reaches no verdict on a lapse."
-  (and (not (let ((p (getf (node-adversary node) :blind-relay)))
-              (and (stringp p) (>= (length id-hex) (length p)) (string-equal p (subseq id-hex 0 (length p))))))
+  (and (not (relay-blind-p node id-hex))
        (ledger-updates-from-relays node id-hex :from gseq :to gseq)
        t))
 
@@ -7812,6 +7810,13 @@
                      (done (cons entry (remove worst set)) :parked-displacing)
                      (done set :full))))))))
 
+(defun relay-blind-p (node id-hex)
+  "FAULT :blind-relay (a ledger id prefix, redteam): true when NODE must read none of ID-HEX's updates
+   on the relays, only its replica and published answers (redteam/check-rotation-lag.sh,
+   check-confiscation-answer.sh).  Every relay read of a ledger's updates asks this."
+  (let ((p (getf (node-adversary node) :blind-relay)))
+    (and (stringp p) (>= (length id-hex) (length p)) (string-equal p (subseq id-hex 0 (length p))))))
+
 (defun judge-later-p (node proof why)
   "PROOF failed verification for WHY.  When our replica of a ledger it rests on is behind, park
    it and start a catch-up of that ledger (KICK-PROOF-CATCH-UP): true, and the caller reports no
@@ -7824,15 +7829,23 @@
         (log! node "fraud proof ~a on ~a not judgeable yet (~a): it needs seq ~a of ~a, our replica is at ~a; ~(~a~), catching up"
               (getf proof :type) (subseq id 0 8) why (cdr n) (subseq (car n) 0 8)
               (replica-tip node (car n)) (park-proof node proof needs)))
-      (dolist (n unmet) (when (find-record node (car n)) (kick-proof-catch-up node (car n) (cdr n))))
+      (dolist (n unmet)
+        (cond ((not (find-record node (car n))))
+              ;; Blind to that ledger on the relays (redteam :blind-relay): parked, never fetched.
+              ;; regtest 1120-112248: a catch-up that ignored the switch let confiscation-answer's
+              ;; blind judge read the dispute it is there to miss.
+              ((relay-blind-p node (car n))
+               (log! node "not catching up ~a for a parked proof: blind to it on the relays" (subseq (car n) 0 8)))
+              (t (kick-proof-catch-up node (car n) (cdr n)))))
       t)))
 
 (defun kick-proof-catch-up (node id seq)
   "Catch our replica of ID up to SEQ on a thread of its own (one per ledger at a time), then have
    the parked proofs judged again: on the main worker when the node runs one, else on that thread.
-   Returns the thread, or NIL when one is already running for ID."
+   Returns the thread, or NIL when one is already running for ID, or when we are blind to ID on the
+   relays (RELAY-BLIND-P)."
   (let ((running (gethash id (node-proof-catch-ups node))))
-    (unless (and running (bt:thread-alive-p running))
+    (unless (or (and running (bt:thread-alive-p running)) (relay-blind-p node id))
       (setf (gethash id (node-proof-catch-ups node))
             (bt:make-thread
              (lambda ()

@@ -3179,6 +3179,27 @@
           (check-equal "caught up: the watch judges it again" (nd::rejudge-parked-proofs n) 1)
           (check "caught up: we dispute" (and (nd:find-fork n id (nd:node-pubkey n)) t))
           (check-equal "caught up: nothing left parked" (funcall parked n) 0))
+        ;; Blind to the ledger on the relays (redteam :blind-relay): parked, and nothing fetched.
+        ;; regtest 1120-112248: confiscation-answer's blind judge must not read, through a proof's
+        ;; catch-up, the dispute the scenario has it miss.  The control is the same replica, not blind.
+        (let ((fetches 0))
+          (sb-int:encapsulate 'nd::catch-up-to 'count (lambda (f &rest args) (incf fetches) (apply f args)))
+          (unwind-protect
+               (let ((n (funcall behind (bus:make-mock-bus))))
+                 (setf (getf (nd::node-adversary n) :blind-relay) (subseq id 0 16))
+                 (nd::handle-operator-fraud n proof)
+                 (funcall settle n)
+                 (check-equal "blind: the proof is parked" (funcall parked n) 1)
+                 (check-equal "blind: no catch-up thread was started" (hash-table-count (nd::node-proof-catch-ups n)) 0)
+                 (check-equal "blind: nothing was fetched" fetches 0)
+                 (check "blind: the log says why" (funcall logged n "blind to it on the relays"))
+                 (check "blind: KICK-PROOF-CATCH-UP refuses too" (null (nd::kick-proof-catch-up n id (1+ qb-seq))))
+                 (check-equal "blind: still nothing fetched" fetches 0)
+                 ;; Control: the same replica on a node that is not blind does fetch.
+                 (nd::handle-operator-fraud (funcall behind (bus:make-mock-bus)) proof)
+                 (loop repeat 200 until (plusp fetches) do (sleep 0.05))
+                 (check "not blind: the catch-up fetches" (plusp fetches)))
+            (sb-int:unencapsulate 'nd::catch-up-to 'count))))
         ;; Behind, and the relays hold the updates but answer slowly (2 s a fetch): the handler
         ;; returns at once, the catch-up runs off it, and the proof is judged when it lands.
         (let* ((slow (make-instance 'slow-relay))
