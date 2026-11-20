@@ -123,7 +123,7 @@ case $ARM in
     done
     mine 1 >/dev/null; sleep 5
     [ -z "$(bcli gettxout "$VTX" "$VVOUT" false | head -1)" ] || fail "the old vault $VAULT is unspent after a block"
-    sp=$(bcli gettxspendingprevout "[{\"txid\":\"$VTX\",\"vout\":$VVOUT}]" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0].get("spendingtxid",""))')
+    sp=$(spender_of "$VTX" "$VVOUT")
     echo "== a rung confirmed at $(bcli getblockcount)"
     mine 2 >/dev/null
     disarm :hold-arm $C1 $W
@@ -151,7 +151,7 @@ case $ARM in
     echo "== the operator's rotation: rc $rc ${RT:+($RT)}"
     for i in $(seq 1 $((WAIT / 10))); do [ -z "$(bcli gettxout "$VTX" "$VVOUT" false | head -1)" ] && break; sleep 10; done
     [ -z "$(bcli gettxout "$VTX" "$VVOUT" false | head -1)" ] || fail "the vault was not spent in ${WAIT}s"
-    sp=$(bcli gettxspendingprevout "[{\"txid\":\"$VTX\",\"vout\":$VVOUT}]" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0].get("spendingtxid",""))')
+    sp=$(spender_of "$VTX" "$VVOUT") || fail "the vault $VAULT is spent, but no transaction in the mempool or the last 30 blocks spends it"
     if [ $rc = 0 ] && [ "$sp" = "$RT" ]; then
       echo "PASS (rotation won the race, $RT): see the rescue arm for its checks."; exit 0
     fi

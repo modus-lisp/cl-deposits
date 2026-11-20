@@ -269,3 +269,21 @@ pick() {
   i=0; for v in "$@"; do declare -g "$v=${sel[$i]}"; i=$((i+1)); done
   echo "== actors: $(for v in "$@"; do printf '%s=%s ' "$v" "${!v}"; done)"
 }
+
+# spender_of TXID VOUT [DEPTH]: the txid that spends TXID:VOUT, from the mempool or from the last
+# DEPTH (30) blocks.  gettxspendingprevout sees only the mempool, so once the spend confirms it
+# answers nothing (regtest 1119-214607: rotation-post-expiry-race read an empty spender, took the
+# rotation's confirmed win for a confiscation, and failed the members who rightly yielded).
+spender_of() {
+  local t=$1 v=$2 depth=${3:-30} sp tip h
+  sp=$(bcli gettxspendingprevout "[{\"txid\":\"$t\",\"vout\":$v}]" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)[0].get("spendingtxid",""))' 2>/dev/null)
+  [ -n "$sp" ] && { echo "$sp"; return 0; }
+  tip=$(bcli getblockcount)
+  for h in $(seq "$tip" -1 $((tip - depth > 0 ? tip - depth : 0))); do
+    sp=$(bcli getblock "$(bcli getblockhash "$h")" 2 | python3 -c 'import json,sys
+b=json.load(sys.stdin); t,v=sys.argv[1],int(sys.argv[2])
+print(next((x["txid"] for x in b["tx"] for i in x["vin"] if i.get("txid")==t and i.get("vout")==v),""))' "$t" "$v")
+    [ -n "$sp" ] && { echo "$sp"; return 0; }
+  done
+  return 1
+}

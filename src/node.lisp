@@ -3156,6 +3156,13 @@
   "A dispute drive taking at least this long logs its duration and the steps it spent it in
    (DRIVE-TIMED).  The numbers the throughput work schedules by: a node with ~60 live disputes
    left one undriven 897 s with every slot busy (regtest 1119-111730, cld364).")
+(defparameter *watch-log-ms* 120000 "A watch pass at least this long logs its step breakdown.")
+(defvar *watch-stats* (make-hash-table :test #'equalp :synchronized t)
+  "node pubkey -> plist: :passes, :last-ms / :last-steps (the last whole pass), :max-ms / :max-steps
+   (the longest), :totals (step -> (ms . calls)), and :current (step . start-time) while a pass runs.
+   regtest 1119-214607: cld364's once-a-minute pass took 7-15 minutes, so its vault watch saw a
+   theft 407 s late and a dispute waited a whole pass between drives; nothing said where it went.")
+
 (defvar *drive-stats* (make-hash-table :test #'equalp)
   "(node pubkey . step) -> (total-ms . calls) over the process's life, :drive the whole drive.")
 (defvar *drive-stats-lock* (bt:make-lock "drive-stats"))
@@ -3492,7 +3499,7 @@
                (unless (or (dormant-dispute-p node r) (in-rearm-round-p node (record-id-hex r))) (incf live)))
     (values owned live (bt:with-lock-held (*drive-threads-lock*) (length (gethash pk *drive-queues*))))))
 
-(defun drive-disputes (node &key parallel)
+(defun drive-disputes (node &key parallel (rearms t))
   "Drive every dispute fork we own.  PARALLEL (the once-a-minute watch): *MAX-DRIVE-THREADS*
    slots for live forks and one for dormant ones, each slot draining a queue in
    DRIVE-SCHEDULE order (live first, least recently driven first) and taking the next fork
@@ -3539,8 +3546,12 @@
                     (let ((w (or (gethash k *drive-waiting*) (setf (gethash k *drive-waiting*) (cons (or (third row) now) nil)))))
                       (when (and (not (cdr w)) (> (- now (car w)) *drive-starved-warn-seconds*))
                         (setf (cdr w) t)
-                        (log! node "dispute ~a: not driven for ~a s, every drive slot busy"
-                              (subseq (first row) 0 8) (- now (car w))))))))
+                        ;; Forks are queued once per watch pass, so a long pass leaves the slots
+                        ;; idle and a fork waiting a whole pass (regtest 1119-214607): say which.
+                        (log! node "dispute ~a: not driven for ~a s (~a of ~a live drive slots running, ~a queued; forks are queued once per watch pass, the last took ~a s)"
+                              (subseq (first row) 0 8) (- now (car w))
+                              (gethash pk *drive-threads* 0) *max-drive-threads* (length (gethash pk *drive-queues*))
+                              (let ((l (getf (gethash pk *watch-stats*) :last-ms))) (if l (round l 1000) "?"))))))))
               (loop for (key cap) in (list (list pk *max-drive-threads*) (list dk 1))
                     for n = (min (- cap (gethash key *drive-threads* 0)) (length (gethash key *drive-queues*)))
                     do (loop repeat (max n 0)
@@ -3548,7 +3559,7 @@
           (dolist (key spawn)
             (let ((key key))
               (bt:make-thread (lambda () (drive-worker node pk key)) :name "drive-dispute")))))
-    (drive-rearms node)))
+    (when rearms (drive-rearms node))))
 
 (defvar *drive-dispute-async* nil
   "Drive a newly entered dispute on its own thread (the daemon sets it; tests drive inline).")
@@ -3576,15 +3587,47 @@
             (bt:make-thread #'drive :name "drive-dispute-now")
             (drive))))))
 
+(defun watch-pass (node)
+  "One pass of the expiry watch, each step timed (WATCH-STATS); one over *WATCH-LOG-MS* logs its
+   breakdown.  The steps run in this order and each one waits for the one before."
+  (let ((pk (node-pubkey node)) (t0 (get-internal-real-time)) (steps '()))
+    (flet ((wstep (name fn)
+             (let ((s0 (get-internal-real-time)))
+               (let ((st (gethash pk *watch-stats*)))
+                 (setf (gethash pk *watch-stats*) (list* :current (cons name (get-universal-time)) (alexandria:remove-from-plist st :current))))
+               (ignore-errors (funcall fn))
+               (push (cons name (ms-since s0)) steps))))
+      (wstep :dispute-expired (lambda () (dispute-expired-quorums node)))
+      (wstep :drive-disputes (lambda () (drive-disputes node :parallel t :rearms nil)))
+      (wstep :drive-rearms (lambda () (drive-rearms node)))
+      (wstep :dereliction (lambda () (drive-dereliction node)))
+      (wstep :vault-watch (lambda () (drive-vault-watch node)))
+      (wstep :migration-watch (lambda () (drive-migration-watch node)))
+      (wstep :obligation-watch (lambda () (drive-obligation-watch node)))
+      (wstep :rotation-rebroadcast (lambda () (drive-rotation-rebroadcast node))))
+    (let* ((ms (ms-since t0)) (steps (nreverse steps))
+           (st (alexandria:remove-from-plist (gethash pk *watch-stats*) :current))
+           (totals (copy-alist (getf st :totals))))
+      (dolist (e steps)
+        (let ((c (assoc (car e) totals)))
+          (if c (setf (cdr c) (cons (+ (cadr c) (cdr e)) (1+ (cddr c)))) (push (list* (car e) (cdr e) 1) totals))))
+      (setf (getf st :passes) (1+ (or (getf st :passes) 0)) (getf st :last-ms) ms (getf st :last-steps) steps
+            (getf st :totals) totals)
+      (when (> ms (or (getf st :max-ms) -1)) (setf (getf st :max-ms) ms (getf st :max-steps) steps))
+      (setf (gethash pk *watch-stats*) st)
+      (when (>= ms *watch-log-ms*)
+        (log! node "watch pass took ~a s [~{~a~^ ~}]" (round ms 1000)
+              (loop for (name . sms) in (sort (copy-list steps) #'> :key #'cdr)
+                    when (>= sms 100) collect (format nil "~(~a~) ~as" name (/ (round sms 100) 10.0))))))))
+
+(defun watch-stats (node)
+  "The expiry watch's timing for NODE (WATCH-PASS), with the step running now and for how long."
+  (let ((st (gethash (node-pubkey node) *watch-stats*)))
+    (append (alexandria:remove-from-plist st :current)
+            (let ((c (getf st :current))) (and c (list :current (list (car c) (- (get-universal-time) (cdr c)))))))))
+
 (defun start-expiry-watch (node &key (interval 60))
-  (bt:make-thread (lambda () (loop (sleep interval)
-                                   (ignore-errors (dispute-expired-quorums node))
-                                   (ignore-errors (drive-disputes node :parallel t))
-                                   (ignore-errors (drive-dereliction node))
-                                   (ignore-errors (drive-vault-watch node))
-                                   (ignore-errors (drive-migration-watch node))
-                                   (ignore-errors (drive-obligation-watch node))
-                                   (ignore-errors (drive-rotation-rebroadcast node))))
+  (bt:make-thread (lambda () (loop (sleep interval) (watch-pass node)))
                   :name "cld-expiry"))
 
 (defun start-invoice-poller (node &key (interval 3))
