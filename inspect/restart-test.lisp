@@ -120,7 +120,12 @@
                       ;; --- Restart once more: reveals must come back from disk, the lottery from public state.
                       (destructuring-bind (b c d) (restart-all (list b c d) (list pb pc pd) bus hf)
                         (check-equal "reveals reloaded from disk" (mapcar (lambda (m) (length (nd:reveals-of m id))) (list b c d)) '(3 3 3))
-                        (let ((outcomes (mapcar (lambda (m) (handler-case (multiple-value-list (nd:claim-or-yield m id))
+                        (let* ((armed-files      ; each fork file as it stands at its arm, before the lottery
+                                 (mapcar (lambda (m priv)
+                                           (let ((p (merge-pathnames (nd::record-file-name (nd:find-fork m id (nd:node-pubkey m))) (dir-for priv))))
+                                             (cons p (uiop:read-file-string p :external-format :latin-1))))
+                                         (list b c d) (list pb pc pd)))
+                               (outcomes (mapcar (lambda (m) (handler-case (multiple-value-list (nd:claim-or-yield m id))
                                                               (error (e) (list :error e))))
                                                 (list b c d))))
                           (check-equal "exactly one winner after the restarts" (count :won outcomes :key #'first) 1)
@@ -130,6 +135,53 @@
                                    (and claim (equalp (btx:txin-prev-hash (first (btx:tx-inputs claim))) (btx:tx-txid ctx)))))
                           (check "everyone replicates the winner's DisputeAcquire"
                                  (let ((winner (nth (position :won outcomes :key #'first) (list b c d))))
-                                   (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey winner)))) (and f (equalp (lg:ledger-operator-key (nd:record-ledger f)) (nd:node-pubkey winner))))) (list b c d)))))))))))))))))
+                                   (every (lambda (m) (let ((f (nd:find-fork m id (nd:node-pubkey winner)))) (and f (equalp (lg:ledger-operator-key (nd:record-ledger f)) (nd:node-pubkey winner))))) (list b c d))))
+                          ;; ref6's disk (regtest 1120-next4): a loser whose yield is on the relay
+                          ;; while its own fork file still ends at its arm (here: killed between the
+                          ;; publish and the save).  Booting again and rerunning the lottery must not
+                          ;; sign a second, different yield at that sequence: it adopts the published
+                          ;; one or signs nothing.
+                          (let* ((li (position :yielded outcomes :key #'first))
+                                 (l (nth li (list b c d))) (lpriv (nth li (list pb pc pd)))
+                                 (lpk (nd:node-pubkey l))
+                                 (y (first (nd:record-history (nd:find-fork l id lpk))))
+                                 (ours-at (lambda ()
+                                            (remove-duplicates
+                                             (loop for e in (bus:mock-bus-events bus)
+                                                   when (= (cl-nostr.event:event-kind e) w:+kind-update+)
+                                                     do (setf e (ignore-errors (w:event->update e)))
+                                                     and when (and e (equalp (up:update-operator-id e) lpk)
+                                                                   (equalp (up:update-ledger-id e) (u:hex->bytes id))
+                                                                   (= (up:update-seq e) (up:update-seq y)))
+                                                           collect (up:encode-update e))
+                                             :test #'equalp))))
+                            (check-equal "the loser's yield is its fork's tip, and on the relay"
+                                         (list (getf (op:update-op y) :type) (length (funcall ours-at))) '(:dispute-yield 1))
+                            (nd:stop-node l)
+                            (incf *height* 7)    ; it comes back later: a yield signed now would carry another header
+                            (destructuring-bind (p . text) (nth li armed-files)
+                              (with-open-file (out p :direction :output :if-exists :supersede :external-format :latin-1)
+                                (write-string text out)))
+                            (let* ((l2 (boot lpriv bus hf)) (f (nd:find-fork l2 id lpk))
+                                   (booted (and f (getf (op:update-op (first (nd:record-history f))) :type))))
+                              (check "booted with its fork at the arm on disk (ref6's shape)"
+                                     (member booted '(:dispute-armed :dispute-yield)))
+                              (let ((again (handler-case (multiple-value-list (nd:claim-or-yield l2 id)) (error (e) (list :error e)))))
+                                (format t "      booted tip ~s; rerun: ~s~%" booted (first again)))
+                              (check-equal "no second update of ours at the yield's sequence" (length (funcall ours-at)) 1)
+                              (let ((tip (first (nd:record-history (nd:find-fork l2 id lpk)))))
+                                (check "the fork ends at the published yield, byte for byte"
+                                       (equalp (up:encode-update tip) (up:encode-update y))))
+                              ;; The property, over everything on the relay: no two signatures of any
+                              ;; member share (ledger, seq) with different content.
+                              (let ((seen (make-hash-table :test #'equalp)) (twice 0))
+                                (dolist (e (bus:mock-bus-events bus))
+                                  (let ((u (and (= (cl-nostr.event:event-kind e) w:+kind-update+) (ignore-errors (w:event->update e)))))
+                                    (when (and u (member (up:update-operator-id u) (list (nd:node-pubkey b) (nd:node-pubkey c) (nd:node-pubkey d)) :test #'equalp))
+                                      (let* ((k (list (up:update-operator-id u) (up:update-ledger-id u) (up:update-seq u)))
+                                             (v (up:encode-update u)) (old (gethash k seen)))
+                                        (if (and old (not (equalp old v))) (incf twice) (setf (gethash k seen) v))))))
+                                (check-equal "no two of a member's signatures share (ledger, seq) with different content" twice 0))
+                              (nd:stop-node l2))))))))))))))))
 
 (report)

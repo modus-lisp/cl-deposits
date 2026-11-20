@@ -663,6 +663,47 @@
   (run-hooks node rec update)
   update)
 
+;;; A DisputeYield of ours is signed at most once per sequence.  The relays may already hold one
+;;; our disk does not (killed between the publish and the save, or a node that broadcast without
+;;; recording: the Rust loser path until b758991, regtest 1120-next4's ref6), and signing another
+;;; there, at a later height, is an equivocation by us.
+
+(defun our-updates-at (node rec seq)
+  "Our own updates of REC's ledger at SEQ as the relays hold them: signed by us and verifying,
+   distinct by bytes.  A failed query signals."
+  (let ((out '()))
+    (dolist (u (ledger-updates-from-relays node (record-id-hex rec) :from seq :to seq) out)
+      (when (and (= (up:update-seq u) seq) (equalp (up:update-operator-id u) (node-pubkey node))
+                 (ignore-errors (up:verify-operator-signature u)))
+        (pushnew u out :test #'equalp :key #'up:encode-update)))))
+
+(defun adopt-update (node rec update)
+  "Record UPDATE, already signed and published by us, on REC: apply, record, persist.  No
+   signing, no publishing: these are the bytes the relays hold."
+  (lg:apply-update (record-ledger rec) update)
+  (record-push rec update)
+  (save-record node rec)
+  (run-hooks node rec update)
+  update)
+
+(defun yield-once (node fork)
+  "Yield our FORK: adopt the DisputeYield of ours the relays already hold at its next sequence,
+   or sign one only when nothing of ours is there.  NIL (and a note) when holding: the query
+   failed, or something of ours other than that yield is already at that sequence."
+  (let* ((tip (tip fork)) (seq (if tip (1+ (up:update-seq tip)) 0))
+         (ours (handler-case (our-updates-at node fork seq)
+                 (error (e) (log! node "yield of ~a held: the relay query failed: ~a" (subseq (record-id-hex fork) 0 8) e)
+                   (return-from yield-once nil)))))
+    (cond ((null ours) (commit-update node fork (new-update node fork (list :type :dispute-yield))))
+          ((and (null (rest ours))
+                (eq (getf (ignore-errors (op:update-op (first ours))) :type) :dispute-yield)
+                (chains-on-p fork (first ours)))
+           (log! node "yield of ~a: adopting ours already published at seq ~a" (subseq (record-id-hex fork) 0 8) seq)
+           (adopt-update node fork (first ours)))
+          (t (log! node "yield of ~a held: ~a update~:p of ours other than its yield at seq ~a"
+                   (subseq (record-id-hex fork) 0 8) (length ours) seq)
+             nil))))
+
 (defvar *cosign-post-expiry-establishment*
   (let ((v (uiop:getenv "CLD_REFUSE_POST_EXPIRY_ROTATION"))) (not (and v (plusp (length v)) (not (string= v "0")))))
   "Member policy, not protocol (DEP-05 §Cosignature Threshold, ruled 2026-11-14: \"we can allow it,
@@ -3279,7 +3320,8 @@
         (return-from %drive-dispute
           (note-dispute node id "not driven: ~:[no replica of the ledger~;no DisputeEnter of ours on the fork~]" base)))
       (flet ((conclude (fmt &rest args)
-               (dstep :yield (commit-update node fork (new-update node fork (list :type :dispute-yield))))
+               (unless (dstep :yield (yield-once node fork))
+                 (return-from %drive-dispute (note-dispute node id "yield held (YIELD-ONCE)")))
                (release-pledges node id)
                (return-from %drive-dispute (apply #'note-dispute node id fmt args))))
         (when (find-if (lambda (r) (> (getf r :round) 1)) (rearm-rounds node id))
@@ -4240,7 +4282,7 @@
   (let ((expiry (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and expiry (null anchor-block-height) (not (expiry-reason-p reason))
                (unarmed-expiry-fork-p expiry))
-      (commit-update node expiry (new-update node expiry (list :type :dispute-yield)))
+      (yield-once node expiry)
       (release-pledges node (record-id-hex rec))
       (note-dispute node (record-id-hex rec) "un-armed expiry dispute yielded for a punitive one (~a)" reason)
       (retire-fork node expiry)))
@@ -5877,7 +5919,7 @@
           ;; output stays unspent, and the re-arm round (DEP-06 Phase 4) must recover it.
           (unless (and (equalp winner-pk (up:x-only (node-pubkey node)))
                        (not (and (getf (node-adversary node) :yield-win) (null lottery-tx))))
-            (commit-update node fork (new-update node fork (list :type :dispute-yield)))
+            (unless (yield-once node fork) (fail "yield held (YIELD-ONCE)"))
             (return-from claim-or-yield (values :yielded nil)))
           (let* ((txid (or confiscation-txid (and conf (btx:tx-txid conf)) (fail "no confiscation tx")))
                  (claim-txid (if lottery-tx (btx:tx-txid lottery-tx) txid))   ; the output we spend
