@@ -960,11 +960,24 @@
                                           :confirmations (gethash "confirmations" u)))
           for own = (let ((o (gethash "own" c))) (and (stringp o) o))
           for want = (let ((e (gethash "expect" c))) (and (stringp e) e))
+          for held = (loop for f across (or (gethash "forks" c) #())
+                           append (multiple-value-bind (pledges custody)
+                                      (nd::fork-pledges-held
+                                       (loop for o across (gethash "ops" f)
+                                             for k = (gethash "op" o)
+                                             collect (cond ((string= k "enter") (list :enter))
+                                                           ((string= k "arm") (let ((p (gethash "pledge" o))) (list :arm (and (stringp p) p))))
+                                                           ((string= k "yield") (list :yield))
+                                                           ((string= k "acquire")
+                                                            (list :acquire (format nil "~a:0" (gethash "claim" o)) (eq (gethash "binds" o) t)))
+                                                           (t (error "unknown fork op ~a" k))))
+                                       :retired (eq (gethash "retired" f) t))
+                                    (append pledges (and custody (list custody)))))
           for got = (nd::pick-pledge utxos (gethash "need" c) (gethash "min_confs" c) own
-                                     (coerce (gethash "taken" c) 'list))
+                                     (append (coerce (gethash "taken" c) 'list) held))
           do (incf n)
              (check-equal (format nil "pledge: ~a" (gethash "name" c)) (getf got :key) want))
-    (check-equal "every pledge_pick case ran" n 9)))
+    (check-equal "every pledge_pick case ran" n 18)))
 
 ;;; inspect/vectors/acquire_binding.json: DEP-06 "An acquire binds once its claim confirms", shared
 ;;; with deposits-rust (deposits-node/tests/vectors/acquire_binding.json): a DisputeAcquire binds iff

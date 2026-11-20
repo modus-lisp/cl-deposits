@@ -3974,6 +3974,10 @@
    a confiscation is kept (note-confiscation persists it)."
   (when (record-confiscation fork) (note-confiscation node (record-fork-of fork) (btx:tx-txid (record-confiscation fork))))
   (remhash (fork-key (record-fork-of fork) (record-fork-operator fork)) (node-ledgers node))
+  ;; DEP-03 "When a pledge is live": retiring our fork ends its dispute's hold on our pledges.
+  ;; (Not while a re-arm round is under way: a yield ends a round, not the dispute, as in DRIVE-DISPUTE.)
+  (when (and (equalp (record-fork-operator fork) (node-pubkey node)) (not (rearm-rounds node (record-fork-of fork))))
+    (release-pledges node (record-fork-of fork)))
   (log! node "fork of ~a by ~a retired (concluded or superseded by a later QuorumBegin)"
         (subseq (record-fork-of fork) 0 8) (subseq (bytes->hex (record-fork-operator fork)) 0 8)))
 
@@ -6720,6 +6724,49 @@
                    (lambda (a b) (or (< (getf a :sats) (getf b :sats))
                                      (and (= (getf a :sats) (getf b :sats)) (string< (getf a :key) (getf b :key)))))))))
 
+;;; DEP-03 §Replacement collateral declaration: a coin pledged in a LIVE dispute is not pledged in
+;;; another.  What a fork of ours still holds, from its own dispute operations.
+
+(defun fork-pledges-held (events &key retired)
+  "EVENTS are a fork's own dispute operations, oldest first: (:enter), (:arm KEY-OR-NIL),
+   (:yield), (:acquire CLAIM-KEY BINDS).  (values PLEDGES CUSTODY ENDED): a pledge is held from its
+   arm until a later yield (or the tombstone a lost lottery leaves), a binding acquire (the winner's
+   claim confirmed: it spent the pledge or left it free), or retirement (RETIRED); a binding claim's
+   output 0 is custody while that acquire stands; ENDED is true when the dispute has ended for us.
+   Regtest 1120-next4 (deposits-rust ref6): counting every pledge ever declared left a long-lived
+   node with 31 coins and none it could pledge.  Vector: pledge_pick.json (its forks cases)."
+  (if retired
+      (values nil nil t)
+      (let ((pledges '()) (custody nil) (ended nil))
+        (dolist (e events)
+          (ecase (first e)
+            (:enter (setf ended nil))
+            (:arm (when (second e) (push (second e) pledges)) (setf custody nil ended nil))
+            (:yield (setf pledges '() custody nil ended t))
+            (:acquire (if (third e)
+                          (setf pledges '() custody (second e) ended t)
+                          (setf custody nil)))))
+        (values (nreverse pledges) custody ended))))
+
+(defun fork-pledge-events (node fork)
+  "FORK's own dispute operations as FORK-PLEDGES-HELD reads them, oldest first; its latest
+   acquire binds by ACQUIRE-CONFIRMED-P."
+  (let* ((us (loop for type in '(:dispute-enter :dispute-armed :dispute-yield :dispute-acquire)
+                   append (remove-if-not (lambda (u) (equalp (up:update-operator-id u) (record-fork-operator fork)))
+                                         (fork-own-updates fork type))))
+         (us (sort (copy-list us) #'< :key #'up:update-seq))
+         (last-acquire (find :dispute-acquire (reverse us) :key (lambda (u) (ignore-errors (op:update-type u))))))
+    (loop for u in us
+          for o = (op:update-op u)
+          collect (ecase (op:operation-type o)
+                    (:dispute-enter (list :enter))
+                    (:dispute-armed (list :arm (and (op:field o :replacement-collateral-txid)
+                                                    (outpoint-key (op:field o :replacement-collateral-txid)
+                                                                  (op:field o :replacement-collateral-vout)))))
+                    (:dispute-yield (list :yield))
+                    (:dispute-acquire (list :acquire (and (op:field o :claim-txid) (outpoint-key (op:field o :claim-txid) 0))
+                                            (and (eq u last-acquire) (acquire-confirmed-p node fork) t)))))))
+
 (defun pledge-collateral (node id-hex)
   "A confirmed UTXO of ours, pledged to ID-HEX, covering its required replacement
    collateral: (txid vout sats), or NIL.  When no single UTXO is large enough but
@@ -6732,26 +6779,26 @@
         (when u (return-from pledge-collateral (list (getf u :txid) (getf u :vout) (getf u :sats))))
         (remhash (first mine) (node-pledges node))))           ; spent or gone: pledge afresh
     (let* ((need (required-replacement-sats (or (find-record node id-hex) (fail "unknown ledger"))))
-           ;; Anything we declared in a DisputeArmed is taken, recorded or not (an arm
-           ;; made by hand on the control socket, or before pledges were kept).
-           (declared (loop for r being the hash-values of (node-ledgers node)
-                           when (and (record-fork-p r) (record-owned-p r))
-                             append (loop for u in (fork-own-updates r :dispute-armed)
-                                          for o = (op:update-op u)
-                                          when (op:field o :replacement-collateral-txid)
-                                            collect (outpoint-key (op:field o :replacement-collateral-txid) (op:field o :replacement-collateral-vout)))))
-           ;; So is a claim of ours (output 0 of every DisputeAcquire's claim_txid): it pays our
-           ;; own address, as our coins do, but it is a ledger's custody until rotated into its
-           ;; vault, and selecting by script would pledge (or consolidate) it for another
-           ;; dispute (the select-by-script hazard of deposits-rust's claim, 1120-090836).
-           (custody (loop for r being the hash-values of (node-ledgers node)
-                          when (and (record-fork-p r) (record-owned-p r))
-                            append (loop for u in (fork-own-updates r :dispute-acquire)
-                                         for o = (op:update-op u)
-                                         when (op:field o :claim-txid)
-                                           collect (outpoint-key (op:field o :claim-txid) 0))))
+           ;; What our forks still hold (FORK-PLEDGES-HELD): the pledges of disputes that have
+           ;; not ended for us, declared on the fork whether recorded in NODE-PLEDGES or not (an
+           ;; arm made by hand, or before pledges were kept), and the custody of a binding claim of
+           ;; ours (output 0 pays our own address, as our coins do, but it is a ledger's custody
+           ;; until rotated: 1120-090836).  A yielded, tombstoned, acquired or retired dispute holds
+           ;; nothing (regtest 1120-next4).
+           (held (loop for r being the hash-values of (node-ledgers node)
+                       when (and (record-fork-p r) (record-owned-p r))
+                         collect (cons (record-fork-of r)
+                                       (multiple-value-list (fork-pledges-held (fork-pledge-events node r))))))
+           (declared (loop for h in held append (second h)))
+           (custody (loop for h in held when (third h) collect (third h)))
+           ;; A NODE-PLEDGES reservation is held until its dispute ends for us: released when our
+           ;; fork concludes or is retired (RELEASE-PLEDGES), and not counted once our fork of it
+           ;; has ended, even if the release was missed.  One with no fork yet is held.
+           (reserved (loop for k being the hash-keys of (node-pledges node) using (hash-value v)
+                           for h = (find v held :key #'first :test #'equal)
+                           unless (and h (fourth h)) collect k))
            (keyed (loop for u in utxos collect (list* :key (outpoint-key (getf u :txid) (getf u :vout)) u)))
-           (taken (append declared custody (loop for k being the hash-keys of (node-pledges node) collect k)))
+           (taken (append declared custody reserved))
            (free (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
                                             (member (getf u :key) taken :test #'equal)))
                             keyed))

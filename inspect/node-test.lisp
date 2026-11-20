@@ -1322,6 +1322,13 @@
               (yielded (count-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-yield)) (list b c d))))
           (check-equal "one winner claimed, the others yielded" (list acquired yielded) '(1 2)))
         (check "every pledge released" (every (lambda (m) (zerop (hash-table-count (nd:node-pledges m)))) (list b c d)))
+        ;; DEP-03: only a LIVE dispute holds a pledge.  A loser's coin, its dispute over (yielded),
+        ;; is pledgeable again (regtest 1120-next4: counting every pledge ever declared left ref6
+        ;; with 31 coins and none it could pledge).
+        (let ((l (find-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-yield)) (list b c d))))
+          (check "a loser's coin is unspent" (gethash (cons (coerce (u:sha256 (nd:node-pubkey l)) 'list) 0) chain))
+          (check "and, its dispute over, is pledgeable to another"
+                 (equalp (first (nd:pledge-collateral l (nd::node-member-ledger-hex l))) (u:sha256 (nd:node-pubkey l)))))
         ;; The winner's claim pays its own key-path address, where its coins are; until it is
         ;; rotated into a vault it is this ledger's custody, never a pledge for another dispute.
         (let* ((w (find-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-acquire)) (list b c d)))
