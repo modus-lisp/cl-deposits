@@ -59,6 +59,7 @@ anyone is zero. Each one is a finding.
 |---|---|---|
 | Long-running ledgers (100k+ updates) | have | The Oct 24–28 soaks found Rust and cl full scans at about 140–190k updates |
 | Many dispute forks on one ledger | idea | cl once held 56 forks on one node |
+| Stale expiry fork, then a punitive proof on the same ledger (regtest red team) | idea | Signet 2026-11-20: ref7's un-armed `quorum_expired` fork of 5effb9e8 (opened Nov 14, never yielded) absorbed its own Equivocation detection six days and 135k updates later; it signed no punitive DisputeEnter and cld4 proved it derelict. Recipe: on regtest, let a ledger's quorum lapse with a member's collateral wallet EMPTY (so it enters, un-armed, and cannot arm); have the operator re-establish (QuorumBegin) and keep operating; then make the operator equivocate (a cl operator: `cld_ctl … "(:equivocate :ledger …)"`, as `devnet/mixed.sh` step 7). Oracle: every member signs a non-expiry DisputeEnter citing the proof within its `dispute_response_blocks` (armed or not), the stale expiry fork is yielded, and no DisputeDereliction names an honest member. Variants: re-establishment unconfirmed under strict-lottery-v8 (the expiry fork still live); the member's history trimmed below genesis (`DEPOSITS_HISTORY_RETAIN` small) so its own proof must bind through the checkpoint; a Rust member on a binary that refuses an un-armed DisputeYield next to one that accepts it |
 | Many ledgers per node | idea | |
 | Bot load spikes | idea | |
 

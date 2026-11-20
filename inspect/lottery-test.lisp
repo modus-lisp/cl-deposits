@@ -472,6 +472,45 @@
                                 (lg:ledger-error () nil))
                               (eq (gethash "ok" case) t)))))))
 
+;;; inspect/vectors/dispute_yield_states.json: where a DisputeYield is valid, shared with
+;;; deposits-rust (deposits-core/tests/vectors/dispute_yield_states.json).
+(with-gate ("DEP-05/06 DisputeYield: the dispute states against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "dispute_yield_states.json")))))
+    (check "the vector has every state, armed and un-armed" (>= (length (gethash "cases" v)) 10))
+    (flet ((arm (commit collateral round)
+             (append (list :type :dispute-armed :armed-block 100
+                           :commitment-hash (make-array 20 :element-type '(unsigned-byte 8) :initial-element commit)
+                           :target-reserves "t")
+                     (when collateral
+                       (list :replacement-collateral-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
+                             :replacement-collateral-vout 0 :replacement-collateral-amount 50000))
+                     (when round (list :rearm-round round)))))
+      (loop for c across (gethash "cases" v)
+            for name = (gethash "name" c)
+            do (let ((l (lg:make-ledger)))
+                 (loop for o across (gethash "ops" c)
+                       do (lg:apply-operation
+                           l (let ((k (gethash "op" o)))
+                               (cond ((string= k "enter") (list :type :dispute-enter :last-valid-sequence 0 :reason (gethash "reason" o)))
+                                     ((string= k "arm") (arm #x11 t nil))
+                                     ((string= k "arm_bare") (arm #x11 nil nil))
+                                     ((string= k "arm_round_2") (arm #x22 t 2))
+                                     ((string= k "yield") (list :type :dispute-yield))
+                                     ((string= k "acquire")
+                                      (list :type :dispute-acquire :new-custodian (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2)
+                                            :claim-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4)
+                                            :new-reserves-address ""))
+                                     (t (error "unknown op ~a" k))))))
+                 (check-equal (format nil "yield: ~a: state before" name)
+                              (string-downcase (symbol-name (lg:ledger-dispute-state l))) (gethash "state_before" c))
+                 (check-equal (format nil "yield: ~a" name)
+                              (handler-case (progn (lg:apply-operation l (list :type :dispute-yield)) "accept")
+                                (lg:ledger-error () "reject"))
+                              (gethash "yield" c))
+                 (when (stringp (gethash "state_after" c))
+                   (check-equal (format nil "yield: ~a: state after" name)
+                                (string-downcase (symbol-name (lg:ledger-dispute-state l))) (gethash "state_after" c))))))))
+
 ;;; inspect/vectors/dispute_armed_round.json: DisputeArmed's rearm_round (TLV 366) on the wire,
 ;;; shared with deposits-rust (deposits-protocol/tests/vectors/dispute_armed_round.json).
 (with-gate ("DEP-06 re-arm rounds: DisputeArmed's TLV 366 against the shared vector")
