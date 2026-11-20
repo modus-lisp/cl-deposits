@@ -3199,7 +3199,7 @@
                  (nd::handle-operator-fraud (funcall behind (bus:make-mock-bus)) proof)
                  (loop repeat 200 until (plusp fetches) do (sleep 0.05))
                  (check "not blind: the catch-up fetches" (plusp fetches)))
-            (sb-int:unencapsulate 'nd::catch-up-to 'count))))
+            (sb-int:unencapsulate 'nd::catch-up-to 'count)))
         ;; Behind, and the relays hold the updates but answer slowly (2 s a fetch): the handler
         ;; returns at once, the catch-up runs off it, and the proof is judged when it lands.
         (let* ((slow (make-instance 'slow-relay))
