@@ -4068,6 +4068,17 @@
            *received-broadcast*)
       (and fraud-proof (w:json (fr:broadcast->json fraud-proof)))))
 
+(defun self-dispute-refusal (us accused33 operator33)
+  "Why US must not dispute a ledger whose current operator is OPERATOR33 on a proof accusing
+   ACCUSED33, or NIL when it may.  DEP-06 §Enter: the accused operator never signs a DisputeEnter
+   on its own ledger.  Its key already signs the ledger's chain, so a fork it opened would put a
+   second update under that key at the fork's first sequence: an equivocation proof against
+   itself (signet soak, 2026-11-19: deposits-rust ref4 forked its own 5effb9e8 at 432509 on a
+   QuorumExpired proof against it, then signed the main chain's 432510).  Vector
+   self_dispute.json."
+  (cond ((and accused33 (equalp accused33 us)) "the proof accuses us")
+        ((and operator33 (equalp operator33 us)) "we operate the ledger")))
+
 (defun enter-dispute (node rec last-valid-seq &key (reason "fraud") anchor-block-hash anchor-block-height fraud-proof-hash fraud-proof)
   "We are a quorum member of REC's ledger and have grounds: fork it and publish DisputeEnter.  A
    punitive one carries its proof (FRAUD-PROOF, or the broadcast being handled) as TLV 345, so an
@@ -4079,6 +4090,15 @@
   (when (reserves-confiscated-p node rec)
     (note-dispute node (record-id-hex rec) "not disputing (~a): its vault was confiscated" reason)
     (return-from enter-dispute nil))
+  ;; DEP-06 §Enter, whatever the caller: never a fork of a ledger we operate (its current operator
+  ;; key is ours) or on a proof against us.  Every caller already asks (not record-owned-p) and
+  ;; quorum membership of its own replica; this is the one place they meet.
+  (let ((why (self-dispute-refusal (node-pubkey node) (and fraud-proof (ignore-errors (hex->bytes (getf fraud-proof :accused))))
+                                   (let ((l (record-ledger rec))) (and l (lg:ledger-operator-key l))))))
+    (when why
+      (note-dispute node (record-id-hex rec) "not disputing (~a): ~a; an operator never disputes its own ledger"
+                    reason why)
+      (return-from enter-dispute nil)))
   (let ((stale (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and stale (not (fork-live-p node stale))) (retire-fork node stale)))
   ;; One DisputeEnter per dispute: a live fork that already entered keeps the grounds it entered
@@ -7521,6 +7541,12 @@
           (if ok
               (dispute-new-operator node chain proof)
               (log! node "unhonoured-obligation proof on ~a rejected: ~a" (subseq id 0 8) why))))
+      (return-from handle-operator-fraud nil))
+    ;; DEP-06 §Enter: a proof against us, or on a ledger we operate, is never ours to act on
+    ;; (UnhonouredObligation, above, is judged on the chain after a custody change and asks
+    ;; (equalp accused us) itself).
+    (when (and rec (self-dispute-refusal (node-pubkey node) (ignore-errors (hex->bytes (getf proof :accused)))
+                                         (let ((l (record-ledger rec))) (and l (lg:ledger-operator-key l)))))
       (return-from handle-operator-fraud nil))
     ;; Already disputing (another proof came first): an offer proof is still owed at confiscation.
     (when (and rec (not (record-owned-p rec)) (offer-proof-p proof) (live-fork node id (node-pubkey node)))
