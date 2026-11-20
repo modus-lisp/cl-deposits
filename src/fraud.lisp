@@ -15,7 +15,7 @@
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire) (#:schnorr #:secp256k1-fast.schnorr))
   (:export #:proof-hash #:evidence-bytes #:proof-discriminant #:respectful-p
            #:verify-equivocation #:update-binds-to-ledger-p #:update-opens-ledger-p #:bound-hashes #:verify-quorum-expired #:verify-non-conforming-update #:verify-proof
-           #:proof->json #:json->proof #:requires-embedding-p #:entry-permitted-p #:dispute-fork-point #:broadcast->json #:json->broadcast #:make-equivocation-proof
+           #:proof->json #:json->proof #:requires-embedding-p #:entry-permitted-p #:dispute-fork-point #:proof-history-needs #:unmet-history-needs #:proof-verdict #:broadcast->json #:json->broadcast #:make-equivocation-proof
            #:make-quorum-expired-proof #:make-non-conforming-update-proof #:uncredited-migration-proof #:latest-migration #:verify-censorship
            #:make-non-conforming-cosignature-proof #:verify-non-conforming-cosignature
            #:make-dispute-dereliction-proof #:verify-dispute-dereliction
@@ -1040,6 +1040,44 @@
                (:equivocation (1- (getf ev :sequence)))
                (:non-conforming-update (1- (getf ev :fault-sequence)))
                (t tip)))))
+
+(defun proof-history-needs (proof)
+  "DEP-06: the ledger sequences PROOF's evidence rests on, as ((ledger-id-hex . seq) ...): a
+   verifier whose replica of that ledger stops short of SEQ cannot judge the proof yet, and a
+   failed verdict then means \"history missing\", not \"invalid\".  A non-conforming update at
+   seq N follows one at N-1 at the latest.  NIL for evidence resting on no ledger sequence
+   (QuorumExpired, WinnerCollateralDeviation).  The reference's FraudProof::history_needs.
+   Regtest 1120-075609: a member 3 s behind refused seq-9 proofs for good and never armed."
+  (let* ((ev (getf proof :evidence)) (id (getf proof :ledger-id))
+         (seq-of (lambda (k) (let ((h (getf ev k)))
+                               (and (stringp h) (plusp (length h))
+                                    (ignore-errors (up:update-seq (up:decode-update (hex->bytes h))))))))
+         (need (lambda (l s) (and l s (list (cons l (max 0 s)))))))
+    (case (getf proof :type)
+      (:non-conforming-update (funcall need id (1- (getf ev :fault-sequence))))
+      (:equivocation (funcall need id (1- (getf ev :sequence))))
+      (:non-conforming-cosignature (funcall need (getf ev :fault-ledger-id) (1- (getf ev :fault-sequence))))
+      (:unauthorized-vault-spend (funcall need (getf ev :spent-ledger-id) (getf ev :governing-quorumbegin-seq)))
+      (:dispute-dereliction (funcall need (getf ev :member-ledger-id) (getf ev :member-active-sequence)))
+      (:stale-cosignature (append (funcall need id (getf ev :stale-update-sequence))
+                                  (funcall need (getf ev :member-ledger-id) (getf ev :member-later-sequence))))
+      ((:uncredited-onchain-payment :uncredited-lightning-payment :unhonoured-obligation)
+       (funcall need id (or (getf ev :proof-sequence) (funcall seq-of :proof-update))))
+      (t '()))))
+
+(defun unmet-history-needs (needs tip-of)
+  "The NEEDS (PROOF-HISTORY-NEEDS) our replicas have not reached; TIP-OF maps a ledger id to our
+   replica's tip sequence, NIL when we hold none."
+  (remove-if (lambda (n) (let ((tip (funcall tip-of (car n)))) (and tip (>= tip (cdr n))))) needs))
+
+(defun proof-verdict (needs tip-of verifies)
+  "DEP-06 (Judging a proof): :judge when the proof VERIFIES (act on it); :park when it failed
+   while one of NEEDS is unmet (hold it, catch up, judge it again: it MUST NOT be treated as
+   invalid); :refuse when it failed with every need met.  The reference's proof_verdict.
+   Vector: proof_history_needs.json."
+  (cond (verifies :judge)
+        ((unmet-history-needs needs tip-of) :park)
+        (t :refuse)))
 
 (defun entry-permitted-p (type embedding)
   "DEP-06 (Entering a dispute): whether the rule lets a member enter a dispute on a proof of TYPE
