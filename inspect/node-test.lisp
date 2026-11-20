@@ -2819,4 +2819,65 @@
       (check "a pass over the limit logs its breakdown, slowest step first"
              (and line (search "[vault-watch 0." line))))))
 
+
+(with-gate ("nodes: a re-arm round's lottery output is followed incrementally, reorg-safe, and concluded once a claim is deep")
+  ;; regtest 1120-055242: FOLLOW-REARM-SPEND rescanned from the round's lottery height to the tip on
+  ;; every watch pass for every fork whose output a claim had spent (cld364: 867,503 blocks a pass;
+  ;; one pass spent 1112 s and more in DRIVE-REARMS, and its vault watch never ran).
+  (let* ((tip 150) (hashes (make-hash-table)) (spends '()) (scanned 0)
+         (hash-of (lambda (h) (or (gethash h hashes) (setf (gethash h hashes) (u:sha256 (coerce (list (mod h 256) (floor h 256) 1) '(vector (unsigned-byte 8))))))))
+         (lot-tx (btx:finalize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p nil
+                              :inputs (list (btx:make-txin :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7) :prev-index 0 :script (u:octets) :sequence #xfffffffd))
+                              :outputs (list (btx:make-txout :value 5000 :script (u:hex->bytes "5120aa00000000000000000000000000000000000000000000000000000000000000"))))))
+         (claim (btx:finalize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p nil
+                             :inputs (list (btx:make-txin :prev-hash (btx:tx-txid lot-tx) :prev-index 0 :script (u:octets) :sequence #xfffffffd))
+                             :outputs (list (btx:make-txout :value 3000 :script (u:hex->bytes "5120bb00000000000000000000000000000000000000000000000000000000000000"))
+                                            (btx:make-txout :value 1000 :script (u:hex->bytes "5120cc00000000000000000000000000000000000000000000000000000000000000"))))))
+         (n (nd:make-node :priv (tk 12121212121212121212) :bus (bus:make-mock-bus) :height-fn (lambda () tip)
+                          :block-hash-fn (lambda (h) (funcall hash-of h))
+                          :spender-fn (lambda (from to outpoints)
+                                        (declare (ignore outpoints))
+                                        (incf scanned (max 0 (1+ (- to from))))
+                                        (loop for (h . tx) in spends when (<= from h to)
+                                              collect (list :txid (btx:tx-txid lot-tx) :vout 0 :tx (u:bytes->hex (btx:serialize-tx tx)) :height h)))))
+         (r (list :round 1 :tx lot-tx :height 100 :lottery :a-lottery))
+         (pass (lambda (id) (setf scanned 0)
+                 ;; A re-arm-shaped spend goes on to derive the next round, which needs a real
+                 ;; LOTTERY; the follow state is recorded before that, and is what is checked here.
+                 (ignore-errors (nd::follow-rearm-spend n id r)) scanned))
+         (a "a1a1a1a1000000000000000000000000000000000000000000000000000000000") (b "b2b2b2b2000000000000000000000000000000000000000000000000000000000"))
+    (check-equal "the first pass scans from the lottery height to the tip" (funcall pass a) 51)
+    (check-equal "the next pass, same tip: nothing" (funcall pass a) 0)
+    (setf tip 152)
+    (check-equal "two new blocks: two blocks" (funcall pass a) 2)
+    (push (cons 153 claim) spends) (setf tip 153)
+    (funcall pass a)
+    (setf tip 154)
+    (check-equal "a claim one confirmation deep: scanned again from its own height" (funcall pass a) 2)
+    (setf tip 155)
+    (funcall pass a)
+    (setf tip 170)
+    (check-equal "three confirmations deep: concluded, never scanned again" (funcall pass a) 0)
+    ;; A reorganisation removes the claim before it is deep.
+    (setf spends '() tip 150 (gethash 153 hashes) nil)
+    (funcall pass b) (push (cons 151 claim) spends) (setf tip 152) (funcall pass b)
+    (setf spends '()) (remhash 151 hashes) (remhash 152 hashes) (setf tip 153)
+    (funcall pass b)
+    (check "the reorganised-out claim is forgotten, not concluded" (not (getf (gethash (list (nd:node-pubkey n) b 1) nd::*rearm-follow*) :concluded)))
+    (check-equal "and the next pass rescans from the lottery height" (funcall pass b) 54)
+    ;; A reorganisation under what was scanned (the block at scanned-to changes): from the lottery height.
+    (setf tip 160) (funcall pass b) (setf (gethash 160 hashes) (u:sha256 (coerce '(9 9 9) '(vector (unsigned-byte 8)))))
+    (check-equal "the block at scanned-to changed: rescanned from the lottery height" (funcall pass b) 61)
+    ;; A re-arm-shaped spend (one in, one out) is never concluded here: the next round may not be
+    ;; registrable yet (its arms or manifest still arriving), so it is followed again, from its height.
+    (let ((c "c3c3c3c3000000000000000000000000000000000000000000000000000000000")
+          (rearm (btx:finalize-tx (btx:make-tx :version 2 :locktime 0 :segwit-p nil
+                                               :inputs (list (btx:make-txin :prev-hash (btx:tx-txid lot-tx) :prev-index 0 :script (u:octets) :sequence #xfffffffd))
+                                               :outputs (list (btx:make-txout :value 4000 :script (u:hex->bytes "5120dd00000000000000000000000000000000000000000000000000000000000000")))))))
+      (setf spends (list (cons 161 rearm)) tip 170)
+      (funcall pass c)
+      (check "a deep re-arm spend whose next round did not register is not concluded"
+             (not (getf (gethash (list (nd:node-pubkey n) c 1) nd::*rearm-follow*) :concluded)))
+      (check-equal "and is scanned again from its own height" (funcall pass c) 10))))
+
 (report)
