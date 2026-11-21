@@ -3077,7 +3077,8 @@
   (let ((n (nd:make-node :priv (tk 77777777777777777777) :bus (bus:make-mock-bus) :height-fn (lambda () 100))))
     (dolist (acc (list #'nd::node-pending #'nd::node-seen #'nd::node-reveals #'nd::node-invoices #'nd::node-dispute-notes
                        #'nd::node-ledgers #'nd::node-pledges #'nd::node-signed-confiscations #'nd::node-seen-confiscations
-                       #'nd::node-known-confiscations #'nd::node-arm-manifests #'nd::node-rearms #'nd::node-confiscation-heights))
+                       #'nd::node-known-confiscations #'nd::node-arm-manifests #'nd::node-rearms #'nd::node-confiscation-heights
+                       #'nd::node-confiscation-height-probes))
       (check (format nil "~(~a~) is synchronized" (sb-kernel:%fun-name acc)) (sb-ext:hash-table-synchronized-p (funcall acc n))))
     (check "the rung caches are synchronized" (and (sb-ext:hash-table-synchronized-p nd::*confirmed-rungs*)
                                                    (sb-ext:hash-table-synchronized-p nd::*unconfirmed-rungs*)))))

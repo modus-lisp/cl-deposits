@@ -110,6 +110,8 @@
   (rearm-sigs (make-hash-table :test #'equal :synchronized t))
   ;; DEP-03 "When the set is final": ledger id -> the block its confiscation confirmed in.
   (confiscation-heights (make-hash-table :test #'equal :synchronized t))
+  ;; ledger id -> the height we last asked the chain for C and it had no answer (CONFISCATION-HEIGHT)
+  (confiscation-height-probes (make-hash-table :test #'equal :synchronized t))
   (lock (bt:make-lock "node"))
   (height-fn (lambda () 0))
   (log '())
@@ -3022,7 +3024,8 @@
   "The block the arm window closes: the earliest DisputeEnter on any fork of
    BASE's ledger plus the members' dispute_arm_blocks (the longest named)."
   (let ((entered (loop for f in (forks-of node (record-id-hex base))
-                       for (u o) = (multiple-value-list (fork-op f :dispute-enter))
+                       ;; the counted one: a repeat entry above C does not move the window
+                       for (u o) = (multiple-value-list (dispute-enter-of node (record-id-hex base) f))
                        when u minimize (or (op:field o :anchor-block-height) (up:update-block-height u))))
         ;; No member names one (the reference never sets dispute_arm_blocks): ours.
         (window (let ((named (loop for m in (lg:ledger-quorum-members (record-ledger base))
@@ -3111,6 +3114,26 @@
       (setf (gethash id-hex (node-confiscation-heights node)) (1+ (- (height node) c)))))
   info)
 
+(defun confiscation-height (node id-hex)
+  "The block ID-HEX's confiscation confirmed in (DEP-03 \"When the set is final\"), or NIL.  Noted
+   when the confiscation is found; after a restart that table is empty while the confiscation's
+   txid is still known (confiscations.txt), so C is derived from the chain before anything is
+   judged by it: the lottery output's confirmations while it is unspent, else the txid's own.
+   Without this a restarted node's first passes counted a DisputeEnter signed above C (its fork
+   point, its grounds, its later rounds) until something rebuilt the confiscation.  The chain is
+   asked at most once a block while it has no answer."
+  (or (gethash id-hex (node-confiscation-heights node))
+      (let ((known (gethash id-hex (node-known-confiscations node))) (h (height node)))
+        (when (and known (or (node-chain-fn node) (node-tx-confs-fn node))
+                   (not (eql (gethash id-hex (node-confiscation-height-probes node)) h)))
+          (setf (gethash id-hex (node-confiscation-height-probes node)) h)
+          (dolist (txid known)
+            (when (node-chain-fn node)
+              (note-confiscation-height node id-hex (ignore-errors (funcall (node-chain-fn node) txid 0))))
+            (when (and (node-tx-confs-fn node) (not (gethash id-hex (node-confiscation-heights node))))
+              (note-confiscation-height node id-hex (list :confirmations (ignore-errors (funcall (node-tx-confs-fn node) txid))))))
+          (gethash id-hex (node-confiscation-heights node))))))
+
 (defun confiscated-lottery (node id-hex)
   "The confiscation of ID-HEX that is on chain: one we signed, or rebuilt from
    public state.  (values tx lottery :pending) while its lottery output is unspent."
@@ -3157,7 +3180,7 @@
                    (and l (equalp (lot:lottery-spk l) spk) l))))))
       ;; DEP-06 §Arm manifests: the arm sets the confiscation's signers published first; then our
       ;; cut, then every subset of the latest arms (a judge without a manifest).
-      (or (let ((c (gethash id-hex (node-confiscation-heights node))) (all (%all-arms node id-hex)))
+      (or (let ((c (confiscation-height node id-hex)) (all (%all-arms node id-hex)))
             (loop for m in (arm-manifests-of node id-hex 1)
                   thereis (let ((named (manifest-arms all m 1 -1 (or c most-positive-fixnum)))) (and named (try named)))))
           (try (ignore-errors (lottery-armers node id-hex)))
@@ -4744,24 +4767,42 @@
   (let ((qb (and base-rec top-lvs (record-latest base-rec :quorum-begin :below (1+ top-lvs)))))
     (if qb (up:update-seq qb) 0)))
 
+(defun fork-enters (node id-hex fork)
+  "FORK's own DisputeEnters that may count in ID-HEX's dispute, newest first: all of them, and
+   once the confiscation has confirmed in block C (CONFISCATION-HEIGHT) those signed at or below C.
+   DEP-03 §When the set is final: a DisputeEnter above C takes no part, as an arm above C does
+   not; it names no fork point, its grounds convict nobody and it admits its author to no later
+   round (regtest 12bc96d2, 2026-11-21: a contagion proof re-sent after the confiscation at 23996
+   was entered on at 34763, and its proof convicted c30c1b29, the only armer of round 2)."
+  (let ((c (confiscation-height node id-hex)))
+    (remove-if-not (lambda (u) (and (equalp (up:update-operator-id u) (record-fork-operator fork))
+                                    (or (null c) (<= (up:update-block-height u) c))))
+                   (fork-own-updates fork :dispute-enter))))
+
+(defun dispute-top (node id-hex)
+  "The highest last_valid_sequence of any DisputeEnter that may count in ID-HEX's dispute (every
+   fork's FORK-ENTERS, not only each one's latest), or NIL with none."
+  (let ((top nil))
+    (dolist (f (forks-of node id-hex) top)
+      (dolist (u (fork-enters node id-hex f))
+        (let ((l (op:field (op:update-op u) :last-valid-sequence)))
+          (when (and l (or (null top) (> l top))) (setf top l)))))))
+
 (defun dispute-enter-of (node id-hex fork)
-  "FORK's DisputeEnter that counts in ID-HEX's dispute, (values update op) or NIL: its operator's
-   latest, and once the confiscation has confirmed in block C (NODE-CONFISCATION-HEIGHTS) its
-   latest signed at or below C.  DEP-03 §When the set is final: a DisputeEnter above C takes no
-   part, as an arm above C does not; it names no fork point, its grounds convict nobody and it
-   admits its author to no later round (regtest 12bc96d2, 2026-11-21: a contagion proof re-sent
-   after the confiscation at 23996 was entered on at 34763, and its proof convicted c30c1b29, the
-   only armer of round 2).  Mirrors deposits-rust's rotation_order::dispute_scope_final; vector
-   rearm_round_agree.json, late_enter."
-  (let ((c (gethash id-hex (node-confiscation-heights node))))
-    (if (null c)
-        (fork-op fork :dispute-enter)
-        (let ((u (find-if (lambda (u) (and (equalp (up:update-operator-id u) (record-fork-operator fork))
-                                           (<= (up:update-block-height u) c)))
-                          (if (record-fork-base fork)
-                              (gethash :dispute-enter (record-index fork))
-                              (record-updates-of fork :dispute-enter)))))
-          (and u (values u (op:update-op u)))))))
+  "FORK's DisputeEnter that counts in ID-HEX's dispute, (values update op) or NIL: its latest among
+   FORK-ENTERS at or above Q (DEP-03 §\"The dispute\": each disputant counts through its latest
+   DisputeEnter at or above Q).  With none at or above Q, its latest, which DISPUTE-FORKS then
+   finds stale.  A repeat entry (one in time, a later one at another fork point) is in the dispute
+   through the one the rule counts: a later entry below Q does not take the fork out, and one
+   above C takes no part at all.  Mirrors deposits-rust's rotation_order::dispute_scope_final;
+   vector rearm_round_agree.json, late_enter."
+  (let* ((es (fork-enters node id-hex fork))
+         ;; only a repeat entry needs Q
+         (q (and (cdr es) (dispute-scope-q (let ((r (find-record node id-hex))) (and r (not (record-fork-p r)) r))
+                                           (dispute-top node id-hex))))
+         (u (or (and q (find-if (lambda (u) (>= (or (op:field (op:update-op u) :last-valid-sequence) -1) q)) es))
+                (first es))))
+    (and u (values u (op:update-op u)))))
 
 (defun dispute-forks (node id-hex)
   "The forks of ID-HEX that are its current dispute (see above), each through DISPUTE-ENTER-OF.
@@ -4771,9 +4812,9 @@
          (lvs-of (mapcar (lambda (f) (multiple-value-bind (u o) (dispute-enter-of node id-hex f)
                                        (and u (op:field o :last-valid-sequence))))
                          forks))
-         (top (reduce (lambda (a b) (if (and a b) (max a b) (or a b))) lvs-of :initial-value nil)))
+         (top (dispute-top node id-hex)))
     (if (null top)
-        (if (gethash id-hex (node-confiscation-heights node))
+        (if (confiscation-height node id-hex)
             (loop for f in forks for l in lvs-of when l collect f)
             forks)
         (let ((q (dispute-scope-q (let ((r (find-record node id-hex))) (and r (not (record-fork-p r)) r)) top)))
@@ -4789,19 +4830,30 @@
         ((member fork (dispute-forks node id-hex)) nil)
         (t (let ((r (find-record node id-hex)))
              (format nil "our fork entered at ~a, below the dispute's QuorumBegin ~a (DEP-03 \"The dispute\")"
-                     (dispute-fork-point-of fork)
+                     (dispute-fork-point node id-hex fork)
                      (dispute-scope-q (and r (not (record-fork-p r)) r)
-                                      (loop for f in (forks-of node id-hex) maximize (dispute-fork-point-of f))))))))
+                                      (loop for f in (forks-of node id-hex) maximize (dispute-fork-point node id-hex f))))))))
 
 (defun dispute-fork-point-of (fork)
-  "The last_valid_sequence of FORK's latest DisputeEnter: its updates at or below it belong to an
-   earlier dispute (DEP-03 §\"The dispute\")."
+  "The last_valid_sequence of FORK's latest DisputeEnter, -1 with none.  Our own next DisputeEnter
+   is judged against this (ENTER-DISPUTE); what FORK takes part in is DISPUTE-FORK-POINT's."
   (multiple-value-bind (u o) (fork-op fork :dispute-enter)
     (if u (op:field o :last-valid-sequence) -1)))
 
-(defun dispute-fork-updates (fork type)
-  "FORK's own updates of TYPE in the current dispute: after its latest DisputeEnter's fork point."
-  (let ((lvs (dispute-fork-point-of fork)))
+(defun dispute-fork-point (node id-hex fork)
+  "The last_valid_sequence of FORK's DisputeEnter that counts in ID-HEX's dispute (DISPUTE-ENTER-OF:
+   once the confiscation confirmed in block C, its latest at or below C), -1 with none.  Its updates
+   at or below it belong to an earlier dispute (DEP-03 §\"The dispute\").  A fork that entered in
+   time and again above C (a repeat entry naming a later fork point) is in the dispute through the
+   first: the later one must not drop the updates between the two.  Vector rearm_round_agree.json,
+   late_enter (repeat_enter)."
+  (multiple-value-bind (u o) (dispute-enter-of node id-hex fork)
+    (if u (op:field o :last-valid-sequence) -1)))
+
+(defun dispute-fork-updates (node id-hex fork type)
+  "FORK's own updates of TYPE in ID-HEX's current dispute: after its counted DisputeEnter's fork
+   point (DISPUTE-FORK-POINT)."
+  (let ((lvs (dispute-fork-point node id-hex fork)))
     (remove-if-not (lambda (u) (> (up:update-seq u) lvs)) (fork-own-updates fork type))))
 
 (defun dispute-scope (updates)
@@ -5200,7 +5252,7 @@
   "The lottery's participants: (values participants excluded snapshot floor).  Once the
    confiscation has confirmed, the arms above its block do not count (DEP-03)."
   (let ((floor-sats (eligibility-floor-sats node id-hex))
-        (c (gethash id-hex (node-confiscation-heights node))))
+        (c (confiscation-height node id-hex)))
     (multiple-value-bind (in out snapshot)
         (multiple-value-bind (grounded ungrounded) (grounded-armers node id-hex (armers-of node id-hex :until c))
           ;; DEP-03 §Lottery: a key the dispute's grounds convict never wins.  Dropped before the cut,
@@ -5359,7 +5411,7 @@
         (let ((seen '()))
           (dolist (p participants)
             (let ((fork (find-fork node id-hex (first p))))
-              (dolist (u (and fork (reverse (dispute-fork-updates fork :obligation-record))))
+              (dolist (u (and fork (reverse (dispute-fork-updates node id-hex fork :obligation-record))))
                 (let ((o (ignore-errors (op:update-op u))))
                   (when (and o (< (up:update-seq u) (sixth p)))
                     (multiple-value-bind (notice qb qu to-us)
@@ -5384,7 +5436,7 @@
           (hob (or (node-height-of-block node) (lambda (b) (declare (ignore b)) nil))))
       (dolist (p participants)
         (let ((fork (find-fork node id-hex (first p))))
-          (dolist (u (and fork (reverse (dispute-fork-updates fork :obligation-record))))
+          (dolist (u (and fork (reverse (dispute-fork-updates node id-hex fork :obligation-record))))
             (let ((o (ignore-errors (op:update-op u))))
               (when (and o (op:field o :uncredited-proof)
                          (< (up:update-seq u) (sixth p)))
@@ -5766,7 +5818,7 @@
   (let ((g (grounded-shape-respectful node id-hex)))
     (when g (return-from dispute-respectful-p (eq g :respectful))))
   (let ((fork (find-fork node id-hex (node-pubkey node))))
-    (and fork (multiple-value-bind (enter enter-op) (fork-op fork :dispute-enter)
+    (and fork (multiple-value-bind (enter enter-op) (dispute-enter-of node id-hex fork)
                 (and enter (expiry-reason-p (op:field enter-op :reason)))))))
 
 (defun unsigned-bytes (tx) (btx:serialize-tx tx :witness nil))
@@ -5905,7 +5957,7 @@
   (let* ((reserves (disputed-reserves view (find-record view id-hex)))
          (tiers (rs:reserves-tiers reserves))
          (ti (position (btx:tx-locktime tx) tiers :key #'rs:tier-locktime))
-         (c (gethash id-hex (node-confiscation-heights view)))
+         (c (confiscation-height view id-hex))
          (named (and manifest (manifest-arms (%all-arms view id-hex) manifest 1 -1 (or c most-positive-fixnum))))
          (all (sort (copy-list (grounded-armers view id-hex (if manifest named (armers-of view id-hex :until c))))
                     #'bytes< :key #'first))
@@ -6268,7 +6320,7 @@
     (let ((jsons (remove-duplicates
                   (append (gethash id (node-obligation-proofs node))
                           (loop for f in (dispute-forks node id)
-                                append (loop for u in (dispute-fork-updates f :obligation-record)
+                                append (loop for u in (dispute-fork-updates node id f :obligation-record)
                                              for o = (ignore-errors (op:update-op u))
                                              when (and o (op:field o :uncredited-proof))
                                                collect (bytes->ascii (op:field o :uncredited-proof)))))
@@ -6450,7 +6502,7 @@
               (return-from current-lottery (values tx l round h)))))
         (return-from current-lottery nil))))
   (multiple-value-bind (tx l) (fork-lottery node id-hex)
-    (when tx (values tx l 1 (or (gethash id-hex (node-confiscation-heights node)) (lottery-output-height node tx))))))
+    (when tx (values tx l 1 (or (confiscation-height node id-hex) (lottery-output-height node tx))))))
 
 (defun rearm-open-tiers (lottery height now)
   "The recovery tiers of LOTTERY (output confirmed at HEIGHT) whose CSV has passed at NOW, tier 0
