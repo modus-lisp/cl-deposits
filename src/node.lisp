@@ -876,8 +876,46 @@
         (log! node "republished ~a update(s) of ~a from seq ~a: a member expected seq ~a"
               sent (subseq (record-id-hex rec) 0 8) n n)))))
 
-(defun solicit-cosignatures (node rec update signers required)
-  "Ask the quorum; return when REQUIRED valid cosignatures are in the update."
+(defparameter *restamp-margin* 2
+  "Blocks of headroom kept under a cosigner's freshness window (*COSIGN-HEIGHT-TOLERANCE*, DEP-02's
+   6): a draft whose block_height has fallen more than (window - margin) behind our tip is
+   re-stamped at the tip before it is asked for again, so it reaches a cosigner still inside.")
+
+(defparameter *max-restamps* 3 "How many times one append re-stamps its draft before it gives up.")
+
+(defvar *before-cosign-request-hook* nil
+  "Testing: called with NODE REC UPDATE ATTEMPT before each cosign_update request is sent (a
+   block that arrives while the draft waits for the box).")
+
+(defun stale-refusal-p (response)
+  "A cosigner's refusal of a block_height too far below its tip (cl: \"more than N below our tip\";
+   the reference: \"is more than N blocks from our height\")."
+  (let ((err (and (hash-table-p response) (not (w:jget response "success")) (w:jget response "error"))))
+    (and (stringp err) (search "block_height" err)
+         (or (search "below our tip" err) (search "blocks from our height" err)))))
+
+(defun draft-stale-p (node update &optional refused-stale)
+  "UPDATE (a draft we have not signed) should be re-dated before it is asked for again: its
+   block_height is more than (window - margin) below our tip, or a cosigner refused it as too
+   old and our tip has moved past it at all."
+  (let ((lag (- (height node) (up:update-block-height update))))
+    (or (> lag (- *cosign-height-tolerance* *restamp-margin*))
+        (and refused-stale (plusp lag)))))
+
+(defun check-restampable (rec draft)
+  "Write-ahead, checked rather than assumed (DEP-02 §Operator, implementer note): DRAFT may be
+   replaced only while it is unsigned and nothing of ours is recorded at its sequence -- every
+   update we sign is recorded and written ahead before a relay sees it (COMMIT-UPDATE), so an
+   empty slot means nothing of ours at that (ledger, sequence) exists anywhere."
+  (when (or (up:update-operator-sig draft) (record-update-at rec (up:update-seq draft)))
+    (fail "seq ~a of ~a is already signed by us; not re-stamping it" (up:update-seq draft) (subseq (record-id-hex rec) 0 8)))
+  t)
+
+(defun solicit-cosignatures (node rec update signers required &key stale-p)
+  "Ask the quorum; return when REQUIRED valid cosignatures are in the update.  With STALE-P (a
+   function of one argument, whether a cosigner refused the draft's height as too old), return
+   :STALE instead of asking again once it says the draft must be re-dated (APPEND-OPERATION
+   re-stamps it: the draft is not ours to keep, we have not signed it)."
   (let* ((data (up::cosign-data update))
          (round (begin-cosign-round node update signers))
          (params (apply #'w:json-object "sequence_number" (up:update-seq update)
@@ -907,8 +945,16 @@
       (take-round)
       ;; A member may still be applying the update this one chains onto (relays
       ;; reorder); ask again after a pause before giving up.
-      (loop until (or (enough) (>= attempt 3))
-            do (dolist (r (send-request node (record-id-hex rec) "cosign_update" params
+      (loop with refused-stale = nil
+            until (or (enough) (>= attempt 3))
+            do (when *before-cosign-request-hook* (funcall *before-cosign-request-hook* node rec update attempt))
+               ;; Every retry used to resend the identical draft: one dated at a height already
+               ;; behind the cosigners' window is refused the same way each time (regtest
+               ;; 1121-101522: ref6 refused seq 5 of fbe37fad three times, "block_height 35890 is
+               ;; more than 6 blocks from our height 35897", and the post-expiry rotation never formed).
+               (when (and stale-p (funcall stale-p refused-stale))
+                 (return-from solicit-cosignatures :stale))
+               (dolist (r (send-request node (record-id-hex rec) "cosign_update" params
                                         :want (- required (length (up:update-cosignatures update)))
                                         :counts (lambda (r) (let ((c (response-cosignature r)))
                                                               (and c (member (up:cosig-pubkey c) signers :key #'lg:member-pubkey :test #'equalp))))
@@ -921,6 +967,13 @@
                                                       (setf (gethash id (node-late-cosign-requests node)) data))
                                         :timeout (if (zerop attempt) *cosign-response-seconds* 3)))
                  (round-add round (response-cosignature r))
+                 ;; A refusal says why: log it, or a stale-height refusal is invisible to the operator.
+                 (when (and (hash-table-p r) (not (response-cosignature r)) (w:jget r "error"))
+                   (log! node "cosign of ~a seq ~a (block_height ~a) refused by ~a: ~a"
+                         (subseq (record-id-hex rec) 0 8) (up:update-seq update) (up:update-block-height update)
+                         (let ((who (gethash "responder" r))) (if (stringp who) (subseq who 0 (min 8 (length who))) "?"))
+                         (w:jget r "error")))
+                 (when (stale-refusal-p r) (setf refused-stale t))
                  (republish-missed node rec r))
                (take-round)
                (incf attempt)
@@ -930,12 +983,14 @@
     (end-cosign-round node update)
     update))
 
-(defun append-operation (node rec op &key (height (height node)) op-fn tier-floor)
+(defun append-operation (node rec op &key (height nil height-p) op-fn tier-floor)
   "The operator's one entry point: chain OP onto REC's ledger with whatever
    cosignatures DEP-05 requires at HEIGHT.  With OP-FN, OP is (funcall OP-FN tip-chain-hash),
    built under the append lock on the tip it extends (a rotation's anchor, DEP-03).  TIER-FLOOR
    (keys . need): also NEED valid cosignatures by KEYS, or nothing is recorded (a rotating
-   QuorumBegin answers its rungs only at the spent tier's floor, FR:ANSWER-COSIGN-NEED)."
+   QuorumBegin answers its rungs only at the spent tier's floor, FR:ANSWER-COSIGN-NEED).
+   HEIGHT defaults to our tip read under the append lock; a defaulted draft whose height falls out
+   of the cosigners' window before its cosignatures are in is re-stamped (DRAFT-STALE-P)."
   (unless (record-owned-p rec) (fail "not our ledger"))
   ;; Serialised per ledger, cosign round included: the control socket (a
   ;; rotation's QuorumAddMember) and the worker (a wallet's transfer) both
@@ -944,6 +999,22 @@
   ;; traffic a rotation never won that race and only succeeded post-expiry,
   ;; when value-moving operations were being refused and nothing competed.
   (bt:with-lock-held ((record-append-lock rec))
+   ;; RE-STAMPING.  An update that needs cosignatures is a DRAFT until COMMIT-UPDATE: we sign it
+   ;; only after the cosignatures are in (DEP-02 §Operator, "the operator signs after collecting
+   ;; the required majority"), and only a signed update is written ahead.  So a draft whose
+   ;; block_height has fallen behind the cosigners' window (DEP-02: "a cosigner refuses a
+   ;; block_height more than 6 blocks below its own tip") may be rebuilt at our tip and asked for
+   ;; again: we have signed nothing at its (ledger, sequence), and DEP-02's write-ahead rule ("MUST
+   ;; NOT sign a different update at a (ledger, sequence) it has already signed") is about what
+   ;; we sign.  DEP-05 §Cosign Rounds names the case: cosignatures kept for the old cosign_data
+   ;; are dead once we sign a different update at that sequence; they are never attached to it.
+   ;; The whole draft is rebuilt, not just its height: the height decides the tier and threshold
+   ;; (DEP-05), the balance commitments and the validity checks.  HEIGHT is read HERE, under the
+   ;; lock: read on entry it was as old as the wait for another append's cosign round.
+   (let ((op0 op) (stale-drafts '()) (restamps 0))
+    (loop
+     (block attempt
+     (let ((height (if height-p height (height node))) (op op0))
     (when op-fn (setf op (funcall op-fn (up:chain-hash (tip rec)))))
     ;; DEP-02 §Balance Commitments: declare the post-update balances of what OP touches.
     ;; ADVERSARY :omit-commitments — an operator that declares none (red team: DEP-18's
@@ -968,7 +1039,16 @@
       (let ((why (cf:descriptor-refusal (record-ledger rec) op))) (when why (fail "~a" why)))
       (lg:speculate (record-ledger rec) op (max height (if (tip rec) (up:update-block-height (tip rec)) 0))
                     (1+ (lg:ledger-sequence (record-ledger rec)))))
-    (let ((update (new-update node rec op :height height)))
+    (let* ((update (new-update node rec op :height height))
+           (may-restamp (and (not height-p) (< restamps *max-restamps*))))
+     (flet ((stale-p (refused-stale) (draft-stale-p node update refused-stale))
+            (restamp (draft)
+              (check-restampable rec draft)
+              (log! node "re-stamping seq ~a of ~a: drafted at block_height ~a, our tip is ~a (unsigned draft; DEP-02 window ~a)"
+                    (up:update-seq draft) (subseq (record-id-hex rec) 0 8) (up:update-block-height draft) (height node)
+                    *cosign-height-tolerance*)
+              (push draft stale-drafts) (incf restamps)
+              (return-from attempt nil)))
       (multiple-value-bind (required signers tier operator-alone allowed)
           (lg:cosign-requirement (record-ledger rec) op height)
         (declare (ignore operator-alone))
@@ -983,18 +1063,25 @@
             (when (> required (count-if-not (lambda (m) (member (lg:member-pubkey m) disputing :test #'equalp)) signers))
               (fail "ledger disputed: ~a of ~a members forked it; ~a cosignatures are out of reach (custody follows the dispute)"
                     (length disputing) (length signers) required)))
-          (solicit-cosignatures node rec update signers required))
+          (when (eq (solicit-cosignatures node rec update signers required :stale-p (and may-restamp #'stale-p)) :stale)
+            (restamp update)))
         (when (and tier-floor (plusp (cdr tier-floor)))
           (let ((have (fr:tier-cosignatures update (car tier-floor))))
             (when (< have (cdr tier-floor))
               ;; The members not yet in: ask for the rest, then judge again.
-              (ignore-errors (solicit-cosignatures node rec update signers
-                                                   (+ (length (up:update-cosignatures update)) (- (cdr tier-floor) have))))
+              (when (eq (ignore-errors (solicit-cosignatures node rec update signers
+                                                             (+ (length (up:update-cosignatures update)) (- (cdr tier-floor) have))
+                                                             :stale-p (and may-restamp #'stale-p)))
+                        :stale)
+                (restamp update))
               (let ((have (fr:tier-cosignatures update (car tier-floor))))
                 (when (< have (cdr tier-floor))
                   (fail "~a: ~a of the ~a cosignatures by the spent vault's tier that answer its rungs (DEP-06); not recording a rotation no judge could answer"
                         (op:operation-type op) have (cdr tier-floor))))))))
-      (commit-update node rec update))))
+      (commit-update node rec update)
+      ;; DEP-05 §Cosign Rounds: a different update is signed at this sequence; the stale drafts' rounds are dead.
+      (dolist (d stale-drafts) (end-cosign-round node d))
+      (return update)))))))))
 
 (defun open-ledger (node &key reserves-id (genesis-block (height node)) (reserves 0) (collateral 0)
                          (ruleset lg:+current-ruleset+))
