@@ -6885,6 +6885,56 @@
    dereliction is judged on).  Regtest 1121-next4c: deposits-rust ref6's re-arm passes spent 10 of
    the 14 coins the pledge-liveness fix freed.")
 
+(defun claim-output-p (tx vout)
+  "Whether output VOUT of TX is a lottery claim's output 0: a ledger's custody until it is spent
+   (rotated into the ledger's vault), whatever our records say.  From TX alone: its input 0 spends
+   output 0 of its prevout through a taproot SCRIPT path (the witness ends in a control block,
+   33+32k bytes, leaf version #xc0) with nSequence #xfffffffd (a full claim) or the reveal CSV (a
+   subset claim), and the coin is its ONE output (a confiscation spends the vault the same way
+   with more outputs; a re-arm spend carries a tier CSV).  Regtest 1121-next4c (deposits-rust
+   ref6): a claim of ad87b48b's lottery, recorded on another ledger's fork, was pledged on
+   9e23c858; 14 of ref6's 31 coins were claim outputs and 7 were pledged.  Vector
+   custody_coin.json."
+  (let* ((ins (btx:tx-inputs tx))
+         (in (and (plusp (length ins)) (elt ins 0)))
+         (w (first (btx:tx-witnesses tx)))
+         (cb (car (last w))))
+    (and in (= vout 0) (= 1 (length (btx:tx-outputs tx)))
+         (zerop (btx:txin-prev-index in))
+         (>= (length w) 2) cb (>= (length cb) 33) (zerop (mod (- (length cb) 33) 32))
+         (= (logand (aref cb 0) #xfe) #xc0)
+         (member (btx:txin-sequence in) (list #xfffffffd lot:+reveal-csv+))
+         t)))
+
+(defvar *custody-coins* (make-hash-table :test #'equal :synchronized t)
+  "\"txid:vout\" -> T when the coin is a claim's output 0 (CLAIM-OUTPUT-P), NIL when not: a
+   transaction never changes.")
+
+(defun without-custody-coins (node utxos)
+  "UTXOS (plists :txid :vout ...) without the coins that are a lottery claim's output 0, asked of
+   NODE-TX-FN once per coin.  A coin whose funding transaction cannot be read this pass is left
+   out too (pledging a ledger's custody loses depositors' funds; skipping a coin costs a retry);
+   with no TX-FN (a test node) every coin is ordinary."
+  (if (null (node-tx-fn node))
+      utxos
+      (remove-if
+       (lambda (u)
+         (let* ((key (outpoint-key (getf u :txid) (getf u :vout)))
+                (verdict (multiple-value-bind (v found) (gethash key *custody-coins*)
+                           (if found
+                               v
+                               (let ((tx (ignore-errors (funcall (node-tx-fn node) (getf u :txid)))))
+                                 (if tx
+                                     (setf (gethash key *custody-coins*) (claim-output-p tx (getf u :vout)))
+                                     :unreadable))))))
+           (case verdict
+             (:unreadable (log! node "pledge: ~a left out this pass, its funding transaction is unreadable" key) t)
+             ((nil) nil)
+             (t (log! node "pledge: ~a (~a sats) is a lottery claim's output 0, a ledger's custody; never pledged"
+                      key (getf u :sats))
+                t))))
+       utxos)))
+
 (defun pledge-collateral (node id-hex &key (round 1))
   "A confirmed UTXO of ours, pledged to ID-HEX, covering its required replacement
    collateral: (txid vout sats), or NIL.  When no single UTXO is large enough but
@@ -6892,7 +6942,7 @@
    and return NIL for now; a pledge already made for ID-HEX is returned again.
    ROUND >= 2 (a re-arm round) leaves *REARM-PLEDGE-RESERVE* coins free (logged when it skips)."
   (let ((mine (loop for k being the hash-keys of (node-pledges node) using (hash-value v) when (equal v id-hex) collect k))
-        (utxos (our-utxos node)))
+        (utxos (without-custody-coins node (our-utxos node))))
     (when mine
       (let ((u (find (first mine) utxos :key (lambda (u) (outpoint-key (getf u :txid) (getf u :vout))) :test #'equal)))
         (when u (return-from pledge-collateral (list (getf u :txid) (getf u :vout) (getf u :sats))))
