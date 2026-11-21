@@ -1458,6 +1458,62 @@
                          (loop for v being the hash-values of chain thereis (and (equalp (cdr v) spk) (> (car v) (- lottery-sats 1000))))))))
             (check "the withholder did not take custody" (null (nd::fork-op (nd:find-fork c id (nd:node-pubkey c)) :dispute-acquire)))))))))
 
+;;; Regtest rearm-rust (2026-11-21, deposits-rust ref7 / ledger c8b9b7b1): a member that armed only
+;;; ROUND 2 had its round-2 arm judged by the round-1 lottery, in which it is no participant, so it
+;;; "lost" and yielded, Tombstoning its fork for the round it armed in; it then won round 2 with
+;;; no acquire possible.  The round-1 driver must leave a later round's arm to DRIVE-REARM: no
+;;; yield, and no reveal of the round-2 preimage into round 1.
+(with-gate ("a round-2 arm is not judged by the round-1 lottery: no yield, no reveal")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (chain (make-hash-table :test #'equalp))
+         (cf (lambda (txid vout) (let ((v (gethash (cons (coerce txid 'list) vout) chain))) (and v (list :value-sats (car v) :confirmations 80)))))
+         (bf (lambda (bytes)
+               (let ((tx (btx:parse-tx (cl-consensus.wire:make-reader bytes))))
+                 (dolist (in (btx:tx-inputs tx)) (remhash (cons (coerce (btx:txin-prev-hash in) 'list) (btx:txin-prev-index in)) chain))
+                 (loop for o in (btx:tx-outputs tx) for i from 0
+                       do (setf (gethash (cons (coerce (btx:tx-txid tx) 'list) i) chain) (cons (btx:txout-value o) (btx:txout-script o))))
+                 (btx:tx-txid tx))))
+         (uf-for (lambda (priv)
+                   (let ((spk (lot:key-path-spk (up:x-only (up:compressed-pubkey (tk (w:even-y-privkey (tk priv))))))))
+                     (lambda (addr) (declare (ignore addr))
+                       (loop for k being the hash-keys of chain using (hash-value v)
+                             when (equalp (cdr v) spk)
+                               collect (list :txid (coerce (car k) '(vector (unsigned-byte 8))) :vout (cdr k) :sats (car v) :confirmations 3))))))
+         (mk (lambda (priv) (nd:make-node :priv (tk priv) :bus bus :height-fn hf :chain-fn cf :broadcast-fn bf :utxos-fn (funcall uf-for priv))))
+         (a (nd:make-node :priv (tk 11111111111111111111) :bus bus :height-fn hf))
+         (b (funcall mk 22222222222222222222)) (c (funcall mk 33333333333333333333)) (d (funcall mk 44444444444444444444))
+         (la (nd:open-ledger a :reserves-id "genesis:r2" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la))
+         (reserves-key (cons (coerce (u:sha256 (hx "f00e2")) 'list) 0)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
+    (setf (gethash reserves-key chain) (cons (floor (+ 15600000 23400000) 1000) nil))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00e2")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
+    (setf (cdr (gethash reserves-key chain)) (rs:reserves-spk (nd::disputed-reserves b (nd:find-record b id))))
+    (dolist (m (list b c d))
+      (setf (gethash (cons (coerce (u:sha256 (nd:node-pubkey m)) 'list) 0) chain) (cons 50000 (lot:key-path-spk (up:x-only (nd:node-pubkey m))))))
+    (let ((expiry (lg:ledger-quorum-expiry (nd:record-ledger la))))
+      (let ((*height* (+ expiry 4)))
+        ;; All three enter; only b and c arm round 1 (d is the redteam that holds its arm).
+        (let ((nd::*drive-dispute-on-enter* nil)) (dolist (m (list b c d)) (nd:dispute-expired-quorums m :grace 3)))
+        (nd:arm-dispute b (nd:find-fork b id (nd:node-pubkey b)) :replacement (nd:pledge-collateral b id))
+        (nd:arm-dispute c (nd:find-fork c id (nd:node-pubkey c)) :replacement (nd:pledge-collateral c id)))
+      (let ((*height* (+ (nd:dispute-arm-closes b (nd:find-record b id)) 1)))
+        (dolist (m (list b c)) (nd:drive-disputes m))
+        (check "b and c confiscated" (null (gethash reserves-key chain)))
+        (dolist (m (list b c)) (nd:drive-disputes m))
+        (check "b and c revealed round 1" (= 2 (length (nd:reveals-of d id))))
+        ;; Round 1 is unclaimed (its winner is not driven).  d arms ROUND 2 only.
+        (let ((fd (nd:find-fork d id (nd:node-pubkey d))))
+          (nd:arm-dispute d fd :replacement (nd:pledge-collateral d id) :round 2)
+          (check-equal "d's fork is armed, for round 2" (list (lg:ledger-dispute-state (nd:record-ledger fd))
+                                                              (op:field (nth-value 1 (nd::fork-op fd :dispute-armed)) :rearm-round))
+                       '(:armed 2))
+          (loop repeat 3 do (nd:drive-disputes d))
+          (check "d did not yield its round-2 arm to round 1's lottery" (null (nd::fork-op fd :dispute-yield)))
+          (check-equal "d's fork is still armed" (lg:ledger-dispute-state (nd:record-ledger fd)) :armed)
+          (check "d did not reveal its round-2 preimage into round 1"
+                 (not (assoc (nd:node-pubkey d) (nd:reveals-of b id) :test #'equalp))))))))
+
 (with-gate ("DEP-02 sequence: a skip on our chain is disputed as non-conforming, a gap is fetched")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (a (nd:make-node :priv (tk 11111111111111111171) :bus bus :height-fn hf))

@@ -3439,6 +3439,17 @@
                           (subseq (bytes->hex (first won)) 0 16) (txid-hex (third won)) (second won))))))
         (when (find-if (lambda (r) (> (getf r :round) 1)) (rearm-rounds node id))
           (return-from %drive-dispute (note-dispute node id "in a re-arm round (DRIVE-REARM)")))
+        ;; Our arm is for a LATER round: DRIVE-REARM reveals and claims it against that round's
+        ;; output.  The passes below judge ROUND 1's lottery, in which a member that armed only a
+        ;; later round is no participant: it revealed its round-2 preimage into round 1, "lost" and
+        ;; yielded, Tombstoning its fork for the round it armed in (regtest rearm-rust 2026-11-21:
+        ;; deposits-rust ref7 on c8b9b7b1, round-2 arm at seq 26, yield at 27, round 2 then won with
+        ;; no acquire possible).  This is noted before round 2's output exists, so REARM-ROUNDS above
+        ;; does not see it yet.
+        (let ((ao (nth-value 1 (fork-op fork :dispute-armed))))
+          (when (and ao (> (or (op:field ao :rearm-round) 1) 1))
+            (return-from %drive-dispute
+              (note-dispute node id "armed round ~a (DRIVE-REARM)" (op:field ao :rearm-round)))))
         (when (or (fork-op fork :dispute-acquire) (fork-op fork :dispute-yield))
           (when (and (loop for v being the hash-values of (node-pledges node) thereis (equal v id))
                      (not (rearm-rounds node id)))
