@@ -6991,14 +6991,26 @@
   (let ((qb (record-latest rec :quorum-begin :below (1+ seq))))   ; the latest at or before SEQ
     (and qb (up:update-seq qb))))
 
+(defun contagion-target-p (node target)
+  "Whether a contagion proof is still worth sending against ledger TARGET: not when we hold it and
+   its vault is already confiscated (RESERVES-CONFISCATED-P, the test ENTER-DISPUTE refuses on).
+   That dispute is over; a DisputeEnter on the proof now would take no part in it (DEP-03 §When the
+   set is final), and one by a member that does not know that convicts a later round's armer.  On
+   regtest (2026-11-21) our restart re-sent the proof against 12bc96d2, 10 767 blocks after its
+   confiscation; deposits-rust ref6 entered on it and cut c30c1b29's round-2 arm."
+  (let ((r (find-record node target)))
+    (not (and r (not (record-fork-p r)) (reserves-confiscated-p node r)))))
+
 (defun broadcast-cosigner-contagion (node rec update)
   "Everyone who signed the non-conforming UPDATE on REC, against every other ledger
    they operate: each cosigner, and the operator (DEP-19 §5; operator contagion
-   puts the operator's whole collateral at stake, not just this ledger's)."
+   puts the operator's whole collateral at stake, not just this ledger's).  Not against a ledger
+   whose vault is already confiscated (CONTAGION-TARGET-P)."
   (let ((qb (governing-quorum-begin-seq rec (up:update-seq update))))
     (when qb
       (dolist (signer (cons (up:update-operator-id update) (mapcar #'up:cosig-pubkey (up:update-cosignatures update))))
-        (dolist (target (remove (record-id-hex rec) (ledgers-operated-by node signer) :test #'string=))
+        (dolist (target (remove-if-not (lambda (id) (contagion-target-p node id))
+                                       (remove (record-id-hex rec) (ledgers-operated-by node signer) :test #'string=)))
           (log! node "contagion: ~a signed the fault on ~a; proof against its ledger ~a"
                 (subseq (bytes->hex signer) 0 8) (subseq (record-id-hex rec) 0 8) (subseq target 0 8))
           (broadcast-fraud node (fr:make-non-conforming-cosignature-proof signer (hex->bytes target) update qb)))))))
