@@ -874,6 +874,65 @@
 
 
 
+;;; Signet cld7 (ea90aca): four identical QuorumExpired proofs re-broadcast every ~72 s pass, 43 per
+;;; ledger per hour, because CHECK-EXPIRED-QUORUMS published on every pass where no fork of ours
+;;; was live and nothing remembered the last publication.
+(with-gate ("quorum expiry: the proof is published once, then on backoff or relay loss; never once the vault is confiscated")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv (tk 11111111111111111161) :bus bus :height-fn hf))
+         (b (nd:make-node :priv (tk 22222222222222222262) :bus bus :height-fn hf))
+         (c (nd:make-node :priv (tk 33333333333333333363) :bus bus :height-fn hf))
+         (d (nd:make-node :priv (tk 44444444444444444464) :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:x1" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la))
+         (now 1000000) (me (cl-nostr.keys:public-hex (nd::node-keypair b))))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "e1")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
+    (labels ((ours () (count-if (lambda (e) (and (= (cl-nostr.event:event-kind e) w:+kind-fraud-proof+) (string= (cl-nostr.event:event-pubkey e) me)
+                                                  (search "quorum" (string-downcase (cl-nostr.event:event-content e)))))
+                                (bus::mock-bus-events bus)))
+             (passes (n) (loop repeat n do (nd:check-expired-quorums b) (incf now 72))))
+      (let ((*height* (+ (lg:ledger-quorum-expiry (nd:record-ledger la)) 1))
+            (nd::*expiry-proof-clock* (lambda () now)))
+        ;; As on cld7: no fork of ours ever becomes live (ENTER-DISPUTE refuses), so every pass qualifies.
+        (sb-int:encapsulate 'nd::enter-dispute 'refuse (lambda (f &rest args) (declare (ignore f args)) nil))
+        (unwind-protect
+             (progn
+               (passes 1)
+               (check-equal "the first pass publishes the proof" (ours) 1)
+               (passes 7)
+               (check-equal "seven more passes (8.4 min) publish nothing: the relay holds it" (ours) 1)
+               ;; 200 passes = 4 h at the 72 s cadence: the old code published 200.  The backoff
+               ;; republishes at +600, +1800, +4200 and +9000 s.
+               (passes 192)
+               (check-equal "200 passes over 4 h: 1 + 4 backoff republications, not 200" (ours) 5)
+               ;; The relays lose it: republished within one relay check (10 min), once.
+               (setf (bus::mock-bus-events bus) '())
+               (passes 10)
+               (check-equal "relay loss: republished within 10 min" (ours) 1)
+               (passes 8)
+               (check-equal "and not again while the relay holds it" (ours) 1)
+               (check "the republication was logged" (some (lambda (l) (search "no longer on the relays" l)) (nd::node-log b)))
+               ;; A later quorum_expiry is a new proof: published at once.
+               (let ((k (cons id (lg:ledger-quorum-expiry (nd:record-ledger la)))))
+                 (check "one entry per (ledger, quorum_expiry)" (gethash k (nd::node-expiry-proofs b)))
+                 (check-equal "and only that one" (hash-table-count (nd::node-expiry-proofs b)) 1)))
+          (sb-int:unencapsulate 'nd::enter-dispute 'refuse))
+        ;; Confiscated: the expiry's dispute is already over, so no proof at all (cld7's four ledgers
+        ;; logged "not disputing (quorum_expired): its vault was confiscated" on every pass).
+        (setf (bus::mock-bus-events bus) '())
+        (clrhash (nd::node-expiry-proofs c))
+        (sb-int:encapsulate 'nd::reserves-confiscated-p 'yes (lambda (f node rec) (declare (ignore f node rec)) t))
+        (unwind-protect
+             (let ((mec (cl-nostr.keys:public-hex (nd::node-keypair c))))
+               (loop repeat 50 do (nd:check-expired-quorums c) (incf now 72))
+               (check-equal "confiscated: 50 passes publish no proof"
+                            (count-if (lambda (e) (and (= (cl-nostr.event:event-kind e) w:+kind-fraud-proof+) (string= (cl-nostr.event:event-pubkey e) mec)))
+                                      (bus::mock-bus-events bus))
+                            0)
+               (check "confiscated: and dispute nothing" (null (nd:find-fork c id (nd:node-pubkey c)))))
+          (sb-int:unencapsulate 'nd::reserves-confiscated-p 'yes))))))
+
 ;; These gates arm by hand: a dispute driven on entry may yield first (an expiry inside its grace,
 ;; a test reason), and a yielded fork takes no further arm of its round (DEP-06 Phase 4 fold, as
 ;; deposits-rust's Tombstoned).
@@ -947,6 +1006,7 @@
 ;; a test reason), and a yielded fork takes no further arm of its round (DEP-06 Phase 4 fold, as
 ;; deposits-rust's Tombstoned).
 (setf cl-deposits.node::*drive-dispute-on-enter* nil)
+
 (with-gate ("replacement collateral: declared, verified, and spent into the new vault by the winner")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (chain (make-hash-table :test #'equalp))      ; "txid:vout" -> sats  (a mock chain view)

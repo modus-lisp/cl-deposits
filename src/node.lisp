@@ -166,6 +166,9 @@
   ;; ledger id hex -> proofs we could not judge yet: our replica was behind the sequence they
   ;; rest on (JUDGE-LATER-P).  Each a plist (:hash :proof :content :needs :at).
   (parked-proofs (make-hash-table :test (quote equal) :synchronized t))
+  ;; (ledger id hex . quorum_expiry) -> (next-republish . interval): the QuorumExpired proofs we
+  ;; published (CHECK-EXPIRED-QUORUMS), each once, then on backoff or when the relays lost it.
+  (expiry-proofs (make-hash-table :test (quote equal) :synchronized t))
   (proof-catch-ups (make-hash-table :test (quote equal) :synchronized t)) ; ledger id hex -> catch-up thread (KICK-PROOF-CATCH-UP)
   ;; ledger id hex -> txids of confiscations we saw confirmed.  Kept apart from the forks: a fork
   ;; forgets its confiscation once the lottery output is spent (the winner's claim), and the vault
@@ -6802,19 +6805,67 @@
            (and enter (expiry-reason-p (op:field eo :reason))
                 (>= (or (op:field eo :last-valid-sequence) -1) (latest-quorum-begin-seq rec)))))))
 
+(defvar *expiry-proof-clock* #'get-universal-time
+  "Seconds now, for the QuorumExpired republication backoff (tests drive a fake one).")
+(defparameter *expiry-proof-backoff* '(600 . 21600)
+  "A published QuorumExpired proof is republished after (CAR) seconds, the wait doubling up to (CDR).")
+(defparameter *expiry-proof-relay-check* 600
+  "Between republications, how often to ask the relays whether they still hold our proof.")
+
+(defun expiry-proof-held-p (node id-hex expiry)
+  "The relays hold a QuorumExpired proof of ours for ID-HEX at quorum_expiry EXPIRY.  NIL also when
+   they cannot be read (then the backoff alone decides)."
+  (let ((me (k:public-hex (node-keypair node))))
+    (some (lambda (e)
+            (and (string= (ev:event-pubkey e) me)
+                 (let ((p (ignore-errors (fr:json->broadcast (w:parse-json (ev:event-content e))))))
+                   (and p (eq (getf p :type) :quorum-expired) (equal (getf p :ledger-id) id-hex)
+                        (eql (getf (getf p :evidence) :quorum-expiry) expiry)))))
+          (ignore-errors (bus:bus-fetch (node-bus node)
+                                        (flt:make-filter :kinds (list w:+kind-fraud-proof+)
+                                                         :tags (list (cons "d" (list (subseq id-hex 0 16))))))))))
+
+(defun publish-expiry-proof-p (node id-hex expiry)
+  "Whether to (re)publish our QuorumExpired proof of ID-HEX at EXPIRY now, and note it if so.
+   Once on first sight; then at the backoff (10 min doubling to 6 h); between those, at most every
+   *EXPIRY-PROOF-RELAY-CHECK* s, when the relays no longer hold it (so a relay that lost it gets it
+   back).  Signet cld7 (ea90aca) re-broadcast four identical proofs every ~72 s pass, 43 per ledger
+   per hour, because nothing remembered the last one."
+  (let* ((key (cons id-hex expiry)) (now (funcall *expiry-proof-clock*))
+         (e (gethash key (node-expiry-proofs node))))
+    (flet ((publish (interval)
+             (setf (gethash key (node-expiry-proofs node))
+                   (list :next (+ now interval) :interval interval :checked now))
+             t))
+      (cond ((null e) (publish (car *expiry-proof-backoff*)))
+            ((>= now (getf e :next))
+             (publish (min (cdr *expiry-proof-backoff*) (* 2 (getf e :interval)))))
+            ((< (- now (getf e :checked)) *expiry-proof-relay-check*) nil)
+            ((progn (setf (getf (gethash key (node-expiry-proofs node)) :checked) now)
+                    (expiry-proof-held-p node id-hex expiry))
+             nil)
+            (t (log! node "quorum expired on ~a: our proof is no longer on the relays; republishing" (subseq id-hex 0 8))
+               (setf (getf (gethash key (node-expiry-proofs node)) :checked) now)
+               t)))))
+
 (defun check-expired-quorums (node &key anchor-block-hash (grace 0) skip)
   "For every ledger we cosign whose quorum_expiry is more than GRACE blocks behind
    the chain tip (and whose id is not in SKIP), publish a QuorumExpired proof and
-   open a dispute fork.  Returns the ledger ids disputed."
+   open a dispute fork.  Returns the ledger ids disputed.  The proof is published once per
+   (ledger, quorum_expiry) and again only on backoff or when the relays lost it
+   (PUBLISH-EXPIRY-PROOF-P); none at all once the vault is confiscated, which ends the dispute
+   an expiry would open (ENTER-DISPUTE refuses one then)."
   (let ((h (height node)) (disputed '()))
     (loop for rec being the hash-values of (node-ledgers node)
           for ledger = (record-ledger rec)
           when (and (expired-quorum-p node rec h grace) (not (member (record-id-hex rec) skip :test #'equal))
-                    (not (expiry-disputed-p node rec)))
+                    (not (expiry-disputed-p node rec))
+                    (not (reserves-confiscated-p node rec)))
             do (let ((proof (fr:make-quorum-expired-proof (lg:ledger-operator-key ledger) (hex->bytes (record-id-hex rec))
                                                           (or anchor-block-hash (make-array 32 :element-type '(unsigned-byte 8)))
                                                           (lg:ledger-quorum-expiry ledger))))
-                 (broadcast-fraud node proof)
+                 (when (publish-expiry-proof-p node (record-id-hex rec) (lg:ledger-quorum-expiry ledger))
+                   (broadcast-fraud node proof))
                  (unless (live-fork node (record-id-hex rec) (node-pubkey node))
                    (enter-dispute node rec (lg:ledger-sequence ledger) :reason "quorum_expired"
                                   :anchor-block-hash anchor-block-hash :anchor-block-height h))
