@@ -651,6 +651,35 @@
 ;;; the saved bytes, by the next boot (PUBLISH-PENDING).  COMMIT-UPDATE is the only place an update
 ;;; of ours is signed (EQUIVOCATE, testing only, aside), so the rule lives here.
 
+(defparameter *fsync-operator-updates*
+  (let ((v (uiop:getenv "CLD_FSYNC_OPERATOR_UPDATES"))) (and v (member v '("1" "true" "on") :test #'string-equal) t))
+  "fsync the write-ahead of an ordinary operator update (CLD_FSYNC_OPERATOR_UPDATES=1 turns it
+   on).  OFF by default, measured (inspect/fsync-bench.lisp, 2026-11-20, 300 updates appended to
+   a 4000-update ledger, interleaved runs): 0.36 ms per write-ahead without fsync, 984 ms with it
+   on the nodes' zfs pool, far past a 20% bar.  A power loss there can lose a published operator
+   update; a kill cannot.  Dispute and rotation updates are always fsync'd: a power-loss re-sign
+   there is an equivocation, and they are rare.")
+
+(defvar *durable* nil "Bound T around a write that must survive power loss: fsync it.")
+(defvar *deferred-saves*)   ; special here, before WRITE-AHEAD binds it (its value: below, at SAVE-RECORD's batch)
+
+(defun fsync-stream (out)
+  (finish-output out)
+  (sb-posix:fsync (sb-sys:fd-stream-fd out)))
+
+(defun fsync-dir (dir)
+  (let ((fd (sb-posix:open (namestring dir) sb-posix:o-rdonly)))
+    (unwind-protect (sb-posix:fsync fd) (sb-posix:close fd))))
+
+(defun durable-update-p (rec update)
+  "A dispute or rotation update (anything on a fork: DisputeEnter, Armed, Yield, Acquire, residue
+   credits; a QuorumBegin; a ledger's continuation after its rotation), or any update when
+   *FSYNC-OPERATOR-UPDATES*."
+  (or *fsync-operator-updates*
+      (record-fork-p rec)
+      (member (getf (ignore-errors (op:update-op update)) :type)
+              '(:quorum-begin :dispute-enter :dispute-armed :dispute-yield :dispute-acquire))))
+
 (defvar *before-publish-hook* nil
   "Testing: called with NODE REC UPDATE after the write-ahead save and before the publish; a
    non-local exit from it is a node killed in that window.")
@@ -666,7 +695,9 @@
     (ensure-directories-exist (node-data-dir node))
     (let ((pending (pending-path node rec)))
       (with-open-file (out pending :direction :output :if-exists :supersede :external-format :latin-1)
-        (write-string (base64-encode (up:encode-update update)) out))
+        (write-string (base64-encode (up:encode-update update)) out)
+        (when *durable* (fsync-stream out)))
+      (when *durable* (fsync-dir (node-data-dir node)))
       (let ((*deferred-saves* nil)) (save-record node rec))
       pending)))
 
@@ -704,7 +735,7 @@
       (setf (lg:ledger-sequence (record-ledger rec)) (up:update-seq update)
             (lg:ledger-chain-tip (record-ledger rec)) (up:chain-hash update))))
   (record-push rec update)
-  (let ((pending (write-ahead node rec update)))
+  (let ((pending (let ((*durable* (durable-update-p rec update))) (write-ahead node rec update))))
     (when *before-publish-hook* (funcall *before-publish-hook* node rec update))
     (setf (record-last-event-id rec) (ev:event-id (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) update))))
     (when pending (ignore-errors (delete-file pending))))
@@ -8200,7 +8231,8 @@
       (if appendable
           (with-open-file (out path :direction :output :if-exists :overwrite :external-format :latin-1)
             (file-position out (- (file-length out) 2))
-            (format out ",~%~s]~%" (base64-encode (up:encode-update (first (record-history rec))))))
+            (format out ",~%~s]~%" (base64-encode (up:encode-update (first (record-history rec)))))
+            (when *durable* (fsync-stream out)))
           ;; Whole file: write beside it and rename.  SBCL DELETES a :supersede
           ;; target when the write is aborted — and a node killed mid-write (or
           ;; an error inside FORMAT) aborts it: that is how replicas vanished.
@@ -8208,8 +8240,10 @@
             (with-open-file (out tmp :direction :output :if-exists :supersede :external-format :latin-1)
               ;; A fork's file holds its own updates only; its base's file holds the rest.
               (format out "[~{~s~^,~%~}]~%" (mapcar (lambda (u) (base64-encode (up:encode-update u)))
-                                                    (reverse (subseq (record-history rec) 0 n)))))
-            (uiop:rename-file-overwriting-target tmp path)))
+                                                    (reverse (subseq (record-history rec) 0 n))))
+              (when *durable* (fsync-stream out)))
+            (uiop:rename-file-overwriting-target tmp path)
+            (when *durable* (fsync-dir (node-data-dir node)))))
       (setf (record-persisted rec) n)
       (persist-checkpoint node rec)))
   (drain-checkpoint-events node rec))
