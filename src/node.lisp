@@ -3414,8 +3414,13 @@
               ((and (null conf) (not (eq lstate :pending)) (not (getf (node-adversary node) :spend-pledge))
                     (< (count (node-pubkey node) (%all-arms node id) :key #'first :test #'equalp) +max-arms+)
                     (let ((ours (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp)))
-                      (and ours (fourth ours) (node-pledge-fn node)
-                           (dstep :pledge-check (pledge-failure (node-pledge-fn node) (fourth ours) (height node) 0 nil)))))
+                      (and ours (fourth ours)
+                           (or (and (dstep :custody-check (pledge-custody-rearm-p node (fourth ours) (not reserves-spent)))
+                                    (progn (log! node "our declared pledge ~a on ~a is a lottery claim's output 0 (a ledger's custody); re-arming with a fresh one"
+                                                 (outpoint-key (first (fourth ours)) (second (fourth ours))) (subseq id 0 8))
+                                           t))
+                               (and (node-pledge-fn node)
+                                    (dstep :pledge-check (pledge-failure (node-pledge-fn node) (fourth ours) (height node) 0 nil)))))))
                (remhash (outpoint-key (first (fourth (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp)))
                                       (second (fourth (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp))))
                         (node-pledges node))
@@ -5964,7 +5969,14 @@
                         (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
                  ;; Our declared replacement collateral (a key-path P2TR of our key) comes along as input 1.
                  (coll (fourth (find (node-pubkey node) (armers-of node id-hex) :key #'first :test #'equalp)))
-                 (coll-spk (and coll (lot:key-path-spk (up:x-only (node-pubkey node)))))
+                 ;; DEP-03 §Claim transaction (multi-input): input 1 MUST be the declared collateral,
+                 ;; any other coin is a WinnerCollateralDeviation; one that is a lottery claim's
+                 ;; output 0 is a ledger's custody, so the claim is refused (CLAIM-COLLATERAL-REFUSAL).
+                 (refusal (and coll (claim-collateral-refusal node coll)))
+                 (coll-spk (if refusal
+                               (progn (log! node "REFUSING to claim the lottery of ~a: ~a" (subseq id-hex 0 8) refusal)
+                                      (fail "claim refused: ~a" refusal))
+                               (and coll (lot:key-path-spk (up:x-only (node-pubkey node))))))
                  ;; DEP-03: the shared claim shape (deposits-core build_lottery_claim_tx).
                  (tx (btx:parse-tx (bw:make-reader
                                     (btx:serialize-tx (lot:claim-tx claim-txid 0 amount coll spk :fee fee :subset (not full))))))
@@ -6909,6 +6921,26 @@
 (defvar *custody-coins* (make-hash-table :test #'equal :synchronized t)
   "\"txid:vout\" -> T when the coin is a claim's output 0 (CLAIM-OUTPUT-P), NIL when not: a
    transaction never changes.")
+
+(defun claim-collateral-refusal (node coll)
+  "Why a claim may not spend COLL (txid vout sats), our declared collateral, as its input 1, else
+   NIL: it is a lottery claim's output 0 (CLAIM-OUTPUT-P), a ledger's custody, and the claim may
+   spend no other coin instead (DEP-03 §Claim transaction); or its funding transaction cannot be
+   read this pass.  With no TX-FN (a test node), NIL."
+  (when (node-tx-fn node)
+    (let ((tx (ignore-errors (funcall (node-tx-fn node) (first coll))))
+          (key (outpoint-key (first coll) (second coll))))
+      (cond ((null tx) (format nil "the funding transaction of our collateral ~a is unreadable; not claiming this pass" key))
+            ((claim-output-p tx (second coll))
+             (format nil "our declared collateral ~a is a lottery claim's output 0, a ledger's custody; a claim must spend the declared pledge and nothing else, so it is not built (re-arm with a fresh pledge, or arm the next round)" key))))))
+
+(defun pledge-custody-rearm-p (node coll vault-unspent)
+  "Our latest arm's declared pledge COLL must be replaced by a same-round re-arm (DEP-03
+   §Eligibility snapshot: a re-arm replaces the declaration; its latest arm counts): it is a
+   lottery claim's output 0, and VAULT-UNSPENT (no confiscation has fixed the set yet)."
+  (and vault-unspent coll (node-tx-fn node)
+       (let ((tx (ignore-errors (funcall (node-tx-fn node) (first coll)))))
+         (and tx (claim-output-p tx (second coll)) t))))
 
 (defun without-custody-coins (node utxos)
   "UTXOS (plists :txid :vout ...) without the coins that are a lottery claim's output 0, asked of

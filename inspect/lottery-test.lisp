@@ -1011,7 +1011,20 @@
         (check-equal "both claim outputs are left out" (length free) 1)
         (check-equal "the faucet coin is the pick"
                      (getf (nd::pick-pledge (funcall keyed free) 5000 1 nil nil) :key)
-                     (nd::outpoint-key (btx:tx-txid faucet) 0))))))
+                     (nd::outpoint-key (btx:tx-txid faucet) 0)))
+      ;; ref6's 9e23c858 arm declares fdff3a5f:0 (ad87b48b's custody): a claim with it is refused,
+      ;; never rebuilt with another coin (DEP-03 §Claim transaction: input 1 is the declared pledge).
+      (let ((fdff (list (btx:tx-txid claim) 0 (btx:txout-value (elt (btx:tx-outputs claim) 0))))
+            (plain (list (btx:tx-txid faucet) 0 (btx:txout-value (elt (btx:tx-outputs faucet) 0))))
+            (blind (nd::make-node :priv (tk 424244) :bus (bus:make-mock-bus) :tx-fn (lambda (txid) (declare (ignore txid)) nil))))
+        (check-equal "fdff3a5f is the custody claim" (u:txid-hex (first fdff))
+                     "fdff3a5f90d57a71e0cf73b6c9565ad2f417708dbe96a26ef24d8b2eba4b5307")
+        (check "a claim with the custody pledge is refused" (search "custody" (or (nd::claim-collateral-refusal node fdff) "")))
+        (check-equal "a claim with a faucet pledge is built" (nd::claim-collateral-refusal node plain) nil)
+        (check "an unreadable pledge is refused for the pass" (search "unreadable" (or (nd::claim-collateral-refusal blind plain) "")))
+        (check "a custody pledge re-arms while the vault is unspent" (nd::pledge-custody-rearm-p node fdff t))
+        (check "no same-round re-arm once the vault is spent" (not (nd::pledge-custody-rearm-p node fdff nil)))
+        (check "a faucet pledge never re-arms for custody" (not (nd::pledge-custody-rearm-p node plain t)))))))
 
 ;;; Local policy, not the shared vector: a re-arm leaves *REARM-PLEDGE-RESERVE* coins free; a round-1
 ;;; arm (reserve 0) may take the last; its own pledge is kept whatever the reserve.
