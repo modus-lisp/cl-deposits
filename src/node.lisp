@@ -4513,17 +4513,38 @@
   (let ((qb (and base-rec top-lvs (record-latest base-rec :quorum-begin :below (1+ top-lvs)))))
     (if qb (up:update-seq qb) 0)))
 
+(defun dispute-enter-of (node id-hex fork)
+  "FORK's DisputeEnter that counts in ID-HEX's dispute, (values update op) or NIL: its operator's
+   latest, and once the confiscation has confirmed in block C (NODE-CONFISCATION-HEIGHTS) its
+   latest signed at or below C.  DEP-03 §When the set is final: a DisputeEnter above C takes no
+   part, as an arm above C does not; it names no fork point, its grounds convict nobody and it
+   admits its author to no later round (regtest 12bc96d2, 2026-11-21: a contagion proof re-sent
+   after the confiscation at 23996 was entered on at 34763, and its proof convicted c30c1b29, the
+   only armer of round 2).  Mirrors deposits-rust's rotation_order::dispute_scope_final; vector
+   rearm_round_agree.json, late_enter."
+  (let ((c (gethash id-hex (node-confiscation-heights node))))
+    (if (null c)
+        (fork-op fork :dispute-enter)
+        (let ((u (find-if (lambda (u) (and (equalp (up:update-operator-id u) (record-fork-operator fork))
+                                           (<= (up:update-block-height u) c)))
+                          (if (record-fork-base fork)
+                              (gethash :dispute-enter (record-index fork))
+                              (record-updates-of fork :dispute-enter)))))
+          (and u (values u (op:update-op u)))))))
+
 (defun dispute-forks (node id-hex)
-  "The forks of ID-HEX that are its current dispute (see above).  A view built under the reading
-   before this rule (DISPUTE-VIEW :every-enter) takes every fork."
+  "The forks of ID-HEX that are its current dispute (see above), each through DISPUTE-ENTER-OF.
+   A view built under the reading before this rule (DISPUTE-VIEW :every-enter) takes every fork."
   (when (gethash :every-enter (node-dispute-notes node)) (return-from dispute-forks (forks-of node id-hex)))
   (let* ((forks (forks-of node id-hex))
-         (lvs-of (mapcar (lambda (f) (multiple-value-bind (u o) (fork-op f :dispute-enter)
+         (lvs-of (mapcar (lambda (f) (multiple-value-bind (u o) (dispute-enter-of node id-hex f)
                                        (and u (op:field o :last-valid-sequence))))
                          forks))
          (top (reduce (lambda (a b) (if (and a b) (max a b) (or a b))) lvs-of :initial-value nil)))
     (if (null top)
-        forks
+        (if (gethash id-hex (node-confiscation-heights node))
+            (loop for f in forks for l in lvs-of when l collect f)
+            forks)
         (let ((q (dispute-scope-q (let ((r (find-record node id-hex))) (and r (not (record-fork-p r)) r)) top)))
           (loop for f in forks for l in lvs-of when (and l (>= l q)) collect f)))))
 
@@ -4667,7 +4688,8 @@
         ;; A fork's arms are its operator's own updates; the prefix it inherited from the base
         ;; (~180k updates on a soaked ledger) is the base operator's, and decoding it on every
         ;; lottery and confiscation decision saturated the node (signet soak, 2026-10-27).
-        for lvs = (dispute-fork-point-of fork)
+        for lvs = (multiple-value-bind (u o) (dispute-enter-of node id-hex fork)
+                    (if u (op:field o :last-valid-sequence) -1))
         append (loop for u in (if (record-fork-base fork) (gethash :dispute-armed (record-index fork)) (record-updates-of fork :dispute-armed))
                      for o = (and (equalp (up:update-operator-id u) (record-fork-operator fork))
                                   (> (up:update-seq u) lvs)   ; an arm of an earlier dispute on this fork does not count
@@ -4694,7 +4716,7 @@
   "The dispute's fork point: the lowest last_valid_sequence any fork of the current dispute
    (DISPUTE-FORKS) names in its DisputeEnter."
   (loop for f in (dispute-forks node id-hex)
-        for (u o) = (multiple-value-list (fork-op f :dispute-enter))
+        for (u o) = (multiple-value-list (dispute-enter-of node id-hex f))
         when u minimize (op:field o :last-valid-sequence)))
 
 (defun fork-point-anchor (update)
@@ -4829,8 +4851,9 @@
                      (t (values proof "a proof to verify"))))))))
 
 (defun arm-grounds (node id-hex fork)
-  "(values verdict why) for FORK's DisputeEnter, VERDICT :GROUNDED, :UNGROUNDED or :UNKNOWN."
-  (multiple-value-bind (u o) (fork-op fork :dispute-enter)
+  "(values verdict why) for FORK's DisputeEnter (DISPUTE-ENTER-OF), VERDICT :GROUNDED, :UNGROUNDED
+   or :UNKNOWN."
+  (multiple-value-bind (u o) (dispute-enter-of node id-hex fork)
     (unless u (return-from arm-grounds (values :ungrounded "no DisputeEnter on its fork")))
     ;; Judged by the node the view belongs to when it holds the ledger, else by the view itself,
     ;; whose base record is the chain the relay gave (a judge that never followed the ledger).
@@ -4912,8 +4935,10 @@
          (lvs (dispute-last-valid-seq node id-hex))
          (pt (and base lvs (record-update-at base lvs)))
          (keys (and pt (list (up:x-only (up:update-operator-id pt))))))
-    (dolist (fork (forks-of node id-hex) (remove-duplicates keys :test #'equalp))
-      (multiple-value-bind (u o) (fork-op fork :dispute-enter)
+    ;; The current dispute's DisputeEnters only (DEP-03 §The accused never win: "each DisputeEnter
+    ;; counted in the current dispute"), as deposits-rust's dispute_accused_keys reads them.
+    (dolist (fork (dispute-forks node id-hex) (remove-duplicates keys :test #'equalp))
+      (multiple-value-bind (u o) (dispute-enter-of node id-hex fork)
         (when (and u (op:field o :fraud-proof)
                    (or (not (lg:ruleset-rule-p ruleset :grounded-arms))
                        (eq (ignore-errors (arm-grounds node id-hex fork)) :grounded)))
@@ -5500,7 +5525,7 @@
     (when (lg:ruleset-rule-p ruleset :grounded-arms)
       (shape-by-grounds ruleset
                         (loop for f in (dispute-forks node id-hex)
-                              for (u o) = (multiple-value-list (fork-op f :dispute-enter))
+                              for (u o) = (multiple-value-list (dispute-enter-of node id-hex f))
                               when u collect (list (op:field o :reason) (arm-grounds node id-hex f)))))))
 
 (defun dispute-respectful-p (node id-hex)
@@ -5635,7 +5660,7 @@
   (let ((g (grounded-shape-respectful view id-hex)))
     (when g (return-from view-respectful-p (eq g :respectful))))
   (let ((reasons (loop for f in (dispute-forks view id-hex)
-                       for (u o) = (multiple-value-list (fork-op f :dispute-enter))
+                       for (u o) = (multiple-value-list (dispute-enter-of view id-hex f))
                        when u collect (op:field o :reason))))
     (and reasons (every #'expiry-reason-p reasons))))
 
