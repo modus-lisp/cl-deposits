@@ -2733,6 +2733,13 @@
                   (progn
                     (check "reserves spent by a known confiscation: the ledger is confiscated" (nd::reserves-confiscated-p c rec))
                     (check "and enter-dispute opens no second dispute on it" (null (nd::enter-dispute c rec 8 :reason "quorum_expired")))
+                    ;; Nor is a contagion proof sent against it (regtest 12bc96d2, 2026-11-21: a
+                    ;; restart re-sent one 10 767 blocks after the confiscation, a member entered on
+                    ;; it, and its grounds cut round 2's only arm).
+                    (setf (gethash id (nd::node-ledgers c)) rec)
+                    (check "and no contagion proof is sent against it" (not (nd::contagion-target-p c id)))
+                    (check "while one is against a ledger we do not hold" (nd::contagion-target-p c (make-string 64 :initial-element #\c)))
+                    (remhash id (nd::node-ledgers c))
                     (check "a ledger with no known confiscation is not" (not (nd::reserves-confiscated-p c (nd::make-record :id-hex (make-string 64 :initial-element #\c))))))
                (handler-bind ((warning #'muffle-warning)) (setf (fdefinition 'nd::disputed-reserves) orig))))))
     (uiop:delete-directory-tree dir :validate (lambda (p) (search "cld-restart-test-" (namestring p))))))

@@ -1177,4 +1177,77 @@
              (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))
     (check-equal "every rearm_round_agree case ran" n 4)))
 
+(defun rra-load-node (c dir)
+  "A node holding case C's updates as replica files in DIR (the base chain, then a file per
+   fork), as the gate above loads them.  (values node ledger-id)."
+  (let* ((node (nd:make-node :priv (tk 4242424242424242424242) :bus (bus:make-mock-bus) :network "regtest"))
+         (id (gethash "ledger_id" c))
+         (dec (loop for h across (gethash "updates" c) for b = (u:hex->bytes h) collect (cons b (up:decode-update b))))
+         (origin (up:update-operator-id (cdr (find 0 dec :key (lambda (x) (up:update-seq (cdr x)))))))
+         (by (make-hash-table :test #'equalp)))
+    (ensure-directories-exist dir)
+    (dolist (x dec) (push x (gethash (up:update-operator-id (cdr x)) by)))
+    (flet ((write-file (path xs)
+             (with-open-file (o path :direction :output :if-exists :supersede)
+               (format o "[~{\"~a\"~^,~%~}]~%" (mapcar (lambda (x) (u:base64-encode (car x))) (sort (copy-list xs) #'< :key (lambda (x) (up:update-seq (cdr x)))))))
+             path))
+      (nd:load-record node (write-file (merge-pathnames (format nil "ledger_~a.json" (subseq id 0 16)) dir) (gethash origin by)))
+      (maphash (lambda (op xs)
+                 (unless (equalp op origin)
+                   (nd:load-record node (write-file (merge-pathnames (format nil "ledger_~a_fork_~a.json" (subseq id 0 16) (subseq (u:bytes->hex op) 0 16)) dir) xs))))
+               by))
+    (values node id)))
+
+;;; DEP-03 §When the set is final, for DisputeEnters (vector rearm_round_agree.json, late_enter):
+;;; 12bc96d2's DisputeEnter signed at 34763, after the confiscation at 23996, on a re-sent
+;;; contagion proof convicting c30c1b29.  Under the rule (`final`) it takes no part: c30c1b29's
+;;; round-2 arm is the cut of (24140, 24146] and the voters are the lottery's on chain.  Without it
+;;; (`control`: no confiscation height known) the arm is cut and the voters lose c30c1b29, which is
+;;; what cld364 did from 01:06Z on 2026-11-21.  Every carried proof is taken as grounded (each
+;;; verifies on regtest), seeded into the grounds cache.
+(with-gate ("DEP-03 when the set is final: a DisputeEnter above the confiscation takes no part (shared vector, 12bc96d2)")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "rearm_round_agree.json"))))
+        (n 0))
+    (loop for c across (gethash "late_enter" v)
+          for name = (subseq (gethash "name" c) 0 10)
+          for dir = (uiop:ensure-directory-pathname (format nil "/tmp/cl-deposits-rra-late-~a/" (random 1000000000)))
+          do (incf n)
+             (multiple-value-bind (node id) (rra-load-node c dir)
+               (dolist (f (nd::forks-of node id))
+                 (dolist (u (nd::fork-own-updates f :dispute-enter))
+                   (when (op:field (op:update-op u) :fraud-proof)
+                     (setf (gethash (up:chain-hash u) (nd::node-grounds-verdicts node)) (cons :grounded "taken as grounded")))))
+               (let ((chash (gethash "confiscation_height" (gethash "chain" c))))
+                 (dolist (arm '("final" "control"))
+                   (let ((e (gethash arm c)))
+                     (if (string= arm "final")
+                         (setf (gethash id (nd::node-confiscation-heights node)) chash)
+                         (remhash id (nd::node-confiscation-heights node)))
+                     (let* ((in (sort (mapcar (lambda (f) (u:bytes->hex (nd::record-fork-operator f))) (nd::dispute-forks node id)) #'string<))
+                            (accused (nd::dispute-accused-keys node id))
+                            (convicted (sort (mapcar #'u:bytes->hex accused) #'string<))
+                            (arms (nd::%all-arms node id))
+                            (voters (sort (mapcar #'u:bytes->hex (nd::lottery-voters node id)) #'string<)))
+                       (check-equal (format nil "~a ~a: the disputants" name arm) in (coerce (gethash "in_dispute" e) 'list))
+                       (check-equal (format nil "~a ~a: Accused(grounds)" name arm) convicted (coerce (gethash "convicted_if_grounded" e) 'list))
+                       (loop for w across (gethash "window_cuts" e)
+                             do (check-equal (format nil "~a ~a: round ~a's cut of (~a, ~a]" name arm (gethash "round" w) (gethash "opens" w) (gethash "closes" w))
+                                             (sort (mapcar (lambda (a) (list (u:bytes->hex (first a)) (sixth a)))
+                                                           (nd::accused-cut (nd::pick-round-arms arms (gethash "round" w) (gethash "opens" w) (gethash "closes" w)) accused))
+                                                   #'string< :key #'first)
+                                             (loop for a across (gethash "arms" w) collect (list (gethash "armer" a) (gethash "seq" a)))))
+                       (check-equal (format nil "~a ~a: the lottery's voters" name arm) voters
+                                    (coerce (if (string= arm "final") (gethash "voters" (gethash "lottery" e)) (gethash "lottery_voters" e)) 'list))
+                       (let* ((m (aref (gethash "manifests" c) 0))
+                              (named (nd::manifest-arms arms (loop for a across (gethash "arms" m) collect (list (u:hex->bytes (aref a 0)) (aref a 1)))
+                                                        (gethash "round" m) (gethash "opens" m) (gethash "closes" m)))
+                              (lot (lot:build-lottery (loop for (pk commitment target) in named
+                                                            collect (lot:make-participant :pubkey (up:x-only pk) :commitment commitment :target target))
+                                                      (mapcar #'u:hex->bytes voters) (lg:majority-threshold (length voters)) :network :regtest)))
+                         (check-equal (format nil "~a ~a: the lottery pays the chain's output iff the rule is applied" name arm)
+                                      (string= (u:bytes->hex (lot:lottery-spk lot)) (gethash "lottery_spk" (gethash "chain" c)))
+                                      (string= arm "final"))))))))
+             (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))
+    (check-equal "every late_enter case ran" n 1)))
+
 (report)
