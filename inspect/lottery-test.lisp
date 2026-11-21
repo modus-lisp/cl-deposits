@@ -966,18 +966,33 @@
                                        (loop for o across (gethash "ops" f)
                                              for k = (gethash "op" o)
                                              collect (cond ((string= k "enter") (list :enter))
-                                                           ((string= k "arm") (let ((p (gethash "pledge" o))) (list :arm (and (stringp p) p))))
+                                                           ((string= k "arm") (let ((p (gethash "pledge" o)))
+                                                                                (list :arm (and (stringp p) p) (or (gethash "round" o) 1))))
                                                            ((string= k "yield") (list :yield))
                                                            ((string= k "acquire")
                                                             (list :acquire (format nil "~a:0" (gethash "claim" o)) (eq (gethash "binds" o) t)))
                                                            (t (error "unknown fork op ~a" k))))
-                                       :retired (eq (gethash "retired" f) t))
+                                       :retired (eq (gethash "retired" f) t)
+                                       :others (loop for a across (or (gethash "others" f) #())
+                                                     when (eq (gethash "binds" a) t) collect (gethash "round" a)))
                                     (append pledges (and custody (list custody)))))
           for got = (nd::pick-pledge utxos (gethash "need" c) (gethash "min_confs" c) own
                                      (append (coerce (gethash "taken" c) 'list) held))
           do (incf n)
              (check-equal (format nil "pledge: ~a" (gethash "name" c)) (getf got :key) want))
-    (check-equal "every pledge_pick case ran" n 18)))
+    (check-equal "every pledge_pick case ran" n 21)))
+
+;;; Local policy, not the shared vector: a re-arm leaves *REARM-PLEDGE-RESERVE* coins free; a round-1
+;;; arm (reserve 0) may take the last; its own pledge is kept whatever the reserve.
+(with-gate ("re-arm reserve: a re-arm leaves the last coins for new disputes")
+  (let ((utxos (list (list :key "aa:0" :sats 50000 :confirmations 6)
+                     (list :key "bb:1" :sats 30000 :confirmations 6)
+                     (list :key "cc:0" :sats 10000 :confirmations 6))))
+    (check-equal "two cover the need: a re-arm takes neither" (nd::pick-pledge utxos 20000 1 nil nil :reserve 2) nil)
+    (check-equal "a round-1 arm takes one" (getf (nd::pick-pledge utxos 20000 1 nil nil) :key) "bb:1")
+    (check-equal "three cover it: the re-arm takes the smallest" (getf (nd::pick-pledge utxos 5000 1 nil nil :reserve 2) :key) "cc:0")
+    (check-equal "a taken coin is not free" (nd::pick-pledge utxos 5000 1 nil '("aa:0") :reserve 2) nil)
+    (check-equal "its own pledge is kept" (getf (nd::pick-pledge utxos 20000 1 "bb:1" '("bb:1") :reserve 2) :key) "bb:1")))
 
 ;;; inspect/vectors/acquire_binding.json: DEP-06 "An acquire binds once its claim confirms", shared
 ;;; with deposits-rust (deposits-node/tests/vectors/acquire_binding.json): a DisputeAcquire binds iff
@@ -1010,7 +1025,9 @@
     (check-equal "max rounds agree" (gethash "max_rounds" v) cl-deposits.node::+acquire-max-rounds+)
     (loop for c across (gethash "cases" v)
           for got = (ab-judge c)
+          for round = (nth-value 1 (ab-judge c))
           do (incf n)
+             (check-equal (format nil "round: ~a" (gethash "name" c)) (or round 0) (gethash "round" c))
              (check-equal (gethash "name" c) (string-downcase (symbol-name got)) (gethash "reason" c))
              (check-equal (format nil "binds: ~a" (gethash "name" c)) (eq got :binds) (eq (gethash "binds" c) t)))
     (check "every acquire_binding case ran" (>= n 13))))
