@@ -110,6 +110,8 @@
   (rearm-sigs (make-hash-table :test #'equal :synchronized t))
   ;; DEP-03 "When the set is final": ledger id -> the block its confiscation confirmed in.
   (confiscation-heights (make-hash-table :test #'equal :synchronized t))
+  ;; ledger id -> the height we last asked the chain for C and it had no answer (CONFISCATION-HEIGHT)
+  (confiscation-height-probes (make-hash-table :test #'equal :synchronized t))
   (lock (bt:make-lock "node"))
   (height-fn (lambda () 0))
   (log '())
@@ -2930,6 +2932,26 @@
       (setf (gethash id-hex (node-confiscation-heights node)) (1+ (- (height node) c)))))
   info)
 
+(defun confiscation-height (node id-hex)
+  "The block ID-HEX's confiscation confirmed in (DEP-03 \"When the set is final\"), or NIL.  Noted
+   when the confiscation is found; after a restart that table is empty while the confiscation's
+   txid is still known (confiscations.txt), so C is derived from the chain before anything is
+   judged by it: the lottery output's confirmations while it is unspent, else the txid's own.
+   Without this a restarted node's first passes counted a DisputeEnter signed above C (its fork
+   point, its grounds, its later rounds) until something rebuilt the confiscation.  The chain is
+   asked at most once a block while it has no answer."
+  (or (gethash id-hex (node-confiscation-heights node))
+      (let ((known (gethash id-hex (node-known-confiscations node))) (h (height node)))
+        (when (and known (or (node-chain-fn node) (node-tx-confs-fn node))
+                   (not (eql (gethash id-hex (node-confiscation-height-probes node)) h)))
+          (setf (gethash id-hex (node-confiscation-height-probes node)) h)
+          (dolist (txid known)
+            (when (node-chain-fn node)
+              (note-confiscation-height node id-hex (ignore-errors (funcall (node-chain-fn node) txid 0))))
+            (when (and (node-tx-confs-fn node) (not (gethash id-hex (node-confiscation-heights node))))
+              (note-confiscation-height node id-hex (list :confirmations (ignore-errors (funcall (node-tx-confs-fn node) txid))))))
+          (gethash id-hex (node-confiscation-heights node))))))
+
 (defun confiscated-lottery (node id-hex)
   "The confiscation of ID-HEX that is on chain: one we signed, or rebuilt from
    public state.  (values tx lottery :pending) while its lottery output is unspent."
@@ -2976,7 +2998,7 @@
                    (and l (equalp (lot:lottery-spk l) spk) l))))))
       ;; DEP-06 §Arm manifests: the arm sets the confiscation's signers published first; then our
       ;; cut, then every subset of the latest arms (a judge without a manifest).
-      (or (let ((c (gethash id-hex (node-confiscation-heights node))) (all (%all-arms node id-hex)))
+      (or (let ((c (confiscation-height node id-hex)) (all (%all-arms node id-hex)))
             (loop for m in (arm-manifests-of node id-hex 1)
                   thereis (let ((named (manifest-arms all m 1 -1 (or c most-positive-fixnum)))) (and named (try named)))))
           (try (ignore-errors (lottery-armers node id-hex)))
@@ -4522,7 +4544,7 @@
    after the confiscation at 23996 was entered on at 34763, and its proof convicted c30c1b29, the
    only armer of round 2).  Mirrors deposits-rust's rotation_order::dispute_scope_final; vector
    rearm_round_agree.json, late_enter."
-  (let ((c (gethash id-hex (node-confiscation-heights node))))
+  (let ((c (confiscation-height node id-hex)))
     (if (null c)
         (fork-op fork :dispute-enter)
         (let ((u (find-if (lambda (u) (and (equalp (up:update-operator-id u) (record-fork-operator fork))
@@ -4542,7 +4564,7 @@
                          forks))
          (top (reduce (lambda (a b) (if (and a b) (max a b) (or a b))) lvs-of :initial-value nil)))
     (if (null top)
-        (if (gethash id-hex (node-confiscation-heights node))
+        (if (confiscation-height node id-hex)
             (loop for f in forks for l in lvs-of when l collect f)
             forks)
         (let ((q (dispute-scope-q (let ((r (find-record node id-hex))) (and r (not (record-fork-p r)) r)) top)))
@@ -4969,7 +4991,7 @@
   "The lottery's participants: (values participants excluded snapshot floor).  Once the
    confiscation has confirmed, the arms above its block do not count (DEP-03)."
   (let ((floor-sats (eligibility-floor-sats node id-hex))
-        (c (gethash id-hex (node-confiscation-heights node))))
+        (c (confiscation-height node id-hex)))
     (multiple-value-bind (in out snapshot)
         (multiple-value-bind (grounded ungrounded) (grounded-armers node id-hex (armers-of node id-hex :until c))
           ;; DEP-03 §Lottery: a key the dispute's grounds convict never wins.  Dropped before the cut,
@@ -5674,7 +5696,7 @@
   (let* ((reserves (disputed-reserves view (find-record view id-hex)))
          (tiers (rs:reserves-tiers reserves))
          (ti (position (btx:tx-locktime tx) tiers :key #'rs:tier-locktime))
-         (c (gethash id-hex (node-confiscation-heights view)))
+         (c (confiscation-height view id-hex))
          (named (and manifest (manifest-arms (%all-arms view id-hex) manifest 1 -1 (or c most-positive-fixnum))))
          (all (sort (copy-list (grounded-armers view id-hex (if manifest named (armers-of view id-hex :until c))))
                     #'bytes< :key #'first))
@@ -6212,7 +6234,7 @@
               (return-from current-lottery (values tx l round h)))))
         (return-from current-lottery nil))))
   (multiple-value-bind (tx l) (fork-lottery node id-hex)
-    (when tx (values tx l 1 (or (gethash id-hex (node-confiscation-heights node)) (lottery-output-height node tx))))))
+    (when tx (values tx l 1 (or (confiscation-height node id-hex) (lottery-output-height node tx))))))
 
 (defun rearm-open-tiers (lottery height now)
   "The recovery tiers of LOTTERY (output confirmed at HEIGHT) whose CSV has passed at NOW, tier 0

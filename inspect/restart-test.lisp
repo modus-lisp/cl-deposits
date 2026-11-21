@@ -184,4 +184,73 @@
                                 (check-equal "no two of a member's signatures share (ledger, seq) with different content" twice 0))
                               (nd:stop-node l2))))))))))))))))
 
+;;; DEP-03 §When the set is final, after a restart (vector rearm_round_agree.json, late_enter:
+;;; 12bc96d2, a DisputeEnter signed at 34763 above the confiscation at 23996).  The block C was
+;;; noted only when the confiscation was found, in memory, so a restarted node judged its first
+;;; passes with every DisputeEnter counted.  Here the node knows the confiscation only as its txid
+;;; (confiscations.txt) and the chain: C must be derived before the first judge, from the lottery
+;;; output's confirmations while it is unspent, else the txid's own (once claimed).  The control:
+;;; a node that cannot ask the chain counts the late enter, as cld364 did.
+(with-gate ("restart: a DisputeEnter above the confiscation takes no part from the first pass (shared vector, 12bc96d2)")
+  (let* ((v (json-simple:parse (uiop:read-file-string (vector-path "rearm_round_agree.json"))))
+         (c (aref (gethash "late_enter" v) 0))
+         (id (gethash "ledger_id" c))
+         (chain (gethash "chain" c))
+         (txid (reverse (u:hex->bytes (gethash "confiscation_txid" chain))))
+         (cheight (gethash "confiscation_height" chain))
+         (tip 35000) (confs (1+ (- tip cheight)))
+         (final (gethash "final" c)) (control (gethash "control" c))
+         (dir (uiop:ensure-directory-pathname (format nil "/tmp/cl-deposits-restart-~a/late-enter/" *run*)))
+         (dec (loop for h across (gethash "updates" c) for b = (u:hex->bytes h) collect (cons b (up:decode-update b))))
+         (origin (up:update-operator-id (cdr (find 0 dec :key (lambda (x) (up:update-seq (cdr x)))))))
+         (by (make-hash-table :test #'equalp)))
+    (ensure-directories-exist dir)
+    ;; the replica files a node keeps: the base chain, then a file per fork
+    (dolist (x dec) (push x (gethash (up:update-operator-id (cdr x)) by)))
+    (maphash (lambda (op xs)
+               (with-open-file (o (merge-pathnames (if (equalp op origin)
+                                                       (format nil "ledger_~a.json" (subseq id 0 16))
+                                                       (format nil "ledger_~a_fork_~a.json" (subseq id 0 16) (subseq (u:bytes->hex op) 0 16)))
+                                                   dir)
+                                  :direction :output :if-exists :supersede)
+                 (format o "[~{\"~a\"~^,~%~}]~%" (mapcar (lambda (x) (u:base64-encode (car x))) (sort (copy-list xs) #'< :key (lambda (x) (up:update-seq (cdr x))))))))
+             by)
+    (unwind-protect
+         (flet ((boot (&key chain-fn tx-confs-fn)
+                  (let ((n (nd:make-node :priv (tk 4343434343434343) :bus (bus:make-mock-bus) :network "regtest" :data-dir dir
+                                         :height-fn (lambda () tip) :chain-fn chain-fn :tx-confs-fn tx-confs-fn)))
+                    (nd:load-data-dir n :log-fn (lambda (&rest a) (declare (ignore a))))
+                    ;; every carried proof taken as grounded (each verifies on regtest)
+                    (dolist (f (nd::forks-of n id))
+                      (dolist (u (nd::fork-own-updates f :dispute-enter))
+                        (when (op:field (op:update-op u) :fraud-proof)
+                          (setf (gethash (up:chain-hash u) (nd::node-grounds-verdicts n)) (cons :grounded "taken as grounded")))))
+                    n))
+                (judged (n)
+                  (list (sort (mapcar (lambda (f) (u:bytes->hex (nd::record-fork-operator f))) (nd::dispute-forks n id)) #'string<)
+                        (sort (mapcar #'u:bytes->hex (nd::dispute-accused-keys n id)) #'string<)
+                        (sort (mapcar #'u:bytes->hex (nd::lottery-voters n id)) #'string<)))
+                (expected (e voters) (list (coerce (gethash "in_dispute" e) 'list) (coerce (gethash "convicted_if_grounded" e) 'list)
+                                           (coerce voters 'list))))
+           ;; before the restart: the confiscation was seen confirm, and only its txid is on disk
+           (let ((a (boot)))
+             (nd::note-confiscation a id txid)
+             (nd:stop-node a))
+           (let ((b (boot :chain-fn (lambda (tx vout) (and (equalp tx txid) (zerop vout) (list :confirmations confs))))))
+             (check "restarted: the confiscation is known, by txid" (member txid (gethash id (nd::node-known-confiscations b)) :test #'equalp))
+             (check "and no block C is held in memory" (null (gethash id (nd::node-confiscation-heights b))))
+             (check-equal "the first judge: disputants, Accused(grounds) and voters are the final set's (C from the lottery output)"
+                          (judged b) (expected final (gethash "voters" (gethash "lottery" final))))
+             (check-equal "C was derived from the chain" (gethash id (nd::node-confiscation-heights b)) cheight)
+             (nd:stop-node b))
+           (let ((b (boot :tx-confs-fn (lambda (tx) (and (equalp tx txid) confs)))))
+             (check-equal "the lottery output claimed: C from the confiscation's own confirmations, the same first judge"
+                          (judged b) (expected final (gethash "voters" (gethash "lottery" final))))
+             (nd:stop-node b))
+           (let ((b (boot)))
+             (check-equal "control: a node that cannot ask the chain counts the late enter"
+                          (judged b) (expected control (gethash "lottery_voters" control)))
+             (nd:stop-node b)))
+      (uiop:delete-directory-tree dir :validate (lambda (p) (search "cl-deposits-restart-" (namestring p))) :if-does-not-exist :ignore))))
+
 (report)
