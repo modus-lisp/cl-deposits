@@ -87,7 +87,7 @@ for i in $(seq 1 $((WAIT / 5))); do
   sleep 5
 done
 [ -n "$CLAIM" ] || fail "round 2's lottery output $R2:0 was not claimed within ${WAIT}s"
-cld_ctl $H '(:log)' 2>/dev/null | tr '"' '\n' | grep -qF "dispute ${W:0:8}: re-arm round 2: won" || fail "$H did not log the round-2 win"
+await_won 600 "dispute ${W:0:8}: re-arm round 2: won" $H >/dev/null || fail "$H did not log the round-2 win within 600 s of the claim"
 for n in $C2 $C3 $C4 $H $OP; do
   if cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND|unauthori[sz]ed spend" | grep -qi "${R2:0:16}"; then
     fail "$n took the re-arm spend for a theft"

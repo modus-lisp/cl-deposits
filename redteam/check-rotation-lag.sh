@@ -45,7 +45,8 @@ for n in $LAG $BLIND; do
   if cld_ctl $n "(:log :n 4000)" | grep -q "signing the .* rungs of ${X:0:8}"; then fail "$n signed the rotation; it was meant not to"; fi
 done
 if accused $LAG "$X" 60; then fail "the lagging watcher $LAG reported the rotation as a theft"; fi
-cld_ctl $LAG "(:log :n 4000)" | grep -q "vault watch: ${X:0:8}'s spend .* is answered by its anchor" \
+lag_answered() { cld_ctl $LAG "(:log :n 4000)" | grep -q "vault watch: ${X:0:8}'s spend .* is answered by its anchor"; }
+poll 300 lag_answered \
   || fail "$LAG never judged the spend answered (its log): the watch did not reach it"
 echo "   $LAG found the rotation's QuorumBegin (on the relay) and reported nothing"
 # BLIND: challenged, answered, accepted.  Its watch runs each pass; give the answer a few.

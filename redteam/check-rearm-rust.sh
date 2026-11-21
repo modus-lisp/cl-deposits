@@ -82,8 +82,9 @@ read -r nout seq <<<"$(bcli getrawtransaction "$R2" 1 | python3 -c 'import json,
 [ "$nout" = 1 ] || fail "$CONF:0 was spent by $R2 with $nout outputs: not a re-arm spend (a claim?)"
 [ "$seq" = 144 ] || fail "the re-arm spend $R2 went through nSequence $seq, not tier 0's 144"
 rl() { tail -c +"$RFROM" "$RLOG" | sed 's/\x1b\[[0-9;]*m//g'; }
-rl | grep -q "re-arm ${W:0:16}: lottery round 1 unclaimed; armed round 2" || fail "$R did not log arming round 2"
-rl | grep -q "re-arm ${W:0:16}: lottery round 1 unclaimed; spent into round 2's lottery (tier 0)" \
+rlhas() { rl | grep -aq "$1"; }
+rlhas "re-arm ${W:0:16}: lottery round 1 unclaimed; armed round 2" || fail "$R did not log arming round 2"
+poll 300 rlhas "re-arm ${W:0:16}: lottery round 1 unclaimed; spent into round 2's lottery (tier 0)" \
   || fail "the re-arm spend $R2 is not R's proposal: $(cld_ctl $H '(:log)' | tr '"' '\n' | grep -F "dispute ${W:0:8}:" | tail -2 | tr '\n' ' ')"
 echo "== re-arm spend $R2 through tier 0, proposed by $R; waiting for $R's round-2 claim"
 CLAIM=""
@@ -93,7 +94,9 @@ for i in $(seq 1 $((WAIT / 5))); do
   sleep 5
 done
 if [ -z "$CLAIM" ]; then rl | grep -E "re-arm ${W:0:16}|Found lottery UTXO|claim" | tail -5 | sed "s/^/   $R: /"; fail "round 2's lottery output $R2:0 was not claimed within ${WAIT}s"; fi
-rl | grep -q "re-arm ${W:0:16}: re-arm round 2: won" || fail "$R did not log the round-2 win (claim $CLAIM)"
+# "won" follows the claim's CONFIRMATION (DisputeAcquire persisted), so keep mining while waiting.
+NPOLL=0; won() { rlhas "re-arm ${W:0:16}: re-arm round 2: won" && return 0; NPOLL=$((NPOLL + 1)); [ $((NPOLL % 6)) -eq 0 ] && mine 1 >/dev/null; return 1; }
+poll 600 won || fail "$R did not log the round-2 win within 600 s of its claim $CLAIM"
 for n in $C2 $C3 $C4 $H $OP; do
   if cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND|unauthori[sz]ed spend" | grep -qi "${R2:0:16}"; then
     fail "$n took the re-arm spend for a theft"

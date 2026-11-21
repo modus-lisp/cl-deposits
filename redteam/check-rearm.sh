@@ -81,7 +81,7 @@ for i in $(seq 1 $((WAIT / 5))); do
   sleep 5
 done
 [ -n "$CLAIM" ] || fail "round 2's lottery output $R2:0 was not claimed within ${WAIT}s"
-won=$(for n in $H $H2; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}: re-arm round 2: won" | head -1 | sed "s/^/$n /"; done)
+won=$(await_won 600 "dispute ${W:0:8}: re-arm round 2: won" $H $H2)
 [ "$(printf '%s\n' "$won" | grep -c 'won')" = 1 ] || fail "expected exactly one round-2 winner, got: ${won:-none}"
 for n in $C2 $C3 $C4 $H $H2 $OP; do
   if cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND|unauthori[sz]ed spend" | grep -qi "${R2:0:16}"; then

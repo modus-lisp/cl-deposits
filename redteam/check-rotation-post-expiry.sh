@@ -160,6 +160,8 @@ case $ARM in
     r1log "$MARK0" | grep "Expiry dispute on ${X:0:16}" | grep -q "published DisputeYield" \
       && fail "$R1 yielded its expiry dispute though the confiscation won: $(r1log "$MARK0" | grep "Expiry dispute on ${X:0:16}" | grep -m1 DisputeYield | cut -c1-200)"
     cllog $C1 "$MARK0" | grep "${X:0:8}" | grep -q "quorum re-established" && fail "$C1 yielded on the recorded QuorumBegin"
+    r1_revealed() { r1log "$MARK0" | grep -q "Published custody-lottery reveal: ledger=${X:0:16}, member=$R1K"; }
+    poll 600 r1_revealed
     rev=$(r1log "$MARK0" | grep -m1 "Published custody-lottery reveal: ledger=${X:0:16}, member=$R1K")
     [ -n "$rev" ] || fail "$R1 published no lottery reveal for $X"
     echo "   $R1: ${rev:0:160}"
