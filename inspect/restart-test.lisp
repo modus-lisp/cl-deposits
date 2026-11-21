@@ -264,4 +264,99 @@
                                              (length (funcall in-archive)) 2))
                               (nd:stop-node l2))))))))))))))))
 
+;; A draft dated outside the cosigners' window is re-stamped, never resent; and never once signed.
+(with-gate ("restart: a cosign draft that falls behind the window is re-stamped on retry (write-ahead holds)")
+  ;; Regtest 1121-101522: an operator on a loaded box drafted seq 5 of fbe37fad at 35890; by its
+  ;; cosign request the members stood at 35897, the reference refused "block_height 35890 is more
+  ;; than 6 blocks from our height 35897" three times -- every retry resent the identical draft --
+  ;; and the post-expiry rotation never formed.  The cosigners here enforce DEP-02's 6-block
+  ;; window (HANDLE-COSIGN).  The operator's draft is unsigned until its cosignatures are in, so
+  ;; re-dating it signs nothing twice; checked below from what reached the relay.
+  (let* ((bus (bus:make-mock-bus))
+         (*height* 5000) (op-height nil)          ; op-height: the operator's own (lagging) view, or NIL = *height*
+         (hf (lambda () *height*)) (ohf (lambda () (or op-height *height*)))
+         (pa 13131313131313131313) (pb 14141414141414141414) (pc 15151515151515151515) (pd 16161616161616161616)
+         (a (boot pa bus ohf)) (b (boot pb bus hf)) (c (boot pc bus hf)) (d (boot pd bus hf))
+         (la (nd:open-ledger a :reserves-id "genesis:restamp" :reserves 15600000 :collateral 23400000))
+         (id (nd:record-id-hex la)) (pk (nd:node-pubkey a))
+         (ours (lambda (seq)
+                 (remove-duplicates
+                  (loop for e in (bus:mock-bus-events bus)
+                        for u = (and (= (cl-nostr.event:event-kind e) w:+kind-update+) (ignore-errors (w:event->update e)))
+                        when (and u (equalp (up:update-operator-id u) pk) (equalp (up:update-ledger-id u) (u:hex->bytes id))
+                                  (= (up:update-seq u) seq))
+                          collect u)
+                  :test #'equalp :key #'up:encode-update)))
+         (logged (lambda (n what) (some (lambda (l) (search what l)) (nd::node-log n)))))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m))))
+    (dolist (m (list b c d)) (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d7")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000)
+    (let* ((w1 (nd:make-wallet :priv (tk 17171717171717171717) :bus bus))
+           (d1 (nd:wallet-open-deposit w1 id)))
+      ;; 1. Seven blocks arrive between the draft and its first cosign request (everyone sees them).
+      (let* ((seq (1+ (lg:ledger-sequence (nd:record-ledger la)))) (drafted *height*) (bumped nil)
+             (nd::*before-cosign-request-hook*
+               (lambda (node rec u attempt) (declare (ignore u))
+                 (when (and (eq node a) (eq rec la) (zerop attempt) (not bumped)) (setf bumped t) (incf *height* 7))))
+             (r (handler-case (nd:credit-onchain a la d1 100000 :txid (u:sha256 (hx "c0ffee7")))
+                  (error (e) (format nil "~a" e)))))
+        (check "a credit drafted 7 blocks behind the members is recorded" (and r (not (stringp r))) r)
+        (let ((pub (funcall ours seq)))
+          (check-equal "one update of ours at that seq reached the relay" (length pub) 1)
+          (check-equal "dated at the tip, not at the stale draft's height"
+                       (and pub (up:update-block-height (first pub))) (+ drafted 7))
+          (check "carries a majority of cosignatures over the re-stamped bytes"
+                 (and pub (>= (length (up:update-cosignatures (first pub))) 2)
+                      (every (lambda (cs) (up:verify-cosignature (first pub) cs)) (up:update-cosignatures (first pub)))))
+          (check "nothing of ours dated at the stale height was ever published"
+                 (notany (lambda (u) (= (up:update-block-height u) drafted)) pub)))
+        (check "the operator logged the re-stamp" (funcall logged a "re-stamping seq"))
+        (check "the members' replicas follow" (every (lambda (m) (= seq (lg:ledger-sequence (nd:record-ledger (nd:find-record m id))))) (list b c d)))
+        (check "nothing left pending" (null (directory (merge-pathnames "pending_*.b64" (dir-for pa))))))
+      ;; 2. The operator's own view lags the members' by 7 (a stale height cache under load): the
+      ;; first request is REFUSED for its height, the refusal is logged with the cosigner's reason,
+      ;; and once our view catches up the retry is re-stamped -- a rotation's first step, the
+      ;; QuorumAddMember the regtest run lost.
+      (let* ((e (boot 18181818181818181818 bus hf))
+             (_ (nd:open-ledger e :reserves-id "genesis:restamp-e"))
+             (seq (1+ (lg:ledger-sequence (nd:record-ledger la))))
+             (__ (setf op-height *height* *height* (+ *height* 7)))
+             (nd::*before-cosign-request-hook*
+               (lambda (node rec u attempt) (declare (ignore u))
+                 (when (and (eq node a) (eq rec la) (= attempt 1)) (setf op-height nil))))
+             (r (handler-case (nd:add-member a la (nd:node-pubkey e) :member-ledger-id (nd::node-member-ledger-hex e))
+                  (error (x) (format nil "~a" x)))))
+        (declare (ignore _ __))
+        (setf op-height nil)
+        (check "a QuorumAddMember refused for its height is re-stamped and recorded" (and r (not (stringp r))) r)
+        (check "the cosigner's stale-height refusal is in the operator's log"
+               (funcall logged a "below our tip"))
+        (let ((pub (funcall ours seq)))
+          (check-equal "one QuorumAddMember of ours at that seq" (length pub) 1)
+          (check-equal "dated at the tip" (and pub (up:update-block-height (first pub))) *height*))
+        (nd:stop-node e))
+      ;; 3. Write-ahead: a re-stamped update killed between its save and its publish comes back as
+      ;; THOSE bytes, and is never re-dated again; and an update already signed is never re-stamped.
+      (let* ((seq (1+ (lg:ledger-sequence (nd:record-ledger la)))) (bumped nil)
+             (killed (let ((nd::*before-cosign-request-hook*
+                             (lambda (node rec u attempt) (declare (ignore u))
+                               (when (and (eq node a) (eq rec la) (zerop attempt) (not bumped)) (setf bumped t) (incf *height* 7))))
+                           (nd::*before-publish-hook* (lambda (node rec u) (declare (ignore u))
+                                                        (when (and (eq node a) (eq rec la)) (throw :killed :killed)))))
+                       (catch :killed (nd:credit-onchain a la d1 50000 :txid (u:sha256 (hx "c0ffee8"))) :survived)))
+             (saved (nd:tip la)))
+        (check-equal "killed after the re-stamped save, before its publish" killed :killed)
+        (check-equal "nothing of ours at that seq on the relay yet" (length (funcall ours seq)) 0)
+        (check "an update already signed is never re-stamped"
+               (handler-case (progn (nd::check-restampable la saved) nil) (error () t)))
+        (check "an unsigned draft at the next seq may be"
+               (nd::check-restampable la (nd::new-update a la (list :type :dispute-yield))))
+        (nd:stop-node a)
+        (incf *height* 7)
+        (let* ((a2 (boot pa bus ohf)) (pub (funcall ours seq)))
+          (check-equal "the boot published it, once" (length pub) 1)
+          (check "as the saved bytes, not a re-dating" (and pub (equalp (up:encode-update (first pub)) (up:encode-update saved))))
+          (nd:stop-node a2))))
+    (dolist (n (list b c d)) (nd:stop-node n))))
+
 (report)
