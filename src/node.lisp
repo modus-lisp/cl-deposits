@@ -3403,6 +3403,25 @@
                  (return-from %drive-dispute (note-dispute node id "yield held (YIELD-ONCE)")))
                (release-pledges node id)
                (return-from %drive-dispute (apply #'note-dispute node id fmt args))))
+        ;; DEP-03 "When a pledge is live": another participant's binding acquire for our arm's round
+        ;; or a later one ended the lottery; yield as its loser, once (YIELD-ONCE adopts a yield of
+        ;; ours already published and never signs a second).  Without it a dispute won by someone
+        ;; else held our pledge for good (regtest 1121-next4c: 12 of deposits-rust ref6's forks).
+        (multiple-value-bind (au ao) (fork-op fork :dispute-armed)
+          (declare (ignore au))
+          (when (and ao (eq (lg:ledger-dispute-state (record-ledger fork)) :armed))
+            (let* ((our-round (or (op:field ao :rearm-round) 1))
+                   (mine (lot:key-path-spk (up:x-only (node-pubkey node))))
+                   ;; Not a claim of ours that someone else named: its output 0 pays our target.
+                   (won (find-if (lambda (a)
+                                   (and (>= (second a) our-round)
+                                        (let ((tx (and (node-tx-fn node) (ignore-errors (funcall (node-tx-fn node) (third a))))))
+                                          (and tx (plusp (length (btx:tx-outputs tx)))
+                                               (not (equalp (btx:txout-script (elt (btx:tx-outputs tx) 0)) mine))))))
+                                 (others-binding-acquires node fork))))
+              (when won
+                (conclude "lost to ~a's binding acquire (claim ~a, round ~a); yielded"
+                          (subseq (bytes->hex (first won)) 0 16) (txid-hex (third won)) (second won))))))
         (when (find-if (lambda (r) (> (getf r :round) 1)) (rearm-rounds node id))
           (return-from %drive-dispute (note-dispute node id "in a re-arm round (DRIVE-REARM)")))
         (when (or (fork-op fork :dispute-acquire) (fork-op fork :dispute-yield))
@@ -3474,8 +3493,13 @@
               ((and (null conf) (not (eq lstate :pending)) (not (getf (node-adversary node) :spend-pledge))
                     (< (count (node-pubkey node) (%all-arms node id) :key #'first :test #'equalp) +max-arms+)
                     (let ((ours (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp)))
-                      (and ours (fourth ours) (node-pledge-fn node)
-                           (dstep :pledge-check (pledge-failure (node-pledge-fn node) (fourth ours) (height node) 0 nil)))))
+                      (and ours (fourth ours)
+                           (or (and (dstep :custody-check (pledge-custody-rearm-p node (fourth ours) (not reserves-spent)))
+                                    (progn (log! node "our declared pledge ~a on ~a is a lottery claim's output 0 (a ledger's custody); re-arming with a fresh one"
+                                                 (outpoint-key (first (fourth ours)) (second (fourth ours))) (subseq id 0 8))
+                                           t))
+                               (and (node-pledge-fn node)
+                                    (dstep :pledge-check (pledge-failure (node-pledge-fn node) (fourth ours) (height node) 0 nil)))))))
                (remhash (outpoint-key (first (fourth (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp)))
                                       (second (fourth (find (node-pubkey node) (armers-of node id) :key #'first :test #'equalp))))
                         (node-pledges node))
@@ -4177,21 +4201,23 @@
   "Whether the acquire naming CLAIM (txid, wire bytes) binds for the dispute that confiscated the
    vault VAULTS names: (txid vout) for every rung of its QuorumBegin's fee ladder (DEP-03), any of
    which may have confirmed.  TX-FN: txid -> (values tx confirmed-p), or NIL when unknown.
-   :BINDS, :UNCONFIRMED (asked again later), :NOT-A-CLAIM (a re-arm spend), :NOT-THIS-LOTTERY."
+   :BINDS, :UNCONFIRMED (asked again later), :NOT-A-CLAIM (a re-arm spend), :NOT-THIS-LOTTERY.
+   Second value: the round a binding claim closes (1 when it spends the confiscation's output 0,
+   one more per re-arm spend followed back), else 0."
   (multiple-value-bind (ctx confirmed) (funcall tx-fn claim)
     (cond ((not (and ctx confirmed)) :unconfirmed)
           ((rearm-shaped-p ctx) :not-a-claim)
           ((zerop (length (btx:tx-inputs ctx))) :not-this-lottery)
           (t (let ((in (elt (btx:tx-inputs ctx) 0)))
                (loop with txid = (btx:txin-prev-hash in) and vout = (btx:txin-prev-index in)
-                     repeat (1+ +acquire-max-rounds+)
+                     for round from 1 to (1+ +acquire-max-rounds+)
                      do (unless (zerop vout) (return :not-this-lottery))
                         (multiple-value-bind (tx conf) (funcall tx-fn txid)
                           (unless tx (return :unconfirmed))
                           (when (some (lambda (i) (member (list (btx:txin-prev-hash i) (btx:txin-prev-index i))
                                                           vaults :test #'equalp))
                                       (coerce (btx:tx-inputs tx) 'list))
-                            (return :binds))
+                            (return (values :binds round)))
                           (unless (and conf (rearm-shaped-p tx)) (return :not-this-lottery))
                           (let ((i (elt (btx:tx-inputs tx) 0)))
                             (setf txid (btx:txin-prev-hash i) vout (btx:txin-prev-index i))))
@@ -4207,15 +4233,25 @@
 
 (defvar *acquire-verdicts* (make-hash-table :test #'equalp :synchronized t)
   "(claim-txid vault-rung-0) -> a final verdict: never re-read.")
+(defvar *acquire-rounds* (make-hash-table :test #'equalp :synchronized t)
+  "(claim-txid vault-rung-0) -> the round a binding claim closes (JUDGE-ACQUIRE's second value).")
 (defvar *unconfirmed-claims* (make-hash-table :test #'equalp :synchronized t)
   "(claim-txid vault-rung-0) -> when we last judged it :UNCONFIRMED: asked again after a minute,
    not on every co-sign check (a phantom acquire's claim never confirms, and every check paid a
    getrawtransaction, which waits on the txindex).")
 
+(defun acquire-round (fork)
+  "The round FORK's binding DisputeAcquire closes, once judged (*ACQUIRE-ROUNDS*), else NIL."
+  (multiple-value-bind (u o) (fork-op fork :dispute-acquire)
+    (let* ((txid (and o (op:field o :claim-txid)))
+           (vaults (and txid (fork-acquire-vaults fork u))))
+      (and vaults (gethash (list txid (first (first vaults))) *acquire-rounds*)))))
+
 (defun acquire-confirmed-p (node fork)
   "FORK carries a DisputeAcquire that binds: its claim_txid confirmed AND spending its dispute's
    lottery outpoint (JUDGE-ACQUIRE).  With no TX-FN, the confirmation alone (TX-CONFS-FN); with
-   neither, T: the acquire as published, the reading before the rule."
+   neither, T: the acquire as published, the reading before the rule.  The round it closes is
+   kept (ACQUIRE-ROUND)."
   (multiple-value-bind (u o) (fork-op fork :dispute-acquire)
     (and o
          (let ((txid (op:field o :claim-txid)))
@@ -4230,10 +4266,13 @@
                         (let ((seen (gethash key *unconfirmed-claims*)))
                           (unless (and seen (< (- (get-universal-time) seen) 60))
                             (let ((v (or (ignore-errors
-                                          (judge-acquire (lambda (t1)
-                                                           (multiple-value-bind (tx confs) (funcall (node-tx-fn node) t1)
-                                                             (and tx (values tx (and confs (plusp confs))))))
-                                                         vaults txid))
+                                          (multiple-value-bind (v round)
+                                              (judge-acquire (lambda (t1)
+                                                               (multiple-value-bind (tx confs) (funcall (node-tx-fn node) t1)
+                                                                 (and tx (values tx (and confs (plusp confs))))))
+                                                             vaults txid)
+                                            (when (eq v :binds) (setf (gethash key *acquire-rounds*) round))
+                                            v))
                                          :unconfirmed)))
                               (if (eq v :unconfirmed)
                                   (progn (setf (gethash key *unconfirmed-claims*) (get-universal-time)) nil)
@@ -6009,7 +6048,14 @@
                         (cat (octets (if (zerop witver) 0 (+ #x50 witver)) (length program)) program)))
                  ;; Our declared replacement collateral (a key-path P2TR of our key) comes along as input 1.
                  (coll (fourth (find (node-pubkey node) (armers-of node id-hex) :key #'first :test #'equalp)))
-                 (coll-spk (and coll (lot:key-path-spk (up:x-only (node-pubkey node)))))
+                 ;; DEP-03 §Claim transaction (multi-input): input 1 MUST be the declared collateral,
+                 ;; any other coin is a WinnerCollateralDeviation; one that is a lottery claim's
+                 ;; output 0 is a ledger's custody, so the claim is refused (CLAIM-COLLATERAL-REFUSAL).
+                 (refusal (and coll (claim-collateral-refusal node coll)))
+                 (coll-spk (if refusal
+                               (progn (log! node "REFUSING to claim the lottery of ~a: ~a" (subseq id-hex 0 8) refusal)
+                                      (fail "claim refused: ~a" refusal))
+                               (and coll (lot:key-path-spk (up:x-only (node-pubkey node))))))
                  ;; DEP-03: the shared claim shape (deposits-core build_lottery_claim_tx).
                  (tx (btx:parse-tx (bw:make-reader
                                     (btx:serialize-tx (lot:claim-tx claim-txid 0 amount coll spk :fee fee :subset (not full))))))
@@ -6609,7 +6655,7 @@
              (unless (or (let ((u (getf (node-adversary node) :hold-rearm-until))) (and u (< h u)))
                          (find me (pick-round-arms (%all-arms node id-hex) (1+ round) wo wc) :key #'first :test #'equalp)
                          (>= (count me (%all-arms node id-hex) :key #'first :test #'equalp) +max-arms+))
-               (let ((p (pledge-collateral node id-hex)))
+               (let ((p (pledge-collateral node id-hex :round (1+ round))))
                  (if p
                      (progn (arm-dispute node fork :replacement p :round (1+ round))
                             (note-dispute node id-hex "lottery round ~a unclaimed; armed round ~a" round (1+ round)))
@@ -6830,44 +6876,76 @@
     (broadcast node signed)
     (values (btx:tx-txid signed) 0 (- total fee))))
 
-(defun pick-pledge (utxos need min-confs own taken)
+(defun pick-pledge (utxos need min-confs own taken &key (reserve 0))
   "The coin to pledge as replacement collateral (DEP-03 §Replacement collateral declaration), from
    UTXOS (plists :key \"txid:vout\" :sats :confirmations): OWN (this dispute's earlier pledge) while it
    is unspent; else the smallest confirmed coin (at least MIN-CONFS, at least 1) covering NEED that no
    other live arm of ours pledges (TAKEN, a list of keys), ties to the smaller key; else NIL.  A coin
    pledged to two disputes is spent by whichever claim lands first and strands the other (regtest
-   rearm-rust, 2026-11-19, deposits-rust).  Vector: pledge_pick.json."
+   rearm-rust, 2026-11-19, deposits-rust).  Vector: pledge_pick.json.  RESERVE (local policy, a
+   re-arm's *REARM-PLEDGE-RESERVE*): a new coin only while more than RESERVE free coins cover NEED;
+   OWN is kept regardless."
   (or (and own (find own utxos :key (lambda (u) (getf u :key)) :test #'equal))
-      (first (sort (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 min-confs))
-                                               (member (getf u :key) taken :test #'equal)
-                                               (< (getf u :sats) need)))
-                              (copy-list utxos))
-                   (lambda (a b) (or (< (getf a :sats) (getf b :sats))
-                                     (and (= (getf a :sats) (getf b :sats)) (string< (getf a :key) (getf b :key)))))))))
+      (let ((free (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 min-confs))
+                                             (member (getf u :key) taken :test #'equal)
+                                             (< (getf u :sats) need)))
+                             (copy-list utxos))))
+        (and (> (length free) reserve)
+             (first (sort free
+                          (lambda (a b) (or (< (getf a :sats) (getf b :sats))
+                                            (and (= (getf a :sats) (getf b :sats)) (string< (getf a :key) (getf b :key)))))))))))
 
 ;;; DEP-03 §Replacement collateral declaration: a coin pledged in a LIVE dispute is not pledged in
 ;;; another.  What a fork of ours still holds, from its own dispute operations.
 
-(defun fork-pledges-held (events &key retired)
-  "EVENTS are a fork's own dispute operations, oldest first: (:enter), (:arm KEY-OR-NIL),
+(defun fork-pledges-held (events &key retired others)
+  "EVENTS are a fork's own dispute operations, oldest first: (:enter), (:arm KEY-OR-NIL [ROUND]),
    (:yield), (:acquire CLAIM-KEY BINDS).  (values PLEDGES CUSTODY ENDED): a pledge is held from its
    arm until a later yield (or the tombstone a lost lottery leaves), a binding acquire (the winner's
-   claim confirmed: it spent the pledge or left it free), or retirement (RETIRED); a binding claim's
-   output 0 is custody while that acquire stands; ENDED is true when the dispute has ended for us.
+   claim confirmed: it spent the pledge or left it free), a binding acquire by ANOTHER participant
+   of the dispute for the arm's round or a later one (OTHERS: the rounds those claims close, by
+   JUDGE-ACQUIRE; the round is over whether or not we yielded to it -- regtest 1121-next4c, 12 of
+   deposits-rust ref6's 25 holding forks), or retirement (RETIRED); a binding claim's output 0 is
+   custody while that acquire stands; ENDED is true when the dispute has ended for us.
    Regtest 1120-next4 (deposits-rust ref6): counting every pledge ever declared left a long-lived
    node with 31 coins and none it could pledge.  Vector: pledge_pick.json (its forks cases)."
   (if retired
       (values nil nil t)
-      (let ((pledges '()) (custody nil) (ended nil))
+      (let ((pledges '()) (custody nil) (ended nil) (last-round 0))
         (dolist (e events)
           (ecase (first e)
             (:enter (setf ended nil))
-            (:arm (when (second e) (push (second e) pledges)) (setf custody nil ended nil))
+            (:arm (when (second e) (push (cons (second e) (or (third e) 1)) pledges))
+             (setf custody nil ended nil last-round (or (third e) 1)))
             (:yield (setf pledges '() custody nil ended t))
             (:acquire (if (third e)
                           (setf pledges '() custody (second e) ended t)
                           (setf custody nil)))))
-        (values (nreverse pledges) custody ended))))
+        (let ((over (and others (reduce #'max others))))
+          (when over
+            (setf pledges (remove-if (lambda (p) (<= (cdr p) over)) pledges))
+            (when (and (plusp last-round) (<= last-round over)) (setf ended t))))
+        (values (mapcar #'car (nreverse pledges)) custody ended))))
+
+(defun others-binding-acquires (node fork)
+  "The binding DisputeAcquires by OTHER participants of the dispute our FORK is in: on the other
+   forks of its ledger we hold, after our DisputeEnter, not naming us, judged (ACQUIRE-CONFIRMED-P)
+   against the same vault as ours (the latest QuorumBegin before our DisputeEnter).  A list of
+   (acquirer round claim-txid)."
+  (let* ((enter (fork-op fork :dispute-enter))
+         (us (node-pubkey node))
+         (q (and enter (record-latest fork :quorum-begin :below (up:update-seq enter))))
+         (ours (and q (first (fr:rotation-rungs (op:update-op q))))))
+    (when ours
+      (loop for f in (forks-of node (record-id-hex fork))
+            for (u o) = (multiple-value-list (fork-op f :dispute-acquire))
+            when (and o (not (eq f fork))
+                      (not (equalp (up:update-operator-id u) us))
+                      (not (equalp (op:field o :new-custodian) us))
+                      (> (up:update-seq u) (up:update-seq enter))
+                      (equalp (first (first (fork-acquire-vaults f u))) ours)
+                      (acquire-confirmed-p node f))
+              collect (list (up:update-operator-id u) (or (acquire-round f) 1) (op:field o :claim-txid))))))
 
 (defun fork-pledge-events (node fork)
   "FORK's own dispute operations as FORK-PLEDGES-HELD reads them, oldest first; its latest
@@ -6883,18 +6961,99 @@
                     (:dispute-enter (list :enter))
                     (:dispute-armed (list :arm (and (op:field o :replacement-collateral-txid)
                                                     (outpoint-key (op:field o :replacement-collateral-txid)
-                                                                  (op:field o :replacement-collateral-vout)))))
+                                                                  (op:field o :replacement-collateral-vout)))
+                                          (or (op:field o :rearm-round) 1)))
                     (:dispute-yield (list :yield))
                     (:dispute-acquire (list :acquire (and (op:field o :claim-txid) (outpoint-key (op:field o :claim-txid) 0))
                                             (and (eq u last-acquire) (acquire-confirmed-p node fork) t)))))))
 
-(defun pledge-collateral (node id-hex)
+(defvar *rearm-pledge-reserve*
+  (let ((v (ignore-errors (parse-integer (or (uiop:getenv "CLD_REARM_PLEDGE_RESERVE") "")))))
+    (if (and v (>= v 0)) v 2))
+  "Local policy, not DEP-03 (CLD_REARM_PLEDGE_RESERVE, default 2): a re-arm round (>= 2) of an old
+   dispute pledges a new coin only while MORE than this many free coins cover its need, so the last
+   ones stay for new disputes' round-1 arms, which may take them (not arming a new dispute is what
+   dereliction is judged on).  Regtest 1121-next4c: deposits-rust ref6's re-arm passes spent 10 of
+   the 14 coins the pledge-liveness fix freed.")
+
+(defun claim-output-p (tx vout)
+  "Whether output VOUT of TX is a lottery claim's output 0: a ledger's custody until it is spent
+   (rotated into the ledger's vault), whatever our records say.  From TX alone: its input 0 spends
+   output 0 of its prevout through a taproot SCRIPT path (the witness ends in a control block,
+   33+32k bytes, leaf version #xc0) with nSequence #xfffffffd (a full claim) or the reveal CSV (a
+   subset claim), and the coin is its ONE output (a confiscation spends the vault the same way
+   with more outputs; a re-arm spend carries a tier CSV).  Regtest 1121-next4c (deposits-rust
+   ref6): a claim of ad87b48b's lottery, recorded on another ledger's fork, was pledged on
+   9e23c858; 14 of ref6's 31 coins were claim outputs and 7 were pledged.  Vector
+   custody_coin.json."
+  (let* ((ins (btx:tx-inputs tx))
+         (in (and (plusp (length ins)) (elt ins 0)))
+         (w (first (btx:tx-witnesses tx)))
+         (cb (car (last w))))
+    (and in (= vout 0) (= 1 (length (btx:tx-outputs tx)))
+         (zerop (btx:txin-prev-index in))
+         (>= (length w) 2) cb (>= (length cb) 33) (zerop (mod (- (length cb) 33) 32))
+         (= (logand (aref cb 0) #xfe) #xc0)
+         (member (btx:txin-sequence in) (list #xfffffffd lot:+reveal-csv+))
+         t)))
+
+(defvar *custody-coins* (make-hash-table :test #'equal :synchronized t)
+  "\"txid:vout\" -> T when the coin is a claim's output 0 (CLAIM-OUTPUT-P), NIL when not: a
+   transaction never changes.")
+
+(defun claim-collateral-refusal (node coll)
+  "Why a claim may not spend COLL (txid vout sats), our declared collateral, as its input 1, else
+   NIL: it is a lottery claim's output 0 (CLAIM-OUTPUT-P), a ledger's custody, and the claim may
+   spend no other coin instead (DEP-03 §Claim transaction); or its funding transaction cannot be
+   read this pass.  With no TX-FN (a test node), NIL."
+  (when (node-tx-fn node)
+    (let ((tx (ignore-errors (funcall (node-tx-fn node) (first coll))))
+          (key (outpoint-key (first coll) (second coll))))
+      (cond ((null tx) (format nil "the funding transaction of our collateral ~a is unreadable; not claiming this pass" key))
+            ((claim-output-p tx (second coll))
+             (format nil "our declared collateral ~a is a lottery claim's output 0, a ledger's custody; a claim must spend the declared pledge and nothing else, so it is not built (re-arm with a fresh pledge, or arm the next round)" key))))))
+
+(defun pledge-custody-rearm-p (node coll vault-unspent)
+  "Our latest arm's declared pledge COLL must be replaced by a same-round re-arm (DEP-03
+   §Eligibility snapshot: a re-arm replaces the declaration; its latest arm counts): it is a
+   lottery claim's output 0, and VAULT-UNSPENT (no confiscation has fixed the set yet)."
+  (and vault-unspent coll (node-tx-fn node)
+       (let ((tx (ignore-errors (funcall (node-tx-fn node) (first coll)))))
+         (and tx (claim-output-p tx (second coll)) t))))
+
+(defun without-custody-coins (node utxos)
+  "UTXOS (plists :txid :vout ...) without the coins that are a lottery claim's output 0, asked of
+   NODE-TX-FN once per coin.  A coin whose funding transaction cannot be read this pass is left
+   out too (pledging a ledger's custody loses depositors' funds; skipping a coin costs a retry);
+   with no TX-FN (a test node) every coin is ordinary."
+  (if (null (node-tx-fn node))
+      utxos
+      (remove-if
+       (lambda (u)
+         (let* ((key (outpoint-key (getf u :txid) (getf u :vout)))
+                (verdict (multiple-value-bind (v found) (gethash key *custody-coins*)
+                           (if found
+                               v
+                               (let ((tx (ignore-errors (funcall (node-tx-fn node) (getf u :txid)))))
+                                 (if tx
+                                     (setf (gethash key *custody-coins*) (claim-output-p tx (getf u :vout)))
+                                     :unreadable))))))
+           (case verdict
+             (:unreadable (log! node "pledge: ~a left out this pass, its funding transaction is unreadable" key) t)
+             ((nil) nil)
+             (t (log! node "pledge: ~a (~a sats) is a lottery claim's output 0, a ledger's custody; never pledged"
+                      key (getf u :sats))
+                t))))
+       utxos)))
+
+(defun pledge-collateral (node id-hex &key (round 1))
   "A confirmed UTXO of ours, pledged to ID-HEX, covering its required replacement
    collateral: (txid vout sats), or NIL.  When no single UTXO is large enough but
    together they are, consolidate them (the result is pledgeable once confirmed)
-   and return NIL for now; a pledge already made for ID-HEX is returned again."
+   and return NIL for now; a pledge already made for ID-HEX is returned again.
+   ROUND >= 2 (a re-arm round) leaves *REARM-PLEDGE-RESERVE* coins free (logged when it skips)."
   (let ((mine (loop for k being the hash-keys of (node-pledges node) using (hash-value v) when (equal v id-hex) collect k))
-        (utxos (our-utxos node)))
+        (utxos (without-custody-coins node (our-utxos node))))
     (when mine
       (let ((u (find (first mine) utxos :key (lambda (u) (outpoint-key (getf u :txid) (getf u :vout))) :test #'equal)))
         (when u (return-from pledge-collateral (list (getf u :txid) (getf u :vout) (getf u :sats))))
@@ -6909,7 +7068,9 @@
            (held (loop for r being the hash-values of (node-ledgers node)
                        when (and (record-fork-p r) (record-owned-p r))
                          collect (cons (record-fork-of r)
-                                       (multiple-value-list (fork-pledges-held (fork-pledge-events node r))))))
+                                       (multiple-value-list
+                                        (fork-pledges-held (fork-pledge-events node r)
+                                                           :others (mapcar #'second (others-binding-acquires node r)))))))
            (declared (loop for h in held append (second h)))
            (custody (loop for h in held when (third h) collect (third h)))
            ;; A NODE-PLEDGES reservation is held until its dispute ends for us: released when our
@@ -6923,7 +7084,13 @@
            (free (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
                                             (member (getf u :key) taken :test #'equal)))
                             keyed))
-           (pick (pick-pledge keyed need (node-min-confs node) nil taken)))
+           (reserve (if (>= round 2) *rearm-pledge-reserve* 0))
+           (pick (pick-pledge keyed need (node-min-confs node) nil taken :reserve reserve)))
+      (when (and (null pick) (plusp reserve) (pick-pledge keyed need (node-min-confs node) nil taken))
+        (log! node "re-arm round ~a of ~a skipped for the reserve: ~a free coin~:p cover ~a sats, and a re-arm leaves the last ~a for new disputes (CLD_REARM_PLEDGE_RESERVE)"
+              round (subseq id-hex 0 8)
+              (count-if (lambda (u) (>= (getf u :sats) need)) free) need reserve)
+        (return-from pledge-collateral nil))
       (cond (pick
              (let ((u pick))
                (setf (gethash (outpoint-key (getf u :txid) (getf u :vout)) (node-pledges node)) id-hex)

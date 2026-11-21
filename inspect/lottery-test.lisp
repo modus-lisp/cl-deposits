@@ -966,18 +966,77 @@
                                        (loop for o across (gethash "ops" f)
                                              for k = (gethash "op" o)
                                              collect (cond ((string= k "enter") (list :enter))
-                                                           ((string= k "arm") (let ((p (gethash "pledge" o))) (list :arm (and (stringp p) p))))
+                                                           ((string= k "arm") (let ((p (gethash "pledge" o)))
+                                                                                (list :arm (and (stringp p) p) (or (gethash "round" o) 1))))
                                                            ((string= k "yield") (list :yield))
                                                            ((string= k "acquire")
                                                             (list :acquire (format nil "~a:0" (gethash "claim" o)) (eq (gethash "binds" o) t)))
                                                            (t (error "unknown fork op ~a" k))))
-                                       :retired (eq (gethash "retired" f) t))
+                                       :retired (eq (gethash "retired" f) t)
+                                       :others (loop for a across (or (gethash "others" f) #())
+                                                     when (eq (gethash "binds" a) t) collect (gethash "round" a)))
                                     (append pledges (and custody (list custody)))))
           for got = (nd::pick-pledge utxos (gethash "need" c) (gethash "min_confs" c) own
                                      (append (coerce (gethash "taken" c) 'list) held))
           do (incf n)
              (check-equal (format nil "pledge: ~a" (gethash "name" c)) (getf got :key) want))
-    (check-equal "every pledge_pick case ran" n 18)))
+    (check-equal "every pledge_pick case ran" n 21)))
+
+;;; inspect/vectors/custody_coin.json: real deposits-rust ref6 transactions (regtest 1121-next4c).  A
+;;; lottery claim's output 0 is a ledger's custody and is never pledged, whatever our records say.
+(with-gate ("custody coins: a claim's output 0 is never pledged (shared vector, real ref6 transactions)")
+  (let* ((v (json-simple:parse (uiop:read-file-string (vector-path "custody_coin.json"))))
+         (txs (loop for c across (gethash "cases" v)
+                    collect (btx:parse-tx (cl-consensus.wire:make-reader (u:hex->bytes (gethash "hex" c))))))
+         (n 0))
+    (loop for c across (gethash "cases" v)
+          for tx in txs
+          do (incf n)
+             (check-equal (format nil "txid: ~a" (gethash "name" c)) (u:txid-hex (btx:tx-txid tx)) (gethash "txid" c))
+             (check-equal (gethash "name" c) (and (nd::claim-output-p tx (gethash "vout" c)) t) (eq (gethash "custody" c) t))
+             (check (format nil "not output 0: ~a" (gethash "name" c)) (not (nd::claim-output-p tx 1))))
+    (check-equal "every custody_coin case ran" n 5)
+    ;; The incident as a pledge saw it: the 4.99M-sat subset claim is the smallest coin covering a
+    ;; 5000-sat need, so without the filter it is the pick; with it, the faucet coin is.
+    (let* ((by-name (lambda (k) (nth (position-if (lambda (c) (search k (gethash "name" c))) (coerce (gethash "cases" v) 'list)) txs)))
+           (subset (funcall by-name "subset")) (claim (funcall by-name "ad87b48b")) (faucet (funcall by-name "(output 0)"))
+           (coin (lambda (tx) (list :txid (btx:tx-txid tx) :vout 0 :sats (btx:txout-value (elt (btx:tx-outputs tx) 0)) :confirmations 6)))
+           (utxos (mapcar coin (list subset claim faucet)))
+           (keyed (lambda (us) (loop for u in us collect (list* :key (nd::outpoint-key (getf u :txid) (getf u :vout)) u))))
+           (node (nd::make-node :priv (tk 424243) :bus (bus:make-mock-bus) :tx-fn (lambda (txid) (let ((tx (find txid txs :key #'btx:tx-txid :test #'equalp))) (and tx (values tx 6)))))))
+      (check-equal "unfiltered, the custody coin is the pick (what ref6 pledged)"
+                   (getf (nd::pick-pledge (funcall keyed utxos) 5000 1 nil nil) :key)
+                   (nd::outpoint-key (btx:tx-txid subset) 0))
+      (let ((free (nd::without-custody-coins node utxos)))
+        (check-equal "both claim outputs are left out" (length free) 1)
+        (check-equal "the faucet coin is the pick"
+                     (getf (nd::pick-pledge (funcall keyed free) 5000 1 nil nil) :key)
+                     (nd::outpoint-key (btx:tx-txid faucet) 0)))
+      ;; ref6's 9e23c858 arm declares fdff3a5f:0 (ad87b48b's custody): a claim with it is refused,
+      ;; never rebuilt with another coin (DEP-03 §Claim transaction: input 1 is the declared pledge).
+      (let ((fdff (list (btx:tx-txid claim) 0 (btx:txout-value (elt (btx:tx-outputs claim) 0))))
+            (plain (list (btx:tx-txid faucet) 0 (btx:txout-value (elt (btx:tx-outputs faucet) 0))))
+            (blind (nd::make-node :priv (tk 424244) :bus (bus:make-mock-bus) :tx-fn (lambda (txid) (declare (ignore txid)) nil))))
+        (check-equal "fdff3a5f is the custody claim" (u:txid-hex (first fdff))
+                     "fdff3a5f90d57a71e0cf73b6c9565ad2f417708dbe96a26ef24d8b2eba4b5307")
+        (check "a claim with the custody pledge is refused" (search "custody" (or (nd::claim-collateral-refusal node fdff) "")))
+        (check-equal "a claim with a faucet pledge is built" (nd::claim-collateral-refusal node plain) nil)
+        (check "an unreadable pledge is refused for the pass" (search "unreadable" (or (nd::claim-collateral-refusal blind plain) "")))
+        (check "a custody pledge re-arms while the vault is unspent" (nd::pledge-custody-rearm-p node fdff t))
+        (check "no same-round re-arm once the vault is spent" (not (nd::pledge-custody-rearm-p node fdff nil)))
+        (check "a faucet pledge never re-arms for custody" (not (nd::pledge-custody-rearm-p node plain t)))))))
+
+;;; Local policy, not the shared vector: a re-arm leaves *REARM-PLEDGE-RESERVE* coins free; a round-1
+;;; arm (reserve 0) may take the last; its own pledge is kept whatever the reserve.
+(with-gate ("re-arm reserve: a re-arm leaves the last coins for new disputes")
+  (let ((utxos (list (list :key "aa:0" :sats 50000 :confirmations 6)
+                     (list :key "bb:1" :sats 30000 :confirmations 6)
+                     (list :key "cc:0" :sats 10000 :confirmations 6))))
+    (check-equal "two cover the need: a re-arm takes neither" (nd::pick-pledge utxos 20000 1 nil nil :reserve 2) nil)
+    (check-equal "a round-1 arm takes one" (getf (nd::pick-pledge utxos 20000 1 nil nil) :key) "bb:1")
+    (check-equal "three cover it: the re-arm takes the smallest" (getf (nd::pick-pledge utxos 5000 1 nil nil :reserve 2) :key) "cc:0")
+    (check-equal "a taken coin is not free" (nd::pick-pledge utxos 5000 1 nil '("aa:0") :reserve 2) nil)
+    (check-equal "its own pledge is kept" (getf (nd::pick-pledge utxos 20000 1 "bb:1" '("bb:1") :reserve 2) :key) "bb:1")))
 
 ;;; inspect/vectors/acquire_binding.json: DEP-06 "An acquire binds once its claim confirms", shared
 ;;; with deposits-rust (deposits-node/tests/vectors/acquire_binding.json): a DisputeAcquire binds iff
@@ -1010,7 +1069,9 @@
     (check-equal "max rounds agree" (gethash "max_rounds" v) cl-deposits.node::+acquire-max-rounds+)
     (loop for c across (gethash "cases" v)
           for got = (ab-judge c)
+          for round = (nth-value 1 (ab-judge c))
           do (incf n)
+             (check-equal (format nil "round: ~a" (gethash "name" c)) (or round 0) (gethash "round" c))
              (check-equal (gethash "name" c) (string-downcase (symbol-name got)) (gethash "reason" c))
              (check-equal (format nil "binds: ~a" (gethash "name" c)) (eq got :binds) (eq (gethash "binds" c) t)))
     (check "every acquire_binding case ran" (>= n 13))))
