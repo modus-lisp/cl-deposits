@@ -4527,6 +4527,20 @@
         (let ((q (dispute-scope-q (let ((r (find-record node id-hex))) (and r (not (record-fork-p r)) r)) top)))
           (loop for f in forks for l in lvs-of when (and l (>= l q)) collect f)))))
 
+(defun rearm-fork-out-of-dispute (node id-hex fork)
+  "Why FORK may not arm a later re-arm round of ID-HEX (DEP-06 Phase 4 step 2), or NIL.  A
+   disputant takes part only through a DisputeEnter at or above Q (DEP-03 §\"The dispute\"); a
+   fork whose latest DisputeEnter is below it (an old dispute of a vault since rotated, even one
+   it yielded) is no part of the current dispute, so an arm on it counts in no round, against no
+   bound and in no manifest.  Vector rearm_round_agree.json (in_dispute / out_of_dispute)."
+  (cond ((null fork) "we hold no fork")
+        ((member fork (dispute-forks node id-hex)) nil)
+        (t (let ((r (find-record node id-hex)))
+             (format nil "our fork entered at ~a, below the dispute's QuorumBegin ~a (DEP-03 \"The dispute\")"
+                     (dispute-fork-point-of fork)
+                     (dispute-scope-q (and r (not (record-fork-p r)) r)
+                                      (loop for f in (forks-of node id-hex) maximize (dispute-fork-point-of f))))))))
+
 (defun dispute-fork-point-of (fork)
   "The last_valid_sequence of FORK's latest DisputeEnter: its updates at or below it belong to an
    earlier dispute (DEP-03 §\"The dispute\")."
@@ -6528,6 +6542,14 @@
              ;; ADVERSARY :hold-rearm-until H — testing only: arm no re-arm round before block H, as
              ;; a member that was down through the scheduled windows (redteam/check-rearm-late.sh).
              (unless (or (let ((u (getf (node-adversary node) :hold-rearm-until))) (and u (< h u)))
+                         ;; A fork outside the current dispute takes no part in any round: its arms
+                         ;; are no arms, so the two tests below could never see one of ours and it
+                         ;; re-armed on every pass of every window (regtest 2026-11-20/21, cld364:
+                         ;; EYAAAAAA on 8082521c, 17 round-2 arms on 34651658).
+                         (let ((why (rearm-fork-out-of-dispute node id-hex fork)))
+                           (when why
+                             (note-dispute node id-hex "lottery round ~a unclaimed; not arming round ~a: ~a" round (1+ round) why)
+                             t))
                          (find me (pick-round-arms (%all-arms node id-hex) (1+ round) wo wc) :key #'first :test #'equalp)
                          (>= (count me (%all-arms node id-hex) :key #'first :test #'equalp) +max-arms+))
                (let ((p (pledge-collateral node id-hex)))
