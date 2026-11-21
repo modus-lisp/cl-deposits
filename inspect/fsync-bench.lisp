@@ -1,0 +1,25 @@
+;;;; inspect/fsync-bench.lisp -- the cost of fsync per write-ahead (not a gate).  Run like a gate
+;;;; file after harness.lisp, with FSYNC_BENCH_DIR on the filesystem the node uses.
+(in-package #:cl-deposits.test)
+(defun fake-next (u seq)
+  (let ((v (up:decode-update (up:encode-update u))))
+    (setf (up:update-seq v) seq) v))
+(defun bench (durable n dir)
+  (uiop:delete-directory-tree (uiop:ensure-directory-pathname dir) :validate t :if-does-not-exist :ignore)
+  (let* ((bus (bus:make-mock-bus))
+         (node (nd:make-node :priv (tk 31415926535897932384) :bus bus :height-fn (lambda () 1000) :data-dir dir))
+         (rec (nd:open-ledger node :reserves-id "genesis:bench")))
+    ;; a large ledger: 4000 updates on disk
+    (let ((t0 (nd:tip rec)))
+      (loop for s from 1 to 4000 do (nd::record-push rec (fake-next t0 s)))
+      (nd::save-record node rec))
+    (let ((t0 (nd:tip rec)) (start (get-internal-real-time)))
+      (loop for i from 1 to n
+            for u = (fake-next t0 (+ (up:update-seq t0) i))
+            do (nd::record-push rec u)
+               (let ((nd::*durable* durable)) (delete-file (nd::write-ahead node rec u))))
+      (/ (- (get-internal-real-time) start) (float internal-time-units-per-second) n))))
+(let ((r (loop for d in '(nil t nil t) collect (cons d (bench d 300 (or (uiop:getenv "FSYNC_BENCH_DIR") "/tmp/cl-deposits-fsync-bench/"))))))
+  (flet ((avg (d) (let ((v (mapcar #'cdr (remove d r :key #'car :test-not #'eq)))) (/ (reduce #'+ v) (length v)))))
+    (format t "~&CLBENCH per update: no fsync ~,3f ms, fsync ~,3f ms (~@d%)~%" (* 1000 (avg nil)) (* 1000 (avg t))
+            (round (* 100 (- (/ (avg t) (avg nil)) 1))))))

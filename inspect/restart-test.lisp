@@ -33,6 +33,51 @@
       (check "the one-update ledger reloads, owned" (let ((r (nd:find-record n2 id))) (and r (nd:record-owned-p r))))
       (nd:stop-node n2))))
 
+(with-gate ("restart: write-ahead -- killed between the save and the publish, the boot publishes the saved bytes")
+  ;; An update of ours is on our disk before any relay sees it (COMMIT-UPDATE), so a node killed in
+  ;; between comes back holding it and publishes THOSE bytes; it never signs another at that seq.
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*)) (p 88888888888888888888) (q 99999999999999999999)
+         (n (boot p bus hf)) (m (boot q bus hf))
+         (la (nd:open-ledger n :reserves-id "genesis:write-ahead")) (id (nd:record-id-hex la))
+         (pk (nd:node-pubkey n))
+         (_ (nd:open-ledger m :reserves-id "genesis:write-ahead-member"))
+         (ours (lambda (seq)
+                 (remove-duplicates
+                  (loop for e in (bus:mock-bus-events bus)
+                        for u = (and (= (cl-nostr.event:event-kind e) w:+kind-update+) (ignore-errors (w:event->update e)))
+                        when (and u (equalp (up:update-operator-id u) pk) (equalp (up:update-ledger-id u) (u:hex->bytes id))
+                                  (= (up:update-seq u) seq))
+                          collect (up:encode-update u))
+                  :test #'equalp)))
+         (seq (1+ (lg:ledger-sequence (nd:record-ledger la))))
+         (killed nil))
+    (declare (ignore _))
+    (let ((nd::*before-publish-hook* (lambda (node rec u) (declare (ignore u))      ; only N, on its ledger: the member commits too
+                                             (when (and (eq node n) (eq rec la)) (throw :killed :killed)))))
+      (setf killed (catch :killed (nd:add-member n la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)) :survived)))
+    (check-equal "the node was killed between its save and its publish" killed :killed)
+    (check-equal "nothing of ours at that seq reached the relay" (length (funcall ours seq)) 0)
+    (let ((saved (nd:tip (nd:find-record n id))))
+      (nd:stop-node n)
+      (incf *height* 5)       ; it comes back later: a fresh signature would carry another header
+      (let* ((n2 (boot p bus hf)) (r2 (nd:find-record n2 id)))
+        (check "the saved update is the tip after the restart"
+               (and r2 (equalp (up:encode-update (nd:tip r2)) (up:encode-update saved)) (= (up:update-seq saved) seq)))
+        (check-equal "the boot published it, once" (length (funcall ours seq)) 1)
+        (check "and published the saved bytes, not a re-signing" (equalp (first (funcall ours seq)) (up:encode-update saved)))
+        (check "nothing left pending" (null (directory (merge-pathnames "pending_*.b64" (dir-for p)))))
+        (let ((n3 (progn (nd:stop-node n2) (boot p bus hf))))
+          (check-equal "a second boot publishes nothing more" (length (funcall ours seq)) 1)
+          (check-equal "the next update chains on, at the next seq"
+                       (let ((m2 (boot 12121212121212121212 bus hf)))
+                                (nd:open-ledger m2 :reserves-id "genesis:write-ahead-member-2")
+                                (nd:add-member n3 (nd:find-record n3 id) (nd:node-pubkey m2) :member-ledger-id (nd::node-member-ledger-hex m2))
+                                (nd:stop-node m2)
+                              (up:update-seq (nd:tip (nd:find-record n3 id))))
+                       (1+ seq))
+          (nd:stop-node n3))
+        (nd:stop-node m)))))
+
 (with-gate ("restart: quorum, deposits, transfer, and a dispute across node restarts")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (pa 11111111111111111111) (pb 22222222222222222222) (pc 33333333333333333333) (pd 44444444444444444444)
@@ -182,6 +227,41 @@
                                              (v (up:encode-update u)) (old (gethash k seen)))
                                         (if (and old (not (equalp old v))) (incf twice) (setf (gethash k seen) v))))))
                                 (check-equal "no two of a member's signatures share (ledger, seq) with different content" twice 0))
+                              ;; CHAOS, the residual: relays that lose our yield (retention, pruning).
+                              ;; An ARCHIVE keeps everything ever published.  Our disk is write-ahead, so
+                              ;; a yield we published is on it: losing the relay copy alone, or our disk
+                              ;; alone (above), never makes us sign a second.  It takes BOTH.
+                              (let* ((archive (copy-list (bus:mock-bus-events bus)))
+                                     (prune (lambda ()   ; the relays drop our update at the yield's seq
+                                              (setf (bus::mock-bus-events bus)
+                                                    (remove-if (lambda (e) (let ((u (and (= (cl-nostr.event:event-kind e) w:+kind-update+) (ignore-errors (w:event->update e)))))
+                                                                             (and u (equalp (up:update-operator-id u) lpk) (= (up:update-seq u) (up:update-seq y))
+                                                                                  (equalp (up:update-ledger-id u) (u:hex->bytes id)))))
+                                                               (bus:mock-bus-events bus)))))
+                                     (in-archive (lambda ()
+                                                   (remove-duplicates
+                                                    (loop for e in (append archive (bus:mock-bus-events bus))
+                                                          for u = (and (= (cl-nostr.event:event-kind e) w:+kind-update+) (ignore-errors (w:event->update e)))
+                                                          when (and u (equalp (up:update-operator-id u) lpk) (= (up:update-seq u) (up:update-seq y))
+                                                                    (equalp (up:update-ledger-id u) (u:hex->bytes id)))
+                                                            collect (up:encode-update u))
+                                                    :test #'equalp))))
+                                ;; relay lost, disk kept: the fork has concluded, nothing is signed
+                                (funcall prune)
+                                (incf *height* 3)
+                                (handler-case (nd:claim-or-yield l2 id) (error () nil))
+                                (check-equal "chaos: relay lost our yield, disk kept it -> no second signature" (length (funcall in-archive)) 1)
+                                ;; relay lost AND disk lost: nothing anywhere says we yielded, so we sign
+                                ;; anew, and the archive then holds two.  The residual, stated by a test.
+                                (nd:stop-node l2)
+                                (destructuring-bind (p . text) (nth li armed-files)
+                                  (with-open-file (out p :direction :output :if-exists :supersede :external-format :latin-1)
+                                    (write-string text out)))
+                                (incf *height* 3)
+                                (setf l2 (boot lpriv bus hf))
+                                (handler-case (nd:claim-or-yield l2 id) (error () nil))
+                                (check-equal "chaos residual: relay lost AND disk lost -> a second signature (archive holds 2)"
+                                             (length (funcall in-archive)) 2))
                               (nd:stop-node l2))))))))))))))))
 
 (report)

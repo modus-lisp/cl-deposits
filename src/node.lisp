@@ -642,9 +642,86 @@
       (and (node-block-hash-fn node) (ignore-errors (funcall (node-block-hash-fn node) height)))
       (sha256 (ascii->bytes (format nil "deposits: no chain view at height ~a" height)))))
 
+;;; WRITE-AHEAD.  Every update we sign is durable on our disk before any relay sees it, so a node
+;;; killed at any point comes back knowing every update of ours that may be out there, and never
+;;; signs a second one at that sequence.  Publishing before saving (the order until 2026-11-20)
+;;; left a window, kill between the publish and the save, in which the update was on the relays and
+;;; not on our disk; the rerun then signed another at the same sequence under a later header.  The
+;;; PENDING file closes the other side: an update saved and not yet published is republished, as
+;;; the saved bytes, by the next boot (PUBLISH-PENDING).  COMMIT-UPDATE is the only place an update
+;;; of ours is signed (EQUIVOCATE, testing only, aside), so the rule lives here.
+
+(defparameter *fsync-operator-updates*
+  (let ((v (uiop:getenv "CLD_FSYNC_OPERATOR_UPDATES"))) (and v (member v '("1" "true" "on") :test #'string-equal) t))
+  "fsync the write-ahead of an ordinary operator update (CLD_FSYNC_OPERATOR_UPDATES=1 turns it
+   on).  OFF by default, measured (inspect/fsync-bench.lisp, 2026-11-20, 300 updates appended to
+   a 4000-update ledger, interleaved runs): 0.36 ms per write-ahead without fsync, 984 ms with it
+   on the nodes' zfs pool, far past a 20% bar.  A power loss there can lose a published operator
+   update; a kill cannot.  Dispute and rotation updates are always fsync'd: a power-loss re-sign
+   there is an equivocation, and they are rare.")
+
+(defvar *durable* nil "Bound T around a write that must survive power loss: fsync it.")
+(defvar *deferred-saves*)   ; special here, before WRITE-AHEAD binds it (its value: below, at SAVE-RECORD's batch)
+
+(defun fsync-stream (out)
+  (finish-output out)
+  (sb-posix:fsync (sb-sys:fd-stream-fd out)))
+
+(defun fsync-dir (dir)
+  (let ((fd (sb-posix:open (namestring dir) sb-posix:o-rdonly)))
+    (unwind-protect (sb-posix:fsync fd) (sb-posix:close fd))))
+
+(defun durable-update-p (rec update)
+  "A dispute or rotation update (anything on a fork: DisputeEnter, Armed, Yield, Acquire, residue
+   credits; a QuorumBegin; a ledger's continuation after its rotation), or any update when
+   *FSYNC-OPERATOR-UPDATES*."
+  (or *fsync-operator-updates*
+      (record-fork-p rec)
+      (member (getf (ignore-errors (op:update-op update)) :type)
+              '(:quorum-begin :dispute-enter :dispute-armed :dispute-yield :dispute-acquire))))
+
+(defvar *before-publish-hook* nil
+  "Testing: called with NODE REC UPDATE after the write-ahead save and before the publish; a
+   non-local exit from it is a node killed in that window.")
+
+(defun pending-path (node rec)
+  (merge-pathnames (format nil "pending_~a.b64" (pathname-name (record-file-name rec))) (node-data-dir node)))
+
+(defun write-ahead (node rec update)
+  "Make UPDATE (already applied and recorded on REC) durable before it is published: the pending
+   file naming it, then the record itself, written now even inside a deferred-save block.
+   Returns the pending path, or NIL with no data dir."
+  (when (node-data-dir node)
+    (ensure-directories-exist (node-data-dir node))
+    (let ((pending (pending-path node rec)))
+      (with-open-file (out pending :direction :output :if-exists :supersede :external-format :latin-1)
+        (write-string (base64-encode (up:encode-update update)) out)
+        (when *durable* (fsync-stream out)))
+      (when *durable* (fsync-dir (node-data-dir node)))
+      (let ((*deferred-saves* nil)) (save-record node rec))
+      pending)))
+
+(defun publish-pending (node)
+  "Boot: publish, as the saved bytes, every update of ours that was saved and never published (a
+   node killed between WRITE-AHEAD and the publish).  A pending update the record does not hold
+   was never saved, so never published: it is dropped, and nothing of ours left this node."
+  (when (node-data-dir node)
+    (dolist (f (directory (merge-pathnames "pending_*.b64" (node-data-dir node))))
+      (handler-case
+          (let* ((u (up:decode-update (base64-decode (string-trim '(#\Newline #\Return #\Space) (uiop:read-file-string f :external-format :latin-1)))))
+                 (id (bytes->hex (up:update-ledger-id u)))
+                 (held (some (lambda (rec) (and rec (equalp (ignore-errors (up:encode-update (record-update-at rec (up:update-seq u))))
+                                                            (up:encode-update u))))
+                             (list (find-record node id) (find-fork node id (node-pubkey node))))))
+            (cond (held (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) u))
+                        (log! node "published saved update ~a seq ~a (killed before its publish)" (subseq id 0 8) (up:update-seq u)))
+                  (t (log! node "dropped pending ~a seq ~a: never saved, so never published" (subseq id 0 8) (up:update-seq u))))
+            (delete-file f))
+        (error (e) (log! node "pending ~a: ~a" (file-namestring f) e))))))
+
 (defun commit-update (node rec update)
-  "Operator-sign, apply, record, publish, persist.  The update's cosignatures
-   must already be in place."
+  "Operator-sign, apply, record, persist, publish (WRITE-AHEAD: saved before any relay sees it).
+   The update's cosignatures must already be in place."
   (up:sign-operator update (node-priv node))
   (handler-case (lg:apply-update (record-ledger rec) update)       ; signals ledger-error if invalid
     (lg:ledger-error (e)
@@ -658,8 +735,10 @@
       (setf (lg:ledger-sequence (record-ledger rec)) (up:update-seq update)
             (lg:ledger-chain-tip (record-ledger rec)) (up:chain-hash update))))
   (record-push rec update)
-  (setf (record-last-event-id rec) (ev:event-id (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) update))))
-  (save-record node rec)
+  (let ((pending (let ((*durable* (durable-update-p rec update))) (write-ahead node rec update))))
+    (when *before-publish-hook* (funcall *before-publish-hook* node rec update))
+    (setf (record-last-event-id rec) (ev:event-id (bus:bus-publish (node-bus node) (w:update-event (node-keypair node) update))))
+    (when pending (ignore-errors (delete-file pending))))
   (run-hooks node rec update)
   update)
 
@@ -8152,7 +8231,8 @@
       (if appendable
           (with-open-file (out path :direction :output :if-exists :overwrite :external-format :latin-1)
             (file-position out (- (file-length out) 2))
-            (format out ",~%~s]~%" (base64-encode (up:encode-update (first (record-history rec))))))
+            (format out ",~%~s]~%" (base64-encode (up:encode-update (first (record-history rec)))))
+            (when *durable* (fsync-stream out)))
           ;; Whole file: write beside it and rename.  SBCL DELETES a :supersede
           ;; target when the write is aborted — and a node killed mid-write (or
           ;; an error inside FORMAT) aborts it: that is how replicas vanished.
@@ -8160,8 +8240,10 @@
             (with-open-file (out tmp :direction :output :if-exists :supersede :external-format :latin-1)
               ;; A fork's file holds its own updates only; its base's file holds the rest.
               (format out "[~{~s~^,~%~}]~%" (mapcar (lambda (u) (base64-encode (up:encode-update u)))
-                                                    (reverse (subseq (record-history rec) 0 n)))))
-            (uiop:rename-file-overwriting-target tmp path)))
+                                                    (reverse (subseq (record-history rec) 0 n))))
+              (when *durable* (fsync-stream out)))
+            (uiop:rename-file-overwriting-target tmp path)
+            (when *durable* (fsync-dir (node-data-dir node)))))
       (setf (record-persisted rec) n)
       (persist-checkpoint node rec)))
   (drain-checkpoint-events node rec))
@@ -8313,4 +8395,5 @@
              (id (loop for k being the hash-keys of (node-ledgers node) when (and (>= (length k) 16) (string= prefix (subseq k 0 16))) return k)))
         (when id (handler-case (load-rearms node id f) (error (e) (funcall log-fn "could not load ~a: ~a" f e))))))
     (handler-case (load-pledges node) (error (e) (funcall log-fn "could not load pledges: ~a" e)))
+    (publish-pending node)
     node))
