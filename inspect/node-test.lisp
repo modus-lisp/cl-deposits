@@ -1645,6 +1645,51 @@
 
 
 
+;;; FAULT :blind-relay covers the dispute's updates on every path, not only a proof's catch-up.
+;;; regtest 1121-next4c: confiscation-answer's blind judge (cld364) saw every member's fork and arm
+;;; on the live subscription, confiscated the vault itself, and so had nothing to challenge.
+(with-gate ("blind-relay: a blind member follows the operator's chain but none of the dispute's updates")
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv (tk 11111111111111111171) :bus bus :height-fn hf))
+         (b (nd:make-node :priv (tk 22222222222222222272) :bus bus :height-fn hf))
+         (c (nd:make-node :priv (tk 33333333333333333373) :bus bus :height-fn hf))
+         (d (nd:make-node :priv (tk 44444444444444444474) :bus bus :height-fn hf))
+         (l1 (nd:open-ledger a :reserves-id "genesis:blind1" :reserves 15600000 :collateral 15600000))
+         (id1 (nd:record-id-hex l1)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a l1 (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m)))
+    (nd:begin-quorum a l1 :funding-txid (u:sha256 (hx "b1")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 15600000)
+    (let* ((w (nd:make-wallet :priv (tk 66666666666666666676) :bus bus)) (w2 (nd:make-wallet :priv (tk 77777777777777777777) :bus bus))
+           (d1 (nd:wallet-open-deposit w id1)) (d2 (nd:wallet-open-deposit w2 id1)))
+      (nd:credit-onchain a l1 d1 100000 :txid (u:sha256 (hx "b3")))
+      ;; B is blind to L1 on the relays from here on; B and C cosign blind, so A's forged lock commits
+      ;; and D, the honest replica, disputes.
+      (setf (getf (nd::node-adversary b) :blind-relay) (subseq id1 0 16))
+      (dolist (m (list b c)) (setf (getf (nd::node-adversary m) :cosign-blind) t))
+      (let* ((forged (list :type :transfer-lock :transfer-nonce (u:sha256 (hx "b4")) :source-deposit-id d1 :destination-deposit-id d2
+                           :amount 90000 :fee 0 :completion-script "sha256(00)" :timeout-height (+ *height* 100)
+                           :transfer-id (u:sha256 (hx "b5")) :nonce 717171 :expiry (+ *height* 144) :witness '()))
+             (u (nd:append-operation a l1 forged))
+             (op-key (nd:node-pubkey a))
+             (others (lambda (n) (remove-if (lambda (x) (equalp (up:update-operator-id x) op-key))
+                                            (nd::ledger-updates-from-relays n id1)))))
+        (dolist (m (list b c)) (setf (getf (nd::node-adversary m) :cosign-blind) nil))
+        (check "the forged lock committed" (and u t))
+        (check "D disputes L1" (and (nd:find-fork d id1 (nd:node-pubkey d)) t))
+        (check "the relays hold D's dispute updates (the control reads them)" (plusp (length (funcall others c))))
+        (check "control: C, not blind, holds D's fork" (and (nd:find-fork c id1 (nd:node-pubkey d)) t))
+        (check "blind: B holds no fork of D's" (null (nd:find-fork b id1 (nd:node-pubkey d))))
+        (check-equal "blind: B's relay reads of L1 carry none of the dispute's updates" (length (funcall others b)) 0)
+        (check "blind: B still reads the operator's chain on the relays"
+               (plusp (length (nd::ledger-updates-from-relays b id1))))
+        (check "blind: B's replica followed the operator's chain to the fault"
+               (>= (lg:ledger-sequence (nd:record-ledger (nd::find-record b id1))) (1- (up:update-seq u))))
+        (nd::catch-up-all b)
+        (check "blind: catching up every replica still makes no fork of D's" (null (nd:find-fork b id1 (nd:node-pubkey d))))
+        ;; Lifting the fault restores the reads (it is a prefix match on the ledger id, nothing more).
+        (setf (getf (nd::node-adversary b) :blind-relay) nil)
+        (check "unblinded: B's relay reads carry the dispute again" (plusp (length (funcall others b))))))))
+
 ;;; FINDINGS D1: a dereliction proof must bind to a real fraud, disclosed by a seated co-member,
 ;;; seen by the accused, and judged on the accused's own window.  The cases are written to
 ;;; inspect/vectors/dereliction.json (CL_DEPOSITS_WRITE_VECTORS=1) and re-verified from it here and

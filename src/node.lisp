@@ -1590,6 +1590,10 @@
               (when (and (not (record-fork-p rec)) (> (up:update-seq update) (1+ (lg:ledger-sequence ledger))))
                 (catch-up node rec))
               (accept-update node rec update)))))
+        ;; FAULT :blind-relay: we follow the operator's chain but read none of the dispute's
+        ;; updates (regtest 1121-next4c: confiscation-answer's blind judge saw every member's fork
+        ;; and arm on the live subscription, confiscated itself, and had nothing to challenge).
+        ((relay-blind-p node id) nil)
         ;; A quorum member's dispute fork (or its continuation).
         ((not (equalp signer (node-pubkey node)))
          (let* ((o (op:decode-operation (up:update-message update)))
@@ -1676,10 +1680,18 @@
                                                                 (list (cons "n" (loop for i from from to to collect (princ-to-string i))))))))))
     ;; Dedup through a hash table: REMOVE-DUPLICATES on a 6000-update list was
     ;; quadratic in EQUALP on 300-byte vectors and took minutes per ledger.
-    (let ((seen (make-hash-table :test #'equalp)) (out '()))
+    (let ((seen (make-hash-table :test #'equalp)) (out '())
+          ;; FAULT :blind-relay: of a ledger we are blind to, only its operator's own chain (we
+          ;; follow the base ledger), never a member's dispute fork.  This is the one funnel every
+          ;; relay read of a ledger's updates goes through; the sites that must read nothing of it
+          ;; ask RELAY-BLIND-P before calling.
+          (only (and (relay-blind-p node id-hex)
+                     (let ((r (find-record node id-hex)))
+                       (if (and r (not (record-fork-p r))) (lg:ledger-operator-key (record-ledger r)) :none)))))
       (dolist (e events)
         (let* ((u (w:event->update e)) (k (up:encode-update u)))
-          (when (and (string= (bytes->hex (up:update-ledger-id u)) id-hex) (not (gethash k seen)))
+          (when (and (string= (bytes->hex (up:update-ledger-id u)) id-hex) (not (gethash k seen))
+                     (or (null only) (and (not (eq only :none)) (equalp (up:update-operator-id u) only))))
             (setf (gethash k seen) t) (push u out))))
       (sort out #'< :key #'up:update-seq))))
 
@@ -7504,7 +7516,7 @@
                                                                  ;; with no LedgerOpen, and could never accept it
                                                                  ;; (regtest confiscation-answer, 2026-11-04).
                                                                  (distinct-updates
-                                                                  (append (unless (getf (node-adversary node) :blind-relay)
+                                                                  (append (unless (relay-blind-p node id-hex)
                                                                             (ledger-updates-from-relays node id-hex))
                                                                           (let ((r (find-record node id-hex)))
                                                                             (and r (not (record-fork-p r)) (record-history r)))

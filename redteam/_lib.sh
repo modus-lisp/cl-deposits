@@ -21,6 +21,24 @@ pubkey_of() {   # pubkey_of NODE — its protocol key, cached in $S/pubkey.NODE 
     [ -n "$k" ] && { echo "$k" >"$c"; echo "$k"; return 0; }; sleep 5
   done; fail "no pubkey for $1"
 }
+# poll SECS CMD... — run CMD every 5 s until it succeeds (0) or SECS pass (1).  For a log line a
+# node writes AFTER the chain event the check just saw (a claim's "won" follows its confirmation; a
+# spend's line follows its manifest publication): grep once and the check races the node
+# (regtest 1120-233824, 1121-042712: both rearm-rust FAILs were that race, the node right).
+poll() { local secs=$1 t0=$SECONDS; shift; until "$@"; do [ $((SECONDS - t0)) -ge "$secs" ] && return 1; sleep 5; done; }
+# won_lines PATTERN NODE... — each node's first log line containing PATTERN, prefixed by the node.
+won_lines() { local pat=$1 n; shift; for n in "$@"; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "$pat" | head -1 | sed "s/^/$n /"; done; }
+# await_won SECS PATTERN NODE... — won_lines once any node has logged PATTERN, mining a block every
+# 30 s meanwhile (a winner logs after its claim's broadcast and DisputeAcquire, and the claim can be
+# seen first); prints nothing and returns 1 after SECS.
+await_won() {
+  local secs=$1 pat=$2 t0=$SECONDS k=0 out; shift 2
+  while :; do
+    out=$(won_lines "$pat" "$@"); [ -n "$out" ] && { echo "$out"; return 0; }
+    [ $((SECONDS - t0)) -ge "$secs" ] && return 1
+    k=$((k + 1)); [ $((k % 6)) -eq 0 ] && mine 1 >/dev/null; sleep 5
+  done
+}
 expect() { case "$1" in *":STATUS :OK"*) ;; *) fail "${2:+$2: }${1:-no answer (control port timed out?)}";; esac; }
 own_ledger() {      # own_ledger NODE — the ledger NODE cites as a member; opened and recorded in $S/env on first use
   local var id; case $1 in cld*) var="L${1#cld}";; ref*) var="RL${1#ref}";; esac

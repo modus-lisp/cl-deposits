@@ -96,7 +96,8 @@ done
 nout=$(bcli getrawtransaction "$R2" 1 | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["vout"]))')
 [ "$nout" = 1 ] || fail "$CONF:0 was spent by $R2 with $nout outputs: not a re-arm spend (a claim?)"
 # A claim has one output too: a re-arm spend is the one a voter logs spending into round 2, or follows.
-grep -aE "dispute ${W:0:8}: .*(spent into round 2|round 2)" "$(cld_dir $H)/node.log" "$(cld_dir $H2)/node.log" >/dev/null \
+voter_logged() { grep -aE "dispute ${W:0:8}: .*(spent into round 2|round 2)" "$(cld_dir $H)/node.log" "$(cld_dir $H2)/node.log" >/dev/null; }
+poll 300 voter_logged \
   || fail "$CONF:0 was spent by $R2, but no voter logged a re-arm into round 2 (a round-1 claim?)"
 for n in $H $H2; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}:" | grep -E "round 2|re-arm" | tail -2 | sed "s/^/   $n: /"; done
 echo "== re-arm spend $R2; waiting for round 2's reveals and claim"
@@ -107,7 +108,7 @@ for i in $(seq 1 $((WAIT / 5))); do
   sleep 5
 done
 [ -n "$CLAIM" ] || fail "round 2's lottery output $R2:0 was not claimed within ${WAIT}s"
-won=$(for n in $H $H2; do cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}: re-arm round 2: won" | head -1 | sed "s/^/$n /"; done)
+won=$(await_won 600 "dispute ${W:0:8}: re-arm round 2: won" $H $H2)
 [ "$(printf '%s\n' "$won" | grep -c 'won')" = 1 ] || fail "expected exactly one round-2 winner, got: ${won:-none}"
 for n in $C2 $C3 $C4 $H $H2 $OP; do
   if cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND|unauthori[sz]ed spend" | grep -qi "${R2:0:16}"; then
