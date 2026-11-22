@@ -9,8 +9,10 @@
 # unclaimed.  The recovery voters are H and R (threshold 2).  H never arms round 2 (ADVERSARY
 # :hold-rearm-until) and never proposes (:rearm-sign-only), so R is round 2's only armer, its
 # proposer and its claimer, and H's part is to answer R's lottery_rearm_sign.
-# PASS = the round-1 output is spent through tier 0 (nSequence 144) into round 2's lottery by R's
-# proposal, R claims that output, and nobody takes the spend for a theft.
+# PASS = the round-1 output is spent through tier 0 (nSequence 144) into round 2's lottery by a
+# spend R broadcast (H never proposes), R claims that output and logs the win, R's own fork ends in
+# one DisputeAcquire chained onto its tip with no yield after its round-2 arm, and nobody takes the
+# spend for a theft.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-1500}
 source "$(dirname "$0")/_lib.sh"
 pick OP C2 C3 C4 H
@@ -84,9 +86,18 @@ read -r nout seq <<<"$(bcli getrawtransaction "$R2" 1 | python3 -c 'import json,
 rl() { tail -c +"$RFROM" "$RLOG" | sed 's/\x1b\[[0-9;]*m//g'; }
 rlhas() { rl | grep -aq "$1"; }
 rlhas "re-arm ${W:0:16}: lottery round 1 unclaimed; armed round 2" || fail "$R did not log arming round 2"
-poll 300 rlhas "re-arm ${W:0:16}: lottery round 1 unclaimed; spent into round 2's lottery (tier 0)" \
-  || fail "the re-arm spend $R2 is not R's proposal: $(cld_ctl $H '(:log)' | tr '"' '\n' | grep -F "dispute ${W:0:8}:" | tail -2 | tr '\n' ' ')"
-echo "== re-arm spend $R2 through tier 0, proposed by $R; waiting for $R's round-2 claim"
+# Who assembled the spend: R broadcasts it the moment it holds the threshold (its wallet logs
+# "Broadcast tx: <txid>"). R's summary line "spent into round 2's lottery" comes only after it has
+# rebuilt the round's arm set and published the manifest, minutes later on a loaded box (6 min in
+# regtest 1122-001432), so gating on it failed runs in which R had proposed, assembled and
+# broadcast this very spend (1121-184933, 1122-011945, 1122-021240), and the trap's restart of R
+# then cut the line off.  H is sign-only, so a spend R did not broadcast is still a failure.
+poll 120 rlhas "Broadcast tx: $R2" \
+  || fail "the re-arm spend $R2 was not broadcast by $R: $(cld_ctl $H '(:log)' | tr '"' '\n' | grep -F "dispute ${W:0:8}:" | tail -2 | tr '\n' ' ')"
+if cld_ctl $H '(:log)' 2>/dev/null | tr '"' '\n' | grep -F "dispute ${W:0:8}:" | grep -q "spent into round 2"; then
+  fail "$H (sign-only) logged proposing the re-arm spend of ${W:0:8}"
+fi
+echo "== re-arm spend $R2 through tier 0, broadcast by $R; waiting for $R's round-2 claim"
 CLAIM=""
 for i in $(seq 1 $((WAIT / 5))); do
   if [ -z "$(bcli gettxout "$R2" 0 true 2>/dev/null | head -1)" ]; then CLAIM=$(spender_of "$R2" 0); [ -n "$CLAIM" ] && break; fi
@@ -97,6 +108,40 @@ if [ -z "$CLAIM" ]; then rl | grep -E "re-arm ${W:0:16}|Found lottery UTXO|claim
 # "won" follows the claim's CONFIRMATION (DisputeAcquire persisted), so keep mining while waiting.
 NPOLL=0; won() { rlhas "re-arm ${W:0:16}: re-arm round 2: won" && return 0; NPOLL=$((NPOLL + 1)); [ $((NPOLL % 6)) -eq 0 ] && mine 1 >/dev/null; return 1; }
 poll 600 won || fail "$R did not log the round-2 win within 600 s of its claim $CLAIM"
+# Custody of record, not just a log line: R's own fork of W on disk ends in exactly one
+# DisputeAcquire, chained onto the update before it, after its round-2 arm, with no DisputeYield
+# after that arm and no two updates at one sequence (regtest rearm-rust 1121, c8b9b7b1: a yield on
+# the round-2 arm left a confirmed claim with no valid acquire anywhere).
+RPK16=${RPUB:0:16}
+FORKF=$(ls "$CLD_ROOT/$R/wallet/ledgers/${W}"_*_"$RPK16".jsonl 2>/dev/null | head -1)
+[ -n "$FORKF" ] || fail "no fork of ${W:0:8} by $R on its disk"
+FCOPY=$(mktemp); cp "$FORKF" "$FCOPY"
+verdict=$(python3 -I - "$FCOPY" "$RPUB" <<'PY'
+import json, sys, hashlib
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+ups = [r for r in rows if r.get("type") == "Update"]
+me = sys.argv[2]
+ours = [u for u in ups if bytes(u["operator_id"]).hex() == me]
+seqs = [u["sequence_number"] for u in ours]
+if len(seqs) != len(set(seqs)): print("two updates of ours at one sequence"); sys.exit()
+tag = lambda u: bytes(u["message"])[2]
+def chain(u):  # chain_hash = SHA256(content_hash || operator_signature)
+    return hashlib.sha256(bytes(u["content_hash"]) + bytes(u["operator_signature"])).digest()
+ups.sort(key=lambda u: u["sequence_number"])
+arms = [i for i, u in enumerate(ups) if tag(u) == 57 and bytes(u["operator_id"]).hex() == me]
+if not arms: print("no arm of ours on the fork"); sys.exit()
+after = ups[arms[-1] + 1:]
+if any(tag(u) == 56 for u in after): print("a DisputeYield follows our last arm"); sys.exit()
+acq = [u for u in after if tag(u) == 55]
+if len(acq) != 1: print("%d DisputeAcquires after our last arm" % len(acq)); sys.exit()
+a = acq[0]; prev = [u for u in ups if u["sequence_number"] == a["sequence_number"] - 1]
+if len(prev) != 1 or bytes(a["previous_hash"]) != chain(prev[0]):
+    print("the acquire at seq %d does not chain onto seq %d" % (a["sequence_number"], a["sequence_number"] - 1)); sys.exit()
+print("ok seq %d" % a["sequence_number"])
+PY
+)
+rm -f "$FCOPY"
+case "$verdict" in ok*) echo "== $R's fork: one DisputeAcquire after its round-2 arm, $verdict, chained onto its tip";; *) fail "$R's fork of ${W:0:8}: $verdict";; esac
 for n in $C2 $C3 $C4 $H $OP; do
   if cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -E "VAULT SPEND|unauthori[sz]ed spend" | grep -qi "${R2:0:16}"; then
     fail "$n took the re-arm spend for a theft"
