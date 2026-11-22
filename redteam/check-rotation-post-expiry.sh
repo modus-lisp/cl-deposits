@@ -80,12 +80,20 @@ if [ "$ARM" = rescue ]; then
 else
   while [ "$(bcli getblockcount)" -le $((EXP + 4)) ]; do mine 1 >/dev/null; sleep 1; done
 fi
-for n in $C1 $W; do cld_ctl $n '(:check-expired)' >/dev/null; done
+# Keep what :check-expired answered: drive-load 1122-030936 failed with C1 (cld1007) not
+# disputing for 180 s, and its fork appeared only after the teardown restart (03:18:12Z vs the
+# FAIL at 03:17:08Z) -- with the answer discarded and the node restarted, nothing said why.
+declare -A CHKX; for n in $C1 $W; do CHKX[$n]=$(cld_ctl $n '(:check-expired)' 2>&1 | tr '\n' ' ' | cut -c1-300); done
 # Each disputant's fork, as C1 sees it (R1 disputes from its own expiry watch).
 fork_state() { cld_ctl $C1 "(:forks :ledger \"$X\")" | grep -oE "\(:OPERATOR \"$(pubkey_of $1 | cut -c1-16)\" [^)]*" | grep -oE ':STATE :[A-Z]+' | cut -d: -f3; }
 for n in $C1 $W $R1; do
   for i in $(seq 1 60); do [ -n "$(fork_state $n)" ] && break; sleep 3; done
-  [ -n "$(fork_state $n)" ] || fail "$n did not dispute the expired quorum (no fork of it on $C1)"
+  if [ -z "$(fork_state $n)" ]; then
+    echo "== $n :check-expired answered: ${CHKX[$n]:-(not asked)}; at height $(bcli getblockcount), expiry $EXP"
+    cld_ctl $n '(:log)' 2>/dev/null | tr '"' '\n' | grep -F -e "${X:0:8}" -e "expired" | tail -8 | sed "s/^/   $n: /"
+    cld_ctl $n '(:drive-stats)' 2>/dev/null | cut -c1-400 | sed "s/^/   $n drive-stats: /"
+    fail "$n did not dispute the expired quorum (no fork of it on $C1)"
+  fi
 done
 echo "== $C1 $R1 $W disputed the expired quorum at $(bcli getblockcount)"
 
