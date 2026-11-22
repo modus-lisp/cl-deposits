@@ -12,6 +12,7 @@
 # REDTEAM_RG=name forms a fresh ledger per run.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
 pick OP C1 C2 C3 H1 H2
+log_mark $OP $C1 $C2 $C3 $H1 $H2   # node_log: this run's lines only
 ARM=${1:-inside}
 X=$(form_ledger "${REDTEAM_RG:-RG}" $OP "" $C1 $C2 $C3 $H1 $H2) || exit 1
 echo "== ledger $X ($ARM)"
@@ -23,7 +24,7 @@ begin() {
   case "$r" in *"ledger disputed"*) echo "SKIP: the operator ($OP) is already accused, so its members disputed this ledger and it cannot rotate: $r"; exit 0;; esac
   expect "$r"
 }
-signed() { cld_ctl "$1" "(:log :n 4000)" | grep -q "signing the .* rungs of ${X:0:8}"; }
+signed() { node_log "$1" | grep -q "signing the .* rungs of ${X:0:8}"; }
 case $ARM in
   inside)
     mine 1 >/dev/null; begin; echo "== QuorumBegin appended one block after the spend"

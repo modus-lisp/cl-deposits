@@ -1,5 +1,36 @@
 # redteam/_lib.sh — shared by the scenario scripts.  Source after devnet/_common.sh and $S/env.
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# In a soak turn (devnet/soak-attackers.sh sets ATTACK_NAME) a scenario that has called setup_phase
+# reports a failure BEFORE its fault lands as "INVALID: setup: ...": no attack happened, so nothing is
+# owed a proof and the oracle must not count a MISS (signet, 2026-11-20/21: three of four MISSes were
+# turns that died in form_ledger).  fault_landed ends the setup phase and records the landing in
+# $S/attack-landed.tsv, which the oracle requires before it judges a scheduled turn.  Outside a soak
+# turn (the regtest suite) a setup failure stays a FAIL: there it is a regression to see.
+SCENARIO_PHASE=
+setup_phase() { SCENARIO_PHASE=setup; }
+fault_landed() {   # fault_landed LEDGER DETAIL... — the fault is on chain or on the relay
+  SCENARIO_PHASE=attack
+  [ -n "${ATTACK_NAME:-}" ] && echo "$(date +%s) $ATTACK_NAME $*" >>"$S/attack-landed.tsv"
+  return 0
+}
+fail() {
+  if [ -n "${ATTACK_NAME:-}" ] && [ "$SCENARIO_PHASE" = setup ]; then echo "INVALID: setup: $*" >&2; exit 75; fi
+  echo "FAIL: $*" >&2; exit 1
+}
+# node_log NODE — NODE's log since log_mark NODE (the whole log if never marked).  The daemon takes
+# (:log :tail N) or (:log :since K); a (:log :n N) is NOT a bound, it returns every line since the node
+# started, earlier runs' included (signet, 2026-11-21: attack-vault-anchored saw the PREVIOUS run's
+# "lapsed-challenge proof against" on a cld7 up since Nov 19, failed, and so never mined past the
+# challenge window).  A node restarted since its mark (count below the mark) gives its whole log.
+declare -gA LOGMARK=()
+log_count() { cld_ctl "$1" '(:log :tail 0)' 2>/dev/null | grep -oE ':COUNT [0-9]+' | head -1 | cut -d' ' -f2; }
+log_mark() { local n c; for n in "$@"; do case $n in cld*) c=$(log_count "$n"); LOGMARK[$n]=${c:-0};; esac; done; }
+node_log() {
+  local n=$1 k=${LOGMARK[$1]:-} out c
+  [ -n "$k" ] || { cld_ctl "$n" '(:log)'; return; }
+  out=$(cld_ctl "$n" "(:log :since $k)")
+  c=$(grep -oE ':COUNT [0-9]+' <<<"$out" | head -1 | cut -d' ' -f2)
+  if [ -n "$c" ] && [ "$c" -lt "$k" ]; then cld_ctl "$n" '(:log)'; else printf '%s\n' "$out"; fi
+}
 # The red team attacks whatever devnet _common.sh selected, and that defaults to signet, where the
 # overnight soak runs.  A scenario run without DEVNET=regtest once attacked the live soak, so
 # signet takes an explicit opt-in.
@@ -80,8 +111,16 @@ form_ledger() {
   [ -n "$l" ] || fail "open ledger $(basename "$row")"
   consent "$l" "$op" "$@" >&2
   prep=$(cld_ctl "$op" "(:prepare-quorum :ledger \"$l\" :expiry-blocks ${FORM_EXPIRY:-4320}${rs:+ :ruleset \"$rs\"})"); expect "$prep" "prepare-quorum"; addr=$(sx "$prep" ":ADDRESS")
-  txid=$(wcli sendtoaddress "$addr" 0.5); mine 3 >/dev/null
+  # An empty txid is a refused sendtoaddress (signet, 2026-11-21 15:01: "Work queue depth exceeded"),
+  # which used to reach begin-quorum as `:TXID "" :VOUT` and fail as a malformed plist.  And the
+  # members refuse to cosign an unconfirmed reserves outpoint, so wait for it rather than retry into
+  # "0 of 3 cosignatures" (2026-11-21 23:14).
+  for i in 1 2 3 4 5; do txid=$(wcli sendtoaddress "$addr" 0.5 2>/dev/null); [ -n "$txid" ] && break; sleep 10; done
+  [ -n "$txid" ] || fail "fund $(basename "$row"): sendtoaddress $addr returned no txid"
+  mine 3 >/dev/null || echo "   $(basename "$row"): mine 3 fell short; waiting for the funding to confirm" >&2
+  await_confs "$txid" "${CLD_MIN_CONFS:-1}" "${FUND_CONF_WAIT:-600}" || fail "fund $(basename "$row"): $txid unconfirmed after ${FUND_CONF_WAIT:-600}s"
   vout=$(outpoint_vout "$txid" "$addr")
+  [ -n "$vout" ] || fail "fund $(basename "$row"): no output to $addr in $txid"
   local r i; for i in 1 2 3; do   # a busy member can miss the cosign round: retry
     r=$(cld_ctl "$op" "(:begin-quorum :ledger \"$l\" :txid \"$txid\" :vout $vout :sats $(( 50000000 - coll )) :collateral-sats $coll)")
     case "$r" in *":STATUS :OK"*) break;; *"cosignatures"*) echo "   begin-quorum retry $i: $r" >&2; sleep 15;; *) break;; esac
@@ -139,7 +178,7 @@ proved_lapsed() {
   local i
   for i in $(seq 1 $(( ${3:-300} / 10 ))); do
     cld_ctl "$1" '(:vault-watch)' >/dev/null 2>&1
-    cld_ctl "$1" '(:log)' 2>/dev/null | grep -q "lapsed-challenge proof against" && return 0
+    node_log "$1" 2>/dev/null | grep -q "lapsed-challenge proof against its ledger ${2:0:8}" && return 0
     sleep 10
   done; return 1
 }

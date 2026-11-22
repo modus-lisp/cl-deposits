@@ -21,7 +21,16 @@ A pool key is a red-team actor (devnet/soak-attackers.sh): adversarial once a sc
 (it is then in $SOAK/redteam-tainted), honest otherwise.  A proof against a pool key that is not
 burned yet waits ORACLE_POOL_GRACE_S (1800) for the scenario to record it before it is an ALARM.
 Scheduled attacks ($SOAK/attacks.tsv, appended by attackers):
-    <unix time> <attack> <ledger id> <accused key prefix> <window s>
+    <unix time> <attack> <ledger id> <accused key prefix> <window s> [spb=<seconds per block>]
+A turn is judged only once its fault LANDED ($SOAK/attack-landed.tsv, <unix time> <attack> ...,
+written by redteam/_lib.sh fault_landed; devnet/soak-attackers.sh writes "<time> markers-on" when it
+starts).  A turn that died before its fault landed (form_ledger failed: Nov 20-21, three MISSes) is
+moot, not a MISS.  Turns from before the markers existed are judged on what they left behind: a
+soak-fault turn landed if it wrote its own attacks.tsv row, a vault turn if its log says
+"== theft broadcast:"; anything else is judged as landed.
+A block-counted attack (attack-vault-anchored: its proof waits out the 72-block challenge) gets a
+window of CHALLENGE_WINDOW_S at the turn's observed block rate (spb=, else ORACLE_SECS_PER_BLOCK)
+plus ORACLE_PROOF_SLACK_S, if that is longer than the row's.
 
   soak-oracle.py --loop SECONDS     poll the relay, judge, append $SOAK/log/oracle.log
   soak-oracle.py --once             one pass
@@ -37,6 +46,10 @@ RELAY = os.environ.get("RELAY_URL", "ws://127.0.0.1:7777")
 POOL_GRACE_S = int(os.environ.get("ORACLE_POOL_GRACE_S", "1800"))
 CHALLENGE_WINDOW_S = int(os.environ.get("ORACLE_CHALLENGE_WINDOW_S", str(72 * 60 * 3 // 2)))
 KINDS = (9101, 9111, 9112)
+SECS_PER_BLOCK = float(os.environ.get("ORACLE_SECS_PER_BLOCK", "60"))     # the soak's design rate
+PROOF_SLACK_S = int(os.environ.get("ORACLE_PROOF_SLACK_S", "900"))
+BLOCK_COUNTED = {"attack-vault-anchored": CHALLENGE_WINDOW_S}            # seconds at 60 s per block
+TURN_S = 5400 + 120                                                      # soak-attackers' turn timeout
 
 
 def load_table(path):
@@ -77,6 +90,9 @@ class World:
         # <unix time> <attack> <scenario verdict> <seconds>: each live attack's end-to-end result
         # (devnet/soak-attackers.sh), e.g. confiscated and the depositors paid
         self.outcomes = [r for r in load_table(os.path.join(soak, "attack-outcomes.tsv")) if len(r) >= 3]
+        # <unix time> <attack> ...: a scenario's fault landed (redteam/_lib.sh fault_landed)
+        self.landed = [r for r in load_table(os.path.join(soak, "attack-landed.tsv")) if len(r) >= 2]
+        self.logdir = os.path.join(soak, "log")
         # Known false accusations whose cause is fixed ($SOAK/alarms-resolved.tsv: <accused prefix>
         # <ledger prefix> <note...>).  They stay counted as ALARMs; the summary also says how many are
         # resolved, so a new ALARM stands out.
@@ -91,6 +107,28 @@ class World:
                     and ledger.lower().startswith(r[1].lower()):
                 return " ".join(r[2:]) or "resolved"
         return None
+
+    def turn_landed(self, t, attack):
+        """Did the turn scheduled at T land its fault?  True, False, or None (still running)."""
+        if any(r[1] == attack and t - 5 <= float(r[0]) <= t + TURN_S for r in self.landed):
+            return True
+        finished = any(r[1] == attack and t - 5 <= float(r[0]) - float(r[3]) <= t + 120
+                       for r in self.outcomes if len(r) >= 4)
+        if self.landed and float(self.landed[0][0]) <= t:      # markers were on: none for this turn
+            return False if finished else None
+        return self.legacy_landed(t, attack)
+
+    def legacy_landed(self, t, attack):
+        if attack.startswith("attack-soak-fault:"):
+            fault = attack.split(":", 1)[1]
+            return any(r[1] == fault and t - 5 <= float(r[0]) <= t + TURN_S for r in self.attacks)
+        if attack in ("attack-vault-spend", "attack-vault-anchored"):
+            for dt in (0, 60):
+                f = os.path.join(self.logdir, "attack-%s-%s.log" % (attack.replace(":", "-", 1),
+                                                                    time.strftime("%m%dT%H%M", time.localtime(t + dt))))
+                if os.path.exists(f):
+                    return any(l.startswith("== theft broadcast:") for l in open(f, errors="replace"))
+        return True                                            # nothing to go on: judge it, as before
 
     def adversarial_key(self, k):
         x = xonly(k)
@@ -180,11 +218,25 @@ def judge(events, world, now=None):
     moot_turns = [(float(r[0]) - float(r[3]), r[1]) for r in world.outcomes
                   if len(r) >= 4 and r[2].startswith(("SKIP", "INVALID"))]
     counts["skipped"] = 0
-    for t, attack, led, acc, window in world.attacks:
-        t, window = float(t), float(window)
+    counts["unlanded"] = 0
+    unlanded = []
+    for r in world.attacks:
+        t, attack, led, acc, window = float(r[0]), r[1], r[2], r[3], float(r[4])
         if led == "-" and any(name == attack and t - 5 <= start <= t + 120 for start, name in moot_turns):
             counts["skipped"] += 1
             continue
+        if led == "-":
+            landed = world.turn_landed(t, attack)
+            if landed is None:
+                continue                                       # running, nothing landed yet
+            if not landed:
+                counts["unlanded"] += 1
+                unlanded.append((t, attack))
+                verdicts.append((t, "INFO", False, f"{attack}: the turn never landed its fault; not judged"))
+                continue
+        if attack in BLOCK_COUNTED:
+            spb = next((float(x[4:]) for x in r[5:] if x.startswith("spb=")), SECS_PER_BLOCK)
+            window = max(window, BLOCK_COUNTED[attack] * spb / 60 + PROOF_SLACK_S)
         hit = any(typ != "QuorumExpired" and e["created_at"] >= t - 60 and e["created_at"] <= t + window
                   and (led.lower() == "-" or led2.lower().startswith(led.lower()))
                   and (xonly(acc2).startswith(xonly(acc)) if acc != "-"
@@ -198,13 +250,15 @@ def judge(events, world, now=None):
         ok = r[2].startswith("PASS")
         # The scenario's precondition did not arise (no verdict), or its lottery is still being followed
         # through re-arm rounds (PENDING: a later PASS or FAIL row settles it).
-        moot = r[2].startswith(("INVALID", "SKIP", "PENDING"))
+        never_landed = len(r) >= 4 and any(name == r[1] and t - 5 <= float(r[0]) - float(r[3]) <= t + 120
+                                           for t, name in unlanded)
+        moot = r[2].startswith(("INVALID", "SKIP", "PENDING")) or never_landed
         a = per.setdefault(r[1], [0, 0, 0])
         if moot:
             a[2] += 1
         else:
             a[0] += ok; a[1] += 1
-        if not ok and not r[2].startswith("PENDING"):
+        if not ok and not r[2].startswith("PENDING") and not never_landed:
             verdicts.append((float(r[0]), "ATTACK", False, f"{r[1]}: scenario verdict {r[2]}"))
     counts["attacks"] = per
     return verdicts, counts
@@ -212,7 +266,7 @@ def judge(events, world, now=None):
 
 def summary_line(counts):
     line = ("oracle: PASS {PASS}  MISS {MISS}  ALARM {ALARM} ({resolved} resolved)  expiry {EXPIRY}  challenges {challenged}"
-            " (answered {answered}, pending {pending})  skipped {skipped}").format(**counts)
+            " (answered {answered}, pending {pending})  skipped {skipped}  unlanded {unlanded}").format(**counts)
     per = counts.get("attacks") or {}
     if per:
         line += "  attacks " + " ".join(f"{a}={p}/{n}" + (f"+{m}moot" if m else "") for a, (p, n, m) in sorted(per.items()))

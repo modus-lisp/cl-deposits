@@ -30,6 +30,14 @@ listed in `soak/adversaries.tsv`, scheduled attacks in `soak/attacks.tsv`. Repla
 (`--replay`) gives ALARM 11: the Oct 30 NonConformingUpdate and its four contagion proofs, and the
 Nov 2 lapsed-challenge vault-spend proofs.
 
+A scheduled turn is judged only once its fault LANDED (`soak/attack-landed.tsv`, written by
+`redteam/_lib.sh` `fault_landed`); a turn that dies in setup reports `INVALID: setup: …` and is moot
+("unlanded" in the summary), not a MISS.  Three of the four MISSes of Nov 20-21 were such turns
+(form_ledger: a born-expired quorum from a height-0 add-member, a refused `sendtoaddress`, a `mine 3`
+that mined nothing).  attack-vault-anchored's window is the 72-block challenge at the turn's
+observed block rate (`spb=` in its attacks.tsv row), not 3600 s: on Nov 21 those 72 blocks took
+132 minutes.
+
 ## Live attackers in the soak
 
 | Attacker | Status | Notes |

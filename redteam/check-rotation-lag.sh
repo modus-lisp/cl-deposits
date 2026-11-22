@@ -18,6 +18,7 @@
 # answer; nobody reported a theft or proved one.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
 pick OP C1 C2 C3 LAG BLIND
+log_mark $OP $C1 $C2 $C3 $LAG $BLIND   # node_log: this run's lines only
 R1=${R1:-ref6}; R2=${R2:-ref7}
 X=$(form_ledger "${REDTEAM_LAG:-LAG$RANDOM}" $OP "" $C1 $C2 $C3 $LAG $BLIND $R1 $R2) || exit 1
 echo "== ledger $X"
@@ -42,10 +43,10 @@ echo "   $LAG's replica at seq ${now:-?}, the operator's at ${op:-?}"
 [ -n "$now" ] && [ -n "$op" ] && [ "$now" -lt "$op" ] || fail "$LAG's replica caught up (${now:-?} vs ${op:-?}): the lag did not hold, so this run proves nothing"
 disarm :mute $LAG $BLIND
 for n in $LAG $BLIND; do
-  if cld_ctl $n "(:log :n 4000)" | grep -q "signing the .* rungs of ${X:0:8}"; then fail "$n signed the rotation; it was meant not to"; fi
+  if node_log $n | grep -q "signing the .* rungs of ${X:0:8}"; then fail "$n signed the rotation; it was meant not to"; fi
 done
 if accused $LAG "$X" 60; then fail "the lagging watcher $LAG reported the rotation as a theft"; fi
-lag_answered() { cld_ctl $LAG "(:log :n 4000)" | grep -q "vault watch: ${X:0:8}'s spend .* is answered by its anchor"; }
+lag_answered() { node_log $LAG | grep -q "vault watch: ${X:0:8}'s spend .* is answered by its anchor"; }
 poll 300 lag_answered \
   || fail "$LAG never judged the spend answered (its log): the watch did not reach it"
 echo "   $LAG found the rotation's QuorumBegin (on the relay) and reported nothing"
@@ -53,14 +54,14 @@ echo "   $LAG found the rotation's QuorumBegin (on the relay) and reported nothi
 ok=
 for i in $(seq 1 30); do
   cld_ctl $BLIND '(:vault-watch)' >/dev/null 2>&1
-  cld_ctl $BLIND "(:log :n 4000)" | grep -q "the challenge of ${X:0:8}'s spend .* is answered" && { ok=1; break; }
+  node_log $BLIND | grep -q "the challenge of ${X:0:8}'s spend .* is answered" && { ok=1; break; }
   sleep 10
 done
-cld_ctl $BLIND "(:log :n 4000)" | grep -q "VAULT SPEND CHALLENGED: ${X:0:8}" || fail "$BLIND never challenged the spend"
-cld_ctl $BLIND "(:log :n 4000)" | grep -q "challenge of ${X:0:8}'s spend recorded on our ledger" || fail "$BLIND did not record its challenge"
-answered_by=$(for n in $OP $C1 $C2 $C3; do cld_ctl $n "(:log :n 4000)" | grep -q "answering the challenge of ${X:0:8}" && echo $n; done)
+node_log $BLIND | grep -q "VAULT SPEND CHALLENGED: ${X:0:8}" || fail "$BLIND never challenged the spend"
+node_log $BLIND | grep -q "challenge of ${X:0:8}'s spend recorded on our ledger" || fail "$BLIND did not record its challenge"
+answered_by=$(for n in $OP $C1 $C2 $C3; do node_log $n | grep -q "answering the challenge of ${X:0:8}" && echo $n; done)
 for n in $R1 $R2; do grep -q "answering the challenge of ${X:0:8}" "$(ref_dir $n)/node.log" 2>/dev/null && answered_by="$answered_by $n"; done
 echo "   answered by:${answered_by:- (none logged)}"
 [ -n "$ok" ] || fail "$BLIND never accepted an answer to its challenge"
-if cld_ctl $BLIND "(:log :n 4000)" | grep -q "lapsed-challenge proof against"; then fail "$BLIND proved the rotation"; fi
+if node_log $BLIND | grep -q "lapsed-challenge proof against its ledger ${X:0:8}"; then fail "$BLIND proved the rotation"; fi
 echo "PASS: $LAG judged the rotation answered from the relay; $BLIND, blind to the relay, challenged it, was answered${answered_by:+ by$answered_by}, and proved nothing."

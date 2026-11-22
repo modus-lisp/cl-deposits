@@ -35,7 +35,7 @@ case "$CLD_CHAIN" in
     BITCOIN_DATADIR="$SIGNET_ROOT/bitcoin"
     BITCOIN_CLI="${BITCOIN_CLI:-$SIGNET_ROOT/bin/bitcoin-cli}"
     BCLI="$BITCOIN_CLI -signet -datadir=$BITCOIN_DATADIR"
-    mine() { "$SIGNET_ROOT/mine.sh" "${1:-1}" >/dev/null; }
+    mine_once() { "$SIGNET_ROOT/mine.sh" "${1:-1}" >/dev/null; }
     ;;
   regtest)
     CLD_ROOT="${CLD_ROOT:-/mnt/lisp/regtest-devnet}"
@@ -49,7 +49,7 @@ case "$CLD_CHAIN" in
     BITCOIND="${BITCOIND:-$(_bin bitcoind)}"
     BITCOIN_RPC_PORT="${BITCOIN_RPC_PORT:-18543}"
     BCLI="$BITCOIN_CLI -regtest -datadir=$BITCOIN_DATADIR -rpcport=$BITCOIN_RPC_PORT"
-    mine() { $BCLI -rpcwallet="$MINER_WALLET" -generate "${1:-1}" >/dev/null; }
+    mine_once() { $BCLI -rpcwallet="$MINER_WALLET" -generate "${1:-1}" >/dev/null; }
     ;;
   *) echo "CLD_CHAIN must be signet or regtest" >&2; exit 2;;
 esac
@@ -60,6 +60,37 @@ BEACON_DIR="$CLD_ROOT/beacon-data/"
 RELAY_FAULTS="$RELAY_STORE.faults.json"                  # red-team fault rules, read by either relay
 bcli() { $BCLI "$@"; }
 wcli() { $BCLI -rpcwallet="$MINER_WALLET" "$@"; }
+# mine N — N blocks, and the chain is CHECKED to have risen by N: the shortfall is mined again (up to
+# 6 tries), and 1 is returned, loudly, if it still has not.  mine_once's miner can fail silently:
+# signet, 2026-11-21 23:14, `Could not satisfy difficulty target` three times inside form_ledger's
+# `mine 3`, so the funding never confirmed and begin-quorum FAILed on "0 of 3 cosignatures".
+# Another miner's blocks count toward N (what a caller needs is the confirmations).
+mine() {
+  local want=${1:-1} h0 h i
+  h0=$(bcli getblockcount 2>/dev/null)
+  case "$h0" in ''|*[!0-9]*) mine_once "$want"; return;; esac   # cannot check: as before
+  h=$h0
+  for i in 1 2 3 4 5 6; do
+    mine_once $(( want - (h - h0) ))
+    h=$(bcli getblockcount 2>/dev/null); case "$h" in ''|*[!0-9]*) h=$h0;; esac
+    [ $(( h - h0 )) -ge "$want" ] && return 0
+    sleep 2
+  done
+  echo "mine: asked for $want block(s), the chain rose $(( h - h0 )) ($h0 -> $h)" >&2; return 1
+}
+# await_confs TXID N SECS — until the miner wallet's TXID has N confirmations (mining a block every
+# 30 s meanwhile); 1 after SECS.
+await_confs() {
+  local txid=$1 n=${2:-1} secs=${3:-300} t0=$SECONDS c
+  while :; do
+    c=$(wcli gettransaction "$txid" 2>/dev/null | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('confirmations', 0))
+except Exception: print(0)")
+    [ "${c:-0}" -ge "$n" ] 2>/dev/null && return 0
+    [ $(( SECONDS - t0 )) -ge "$secs" ] && return 1
+    [ $(( (SECONDS - t0) % 30 )) -lt 5 ] && mine 1 >/dev/null 2>&1; sleep 5
+  done
+}
 
 CLD_LN_NODE="${CLD_LN_NODE:-clp3}"                       # cld1's Lightning node (a cl-payments daemon)
 CLD_LN_CONTROL="127.0.0.1:$(( 9930 + ${CLD_LN_NODE#clp} + 100 ))"

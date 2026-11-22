@@ -3409,4 +3409,55 @@
           (check "caught up, an honest update is no proof: refused" (funcall logged n "fraud proof rejected"))
           (check-equal "and not parked" (funcall parked n) 0))))))
 
+;; Signet soak, 2026-11-20: a pool node woken while bitcoind rejected every RPC ran add-member
+;; before its first getblockcount, stamped membership_until = 0 + 4320 at a real height of 11050,
+;; and prepare-quorum then refused the quorum as born expired.  An unknown height must be refused
+;; by everything that stamps one, never read as 0.  The negative control below restores the old
+;; reading (unknown = 0) and requires the same checks to catch it.
+(defun unknown-height-observations ()
+  "Run the soak's shape on fresh nodes; return (refused-add refused-prepare refused-open
+   untils-staged-while-unknown untils-after)."
+  (let* ((bus (bus:make-mock-bus)) (h 11050) (hf (lambda () h))
+         (a (nd:make-node :priv (tk 12121212121212121212) :bus bus :height-fn hf))
+         (ms (loop for k in '(13131313131313131313 14141414141414141414 15151515151515151515)
+                   collect (nd:make-node :priv (tk k) :bus bus :height-fn hf)))
+         (la (nd:open-ledger a :reserves-id "genesis:unknown-height" :reserves 15600000 :collateral 23400000)))
+    (dolist (m ms) (nd:open-ledger m :reserves-id (format nil "genesis:uh-~a" (nd:node-pubkey-hex m))))
+    (setf h nil)                       ; bitcoind stops answering before our first successful read
+    (let* ((refused-add (handler-case (progn (nd:add-member a la (nd:node-pubkey (first ms))) nil)
+                          (nd:node-error (e) (search "chain height unknown" (princ-to-string e)))))
+           (staged-unknown (mapcar #'lg:member-membership-until (lg:ledger-next-quorum-members (nd:record-ledger la))))
+           (refused-prepare (handler-case (progn (nd:prepare-quorum a la) nil)
+                              (nd:node-error (e) (search "chain height unknown" (princ-to-string e)))))
+           (refused-open (handler-case (progn (nd:open-ledger a :reserves-id "genesis:uh-second") nil)
+                           (nd:node-error (e) (search "chain height unknown" (princ-to-string e))))))
+      (setf h 11050)
+      (dolist (m ms) (handler-case (nd:add-member a la (nd:node-pubkey m)) (error () nil)))
+      (list refused-add refused-prepare refused-open staged-unknown
+            (mapcar #'lg:member-membership-until (lg:ledger-next-quorum-members (nd:record-ledger la)))))))
+
+(with-gate ("nodes: an unknown chain height is refused, never stamped as 0")
+  (let ((cli-unknown (funcall (cl-deposits.daemon:bitcoin-cli-height-fn "false")))
+        (cli-known (funcall (cl-deposits.daemon:bitcoin-cli-height-fn "printf 11050"))))
+    (check-equal "bitcoin-cli height before any successful getblockcount is NIL, not 0" cli-unknown nil)
+    (check-equal "and the real height once bitcoind answers" cli-known 11050))
+  (destructuring-bind (add prepare open staged untils) (unknown-height-observations)
+    (check "add-member refuses while the height is unknown" add)
+    (check-equal "nothing was staged while the height was unknown" staged nil)
+    (check "prepare-quorum refuses while the height is unknown" prepare)
+    (check "a new update (open-ledger) refuses while the height is unknown" open)
+    (check-equal "once known, every staged commitment runs from the real height" untils (list 15370 15370 15370)))
+  ;; Negative control: the old reading of an unknown height as 0.  The checks above must catch it.
+  (let ((fixed (fdefinition 'nd::known-height)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'nd::known-height) (lambda (node) (or (funcall (nd::node-height-fn node)) 0)))
+           (destructuring-bind (add prepare open staged untils) (unknown-height-observations)
+             (declare (ignore untils))
+             (check "control (unknown read as 0): add-member is NOT refused" (not add))
+             (check "control: prepare-quorum is NOT refused" (not prepare))
+             (check "control: open-ledger is NOT refused" (not open))
+             (check-equal "control: the soak's signature, a commitment staged to end at 0 + 4320" staged '(4320))))
+      (setf (fdefinition 'nd::known-height) fixed))))
+
 (report)

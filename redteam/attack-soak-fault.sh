@@ -20,6 +20,7 @@
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env" 2>/dev/null
 FAULT=${1:?forge-lock|invalid-credit|equivocate|omit-commitments|falsify-commitments}; WAIT=${WAIT:-2400}
 source "$(dirname "$0")/_lib.sh"
+setup_phase   # a failure before the fault lands is INVALID: setup in a soak turn
 # Attacker roles (OP and the colluders, which are burned for good) come only from nodes outside the
 # soak ($S/soak-nodes, written by devnet/soak-attackers.sh), minted on demand, so no soak member is
 # ever made a colluder and loses its collateral to contagion.  The honest member H may be a soak node.
@@ -46,20 +47,21 @@ trap cleanup EXIT
 
 case $FAULT in
   forge-lock)
-    blind t; cld_ctl $OP "(:forge-lock :ledger \"$E\" :from \"$D\" :to \"$D\" :msat 1000000)" >/dev/null; sleep 15; blind nil
+    blind t; cld_ctl $OP "(:forge-lock :ledger \"$E\" :from \"$D\" :to \"$D\" :msat 1000000)" >/dev/null; fault_landed "$E" forge-lock; sleep 15; blind nil
     taint $OP $M1 $M2 $M3;;
   invalid-credit)
     RES=$(cld_ctl $OP "(:info)" | grep -oE "\(:ID \"$E\"[^)]*" | grep -oE ':RESERVES [0-9]+' | cut -d' ' -f2)
     blind t; cld_ctl $OP "(:adversary :set :sign-invalid t)" >/dev/null
     cld_ctl $OP "(:credit :ledger \"$E\" :deposit \"$D\" :msat $(( ${RES:-25000000000} * 2 )) :txid \"$CTX\" :vout $CVOUT)" >/dev/null
+    fault_landed "$E" invalid-credit
     sleep 15; cld_ctl $OP "(:adversary :set :sign-invalid nil)" >/dev/null; blind nil
     taint $OP $M1 $M2 $M3;;
   equivocate)
-    expect "$(cld_ctl $OP "(:equivocate :ledger \"$E\")")" "equivocate"; taint $OP;;
+    expect "$(cld_ctl $OP "(:equivocate :ledger \"$E\")")" "equivocate"; fault_landed "$E" equivocate; taint $OP;;
   omit-commitments|falsify-commitments)
     cld_ctl $OP "(:adversary :set :$FAULT t)" >/dev/null
     R=$(cld_ctl $OP "(:credit :ledger \"$E\" :deposit \"$D\" :msat 1000 :txid \"$CTX\" :vout $CVOUT)")
-    cld_ctl $OP "(:adversary :set :$FAULT nil)" >/dev/null
+    cld_ctl $OP "(:adversary :set :$FAULT nil)" >/dev/null; fault_landed "$E" "$FAULT attempted"
     echo "== operator's attempt: $(echo "$R" | cut -c1-200)"
     sleep 30; S1=$(seq_of)
     echo "== $E seq before $S0, after $S1"

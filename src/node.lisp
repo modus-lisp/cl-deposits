@@ -331,7 +331,17 @@
   "(:inbox N :cosign-inbox N) — how far behind the two lanes are."
   (list :inbox (length (node-inbox node)) :cosign-inbox (length (node-fast-inbox node))))
 
-(defun height (node) (funcall (node-height-fn node)))
+;; A height fn answers NIL while the chain height is UNKNOWN (bitcoind has not answered a
+;; getblockcount since the node started).  HEIGHT keeps answering 0 then, as it always did, for
+;; the many comparisons that merely wait on the chain; anything that STAMPS a height into what we
+;; sign or publish uses KNOWN-HEIGHT, which refuses instead (signet soak, 2026-11-20: a pool node
+;; woken while bitcoind rejected RPCs ran add-member at "height 0" and staged membership_until
+;; 4320 at height ~11050, so the quorum was born expired).
+(defun height-known-p (node) (and (funcall (node-height-fn node)) t))
+(defun height (node) (or (funcall (node-height-fn node)) 0))
+(defun known-height (node)
+  (or (funcall (node-height-fn node))
+      (fail "chain height unknown: bitcoind has not answered getblockcount since we started; retry")))
 (defun find-record (node id-hex) (gethash id-hex (node-ledgers node)))
 (defun own-ledger (node) (and (node-member-ledger-hex node) (find-record node (node-member-ledger-hex node))))
 (defun tip (rec) (car (record-history rec)))
@@ -627,7 +637,7 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Building and publishing our own updates
 
-(defun new-update (node rec op &key (height (height node)))
+(defun new-update (node rec op &key (height (known-height node)))
   "DEP-02 §Block height and hash: dated at our tip but never below the chain's last height (a
    reorganisation that lowered our tip leaves us at that height), and naming a block."
   (let* ((t0 (tip rec))
@@ -1118,7 +1128,7 @@
   "Ask MEMBER-PUBKEY to join REC's quorum; on consent, stage them with QuorumAddMember.
    The request is addressed (tag l) to MEMBER-LEDGER-ID — the member's own ledger —
    as the reference does; its nodes only answer requests for ledgers they operate."
-  (let* ((until (+ (height node) membership-blocks))
+  (let* ((until (+ (known-height node) membership-blocks))
          (ruleset (or ruleset (let ((l (record-ledger rec)))   ; DEP-18 §operator policy, LG:PROPOSED-RULESET
                                 (lg:proposed-ruleset (or (lg:ledger-active-ruleset l)
                                                          (and (null (lg:ledger-quorum-members l)) lg:+current-ruleset+))
@@ -1193,18 +1203,19 @@
   "Build (and pin) the reserves output the next QuorumBegin will point at, so
    it can be funded on chain first.  Returns the reserves.  RULESET defaults to the reference
    operator policy (DEP-18 §operator policy, LG:PLANNED-RULESET)."
-  (let* ((staged (lg:ledger-next-quorum-members (record-ledger rec)))
+  (let* ((h (known-height node))
+         (staged (lg:ledger-next-quorum-members (record-ledger rec)))
          (ruleset (or ruleset (lg:planned-ruleset (lg:ledger-active-ruleset (record-ledger rec)) (mapcar #'lg:member-supported-rulesets staged))))
          ;; DEP-05: quorum_expiry is the shortest member commitment.
-         (expiry (lg:planned-quorum-expiry staged (height node) expiry-blocks))
+         (expiry (lg:planned-quorum-expiry staged h expiry-blocks))
          (reserves (rs:build-reserves :operator (node-pubkey node) :members (mapcar #'lg:member-pubkey staged)
                                       :ledger-hash (up:chain-hash (tip rec)) :quorum-expiry expiry
                                       :ruleset ruleset :network (intern (string-upcase (node-network node)) :keyword))))
     (when (null staged) (fail "no staged members"))
     ;; A member whose commitment has already lapsed would make the quorum born
     ;; expired (every value-moving op refused): say which, rather than pin it.
-    (when (<= expiry (height node))
-      (fail "quorum would be born expired: a member's commitment ends at ~a, height ~a" expiry (height node)))
+    (when (<= expiry h)
+      (fail "quorum would be born expired: a member's commitment ends at ~a, height ~a" expiry h))
     (setf (record-pinned rec) (cons reserves expiry))
     reserves))
 
@@ -2098,9 +2109,9 @@
           (unless (record-fork-p rec) (setf (gethash their-id (node-ledgers node)) rec))
           ;; Member policy: a seat on a quorum past its expiry is offered, never owed.
           (let ((e (lg:ledger-quorum-expiry (record-ledger rec))))
-            (unless (member-cosigns-post-expiry-p (height node) e t *cosign-post-expiry-establishment*)
+            (unless (member-cosigns-post-expiry-p (known-height node) e t *cosign-post-expiry-establishment*)
               (fail "member policy: we do not join a rotation past quorum_expiry ~a" e)))
-          (let* ((until (let ((u (w:jget params "membership_until"))) (if (integerp u) u (+ (height node) 4320))))
+          (let* ((until (let ((u (w:jget params "membership_until"))) (if (integerp u) u (+ (known-height node) 4320))))
                  (consent (schnorr:schnorr-sign (node-priv node)
                                                 (sha256 (cat (ascii->bytes "COLLATERAL_CONSENT") operator (ascii->bytes their-id)))
                                                 (random-aux)))
@@ -2370,7 +2381,7 @@
   "DEP-10: a funding offer for DESCRIPTOR's deposit, cosigned by a member once the quorum is
    active.  Returns the response object."
   (unless (< 0 min-sats max-sats) (fail "need 0 < min_sats < max_sats"))
-  (let* ((offer-id (random-aux)) (deadline (+ (height node) blocks-valid)))
+  (let* ((offer-id (random-aux)) (deadline (+ (known-height node) blocks-valid)))
     (multiple-value-bind (address spk) (offer-address node offer-id)
       (let ((offer (list :offer-id offer-id :descriptor descriptor :deposit-id (op:deposit-id descriptor)
                          :address address :spk spk :deadline deadline :min min-sats :max max-sats :status :pending))
@@ -2441,7 +2452,7 @@
       (let ((*extra-cosign-params* (list "migration_manifest" (bytes->hex (op:encode-manifest manifest)))))
         (append-operation node rec (%strip-nil-fields
                                     (list :type :dormancy-accept :deposit-id premium-deposit :exit-address spk
-                                          :expires-at-height (+ (height node) expiry-blocks) :manifest-hash hash
+                                          :expires-at-height (+ (known-height node) expiry-blocks) :manifest-hash hash
                                           :offer-event-id offer-event-id :accepted-total total
                                           :source-ledger-id source-ledger)))))))
 
