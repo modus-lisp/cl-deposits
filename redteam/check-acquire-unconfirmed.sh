@@ -8,6 +8,7 @@
 # its updates cosigned by C1 C2 and the reference members, and none logs "custody moved" for it.
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
 pick OP C1 C2 P
+log_mark $OP $C1 $C2 $P   # node_log: this run's lines only
 R1=${R1:-ref6}; R2=${R2:-ref7}
 for n in $OP $C1 $C2 $P; do cld_running $n || continue; stop_cld $n >/dev/null; start_cld $n >/dev/null & done; wait
 ROW=${REDTEAM_AU:-AU$RANDOM}
@@ -21,7 +22,7 @@ out=$("$CLD_SRC/devnet/cld-wallet.sh" w1 "$X" open); dep=$(sx "$out" ":DEPOSIT")
 r=$(cld_ctl $OP "(:credit :ledger \"$X\" :deposit \"$dep\" :msat 1000000 :txid \"$VTX\" :vout $VOUT)")
 echo "   credit after the phantom acquire: ${r:0:160}"
 for n in $C1 $C2; do
-  if cld_ctl $n "(:log :n 3000)" | grep -qE "refused cosign seq .*custody moved by DisputeAcquire"; then
+  if node_log $n | grep -qE "refused cosign seq .*custody moved by DisputeAcquire"; then
     cld_ctl $n "(:forks :ledger \"$X\")" | grep -q 'ARMED' && fail "$n read the unconfirmed acquire on $X as custody moved"
   fi
 done

@@ -28,6 +28,7 @@
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env"; source "$(dirname "$0")/_lib.sh"
 ARM=${1:-rescue}; WAIT=${WAIT:-1200}
 pick OP C1 C2 W
+log_mark $OP $C1 $C2 $W   # node_log: this run's lines only
 R1=${R1:-ref6}
 # Each picked node runs the checkout's code (the policy switch, :hold-arm and :rotate-spent-vault
 # are new): a pool node may be running, or pinned by its version file to, an older build, so on
@@ -105,7 +106,7 @@ rotate() {   # the operator's whole rotation; prints the rotation txid, or fails
   done
   r=$(CLD_CTL_TIMEOUT=240 cld_ctl $OP "(:add-member :ledger \"$X\" :member \"$(pubkey_of $W)\" :member-ledger \"$(own_ledger "$W")\")")
   case "$r" in *":STATUS :OK"*) echo "   $W CONSENTED" >&2; return 2;; *) echo "   $W declined: $r" >&2;; esac
-  cld_ctl $W '(:log :n 2000)' | grep "refused consent" | grep -q "member policy" \
+  node_log $W | grep "refused consent" | grep -q "member policy" \
     || { echo "   $W's log has no member-policy refusal of the seat" >&2; return 3; }
   r=$(cld_ctl $OP "(:trim-staged :ledger \"$X\")"); case "$r" in *":STATUS :OK"*) ;; *) echo "   trim: $r" >&2; return 1;; esac
   r=$(cld_ctl $OP "(:rotate-vault :ledger \"$X\" :expiry-blocks 4320)"); case "$r" in *":STATUS :OK"*) ;; *) echo "   rotate-vault: $r" >&2; return 1;; esac
@@ -150,7 +151,7 @@ case $ARM in
     [ -n "$(bcli gettxout "$RT" 0 | head -1)" ] || echo "   (the old vault was spent by $sp, a higher rung of the rotation's ladder)"
     WK=$(pubkey_of $W | cut -c1-16); WL=$(own_ledger "$W")
     for n in $OP $C1 $C2; do
-      cld_ctl $n '(:log :n 4000)' | grep -iE "against [^ ]*($WK|${WL:0:8})|accused[^ ]* ($WK|${WL:0:8})|VAULT SPEND: ${WL:0:8}" | grep -q . && fail "$n holds a proof against $W"
+      node_log $n | grep -iE "against [^ ]*($WK|${WL:0:8})|accused[^ ]* ($WK|${WL:0:8})|VAULT SPEND: ${WL:0:8}" | grep -q . && fail "$n holds a proof against $W"
       cld_ctl $n "(:forks :ledger \"$WL\")" | grep -q ':OPERATOR' && fail "$n has a dispute on $W's own ledger"
     done
     echo "PASS: past expiry the operator re-established with the members that agreed ($C1 $R1 $C2); $W declined by policy and nothing holds that against it; every expiry dispute stood while the rotation was unconfirmed and yielded once it confirmed; no confiscation ($sp spent the vault).";;

@@ -35,7 +35,20 @@ register_pool() {   # every cl node that is not a soak operator, as a red-team p
     grep -q "^pool $k" "$SOAK/adversaries.tsv" || echo "pool $k $n" >>"$SOAK/adversaries.tsv"
   done
 }
+# secs_per_block [N] — the chain's mean block interval over its last N (144) blocks, for the oracle
+# to size a block-counted window (the vault-anchored challenge: 72 blocks took 132 min on Nov 21,
+# where the 3600 s default assumed 72).  Empty if bitcoind does not answer.
+secs_per_block() {
+  local n=${1:-144} tip t1 t0
+  tip=$(bcli getblockcount 2>/dev/null) || return 0; [ -n "$tip" ] && [ "$tip" -gt "$n" ] || return 0
+  t1=$(bcli getblockheader "$(bcli getblockhash "$tip")" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['time'])" 2>/dev/null)
+  t0=$(bcli getblockheader "$(bcli getblockhash $((tip - n)))" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['time'])" 2>/dev/null)
+  [ -n "$t1" ] && [ -n "$t0" ] && [ "$t1" -gt "$t0" ] && echo $(( (t1 - t0) / n ))
+}
 ai=0
+# From now on every turn's landing is recorded: the oracle reads a turn with no marker after this
+# row as one that never landed (devnet/soak-oracle.py World.turn_landed).
+echo "$(date +%s) markers-on" >>"$SOAK/attack-landed.tsv"
 # resolve_pending_lotteries — a turn whose lottery was still unclaimed at its end (PENDING) is followed
 # here, through re-arm rounds (DEP-06 Phase 4): PASS once any honest node logs a round's win, FAIL past
 # LOTTERY_BOUND (default 48 h).  Rows: $SOAK/lottery-pending.tsv "TIME ATTACK LEDGER CONFISCATION";
@@ -67,7 +80,11 @@ while true; do
   "$CLD_SRC/devnet/soak.sh" names >/dev/null 2>&1; register_pool
   t=$(date +%s); out="$SOAK/log/attack-${a/:/-}-$(date +%m%dT%H%M).log"
   script=${a%%:*}; arg=""; [[ "$a" == *:* ]] && arg=${a#*:}
-  [[ "$REFUSAL_ATTACKS" == *" $a "* ]] || echo "$t $a - - $WINDOW" >>"$SOAK/attacks.tsv"
+  # A 6th column spb=S (seconds per block) lets the oracle size a block-counted window.  The scenario
+  # records its landing in $SOAK/attack-landed.tsv (redteam/_lib.sh fault_landed); a turn that never
+  # lands is moot, and its failure reads INVALID: setup.
+  spb=$(secs_per_block)
+  [[ "$REFUSAL_ATTACKS" == *" $a "* ]] || echo "$t $a - - $WINDOW${spb:+ spb=$spb}" >>"$SOAK/attacks.tsv"
   echo "$(date +%FT%T) running $a"
   up_before=" $(for n in $(cld_names); do cld_running "$n" && echo "$n"; done | tr '\n' ' ') "
   ( export REDTEAM_V="V$(date +%s)" DEVNET=signet REDTEAM_ON_SIGNET=1 REDTEAM_MINT=1 REDTEAM_AVOID="$SOAK_OPS" REFS="${ATTACK_REFS-ref6 ref7}"
@@ -83,5 +100,5 @@ while true; do
     cld_running "$n" && stop_cld "$n" >/dev/null 2>&1 && echo "$(date +%FT%T)   stopped actor $n"
   done
   echo "$(date +%s) $a ${v:-none} $(( $(date +%s) - t ))" >>"$SOAK/attack-outcomes.tsv"   # the oracle's per-attack table
-  echo "$(date +%FT%T) $a: ${v:-no verdict} (exit $rc, $(( $(date +%s) - t ))s)  $(grep -E '^(PASS|FAIL|SKIP|PENDING)' "$out" | tail -1 | cut -c1-160)"
+  echo "$(date +%FT%T) $a: ${v:-no verdict} (exit $rc, $(( $(date +%s) - t ))s)  $(grep -E '^(PASS|FAIL|SKIP|INVALID|PENDING)' "$out" | tail -1 | cut -c1-160)"
 done

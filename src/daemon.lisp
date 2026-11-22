@@ -509,8 +509,9 @@
   "The lock guards the cached value only, never the call to bitcoind: one caller refreshes a
    stale height while every other gets the cached one at once.  Holding it across the call put
    the worker and the cosigner behind a dispute drive's bitcoind round trips (signet soak,
-   2026-10-28)."
-  (let ((lock (bt:make-lock "height")) (value 0) (at 0) (refreshing nil))
+   2026-10-28).  NIL until the first getblockcount succeeds: an unknown height is not height 0
+   (NODE:KNOWN-HEIGHT refuses to stamp it; signet soak, 2026-11-20)."
+  (let ((lock (bt:make-lock "height")) (value nil) (at 0) (refreshing nil))
     (lambda ()
       (let ((mine nil))
         (bt:with-lock-held (lock)

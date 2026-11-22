@@ -19,6 +19,7 @@
 source "$(dirname "$0")/../devnet/_common.sh"
 S="$CLD_ROOT/soak"; source "$S/env"; WAIT=${WAIT:-120}
 source "$(dirname "$0")/_lib.sh"
+setup_phase
 pick OP T2 T3 T4 T5 HON   # OP and T2..T5 steal and are burned; HON detects
 ROW=${REDTEAM_V:-V}   # REFS="" forms a cl-only quorum
 V=$(form_ledger "$ROW" $OP "" $T2 $T3 $T4 $T5 $HON ${REFS-ref6 ref7}) || exit 1
@@ -32,6 +33,7 @@ echo "== thieves: $OP (operator) + $T2 $T3 $T4 $T5 (threshold 5 of 8); destinati
 for n in $T2 $T3 $T4 $T5; do expect "$(cld_ctl $n "(:adversary :set :theft-sign t)")"; done
 
 T0=$(date -u +%s)
+log_mark $HON   # detection is judged on what HON logs from here on, for THIS ledger
 echo "== spending the vault at Tier 0"
 # cld_ctl's 60s timeout is shorter than the daemon's 90s signature-collection window:
 # talk to the control port directly with a longer timeout for this one call.
@@ -39,6 +41,7 @@ out=$(printf '%s\n' "(:vault-spend :ledger \"$V\" :address \"$DEST\")" | timeout
 echo "$out" | head -2
 case "$out" in *":STATUS :OK"*) ;; *) fail "theft failed: $out";; esac
 THEFT_TXID=$(sx "$out" ":TXID"); SIGS=$(sx "$out" ":SIGS")
+fault_landed "$V" "theft $THEFT_TXID"
 taint $OP $T2 $T3 $T4 $T5
 echo "== theft broadcast: $THEFT_TXID ($SIGS signatures) at $(date -u +%H:%M:%S)"
 
@@ -52,14 +55,14 @@ spent=$(bcli gettxout "$THEFT_TXID" 0 2>/dev/null | python3 -c "import json,sys;
 echo "== watching the honest minority ($HON) for ${WAIT}s"
 detected=0
 for i in $(seq 1 $WAIT); do
-  detected=$(cld_ctl $HON '(:log)' 2>/dev/null | grep -c "VAULT SPEND" || true)
+  detected=$(node_log $HON 2>/dev/null | grep -c "VAULT SPEND: ${V:0:8}" || true)
   [ "$detected" -gt 0 ] && break
   sleep 1
 done
 echo "== $HON VAULT SPEND log lines: $detected"
 sleep 30
 for n in $HON; do
-  echo "--- $n"; cld_ctl $n '(:log)' 2>/dev/null | grep -E "VAULT SPEND|vault spend|unauthori" | tail -12
+  echo "--- $n"; node_log $n 2>/dev/null | grep -E "VAULT SPEND|vault spend|unauthori" | tail -12
 done
 # Contagion: the signers' other ledgers (L1 L2 L3 L4 L5) should be disputed by cld6's quorums.
 disputed=0

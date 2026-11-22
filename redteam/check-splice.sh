@@ -10,6 +10,7 @@
 #        replicas record the splice in the QuorumBegin (collateral rose by the spliced value).
 source "$(dirname "$0")/../devnet/_common.sh"; S="$CLD_ROOT/soak"; source "$S/env" 2>/dev/null; source "$(dirname "$0")/_lib.sh"
 pick OP C1 C2 C3
+log_mark $OP $C1 $C2 $C3   # node_log: this run's lines only
 R1=${R1:-ref6}; R2=${R2:-ref7}
 for n in $OP $C1 $C2 $C3; do cld_running $n || continue; stop_cld $n >/dev/null; start_cld $n >/dev/null & done; wait
 SPLICE_BTC=0.0007; SPLICE_SATS=70000
@@ -73,5 +74,5 @@ txb=$(bcli getrawtransaction "$RTB" true) || fail "B: rotation $RTB is not on ch
 echo "   B: rotation $RTB spends the vault and the splice"
 C1B=$(coll $C1 "$RL"); [ -n "$C1B" ] && [ "$C1B" -gt $(( C0B + SPLICE_SATS * 1000 / 2 )) ] || fail "B: $C1's collateral $C0B -> $C1B did not take the splice"
 echo "   B: cl member $C1 cosigned and records collateral $C0B -> $C1B msat"
-cld_ctl $C1 "(:log :n 4000)" | grep -qE "signing the .* rungs of ${RL:0:8}" || fail "B: the cl member did not sign the reference operator's spliced rotation"
+node_log $C1 | grep -qE "signing the .* rungs of ${RL:0:8}" || fail "B: the cl member did not sign the reference operator's spliced rotation"
 echo "PASS: both operators spliced a UTXO into the vault at rotation, signed across implementations."
