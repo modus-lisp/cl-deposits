@@ -4221,12 +4221,31 @@
             ((fork-op fork :dispute-yield) nil)
             ((null enter) t)
             ((null base) t)
-            ((>= (or (op:field eo :last-valid-sequence) -1) (latest-quorum-begin-seq base)) t)
-            ;; strict-lottery-v8 (:expiry-ends-on-spend, judged at the fork point): a later
-            ;; QuorumBegin answers an expiry dispute only once its spend of the vault confirmed.
-            (t (and (expiry-reason-p (op:field eo :reason))
-                    (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :expiry-ends-on-spend)
-                    (not (reestablishment-confirmed-p node base (op:field eo :last-valid-sequence)))))))))
+            (t (let ((lvs (or (op:field eo :last-valid-sequence) -1)) (qb (latest-quorum-begin-seq base)))
+                 (cond ((>= lvs qb) t)
+                       ((not (expiry-reason-p (op:field eo :reason))) nil)
+                       ;; strict-lottery-v8 (:expiry-ends-on-spend, judged at the fork point): a later
+                       ;; QuorumBegin answers an expiry dispute only once its spend of the vault confirmed.
+                       (t (let ((on-spend (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :expiry-ends-on-spend)))
+                            (expiry-fork-live-p lvs qb on-spend
+                                                (and on-spend (reestablishment-confirmed-p node base lvs))))))))))))
+
+(defun expiry-fork-live-p (last-valid-seq latest-quorum-begin-seq on-spend rotation-confirmed)
+  "An unconcluded fork on a quorum_expired DisputeEnter at LAST-VALID-SEQ still speaks for its
+   ledger: no QuorumBegin since has answered its ground (EXPIRY-DISPUTE-ENDED-P, ignoring
+   confiscation; under ON-SPEND only a re-establishment whose spend confirmed answers it).  An
+   answered one is history and stands in for no later dispute: DEP-05 \"A member MUST NOT let a
+   live dispute on an earlier ground stand in for it\" (signet soak, 2026-11-22: deposits-rust
+   ref4's fork of 0aeebcc5 at 359090, re-established at 359228..436154, carried the dispute of
+   that quorum's own expiry).  Vector: expiry_dispute_ends.json, its fork_reuse cases."
+  (not (expiry-dispute-ended-p last-valid-seq latest-quorum-begin-seq nil
+                               :on-spend on-spend :rotation-confirmed rotation-confirmed)))
+
+(defun fork-reuse-p (live unarmed-expiry punitive)
+  "Whether a new dispute of ours is carried by our existing fork: it is LIVE (FORK-LIVE-P), and a
+   PUNITIVE dispute is never carried by an UNARMED-EXPIRY fork (UNARMED-EXPIRY-FORK-P).  Vector:
+   expiry_dispute_ends.json, its fork_reuse cases."
+  (and live (not (and punitive unarmed-expiry))))
 
 (defun live-fork (node id-hex operator33)
   "OPERATOR33's fork of ID-HEX when it is live (fork-live-p), else NIL."
@@ -4248,7 +4267,7 @@
    DisputeEnter, and was proved derelict.  Here the same fork made HANDLE-OPERATOR-FRAUD skip the
    proof outright."
   (let ((f (live-fork node id-hex (node-pubkey node))))
-    (and f (not (and punitive (unarmed-expiry-fork-p f))) f)))
+    (and f (fork-reuse-p t (unarmed-expiry-fork-p f) punitive) f)))
 
 (defun retire-fork (node fork)
   "Drop a fork that is no longer live so a new dispute can open in its place; what it knew of

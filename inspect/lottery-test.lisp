@@ -355,6 +355,31 @@
                                  t)
                             (eq (gethash "arm" c) t))))))
 
+;;; The same vector's fork_reuse cases: whether a new dispute is carried by our existing
+;;; quorum_expired fork (FORK-LIVE-P's expiry arm, then BLOCKING-FORK's rule), and its ended cases
+;;; that name a history_window_from: the ledger's latest QuorumBegin lies below a window an
+;;; implementation might hold in memory (deposits-rust ref4 on 0aeebcc5, signet 2026-11-22).  This
+;;; node indexes the whole history, so the window is only checked to be below that QuorumBegin.
+(with-gate ("dispute: an answered expiry fork stands in for no later dispute, against the shared vector")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "expiry_dispute_ends.json")))))
+    (check "the vector has its fork_reuse cases" (>= (length (gethash "fork_reuse" v)) 8))
+    (check "and an ended case below a window"
+           (some (lambda (c) (integerp (gethash "history_window_from" c))) (coerce (gethash "ended" v) 'list)))
+    (loop for c across (gethash "ended" v)
+          for w = (gethash "history_window_from" c)
+          when (integerp w)
+            do (check (format nil "~a: the QuorumBegin is below the window" (gethash "name" c))
+                      (< (gethash "latest_quorum_begin_sequence" c) w)))
+    (loop for c across (gethash "fork_reuse" v)
+          for on-spend = (lg:ruleset-rule-p (gethash "ruleset" c) :expiry-ends-on-spend)
+          for armed = (eq (gethash "fork_armed" c) t)
+          for live = (cl-deposits.node::expiry-fork-live-p
+                      (gethash "fork_last_valid_sequence" c) (gethash "latest_quorum_begin_sequence" c)
+                      on-spend (eq (gethash "rotation_spend_confirmed" c) t))
+          do (check-equal (gethash "name" c)
+                          (and (cl-deposits.node::fork-reuse-p live (not armed) (eq (gethash "new_punitive" c) t)) t)
+                          (eq (gethash "reuse" c) t)))))
+
 ;;; inspect/vectors/dispute_ground.json, shared with deposits-rust
 ;;; (deposits-protocol/tests/vectors/dispute_ground.json).
 (with-gate ("dispute: the ground of a DisputeEnter against the shared vector")
