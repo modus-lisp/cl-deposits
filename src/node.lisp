@@ -780,15 +780,37 @@
   (run-hooks node rec update)
   update)
 
-(defun yield-once (node fork)
+(defun fork-yield-evidence-p (fork)
+  "FORK's yields are judged under yield-evidence-v9 (its ruleset, the fork point's)."
+  (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :yield-evidence))
+
+;; Case C5 of the yield-builder audit, HELD pending a ruling (2026-11-23): an un-armed expiry
+;; fork standing down for our punitive dispute of the same ledger has none of yield-evidence-v9's
+;; three reasons (its expiry ground is not answered).  The choices before the user: retire it
+;; without a yield, or a fourth reason superseded_by (the hash of our own later DisputeEnter,
+;; un-armed forks only).  Kept here, alone, so either is a small change; until then it is today's
+;; behaviour: YIELD-ONCE with no reason, which under v9 holds (signs nothing) and is a no-op.
+(defun stand-down-for-punitive (node expiry)
+  "Yield our un-armed expiry fork EXPIRY because a punitive dispute of its ledger supersedes it."
+  (yield-once node expiry))
+
+(defun yield-once (node fork &key reason)
   "Yield our FORK: adopt the DisputeYield of ours the relays already hold at its next sequence,
    or sign one only when nothing of ours is there.  NIL (and a note) when holding: the query
-   failed, or something of ours other than that yield is already at that sequence."
+   failed, or something of ours other than that yield is already at that sequence.  REASON is
+   the yield's evidence, a plist of one of :LOST-TO :REESTABLISHED :EXCLUDED-BY (DEP-06 \"What a
+   yield must say\"): carried whenever known, and required under yield-evidence-v9, where a yield
+   without one is never signed (the fold would refuse it)."
+  (when (and (fork-yield-evidence-p fork) (/= 1 (count-if (lambda (k) (getf reason k)) '(:lost-to :reestablished :excluded-by))))
+    (log! node "yield of ~a held: yield-evidence-v9 needs exactly one reason, have ~s" (subseq (record-id-hex fork) 0 8) reason)
+    (return-from yield-once nil))
   (let* ((tip (tip fork)) (seq (if tip (1+ (up:update-seq tip)) 0))
          (ours (handler-case (our-updates-at node fork seq)
                  (error (e) (log! node "yield of ~a held: the relay query failed: ~a" (subseq (record-id-hex fork) 0 8) e)
                    (return-from yield-once nil)))))
-    (cond ((null ours) (commit-update node fork (new-update node fork (list :type :dispute-yield))))
+    (cond ((null ours) (commit-update node fork (new-update node fork (append (list :type :dispute-yield)
+                                                                               (loop for k in '(:lost-to :reestablished :excluded-by)
+                                                                                     when (getf reason k) append (list k (getf reason k)))))))
           ((and (null (rest ours))
                 (eq (getf (ignore-errors (op:update-op (first ours))) :type) :dispute-yield)
                 (chains-on-p fork (first ours)))
@@ -3367,6 +3389,15 @@
                 (progn (remhash txid *unconfirmed-rungs*) (setf (gethash txid *confirmed-rungs*) t))
                 (progn (setf (gethash txid *unconfirmed-rungs*) (get-universal-time)) nil)))))))
 
+(defun reestablishing-quorum-begin (node rec last-valid-seq &key (on-spend t))
+  "The newest QuorumBegin of REC after LAST-VALID-SEQ (a re-establishment of the quorum after
+   the fork point), with its vault spend confirmed when ON-SPEND (strict-lottery-v8): what a
+   yield-evidence-v9 stand-down names (its content hash, DEP-06 \"What a yield must say\")."
+  (loop for u in (record-updates-of rec :quorum-begin)        ; newest first
+        while (> (up:update-seq u) (or last-valid-seq -1))
+        when (or (not on-spend) (quorum-begin-spend-confirmed-p node u))
+          return u))
+
 (defun reestablishment-confirmed-p (node rec last-valid-seq)
   "Some QuorumBegin of REC after LAST-VALID-SEQ has its vault spend confirmed (strict-lottery-v8,
    :expiry-ends-on-spend)."
@@ -3526,6 +3557,18 @@
   "Drive FORK one step (%DRIVE-DISPUTE), timed (DRIVE-TIMED)."
   (drive-timed node fork (lambda () (%drive-dispute node fork))))
 
+(defun lost-to-acquire (node fork our-round)
+  "Another participant's binding acquire (OTHERS-BINDING-ACQUIRES: (acquirer round claim-txid))
+   of round OUR-ROUND or later whose claim is not ours (its output 0 does not pay our key): what a
+   loser's yield names as lost_to (DEP-06 \"What a yield must say\", reason 1), or NIL."
+  (let ((mine (lot:key-path-spk (up:x-only (node-pubkey node)))))
+    (find-if (lambda (a)
+               (and (>= (second a) our-round)
+                    (let ((tx (and (node-tx-fn node) (ignore-errors (funcall (node-tx-fn node) (third a))))))
+                      (and tx (plusp (length (btx:tx-outputs tx)))
+                           (not (equalp (btx:txout-script (elt (btx:tx-outputs tx) 0)) mine))))))
+             (others-binding-acquires node fork))))
+
 (defun %drive-dispute (node fork)
   (bt:with-lock-held (*drive-threads-lock*)   ; DRIVE-SCHEDULE: least recently driven first
     (setf (gethash (cons (node-pubkey node) (record-id-hex fork)) *drive-last*) (get-universal-time)))
@@ -3534,8 +3577,8 @@
       (unless (and base enter)
         (return-from %drive-dispute
           (note-dispute node id "not driven: ~:[no replica of the ledger~;no DisputeEnter of ours on the fork~]" base)))
-      (flet ((conclude (fmt &rest args)
-               (unless (dstep :yield (yield-once node fork))
+      (flet ((conclude (reason fmt &rest args)
+               (unless (dstep :yield (yield-once node fork :reason reason))
                  (return-from %drive-dispute (note-dispute node id "yield held (YIELD-ONCE)")))
                (release-pledges node id)
                (return-from %drive-dispute (apply #'note-dispute node id fmt args))))
@@ -3546,17 +3589,9 @@
         (multiple-value-bind (au ao) (fork-op fork :dispute-armed)
           (declare (ignore au))
           (when (and ao (eq (lg:ledger-dispute-state (record-ledger fork)) :armed))
-            (let* ((our-round (or (op:field ao :rearm-round) 1))
-                   (mine (lot:key-path-spk (up:x-only (node-pubkey node))))
-                   ;; Not a claim of ours that someone else named: its output 0 pays our target.
-                   (won (find-if (lambda (a)
-                                   (and (>= (second a) our-round)
-                                        (let ((tx (and (node-tx-fn node) (ignore-errors (funcall (node-tx-fn node) (third a))))))
-                                          (and tx (plusp (length (btx:tx-outputs tx)))
-                                               (not (equalp (btx:txout-script (elt (btx:tx-outputs tx) 0)) mine))))))
-                                 (others-binding-acquires node fork))))
+            (let ((won (lost-to-acquire node fork (or (op:field ao :rearm-round) 1))))
               (when won
-                (conclude "lost to ~a's binding acquire (claim ~a, round ~a); yielded"
+                (conclude (list :lost-to (third won)) "lost to ~a's binding acquire (claim ~a, round ~a); yielded"
                           (subseq (bytes->hex (first won)) 0 16) (txid-hex (third won)) (second won))))))
         (when (find-if (lambda (r) (> (getf r :round) 1)) (rearm-rounds node id))
           (return-from %drive-dispute (note-dispute node id "in a re-arm round (DRIVE-REARM)")))
@@ -3591,14 +3626,21 @@
             ;; confirmed ends it; recorded but unspent, the race goes on (regtest 2026-11-15:
             ;; the reference yielded its armed stake while its own confiscation sat in the
             ;; mempool, and that confiscation then won).
-            (when (and (dispute-enter-expiry-p enter enter-op expiry) (not confirmed)
-                       (let* ((lvs (op:field enter-op :last-valid-sequence))
-                              (on-spend (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :expiry-ends-on-spend))
-                              (spent (or (not on-spend) (dstep :reestablished (reestablishment-confirmed-p node base lvs)))))
-                         (or (expiry-dispute-ended-p lvs (latest-quorum-begin-seq base) nil
-                                                     :on-spend on-spend :rotation-confirmed spent)
-                             (and expiry (<= h (+ expiry *expiry-grace-blocks*)) spent))))
-              (conclude "quorum re-established (expiry ~a); yielded" expiry)))
+            ;; yield-evidence-v9: the yield names the re-establishing QuorumBegin (DEP-06 "What a
+            ;; yield must say", reason 2), so only that answers it: never the tip-based arm below
+            ;; (the re-established quorum's expiry ahead of the tip), which names nothing.
+            (when (and (dispute-enter-expiry-p enter enter-op expiry) (not confirmed))
+              (let* ((lvs (op:field enter-op :last-valid-sequence))
+                     (on-spend (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :expiry-ends-on-spend))
+                     (qb (dstep :reestablished (reestablishing-quorum-begin node base lvs :on-spend on-spend)))
+                     (reason (and qb (list :reestablished (up:content-hash qb)))))
+                (when (if (fork-yield-evidence-p fork)
+                          qb
+                          (let ((spent (or (not on-spend) qb)))
+                            (or (expiry-dispute-ended-p lvs (latest-quorum-begin-seq base) nil
+                                                        :on-spend on-spend :rotation-confirmed spent)
+                                (and expiry (<= h (+ expiry *expiry-grace-blocks*)) spent))))
+                  (conclude reason "quorum re-established (expiry ~a); yielded" expiry)))))
           (let ((reserves-spent (dstep :reserves-spent
                                 (multiple-value-bind (r txid vout) (disputed-reserves node base)
                                   (declare (ignore r))
@@ -3619,7 +3661,11 @@
                         (note-dispute node id "lottery round 1 spent into round 2's lottery"))
                        ((and r1 (not (lottery-spend-confirmed-p node r1)))
                         (note-dispute node id "lottery output spent in the mempool; judging it once it confirms"))
-                       (t (conclude "lottery claimed by its winner; yielded")))))
+                       ;; yield-evidence-v9: a spent output names no winner; the yield waits for the
+                       ;; winner's binding acquire (lost_to, above), and our pledge stays held until it.
+                       ((fork-yield-evidence-p fork)
+                        (note-dispute node id "lottery claimed; awaiting the winner's binding acquire to name (yield-evidence-v9)"))
+                       (t (conclude nil "lottery claimed by its winner; yielded")))))
               ((and reserves-spent (null conf))
                (note-dispute node id "reserves spent, but not by a confiscation we can rebuild"))
               ;; ADVERSARY :hold-arm — a member that disputes but does not arm (yet): without its
@@ -3680,7 +3726,8 @@
                       (note-dispute node id "~a of ~a revealed; the reveal deadline is ~a blocks after the confiscation"
                                     (length (revealed-indices node id lottery)) (length (lot:lottery-participants lottery)) lot:+reveal-csv+))
                      (t (handler-case (let ((outcome (dstep :claim (claim-or-yield node id :confiscation-txid (btx:tx-txid conf)))))
-                                        (release-pledges node id)
+                                        ;; not while awaiting the winner's claim (yield-evidence-v9)
+                                        (when (member outcome '(:won :yielded)) (release-pledges node id))
                                         (note-dispute node id "lottery: ~(~a~)" outcome))
                           (error (e) (note-dispute node id "waiting to claim: ~a" e))))))
               ;; Our assembled confiscation fell out of the mempool: push the rung the schedule
@@ -4322,11 +4369,44 @@
 
 (defun acquire-binds-p (node fork)
   "FORK's DisputeAcquire moves custody: as published under an earlier ruleset, and under
-   strict-lottery-v8 (the base ledger's ruleset) only once its claim confirmed (DEP-06 §Phase 4)."
-  (and (fork-op fork :dispute-acquire)
-       (let ((base (find-record node (record-id-hex fork))))
-         (or (not (and base (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger base)) :acquire-on-confirm)))
-             (acquire-confirmed-p node fork)))))
+   strict-lottery-v8 (the base ledger's ruleset) only once its claim confirmed (DEP-06 §Phase 4).
+   An acquire after its author's own yield (DEP-06 \"A claim after the claimant's own yield\",
+   the advantage rule) moves custody only by the binding judgment, under every ruleset."
+  (multiple-value-bind (u o) (fork-op fork :dispute-acquire)
+    (declare (ignore o))
+    (and u
+         (let ((base (find-record node (record-id-hex fork))))
+           (or (and (not (and base (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger base)) :acquire-on-confirm)))
+                    (zerop (fork-acquire-min-round fork u)))
+               (acquire-confirmed-p node fork))))))
+
+(defun acquire-min-round (events)
+  "DEP-06 \"A claim after the claimant's own yield\": EVENTS are the acquirer's own dispute
+   operations on its fork before the acquire, oldest first, as (:arm ROUND), (:yield) or anything
+   else.  When a yield follows its latest arm, the acquire must bind that arm's round or a later
+   one: that round.  Otherwise 0 (no bound).  Vector: claim_after_yield.json (min_round)."
+  (let ((arm 0) (yielded nil))
+    (dolist (e events)
+      (case (first e)
+        (:arm (setf arm (or (second e) 1) yielded nil))
+        (:yield (setf yielded t))
+        (:acquire (setf yielded nil))))
+    (if yielded arm 0)))
+
+(defun fork-acquire-min-round (fork u)
+  "ACQUIRE-MIN-ROUND of the DisputeAcquire U on FORK, from U's author's arms and yields before it."
+  (let ((me (up:update-operator-id u)))
+    (acquire-min-round
+     (loop for x in (sort (remove-if-not (lambda (x) (and (equalp (up:update-operator-id x) me) (< (up:update-seq x) (up:update-seq u))))
+                                         (append (copy-list (fork-own-updates fork :dispute-armed))
+                                                 (copy-list (fork-own-updates fork :dispute-yield))
+                                                 (copy-list (fork-own-updates fork :dispute-acquire))))
+                          #'< :key #'up:update-seq)
+           for o = (op:update-op x)
+           collect (case (op:operation-type o)
+                     (:dispute-armed (list :arm (or (op:field o :rearm-round) 1)))
+                     (:dispute-yield (list :yield))
+                     (t (list :acquire)))))))
 
 (defun acquired-fork (node id-hex)
   "The fork of ID-HEX's ledger whose DisputeAcquire took custody, if any (ACQUIRE-BINDS-P)."
@@ -4389,6 +4469,83 @@
                             (setf txid (btx:txin-prev-hash i) vout (btx:txin-prev-index i))))
                      finally (return :not-this-lottery)))))))
 
+;;; DEP-06 "What a yield must say" (yield-evidence-v9, ruled 2026-11-23): a DisputeYield names why
+;;; its round ended, and a judge checks it from public state.  Shared vector
+;;; inspect/vectors/yield_evidence.json (deposits-rust deposits-node judge_yield).
+
+(defun lottery-tx-round (tx-fn vaults txid)
+  "The round of the lottery the transaction TXID created for the dispute of VAULTS: 1 when it
+   spends a vault, one more for each confirmed re-arm spend walked back (each spending output 0 of
+   the previous).  (values :binds round), or :unconfirmed (a transaction unknown) or
+   :not-this-lottery."
+  (loop with cur = txid
+        for round from 1 to (1+ +acquire-max-rounds+)
+        do (multiple-value-bind (tx conf) (funcall tx-fn cur)
+             (unless tx (return :unconfirmed))
+             (when (some (lambda (i) (member (list (btx:txin-prev-hash i) (btx:txin-prev-index i)) vaults :test #'equalp))
+                         (coerce (btx:tx-inputs tx) 'list))
+               (return (values :binds round)))
+             (unless (and conf (rearm-shaped-p tx)) (return :not-this-lottery))
+             (let ((i (elt (btx:tx-inputs tx) 0)))
+               (unless (zerop (btx:txin-prev-index i)) (return :not-this-lottery))
+               (setf cur (btx:txin-prev-hash i))))
+        finally (return :not-this-lottery)))
+
+(defun judge-yield (&key ruleset reasons yield-height (arm-round 1) yielder targets pledges vaults tx-fn
+                      dispute-reason last-valid-sequence quorum-begins participants)
+  "The verdict on a DisputeYield: (values VERDICT WHY), VERDICT :valid, :invalid or :pending (no
+   verdict yet: asked again).  RULESET: the fork's (the fork point's).  REASONS: a plist of the
+   yield's :lost-to / :reestablished / :excluded-by.  YIELD-HEIGHT: its signed block_height.
+   ARM-ROUND: the yielder's latest arm's round before it.  YIELDER: its x-only key; TARGETS: the
+   scriptPubKeys of the target_reserves it declared; PLEDGES: the collateral outpoints (txid vout) it
+   declared.  VAULTS: the dispute's vault outpoints (JUDGE-ACQUIRE).  TX-FN: txid -> (values tx
+   height-or-NIL), NIL when unknown.  DISPUTE-REASON / LAST-VALID-SEQUENCE: the fork's DisputeEnter.
+   QUORUM-BEGINS: the operator chain's QuorumBegins as (content-hash seq spend-confirmed-p).
+   PARTICIPANTS: the x-only keys of the lottery an :excluded-by names, as the judge rebuilt it."
+  (unless (lg:ruleset-rule-p ruleset :yield-evidence) (return-from judge-yield (values :valid :legacy)))
+  (let ((named (loop for k in '(:lost-to :reestablished :excluded-by) when (getf reasons k) collect k)))
+    (unless (= 1 (length named)) (return-from judge-yield (values :invalid :no-reason)))
+    (let ((hash (getf reasons (first named)))
+          (conf-fn (lambda (txid) (multiple-value-bind (tx height) (funcall tx-fn txid)
+                                    (and tx (values tx (and height t)))))))
+      (flet ((seen (txid)
+               ;; the named transaction: confirmed, and at or below the yield's height
+               (multiple-value-bind (tx height) (funcall tx-fn txid)
+                 (cond ((not (and tx height)) (return-from judge-yield (values :pending :unconfirmed)))
+                       ((> height yield-height) (return-from judge-yield (values :invalid :early)))
+                       (t tx)))))
+        (ecase (first named)
+          (:lost-to
+           (let ((tx (seen hash)))
+             (multiple-value-bind (v round) (judge-acquire conf-fn vaults hash)
+               (case v
+                 (:unconfirmed (values :pending :unconfirmed))
+                 ((:not-a-claim :not-this-lottery) (values :invalid v))
+                 (t (cond ((< round arm-round) (values :invalid :earlier-round))
+                          ((or (and (plusp (length (btx:tx-outputs tx)))
+                                    (member (btx:txout-script (elt (btx:tx-outputs tx) 0)) targets :test #'equalp))
+                               (and (> (length (btx:tx-inputs tx)) 1)
+                                    (let ((i (elt (btx:tx-inputs tx) 1)))
+                                      (member (list (btx:txin-prev-hash i) (btx:txin-prev-index i)) pledges :test #'equalp))))
+                           (values :invalid :own-claim))
+                          (t (values :valid :valid))))))))
+          (:reestablished
+           (let ((q (find hash quorum-begins :key #'first :test #'equalp)))
+             (cond ((not (expiry-reason-p dispute-reason)) (values :invalid :not-expiry))
+                   ((null q) (values :pending :unknown-quorum-begin))
+                   ((<= (second q) (or last-valid-sequence -1)) (values :invalid :not-after-fork-point))
+                   ((not (third q)) (values :pending :rotation-unconfirmed))
+                   (t (values :valid :valid)))))
+          (:excluded-by
+           (seen hash)
+           (multiple-value-bind (v round) (lottery-tx-round conf-fn vaults hash)
+             (case v
+               (:unconfirmed (values :pending :unconfirmed))
+               (:not-this-lottery (values :invalid :not-this-lottery))
+               (t (cond ((< round arm-round) (values :invalid :earlier-round))
+                        ((member yielder participants :test #'equalp) (values :invalid :in-lottery))
+                        (t (values :valid :valid))))))))))))
+
 (defun fork-acquire-vaults (fork u)
   "The vault the DisputeAcquire U on FORK is judged against: every rung's vault outpoint of the
    latest QuorumBegin before it not authored by the acquirer (it rotates only after acquiring)."
@@ -4414,6 +4571,16 @@
       (and vaults (gethash (list txid (first (first vaults))) *acquire-rounds*)))))
 
 (defun acquire-confirmed-p (node fork)
+  "%ACQUIRE-CLAIM-BINDS-P, and for an acquire after its author's own yield (DEP-06 \"A claim after
+   the claimant's own yield\") only when the claim binds the yielded arm's round or a later one
+   (FORK-ACQUIRE-MIN-ROUND), which only the chain judgment can tell."
+  (multiple-value-bind (u o) (fork-op fork :dispute-acquire)
+    (and o (%acquire-claim-binds-p node fork)
+         (let ((min (fork-acquire-min-round fork u)))
+           (or (zerop min)
+               (and (node-tx-fn node) (>= (or (acquire-round fork) 0) min)))))))
+
+(defun %acquire-claim-binds-p (node fork)
   "FORK carries a DisputeAcquire that binds: its claim_txid confirmed AND spending its dispute's
    lottery outpoint (JUDGE-ACQUIRE).  With no TX-FN, the confirmation alone (TX-CONFS-FN); with
    neither, T: the acquire as published, the reading before the rule.  The round it closes is
@@ -4566,7 +4733,7 @@
   (let ((expiry (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and expiry (null anchor-block-height) (not (expiry-reason-p reason))
                (unarmed-expiry-fork-p expiry))
-      (yield-once node expiry)
+      (stand-down-for-punitive node expiry)
       (release-pledges node (record-id-hex rec))
       (note-dispute node (record-id-hex rec) "un-armed expiry dispute yielded for a punitive one (~a)" reason)
       (retire-fork node expiry)))
@@ -6271,8 +6438,25 @@
           ;; output stays unspent, and the re-arm round (DEP-06 Phase 4) must recover it.
           (unless (and (equalp winner-pk (up:x-only (node-pubkey node)))
                        (not (and (getf (node-adversary node) :yield-win) (null lottery-tx))))
-            (unless (yield-once node fork) (fail "yield held (YIELD-ONCE)"))
+            ;; DEP-06 "What a yield must say" (yield-evidence-v9): a lottery we armed for and are not
+            ;; in is reason 3 (excluded_by, the transaction that created it); a draw we merely
+            ;; computed as lost is no reason yet: wait for the winner's claim to bind (lost_to,
+            ;; %DRIVE-DISPUTE), our pledge held meanwhile.  The :yield-win adversary (a drawn winner
+            ;; yielding) has no reason at all, so under v9 it only withholds its claim.
+            (let* ((in-lottery (member (up:x-only (node-pubkey node)) (mapcar #'lot:participant-pubkey participants) :test #'equalp))
+                   (won (and in-lottery (fork-yield-evidence-p fork)
+                             (lost-to-acquire node fork (or (op:field (or (nth-value 1 (fork-op fork :dispute-armed)) '(:type :dispute-armed)) :rearm-round) 1))))
+                   (reason (cond ((not in-lottery) (and conf (list :excluded-by (btx:tx-txid conf))))
+                                 (won (list :lost-to (third won))))))
+              (when (and (fork-yield-evidence-p fork) (null reason))
+                (return-from claim-or-yield (values :awaiting-claim nil)))
+              (unless (yield-once node fork :reason reason) (fail "yield held (YIELD-ONCE)")))
             (return-from claim-or-yield (values :yielded nil)))
+          ;; DEP-06 "A claim after the claimant's own yield": the fold takes such an acquire, but a
+          ;; node SHOULD never make one.  Our fork yielded this arm's round: broadcast no claim
+          ;; (regtest c8b9b7b1, 2026-11-21: deposits-rust ref7's).
+          (when (eq (lg:ledger-dispute-state (record-ledger fork)) :tombstoned)
+            (fail "our fork yielded this round; not claiming"))
           (let* ((txid (or confiscation-txid (and conf (btx:tx-txid conf)) (fail "no confiscation tx")))
                  (claim-txid (if lottery-tx (btx:tx-txid lottery-tx) txid))   ; the output we spend
                  (amount (btx:txout-value (first (btx:tx-outputs conf))))
@@ -7208,6 +7392,7 @@
             (:arm (when (second e) (push (cons (second e) (or (third e) 1)) pledges))
              (setf custody nil ended nil last-round (or (third e) 1)))
             (:yield (setf pledges '() custody nil ended t))
+            (:void-yield)                ; a yield whose evidence is not seen: absent (DEP-06)
             (:acquire (if (third e)
                           (setf pledges '() custody (second e) ended t)
                           (setf custody nil)))))
@@ -7237,6 +7422,20 @@
                       (acquire-confirmed-p node f))
               collect (list (up:update-operator-id u) (or (acquire-round f) 1) (op:field o :claim-txid))))))
 
+(defun yield-evidence-seen-p (node yield-op)
+  "DEP-06 \"What a yield must say\": whether the transaction a DisputeYield names (:LOST-TO or
+   :EXCLUDED-BY) is confirmed, so the yield counts.  A yield naming none (an earlier ruleset's, or
+   :REESTABLISHED, checked when it was signed) counts as before; with no chain view, as
+   published.  Only the confirmation is asked here: the full judgment is JUDGE-YIELD."
+  (let ((txid (or (op:field yield-op :lost-to) (op:field yield-op :excluded-by))))
+    (cond ((null txid) t)
+          ((node-tx-fn node)
+           (let ((c (nth-value 1 (ignore-errors (funcall (node-tx-fn node) txid)))))
+             (and c (plusp c))))
+          ((node-tx-confs-fn node)
+           (let ((c (ignore-errors (funcall (node-tx-confs-fn node) txid)))) (and c (plusp c))))
+          (t t))))
+
 (defun fork-pledge-events (node fork)
   "FORK's own dispute operations as FORK-PLEDGES-HELD reads them, oldest first; its latest
    acquire binds by ACQUIRE-CONFIRMED-P."
@@ -7253,7 +7452,9 @@
                                                     (outpoint-key (op:field o :replacement-collateral-txid)
                                                                   (op:field o :replacement-collateral-vout)))
                                           (or (op:field o :rearm-round) 1)))
-                    (:dispute-yield (list :yield))
+                    ;; DEP-06 "An invalid yield is void": one naming a transaction not confirmed
+                    ;; (YIELD-EVIDENCE-SEEN-P) frees no pledge; read as absent until it is.
+                    (:dispute-yield (if (yield-evidence-seen-p node o) (list :yield) (list :void-yield)))
                     (:dispute-acquire (list :acquire (and (op:field o :claim-txid) (outpoint-key (op:field o :claim-txid) 0))
                                             (and (eq u last-acquire) (acquire-confirmed-p node fork) t)))))))
 

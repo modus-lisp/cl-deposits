@@ -47,8 +47,8 @@
 ;; balance-anchor-v6 is anchor-ladder-v5's rules plus that one.  We enforce every rule of every
 ;; registered ruleset, so we declare them all.  A ruleset's rules are frozen once registered: a
 ;; change is a new name.
-(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7" "strict-lottery-v8"))
-(defparameter +supported-rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7" "strict-lottery-v8"))
+(defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7" "strict-lottery-v8" "yield-evidence-v9"))
+(defparameter +supported-rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7" "strict-lottery-v8" "yield-evidence-v9"))
 (defparameter +current-ruleset+ "strict-lottery-v8"
   "What a new ledger's LedgerOpen names, and what a quorum moves to when every member declares it.")
 
@@ -60,8 +60,17 @@
      :grounded-arms)
     ("strict-lottery-v8" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
      :grounded-arms :strict-lottery :fraud-survives-rotation :acquire-on-confirm
-     :expiry-ends-on-spend :recorded-threshold-answer))
+     :expiry-ends-on-spend :recorded-threshold-answer)
+    ;; DEP-18 §yield-evidence-v9 (2026-11-23): strict-lottery-v8's rules plus evidence-carrying yields
+    ;; (DEP-06 "What a yield must say"; vector yield_evidence.json).
+    ("yield-evidence-v9" :signed-header :born-expired :collateral-floor :vault-spend-proofs :missing-balance-commitment
+     :grounded-arms :strict-lottery :fraud-survives-rotation :acquire-on-confirm
+     :expiry-ends-on-spend :recorded-threshold-answer :yield-evidence))
   "DEP-18: the gated rules each ruleset adds to the intrinsic ones.")
+
+;; DEP-18 §operator policy step 1 names +CURRENT-RULESET+, not yet yield-evidence-v9: an operator
+;; names v9 only by its own choice, since one yield (an un-armed expiry disputant standing down for
+;; a punitive dispute) has no reason among its three (held for a ruling, 2026-11-23).
 
 (defun ruleset-rule-p (ruleset rule)
   "Does RULESET (a name, or NIL for none) enforce the gated RULE?  NIL is dormant: a ledger
@@ -231,7 +240,8 @@
   (dormancy-accept nil)             ; receiver: our DormancyAccept (:hash :spk :total :expires :premium-deposit :resolved :outpoint)
   (confiscation-txid nil)           ; DEP-06: the confiscation a custody change followed (DisputeAcquire)
   (quorum-at-fork '())              ; the quorum at the fork point (DisputeEnter), which a fork's records are judged by
-  (arm-commitment nil))             ; the commitment_hash of this fork's DisputeArmed, which a re-arm must repeat (DEP-03)
+  (arm-commitment nil)              ; the commitment_hash of this fork's DisputeArmed, which a re-arm must repeat (DEP-03)
+  (disputant nil))                  ; the author of the fork's DisputeEnter (*UPDATE-OPERATOR*), NIL when unknown
 
 (defun make-ledger () (%make-ledger))
 
@@ -268,6 +278,7 @@
 
 (defvar *block-height* 0 "The block height of the update being applied (for descriptor snapshots).")
 (defvar *update-seq* 0 "The sequence of the update being applied.")
+(defvar *update-operator* nil "The operator_id of the update being applied (NIL: an operation applied bare).")
 
 (defparameter +exit-cutoff-margin+ 144 "DEP-20 §3 exit_cutoff_margin_blocks (DEP-11 default).")
 (defparameter exit-dust-msats 330000 "DEP-20 §3: requests below 330 sats are carried, not settled.")
@@ -900,7 +911,7 @@
                          :joined-at-sequence (1+ (ledger-sequence ledger)))
                    (ledger-joined-quorums ledger)))))
       (:ledger-close nil)
-      (:dispute-enter (setf (ledger-dispute-state ledger) :disputed)
+      (:dispute-enter (setf (ledger-dispute-state ledger) :disputed (ledger-disputant ledger) *update-operator*)
                       ;; a live fork cleared its quorum and set this already (MAKE-FORK); a replay sets it here
                       (when (ledger-quorum-members ledger)
                         (setf (ledger-quorum-at-fork ledger) (ledger-quorum-members ledger))))
@@ -943,10 +954,28 @@
          (unless (f :replacement-collateral-txid)
            (fail :dispute-armed-no-upgrade "a re-arm must declare replacement collateral")))
        (setf (ledger-dispute-state ledger) :armed (ledger-arm-commitment ledger) (f :commitment-hash)))
-      (:dispute-acquire (setf (ledger-confiscation-txid ledger) (f :confiscation-txid)
+      (:dispute-acquire
+       ;; An acquire ends an armed round (as deposits-rust's DisputeState::Armed takes 55).  DEP-06 "A
+       ;; claim after the claimant's own yield" (ruled 2026-11-23, the advantage rule): a yielded fork
+       ;; that armed takes its OWN disputant's acquire too, structurally; whether it moves custody is
+       ;; the binding judgment, with the round bound (ACQUIRE-MIN-ROUND).  Another participant's acquire
+       ;; on it is refused.  regtest c8b9b7b1 (2026-11-21): ref7's round-2 claim confirmed after its
+       ;; own stray yield, and no acquire was valid anywhere.  Vector claim_after_yield.json.
+       (case (ledger-dispute-state ledger)
+         (:armed)
+         (:tombstoned
+          (unless (and (ledger-arm-round ledger) (ledger-disputant ledger)
+                       (equalp (f :new-custodian) (ledger-disputant ledger)))
+            (fail :dispute-acquire (if (ledger-arm-round ledger)
+                                       "on a yielded fork only its own disputant's acquire is taken"
+                                       "a yielded fork that never armed takes no acquire"))))
+         (t (fail :dispute-acquire (format nil "an acquire needs an armed fork (state ~(~a~))" (ledger-dispute-state ledger)))))
+       (setf (ledger-confiscation-txid ledger) (f :confiscation-txid)
                               (ledger-operator-key ledger) (f :new-custodian)
                               (ledger-vault-current-p ledger) nil (ledger-dormancy-notice ledger) nil
-                              (ledger-dispute-state ledger) :normal (ledger-quorum-at-fork ledger) '()))
+                              (ledger-dispute-state ledger) :normal (ledger-quorum-at-fork ledger) '())
+       ;; the acquirer is the ledger's operator now: a later dispute is a new one
+       (setf (ledger-disputant ledger) nil))
       (:dormancy-notice
        (when (ledger-dormancy-notice ledger) (fail :dormancy-notice "a notice is already outstanding"))
        (unless (>= (f :rotation-height) (+ *block-height* (ledger-dormancy-notice-blocks ledger)))
@@ -1065,6 +1094,11 @@
       (:dispute-yield
        (unless (member (ledger-dispute-state ledger) '(:disputed :armed))
          (fail :dispute-yield (format nil "a yield needs a disputed or armed fork (state ~(~a~))" (ledger-dispute-state ledger))))
+       ;; yield-evidence-v9 (the fork point's ruleset): exactly one reason (DEP-06 "What a yield must
+       ;; say").  Under an earlier ruleset a yield is taken as before, reason or none.
+       (when (and (ruleset-rule-p (ledger-active-ruleset ledger) :yield-evidence)
+                  (/= 1 (count-if #'f '(:lost-to :reestablished :excluded-by))))
+         (fail :dispute-yield "under yield-evidence-v9 a yield carries exactly one reason"))
        (setf (ledger-dispute-state ledger) :tombstoned))
       (:transfer-lock
        (let* ((d (find-deposit ledger (f :source-deposit-id)))
@@ -1117,7 +1151,8 @@
     (unless (equalp (up:update-prev-hash update) (ledger-chain-tip ledger))
       (fail :chain-break (format nil "at sequence ~a" (up:update-seq update)))))
   (let ((*block-height* (up:update-block-height update))
-        (*update-seq* (up:update-seq update)))
+        (*update-seq* (up:update-seq update))
+        (*update-operator* (up:update-operator-id update)))
     (let ((o (op:decode-operation (up:update-message update))))
       (unless (eq (op:operation-type o) :quorum-begin) (%release-expired-exits ledger *block-height*))
       (apply-operation ledger o)))
@@ -1289,7 +1324,10 @@
                          (loop for (k v) on (cddr f) by #'cddr do (setf (gethash (dec k) h) (dec v)))
                          h))
                    (:v (coerce (mapcar #'dec (cdr f)) 'simple-vector))
-                   (:s (let ((o (allocate-instance (find-class (sym (second f) (third f))))))
+                   (:s (let* ((class (find-class (sym (second f) (third f))))
+                              ;; a ledger from its constructor: a checkpoint written before a slot
+                              ;; existed (DISPUTANT, 2026-11-23) reads that slot's default
+                              (o (if (eq (class-name class) 'ledger) (%make-ledger) (allocate-instance class))))
                          (loop for (n v) on (cdddr f) by #'cddr
                                do (setf (slot-value o (sym (second f) n)) (dec v)))
                          o))))))

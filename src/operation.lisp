@@ -119,7 +119,10 @@
     (55 :dispute-acquire
      (:new-custodian 108 :pubkey) (:claim-txid 110 :bytes32) (:new-reserves-address 120 :string)
      (:confiscation-txid 352 :bytes32 :optional))
-    (56 :dispute-yield)
+    ;; DEP-06 "What a yield must say" (yield-evidence-v9): exactly one reason under that ruleset, each a
+    ;; 32-byte hash; odd tags, so a node that does not know them skips them (vector yield_evidence.json)
+    (56 :dispute-yield
+     (:lost-to 367 :bytes32 :optional) (:reestablished 369 :bytes32 :optional) (:excluded-by 371 :bytes32 :optional))
     (57 :dispute-armed
      (:armed-block 118 :u32) (:commitment-hash 112 :bytes20) (:target-reserves 122 :string)
      (:replacement-collateral-txid 280 :bytes32 :optional) (:replacement-collateral-vout 282 :u32 :optional)

@@ -1120,6 +1120,172 @@
                    (list "46a66b127e0e3afd04f2e4399681128399caab6d6133320c7d02d3569f5c3c79" 0)))
     (check-equal "judged for a606a4ca's vault: not its lottery" (ab-judge c) :not-this-lottery)))
 
+;;; inspect/vectors/claim_after_yield.json: DEP-06 "A claim after the claimant's own yield" (ruled
+;;; 2026-11-23, the advantage rule), shared with deposits-rust and the spec.  The fork is SELF's (its
+;;; DisputeEnter applied with *UPDATE-OPERATOR* bound to SELF); the acquire after its own yield is taken
+;;; structurally, and moves custody only if its claim binds the yielded arm's round or a later one.
+(defun cay-ops (c self)
+  (flet ((arm (commit round)
+           (append (list :type :dispute-armed :armed-block 100
+                         :commitment-hash (make-array 20 :element-type '(unsigned-byte 8) :initial-element commit)
+                         :target-reserves "t"
+                         :replacement-collateral-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
+                         :replacement-collateral-vout 0 :replacement-collateral-amount 50000)
+                   (when round (list :rearm-round round)))))
+    (loop for o across (gethash "ops" c)
+          for k = (gethash "op" o)
+          collect (cond ((string= k "enter") (list :type :dispute-enter :last-valid-sequence 0 :reason (gethash "reason" o)))
+                        ((string= k "arm") (arm #x11 nil))
+                        ((string= k "arm_round_2") (arm #x22 2))
+                        ((string= k "yield") (list :type :dispute-yield))
+                        (t (error "unknown op ~a" k))))
+    ))
+
+(with-gate ("DEP-06 the advantage rule: a claim after the claimant's own yield (shared vector)")
+  (let* ((v (json-simple:parse (uiop:read-file-string (vector-path "claim_after_yield.json"))))
+         (self (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2))
+         (other (make-array 33 :element-type '(unsigned-byte 8) :initial-element 3))
+         (n 0))
+    (setf (aref self 1) 1 (aref other 1) 1)
+    (loop for c across (gethash "cases" v)
+          for name = (gethash "name" c)
+          for ops = (cay-ops c self)
+          do (incf n)
+             (let ((l (lg:make-ledger)))
+               (setf (lg:ledger-active-ruleset l) (gethash "ruleset" c))
+               (let ((lg::*update-operator* self))
+                 (dolist (o ops) (lg:apply-operation l o)))
+               (let ((acq (list :type :dispute-acquire
+                                :new-custodian (if (string= (gethash "acquire_by" c) "self") self other)
+                                :claim-txid (u:txid-bytes (or (and (stringp (gethash "claim_txid" c)) (gethash "claim_txid" c)) (make-string 64 :initial-element #\4)))
+                                :new-reserves-address "")))
+                 (check-equal (format nil "fold: ~a" name)
+                              (handler-case (let ((lg::*update-operator* self)) (lg:apply-operation l acq) "accept")
+                                (lg:ledger-error () "reject"))
+                              (gethash "fold" c))
+                 (when (string= (gethash "fold" c) "accept")
+                   (check-equal (format nil "custody to the claimant on the fold: ~a" name)
+                                (lg:ledger-operator-key l) (getf acq :new-custodian))
+                   ;; the round bound, from the acquirer's own arms and yields before the acquire
+                   (let ((min (nd::acquire-min-round
+                               (loop for o in ops
+                                     collect (case (getf o :type)
+                                               (:dispute-armed (list :arm (or (getf o :rearm-round) 1)))
+                                               (:dispute-yield (list :yield))
+                                               (t (list :other)))))))
+                     (check-equal (format nil "min_round: ~a" name) min (gethash "min_round" c))
+                     (multiple-value-bind (verdict round) (ab-judge c)
+                       (check-equal (format nil "binding: ~a" name) (string-downcase (symbol-name verdict)) (gethash "binding" c))
+                       (check-equal (format nil "round: ~a" name) (or round 0) (gethash "round" c))
+                       (let ((custodian (and (eq verdict :binds) (>= round min))))
+                         (check-equal (format nil "custodian: ~a" name) (if custodian "self" "none") (gethash "custodian" c))
+                         ;; what the claimant's fork still holds (the pledge_pick fork fold)
+                         (let ((held (gethash "held" c))
+                               (claim-key (format nil "~a:0" (gethash "claim_txid" c))))
+                           (multiple-value-bind (pledges custody)
+                               (nd::fork-pledges-held
+                                (append (loop for o in ops
+                                              collect (case (getf o :type)
+                                                        (:dispute-enter (list :enter))
+                                                        (:dispute-armed (let ((r (or (getf o :rearm-round) 1)))
+                                                                          (list :arm (format nil "~{~a~}:0" (make-list 32 :initial-element (if (= r 1) "d4" "d5"))) r)))
+                                                        (:dispute-yield (list :yield))))
+                                        (list (list :acquire claim-key custodian))))
+                             (check-equal (format nil "held pledges: ~a" name) pledges (coerce (gethash "pledges" held) 'list))
+                             (check-equal (format nil "held custody: ~a" name) custody
+                                          (let ((k (gethash "custody" held))) (and (stringp k) k))))))))))))
+    (check "every claim_after_yield case ran" (>= n 8))))
+
+;;; The same case on a NODE: the fork's own acquire after its own yield is judged by
+;;; ACQUIRE-CONFIRMED-P with the round bound (FORK-ACQUIRE-MIN-ROUND), from the fork's updates.
+(with-gate ("DEP-06 the advantage rule: the round bound read off a fork's own updates")
+  (check-equal "an acquire after a yield of a round-2 arm: bound 2"
+               (nd::acquire-min-round '((:arm 2) (:yield))) 2)
+  (check-equal "a later arm after the yield lifts nothing: bound 0 until it yields again"
+               (nd::acquire-min-round '((:arm 1) (:yield) (:arm 2))) 0)
+  (check-equal "no yield: no bound" (nd::acquire-min-round '((:arm 2))) 0)
+  (check-equal "yield, re-arm, yield: the latest arm's round" (nd::acquire-min-round '((:arm 1) (:yield) (:arm 2) (:yield))) 2))
+
+;;; DEP-06 "An invalid yield is void": a yield naming a transaction that is not confirmed frees no
+;;; pledge (FORK-PLEDGE-EVENTS reads it as (:void-yield)); once it confirms, it does.  Mirrors
+;;; deposits-rust's a_yield_whose_named_transaction_is_unconfirmed_frees_no_pledge.
+(with-gate ("DEP-06 a yield whose evidence is not seen frees no pledge")
+  (let* ((named (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (held (lambda (yield-op confs)
+                 (let* ((n (nd:make-node :priv (tk 31337) :bus (bus:make-mock-bus) :tx-fn (lambda (txid) (if (equalp txid named) (values :tx confs) nil))))
+                        (ev (list (list :enter) (list :arm "d7:1" 1)
+                                  (if (nd::yield-evidence-seen-p n yield-op) (list :yield) (list :void-yield)))))
+                   (length (nd::fork-pledges-held ev))))))
+    (check-equal "lost_to unconfirmed: the pledge is held" (funcall held (list :type :dispute-yield :lost-to named) 0) 1)
+    (check-equal "lost_to confirmed: freed" (funcall held (list :type :dispute-yield :lost-to named) 3) 0)
+    (check-equal "excluded_by unconfirmed: held" (funcall held (list :type :dispute-yield :excluded-by named) 0) 1)
+    (check-equal "excluded_by confirmed: freed" (funcall held (list :type :dispute-yield :excluded-by named) 3) 0)
+    (check-equal "a reasonless yield: freed" (funcall held (list :type :dispute-yield) 0) 0)))
+
+;;; inspect/vectors/yield_evidence.json: DEP-06 "What a yield must say" (yield-evidence-v9, ruled
+;;; 2026-11-23), shared with deposits-rust and the spec: the reason TLVs on the wire, the fold's
+;;; structural check, and the judge.
+(defun ye-tx-fn (c)
+  (let ((txs (make-hash-table :test #'equalp)))
+    (loop for x across (gethash "txs" c)
+          do (setf (gethash (u:txid-bytes (gethash "txid" x)) txs)
+                   (list (btx:make-tx :version 2 :locktime 0
+                                      :inputs (loop for i across (gethash "inputs" x)
+                                                    collect (btx:make-txin :prev-hash (u:txid-bytes (gethash "txid" i))
+                                                                           :prev-index (gethash "vout" i)
+                                                                           :script (make-array 0 :element-type '(unsigned-byte 8))
+                                                                           :sequence (gethash "sequence" i)))
+                                      :outputs (loop for o across (gethash "outputs" x)
+                                                     collect (btx:make-txout :value 1000 :script (u:hex->bytes o))))
+                         (let ((hh (gethash "height" x))) (and (integerp hh) hh)))))
+    (lambda (txid) (let ((e (gethash txid txs))) (and e (values (first e) (second e)))))))
+
+(defun ye-reasons (r)
+  "A vector `reasons` object as YIELD-ONCE's plist: txids as wire bytes, the reestablished hash as written."
+  (loop for (json key txid) in '(("lost_to" :lost-to t) ("reestablished" :reestablished nil) ("excluded_by" :excluded-by t))
+        for x = (gethash json r)
+        when (stringp x) append (list key (if txid (u:txid-bytes x) (u:hex->bytes x)))))
+
+(with-gate ("DEP-06 yield evidence: reasons on the wire, the fold, the judge (shared vector)")
+  (let ((v (json-simple:parse (uiop:read-file-string (vector-path "yield_evidence.json")))) (n 0))
+    (loop for w across (gethash "wire" v)
+          for op = (append (list :type :dispute-yield) (ye-reasons (gethash "reasons" w)))
+          do (check-equal (format nil "wire: ~a" (gethash "name" w)) (u:bytes->hex (op:encode-operation op)) (gethash "hex" w))
+             (check-equal (format nil "wire round trip: ~a" (gethash "name" w))
+                          (op:decode-operation (u:hex->bytes (gethash "hex" w))) op))
+    (loop for c across (gethash "cases" v)
+          for name = (gethash "name" c)
+          for reasons = (ye-reasons (gethash "reasons" c))
+          for y = (gethash "yielder" c)
+          do (incf n)
+             ;; the fold: a fork under the case's ruleset, entered and armed, takes the yield or not
+             (let ((l (lg:make-ledger)))
+               (setf (lg:ledger-active-ruleset l) (gethash "ruleset" c))
+               (lg:apply-operation l (list :type :dispute-enter :last-valid-sequence 0 :reason "equivocation"))
+               (lg:apply-operation l (list :type :dispute-armed :armed-block 100
+                                           :commitment-hash (make-array 20 :element-type '(unsigned-byte 8) :initial-element 1)
+                                           :target-reserves "t"))
+               (check-equal (format nil "fold: ~a" name)
+                            (handler-case (progn (lg:apply-operation l (append (list :type :dispute-yield) reasons)) "accept")
+                              (lg:ledger-error () "reject"))
+                            (gethash "fold" c)))
+             (multiple-value-bind (verdict why)
+                 (nd::judge-yield :ruleset (gethash "ruleset" c) :reasons reasons
+                                  :yield-height (gethash "yield_height" c) :arm-round (gethash "arm_round" c)
+                                  :yielder (u:hex->bytes (gethash "xonly" y))
+                                  :targets (map 'list #'u:hex->bytes (gethash "targets" y))
+                                  :pledges (map 'list (lambda (p) (list (u:txid-bytes (gethash "txid" p)) (gethash "vout" p))) (gethash "pledges" y))
+                                  :vaults (map 'list (lambda (p) (list (u:txid-bytes (gethash "txid" p)) (gethash "vout" p))) (gethash "vaults" c))
+                                  :tx-fn (ye-tx-fn c)
+                                  :dispute-reason (gethash "reason" (gethash "dispute" c))
+                                  :last-valid-sequence (gethash "last_valid_sequence" (gethash "dispute" c))
+                                  :quorum-begins (map 'list (lambda (q) (list (u:hex->bytes (gethash "hash" q)) (gethash "seq" q) (eq (gethash "spend_confirmed" q) t)))
+                                                      (gethash "quorum_begins" c))
+                                  :participants (map 'list #'u:hex->bytes (gethash "participants" c)))
+               (check-equal (format nil "verdict: ~a" name) (string-downcase (symbol-name verdict)) (gethash "verdict" c))
+               (check-equal (format nil "why: ~a" name) (string-downcase (symbol-name why)) (gethash "why" c))))
+    (check "every yield_evidence case ran" (>= n 24))))
+
 ;;; inspect/vectors/rearm_round_agree.json: DEP-03 §"The dispute" and DEP-06 Phase 4 step 2 over
 ;;; real regtest ledgers (2026-11-19/21), shared with deposits-rust (armers.rs) and the spec.  A
 ;;; stale DisputeEnter (below Q, yielded) took the Rust voters to the old QuorumBegin, so ref6 never
