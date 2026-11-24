@@ -716,8 +716,15 @@
                        ((string= (first w) "case") (setf name (second w) ups '()))
                        ((string= (first w) "u")
                         (let* ((who (char (second w) 0)) (seq (parse-integer (third w)))
+                               (chain-at (lambda (pred) (let ((e (find-if pred (reverse ups))))
+                                                          (if e (up:chain-hash (cdr e)) (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))))
+                               ;; the vector's chaining: a disputant takes part through its counted fork's chain
+                               (prev (cond ((char= who #\o) (funcall chain-at (lambda (e) (char= (char (car e) 0) #\o))))
+                                           ((string= (fourth w) "enter")
+                                            (let ((tag (format nil "o:~a" (fifth w)))) (funcall chain-at (lambda (e) (string= (car e) tag)))))
+                                           (t (funcall chain-at (lambda (e) (char= (char (car e) 0) who))))))
                                (u (up:make-signed-update :operator-id (key who) :ledger-id (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)
-                                                         :seq seq :prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                                         :seq seq :prev-hash prev
                                                          :message (msg (fourth w) (and (fifth w) (parse-integer (fifth w)))))))
                           (setf ups (append ups (list (cons (format nil "~a:~a" who seq) u))))))
                        ((string= (first w) "expect")
@@ -727,16 +734,30 @@
                           (check-equal (format nil "dispute_scope ~a" name) got (rest w))))))))
     (check-equal "every dispute_scope case ran" cases 5)))
 
+(defun permutations-or-shuffles (n)
+  "Every permutation of 0..N-1 when N <= 6, else the identity, its reverse and 300 fixed shuffles
+   (a 31-bit LCG seeded at 1)."
+  (let ((ids (loop for i below n collect i)))
+    (if (<= n 6)
+        (labels ((perms (l) (if (null l) (list nil) (loop for x in l append (mapcar (lambda (p) (cons x p)) (perms (remove x l)))))))
+          (perms ids))
+        (let ((seed 1) (out (list ids (reverse ids))))
+          (dotimes (k 300 out)
+            (let ((v (coerce ids 'vector)))
+              (loop for i from (1- n) downto 1
+                    do (setf seed (mod (+ (* seed 1103515245) 12345) 2147483648))
+                       (rotatef (aref v i) (aref v (mod seed (1+ i)))))
+              (push (coerce v 'list) out)))))))
+
 ;;; inspect/vectors/enter_after_yield.txt: DEP-06 "A yield binds only its author" (ruled
 ;;; 2026-11-24, latest counts), shared with deposits-rust (deposits-core/tests/
 ;;; enter_after_yield_vector.rs; deposits-node enter_after_yield_pledge_tests).  The scope cases
 ;;; through DISPUTE-SCOPE; the pledge cases through what a superseded fork of ours keeps
 ;;; (SUPERSEDED-ENTRY, SUPERSEDED-PLEDGES-HELD) and FORK-PLEDGES-HELD for the forks still ours.
-(with-gate ("enter after yield: latest counts, and superseding ends no pledge (shared vector)")
-  (let ((cases 0) (pledge-cases 0) (ingests 0) (keys (make-hash-table)))
-    (labels ((key (c) (or (gethash c keys)
-                          (setf (gethash c keys) (let ((k (make-array 33 :element-type '(unsigned-byte 8) :initial-element (char-code c))))
-                                                   (setf (aref k 0) 2) k))))
+(with-gate ("enter after yield: latest counts, set-wise, and superseding ends no pledge (shared vector)")
+  (let ((cases 0) (pledge-cases 0) (orderings 0) (keys (make-hash-table)))
+    (labels ((key (c) (or (gethash c keys)   ; the public key of the secret 32 x <code of C>, as deposits-rust's
+                          (setf (gethash c keys) (up::scalar-point (make-array 32 :element-type '(unsigned-byte 8) :initial-element (char-code c))))))
              (b32 (n) (make-array 32 :element-type '(unsigned-byte 8) :initial-element n))
              (str-hash (s) (u:sha256 (map '(vector (unsigned-byte 8)) #'char-code s)))
              (opt (w k) (loop for x in w when (and (> (length x) (length k)) (string= k x :end2 (length k))) return (subseq x (length k))))
@@ -836,37 +857,22 @@
                            ((string= (first w) "expect")
                             (let* ((all (mapcar #'third ups))
                                    (kept (nd::dispute-scope all))
-                                   (got (mapcar (lambda (k) (first (find k ups :key #'third))) kept)))
+                                   (got (mapcar (lambda (k) (first (find k ups :key #'third))) kept))
+                                   (want (sort (copy-list (rest w)) #'string<))
+                                   (orders (permutations-or-shuffles (length all)))
+                                   (bad 0))
                               (incf cases)
                               (check-equal (format nil "enter_after_yield ~a" name) got (rest w))
-                              ;; the ingest, fed the updates in this order, ends on the same entry
-                              (dolist (who (remove-duplicates (loop for (nil nil u) in ups unless (equalp (up:update-operator-id u) (key #\o))
-                                                                    collect (up:update-operator-id u))
-                                                              :test #'equalp))
-                                (let ((counted (find-if (lambda (u) (and (equalp (up:update-operator-id u) who) (eq (nd::%op-type u) :dispute-enter))) kept))
-                                      (cur nil) (tip nil) (acquired nil))
-                                  (dolist (u all)
-                                    (when (equalp (up:update-operator-id u) who)
-                                      (cond ((not (eq (nd::%op-type u) :dispute-enter))
-                                             (when (and tip (equalp (up:update-prev-hash u) (up:chain-hash tip)))
-                                               (setf tip u)
-                                               (when (eq (nd::%op-type u) :dispute-acquire) (setf acquired t))))
-                                            ((null cur) (setf cur u tip u))
-                                            ((equalp (up:update-prev-hash u) (up:chain-hash tip)) (setf cur u tip u))   ; continuation
-                                            ((let* ((lvs (op:field (op:update-op u) :last-valid-sequence))
-                                                    (top (max lvs (op:field (op:update-op cur) :last-valid-sequence)))
-                                                    (q (loop for x in all when (and (equalp (up:update-operator-id x) (key #\o)) (<= (up:update-seq x) top)
-                                                                                    (eq (nd::%op-type x) :quorum-begin))
-                                                             maximize (up:update-seq x))))
-                                               (and (not (equalp (up:content-hash u) (up:content-hash cur))) (>= lvs (or q 0))
-                                                    (nd::entry-supersedes-p cur u :acquired acquired)))
-                                             (setf cur u tip u acquired nil)))))
-                                  (when counted
-                                    (incf ingests)
-                                    (check-equal (format nil "enter_after_yield ~a: the ingest takes the scope's entry" name)
-                                                 (first (find cur ups :key #'third)) (first (find counted ups :key #'third))))))))))))
-        (check-equal "every enter_after_yield case ran" (list cases pledge-cases) '(17 8))
-        (check "the ingest was compared on every case" (>= ingests 17))))))
+                              ;; a function of the SET: every order of the same updates, the same scope
+                              (dolist (ord orders)
+                                (let* ((perm (mapcar (lambda (i) (nth i all)) ord))
+                                       (k (nd::dispute-scope perm)))
+                                  (unless (equal (sort (mapcar (lambda (x) (first (find x ups :key #'third))) k) #'string<) want)
+                                    (incf bad))))
+                              (incf orderings (length orders))
+                              (check-equal (format nil "enter_after_yield ~a: ~a orders, the same scope" name (length orders)) bad 0)))))))
+        (check-equal "every enter_after_yield case ran" (list cases pledge-cases) '(19 8))
+        (check "every order was tried" (> orderings 1000))))))
 
 (defun split-sequence-simple (s)
   (let ((out '()) (cur '()))

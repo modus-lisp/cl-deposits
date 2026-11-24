@@ -154,6 +154,8 @@
   (utxos-fn nil)                               ; (lambda (address)) -> list of plists :txid :vout :sats :confirmations
   (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
   (superseded '())                             ; what our superseded forks still hold (NOTE-SUPERSEDED)
+  ;; "ledger_disputant" -> that member's updates not on the fork we hold of it (INGEST-MEMBER-UPDATE)
+  (side-forks (make-hash-table :test #'equal :synchronized t))
   (dispute-notes (make-hash-table :test #'equal :synchronized t))   ; ledger id -> the last dispute-driver state we logged
   (parent nil)                                 ; a DISPUTE-VIEW's node: whose records judge an arm's grounds
   (grounds-verdicts (make-hash-table :test #'equalp :synchronized t)) ; DisputeEnter chain hash -> (verdict . why)
@@ -1749,55 +1751,179 @@
         ((not (equalp signer (node-pubkey node)))
          (ingest-member-update node rec id signer update))))))
 
-(defun entry-supersedes-p (old new &key acquired)
-  "DEP-03 \"The dispute\" (latest counts, ruled 2026-11-24): whether a disputant's DisputeEnter
-   NEW supersedes OLD, the entry its counted fork opened, both at or above Q.  Never a fork its
-   author ACQUIRED on (a DisputeAcquire on it); else a later sequence, or at the same sequence a
-   punitive entry over an expiry one.  DISPUTE-SCOPE and the ingest (SUPERSEDES-FORK-P) both ask
-   this, as deposits-rust's rotation_order::dispute_scope does.  Vector enter_after_yield.txt."
-  (and (not acquired)
-       (let ((so (up:update-seq old)) (sn (up:update-seq new)))
-         (or (> sn so)
-             (and (= sn so)
-                  (expiry-reason-p (op:field (op:update-op old) :reason))
-                  (not (expiry-reason-p (op:field (op:update-op new) :reason))))))))
+;;; DEP-03 "The dispute": a disputant's counted DisputeEnter is a function of the SET of its
+;;; updates, never of their order (two honest nodes receive them in different orders).
 
-(defun supersedes-fork-p (rec fork update)
-  "Whether a disputant's DisputeEnter UPDATE replaces its FORK we hold (ENTRY-SUPERSEDES-P),
-   whatever the fork's yield says or whether it yielded at all.  Not a relay's echo of the entry
-   the fork holds, not one chained onto the fork's own tip (a continuation: it is accepted on the
-   fork and counts from there), and not an entry the scope would not count: one forking below Q,
-   the latest QuorumBegin of REC (the disputed ledger) at or below either fork point.
-   Superseding ends no pledge (RETIRE-FORK :SUPERSEDED)."
-  (multiple-value-bind (old oo) (fork-op fork :dispute-enter)
-    (let* ((lvs (op:field (op:update-op update) :last-valid-sequence))
-           (top (max lvs (or (and oo (op:field oo :last-valid-sequence)) 0)))
-           (q (record-latest rec :quorum-begin :below (1+ top))))
-      (and old
-           (not (equalp (up:content-hash old) (up:content-hash update)))
-           (let ((tp (tip fork))) (not (and tp (equalp (up:update-prev-hash update) (up:chain-hash tp)))))
-           (not (and q (< lvs (up:update-seq q))))
-           (entry-supersedes-p old update :acquired (fork-op fork :dispute-acquire))))))
+(defun entry-order< (a b)
+  "The canonical order of one disputant's DisputeEnters: sequence; at one sequence a punitive entry
+   before a quorum_expired one; then content hash ascending."
+  (let ((sa (up:update-seq a)) (sb (up:update-seq b)))
+    (if (/= sa sb) (< sa sb)
+        (let ((ea (expiry-reason-p (op:field (op:update-op a) :reason)))
+              (eb (expiry-reason-p (op:field (op:update-op b) :reason))))
+          (if (not (eq ea eb)) eb
+              (let ((ha (up:content-hash a)) (hb (up:content-hash b)))
+                (loop for x across ha for y across hb
+                      when (/= x y) return (< x y) finally (return nil))))))))
+
+(defun counted-entry (enters acquired-p)
+  "Of one disputant's ENTERS (all at or above Q), the one it takes part through: in ENTRY-ORDER<,
+   the first, replaced by each later one at a higher sequence unless ACQUIRED-P of the counted
+   entry (its fork carries its author's DisputeAcquire), which nothing supersedes.  DISPUTE-SCOPE
+   and the ingest (INGEST-MEMBER-UPDATE) both ask this, as deposits-rust's
+   rotation_order::dispute_scope does.  Vector enter_after_yield.txt (every permutation)."
+  (let* ((es (sort (remove-duplicates (copy-list enters) :test #'equalp :key #'up:content-hash) #'entry-order<))
+         (cur (first es)))
+    (dolist (e (rest es) cur)
+      (when (funcall acquired-p cur) (return cur))
+      (when (> (up:update-seq e) (up:update-seq cur)) (setf cur e)))))
+
+(defun fork-acquired-p (updates enter)
+  (some (lambda (u) (eq (%op-type u) :dispute-acquire)) (fork-from updates enter)))
+
+(defvar *side-fork-limit* 512 "At most this many held updates per disputant's other forks.")
+
+(defun side-key (id signer) (fork-key id signer))
+
+(defun pool-counted (rec pool)
+  "The counted entry among POOL (one disputant's updates of REC's ledger): its enters at or above
+   Q (REC's latest QuorumBegin at or below their highest fork point), COUNTED-ENTRY."
+  (let* ((enters (remove-if-not (lambda (u) (eq (%op-type u) :dispute-enter)) pool))
+         (top (and enters (reduce #'max enters :key (lambda (u) (op:field (op:update-op u) :last-valid-sequence)))))
+         (q (and top (record-latest rec :quorum-begin :below (1+ top))))
+         (in (remove-if (lambda (u) (and q (< (op:field (op:update-op u) :last-valid-sequence) (up:update-seq q)))) enters)))
+    (and in (counted-entry in (lambda (e) (fork-acquired-p pool e))))))
 
 (defun ingest-member-update (node rec id signer update)
-  "A quorum member's dispute fork (or its continuation)."
-         (let* ((o (op:decode-operation (up:update-message update)))
-                (fork (let ((f (find-fork node id signer)))
-                        (if (and f (eq (op:operation-type o) :dispute-enter) (not (record-owned-p f))
-                                 (supersedes-fork-p rec f update))
-                            (progn (retire-fork node f :superseded t) nil)
-                            f))))
-           (cond (fork
-                  ;; a burst published out of order (the reference appends its QuorumAddMembers
-                  ;; and DisputeArmed at once): fill the gap first, or the fork never arms here
-                  (when (> (up:update-seq update) (1+ (lg:ledger-sequence (record-ledger fork))))
-                    (catch-up-fork node fork (1- (up:update-seq update))))
-                  (accept-update node fork update))
-                 ((and (eq (op:operation-type o) :dispute-enter)
-                       (member signer (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp))
-                  (let ((fork (make-fork node rec (op:field o :last-valid-sequence) signer)))
-                    (accept-update node fork update)
-                    (log! node "fork of ~a by ~a at seq ~a" (subseq id 0 8) (subseq (bytes->hex signer) 0 8) (op:field o :last-valid-sequence)))))))
+  "A quorum member's dispute fork (or its continuation).  The fork we hold for it is the one its
+   counted DisputeEnter opens (POOL-COUNTED over everything it sent us of this ledger, whatever
+   the order it arrived in); its other updates are held aside (NODE-SIDE-FORKS) until they are
+   counted or pruned, so a late DisputeAcquire on a superseded fork, or an earlier entry arriving
+   after a later one, moves us to the same fork every member holds."
+  (let* ((o (op:decode-operation (up:update-message update)))
+         (f (find-fork node id signer))
+         (key (side-key id signer)))
+    (when (and f (record-owned-p f))
+      (return-from ingest-member-update (%ingest-on-fork node f update)))
+    (unless (member signer (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
+      (return-from ingest-member-update (and f (%ingest-on-fork node f update))))
+    (cond ((and f (on-fork-p f update)) (%ingest-on-fork node f update))
+          ((and f (not (eq (op:operation-type o) :dispute-enter)) (> (up:update-seq update) (1+ (up:update-seq (tip f))))
+                (not (side-chains-p (gethash key (node-side-forks node)) update)))
+           ;; a gap on the fork we hold (a burst out of order): CATCH-UP-FORK, as before; what still
+           ;; does not land on it is held aside, never dropped
+           (handler-case (%ingest-on-fork node f update)
+             (error (e) (log! node "fork of ~a by ~a: seq ~a held aside (~a)" (subseq id 0 8) (subseq (bytes->hex signer) 0 8)
+                              (up:update-seq update) e)))
+           (unless (on-fork-p f update) (hold-aside node key update)))
+          ((null f)
+           (if (and (eq (op:operation-type o) :dispute-enter) (chains-to-base-p rec update))
+               (let ((fork (make-fork node rec (op:field o :last-valid-sequence) signer)))
+                 (accept-update node fork update)
+                 (log! node "fork of ~a by ~a at seq ~a" (subseq id 0 8) (subseq (bytes->hex signer) 0 8) (op:field o :last-valid-sequence)))
+               (hold-aside node key update)))
+          (t (hold-aside node key update)))
+    (recount-disputant node rec id signer)))
+
+(defun on-fork-p (fork update)
+  "UPDATE continues FORK (its previous_hash is FORK's tip's chain hash), or FORK already holds it."
+  (let ((tp (tip fork)))
+    (or (and tp (equalp (up:update-prev-hash update) (up:chain-hash tp)))
+        (find (up:content-hash update) (record-history fork) :key #'up:content-hash :test #'equalp
+              :end (min 64 (length (record-history fork)))))))
+
+(defun side-chains-p (side update)
+  (some (lambda (u) (equalp (up:update-prev-hash update) (up:chain-hash u))) side))
+
+(defun %ingest-on-fork (node fork update)
+  ;; a burst published out of order (the reference appends its QuorumAddMembers and DisputeArmed
+  ;; at once): fill the gap first, or the fork never arms here
+  (when (> (up:update-seq update) (1+ (lg:ledger-sequence (record-ledger fork))))
+    (catch-up-fork node fork (1- (up:update-seq update))))
+  (accept-update node fork update))
+
+(defun hold-aside (node key update)
+  (let ((side (gethash key (node-side-forks node))))
+    (unless (find (up:content-hash update) side :key #'up:content-hash :test #'equalp)
+      (setf (gethash key (node-side-forks node))
+            (let ((l (cons update side))) (if (> (length l) *side-fork-limit*) (subseq l 0 *side-fork-limit*) l)))
+      (save-side-forks node))))
+
+(defun fork-own-pool (fork signer)
+  "FORK's own updates by SIGNER past its fork point: the history is newest first, and past the
+   fork point every update is the disputant's."
+  (loop for u in (record-history fork) while (equalp (up:update-operator-id u) signer) collect u))
+
+(defun chain-from (pool root)
+  "ROOT and every update of POOL chained from it (continuation entries included), by sequence."
+  (let ((hashes (make-hash-table :test #'equalp)) (out (list root)))
+    (setf (gethash (up:chain-hash root) hashes) t)
+    (dolist (u (sort (copy-list pool) #'< :key #'up:update-seq) (nreverse out))
+      (when (and (not (eq u root)) (gethash (up:update-prev-hash u) hashes))
+        (setf (gethash (up:chain-hash u) hashes) t)
+        (push u out)))))
+
+(defun chain-root (pool u)
+  "The first update of the chain U is on, walking previous_hash back through POOL."
+  (loop for p = (find (up:update-prev-hash u) pool :key #'up:chain-hash :test #'equalp)
+        while (and p (not (eq p u))) do (setf u p))
+  u)
+
+(defun chains-to-base-p (rec enter)
+  "ENTER's previous_hash is the chain hash of REC's update at its last_valid_sequence."
+  (let* ((lvs (op:field (op:update-op enter) :last-valid-sequence))
+         (at (find lvs (record-history rec) :key #'up:update-seq)))
+    (and at (equalp (up:update-prev-hash enter) (up:chain-hash at)))))
+
+(defun drain-aside (node key fork)
+  "Move onto FORK, in order, what is held aside under KEY and now continues it."
+  (loop for u = (find-if (lambda (u) (on-fork-p fork u)) (gethash key (node-side-forks node)))
+        while u
+        do (setf (gethash key (node-side-forks node)) (remove u (gethash key (node-side-forks node)) :test #'eq))
+           (save-side-forks node)
+           (ignore-errors (accept-update node fork u))
+           (unless (and (tip fork) (equalp (up:content-hash (tip fork)) (up:content-hash u)))
+             (return))))
+
+(defun recount-disputant (node rec id signer)
+  "Hold the fork SIGNER's counted DisputeEnter is on (POOL-COUNTED over the fork we hold and
+   everything held aside): what continues the fork we hold is moved onto it first; when the counted
+   entry is on another chain, and that chain is complete back to REC, swap: the fork we hold goes
+   aside and the counted one is rebuilt from its first entry with its whole chain."
+  (let ((key (side-key id signer)))
+    (let ((f (find-fork node id signer))) (when f (drain-aside node key f)))
+    (let* ((f (find-fork node id signer))
+           (side (gethash key (node-side-forks node)))
+           (mine (and f (fork-own-pool f signer)))
+           (pool (append mine side))
+           (counted (and side (pool-counted rec pool)))
+           (root (and counted (not (member counted mine :test #'eq)) (chain-root pool counted))))
+      (when (and root (eq (%op-type root) :dispute-enter) (chains-to-base-p rec root))
+        (let ((chain (chain-from pool root)))
+          (when f (retire-fork node f :superseded t))
+          (let ((fork (make-fork node rec (op:field (op:update-op root) :last-valid-sequence) signer)))
+            (dolist (u chain) (ignore-errors (accept-update node fork u)))
+            (setf (gethash key (node-side-forks node)) (set-difference pool chain :test #'eq))
+            (save-side-forks node)
+            (drain-aside node key fork))
+          (log! node "fork of ~a by ~a: its counted DisputeEnter is seq ~a (DEP-03, set-wise)" (subseq id 0 8)
+                (subseq (bytes->hex signer) 0 8) (up:update-seq counted)))))))
+
+(defun save-side-forks (node)
+  (when (node-data-dir node)
+    (ensure-directories-exist (node-data-dir node))
+    (with-open-file (out (merge-pathnames "side-forks.sexp" (node-data-dir node)) :direction :output :if-exists :supersede)
+      (with-standard-io-syntax
+        (prin1 (loop for k being the hash-keys of (node-side-forks node) using (hash-value v)
+                     when v collect (cons k (mapcar (lambda (u) (bytes->hex (up:encode-update u))) v)))
+               out)))))
+
+(defun load-side-forks (node)
+  (let ((f (and (node-data-dir node) (probe-file (merge-pathnames "side-forks.sexp" (node-data-dir node))))))
+    (when f
+      (with-open-file (in f)
+        (loop for (k . us) in (with-standard-io-syntax (let ((*read-eval* nil)) (read in nil '())))
+              do (setf (gethash k (node-side-forks node)) (mapcar (lambda (h) (up:decode-update (hex->bytes h))) us)))))))
 
 (defun accept-update (node rec update)
   "Validate an operator's update against our replica and apply it, one writer at a time."
@@ -5227,17 +5353,21 @@
 
 (defun fork-from (updates enter)
   "The updates on the fork ENTER opens: its author's non-DisputeEnter updates in UPDATES chained
-   from it (each previous_hash the CHAIN-HASH of the one before)."
-  (let ((hashes (list (up:chain-hash enter))) (out '()) (by (up:update-operator-id enter)))
-    (loop
-      (let ((before (length out)))
-        (dolist (u updates)
-          (when (and (equalp (up:update-operator-id u) by) (not (member u out :test #'eq))
-                     (member (up:update-prev-hash u) hashes :test #'equalp)
-                     (not (eq (%op-type u) :dispute-enter)))
-            (push (up:chain-hash u) hashes)
-            (push u out)))
-        (when (= before (length out)) (return (nreverse out)))))))
+   from it (each previous_hash the CHAIN-HASH of one already on it), in sequence order: one pass,
+   since a chain only climbs."
+  (let* ((by (up:update-operator-id enter))
+         ;; copied: REMOVE-IF-NOT may share UPDATES' tail, and SORT is destructive
+         (mine (sort (copy-list (remove-if-not (lambda (u) (and (equalp (up:update-operator-id u) by) (not (eq u enter))
+                                                                (> (up:update-seq u) (up:update-seq enter))))
+                                               updates))
+                     #'< :key #'up:update-seq))
+         (hashes (make-hash-table :test #'equalp))
+         (out '()))
+    (setf (gethash (up:chain-hash enter) hashes) t)
+    (dolist (u mine (nreverse out))
+      (when (and (gethash (up:update-prev-hash u) hashes) (not (eq (%op-type u) :dispute-enter)))
+        (setf (gethash (up:chain-hash u) hashes) t)
+        (push u out)))))
 
 (defun reentry-yield-verdict (updates enter yield &key chain)
   "DEP-06 \"What a yield must say\": the verdict a yield builder's own judge gives YIELD, the
@@ -5298,43 +5428,41 @@
                                        (t :valid))))))))))))))
 
 (defun dispute-scope (updates)
-  "UPDATES (a disputed ledger's, every operator's) reduced to its current dispute (see above).
-   Latest counts (ruled 2026-11-24): a later DisputeEnter supersedes the disputant's earlier fork
-   whatever that fork's yield says; superseding ends no pledge (DEP-03 \"When a pledge is live\").
-   A repeat DisputeEnter after the counted one is out, as in deposits-rust.  Vector
+  "UPDATES (a disputed ledger's, every operator's) reduced to its current dispute (see above), a
+   function of the SET of UPDATES: each disputant takes part through its counted DisputeEnter
+   (COUNTED-ENTRY: canonical order, latest counts, an acquired fork never superseded) and the
+   updates on that fork's chain (FORK-FROM) past its fork point; superseding ends no pledge
+   (DEP-03 \"When a pledge is live\").  As deposits-rust's rotation_order::dispute_scope.  Vector
    inspect/vectors/enter_after_yield.txt."
   (let* ((open (find-if (lambda (u) (zerop (up:update-seq u))) updates))
          (origin (and open (up:update-operator-id open)))
          (enters (and origin
-                      (loop for u in updates
-                            when (and (not (equalp (up:update-operator-id u) origin))
-                                      (eq (%op-type u) :dispute-enter))
-                              collect (list (up:update-operator-id u) (up:update-seq u)
-                                            (op:field (op:update-op u) :last-valid-sequence) u)))))
+                      (remove-if-not (lambda (u) (and (not (equalp (up:update-operator-id u) origin))
+                                                      (eq (%op-type u) :dispute-enter)))
+                                     updates))))
     (if (null enters)
         updates
-        (let* ((top (reduce #'max enters :key #'third))
+        (let* ((top (reduce #'max enters :key (lambda (u) (op:field (op:update-op u) :last-valid-sequence))))
                (q (or (loop for u in updates
                             when (and (equalp (up:update-operator-id u) origin) (<= (up:update-seq u) top)
                                       (eq (%op-type u) :quorum-begin))
                               maximize (up:update-seq u))
                       0))
-               (fork-of (make-hash-table :test #'equalp)))
-          ;; each disputant's counted entry: in sequence order (stable), ENTRY-SUPERSEDES-P
-          (dolist (e (stable-sort (remove-if (lambda (e) (< (third e) q)) enters) #'< :key #'second))
-            (let ((cur (gethash (first e) fork-of)))
-              (when (or (null cur)
-                        (entry-supersedes-p cur (fourth e)
-                                            :acquired (some (lambda (u) (eq (%op-type u) :dispute-acquire)) (fork-from updates cur))))
-                (setf (gethash (first e) fork-of) (fourth e)))))
-          ;; any other entry (below Q, superseded, not superseding) names no fork point
-          ;; (vector rearm_round_agree.json)
-          (remove-if-not (lambda (u) (or (equalp (up:update-operator-id u) origin)
-                                         (let ((f (gethash (up:update-operator-id u) fork-of)))
-                                           (and f (> (up:update-seq u) (op:field (op:update-op f) :last-valid-sequence))
-                                                (or (equalp (up:content-hash u) (up:content-hash f))
-                                                    (not (eq (%op-type u) :dispute-enter)))))))
-                         updates)))))
+               (by (make-hash-table :test #'equalp))
+               (keep (make-hash-table :test #'eq)))
+          (dolist (e enters)
+            (when (>= (op:field (op:update-op e) :last-valid-sequence) q)
+              (push e (gethash (up:update-operator-id e) by))))
+          (loop for es being the hash-values of by
+                for cur = (counted-entry es (lambda (e) (fork-acquired-p updates e)))
+                for lvs = (op:field (op:update-op cur) :last-valid-sequence)
+                do (dolist (u updates)
+                     (when (and (equalp (up:update-operator-id u) (up:update-operator-id cur))
+                                (equalp (up:content-hash u) (up:content-hash cur)) (> (up:update-seq u) lvs))
+                       (setf (gethash u keep) t)))
+                   (dolist (u (fork-from updates cur))
+                     (when (> (up:update-seq u) lvs) (setf (gethash u keep) t))))
+          (remove-if-not (lambda (u) (or (equalp (up:update-operator-id u) origin) (gethash u keep))) updates)))))
 
 (defun node-chain-view (node)
   "NODE's chain view for REENTRY-YIELD-VERDICT: txid -> the height of the block confirming it,
@@ -9336,5 +9464,6 @@
         (when id (handler-case (load-rearms node id f) (error (e) (funcall log-fn "could not load ~a: ~a" f e))))))
     (handler-case (load-pledges node) (error (e) (funcall log-fn "could not load pledges: ~a" e)))
     (handler-case (load-superseded node) (error (e) (funcall log-fn "could not load superseded forks: ~a" e)))
+    (handler-case (load-side-forks node) (error (e) (funcall log-fn "could not load side forks: ~a" e)))
     (publish-pending node)
     node))

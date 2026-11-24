@@ -1276,6 +1276,63 @@
           (nd::handle-update c (w:update-event (nd::node-keypair b) re))
           (check "the echo is not a new entry" (eq f (nd:find-fork c id bk)))))))))
 
+;; DEP-03 "The dispute": the fork a member holds for a disputant is a function of the SET of that
+;; disputant's updates, never of the order they arrived in.  b enters (fork A) and arms, the operator
+;; moves on, b enters again and arms: as a continuation of A (A live: ENTER-DISPUTE appends to it),
+;; or, A yielded first, on a new fork B that supersedes A.  A fresh member is handed b's updates in
+;; every order and must end on the fork holding b's later entry and its arm.
+(defun %arrival-order-gate (yield-first tag)
+  (let ((lg:+current-ruleset+ "yield-evidence-v9"))
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv (tk 11111111111111111194) :bus bus :height-fn hf))
+         (b (nd:make-node :priv (tk 22222222222222222294) :bus bus :height-fn hf))
+         (c (nd:make-node :priv (tk 33333333333333333394) :bus bus :height-fn hf))
+         (d (nd:make-node :priv (tk 44444444444444444494) :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id tag :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d94")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
+    (let ((*height* (+ (lg:ledger-quorum-expiry (nd:record-ledger la)) 4)) (bk (nd:node-pubkey b)))
+      (flet ((arm (fork n)
+               (nd::commit-update b fork (nd::new-update b fork (list :type :dispute-armed :armed-block *height*
+                                                                      :commitment-hash (make-array 20 :element-type '(unsigned-byte 8) :initial-element n)
+                                                                      :target-reserves tag))))
+             (own (fork type) (nd::fork-op fork type)))
+        (check-equal "b opens an expiry dispute" (nd:dispute-expired-quorums b :grace 3) (list id))
+        (let* ((fa (nd:find-fork b id bk)) (e1 (progn (arm fa 1) (own fa :dispute-enter))) (a1 (own fa :dispute-armed))
+               (y1 (when yield-first
+                     (nd::commit-update b fa (nd::new-update b fa (list :type :dispute-yield :lost-to (u:sha256 (hx "c1a9")))))
+                     (own fa :dispute-yield))))
+          (nd:add-member a la (nd:node-pubkey d) :member-ledger-id (nd::node-member-ledger-hex d))
+          (let* ((fb (nd::enter-dispute b (nd:find-record b id) (lg:ledger-sequence (nd:record-ledger (nd:find-record b id))) :reason "quorum_expired"))
+                 (e2 (progn (arm fb 2) (own fb :dispute-enter))) (a2 (own fb :dispute-armed))
+                 (four (remove nil (list e1 a1 y1 e2 a2)))
+                 (base (nd:find-record c id)) (hist (nd::record-history base))
+                 (wrong 0) (orders 0))
+            (check "b's updates: two entries, two arms" (and e1 a1 e2 a2 (not (eq e1 e2))))
+            (check "the second entry is on a new fork iff A yielded first" (eq (null yield-first) (eq fa fb)))
+            (labels ((perms (l) (if (null l) (list nil) (loop for x in l append (mapcar (lambda (p) (cons x p)) (perms (remove x l)))))))
+              (dolist (ord (perms four))
+                (let ((m (nd:make-node :priv (tk 55555555555555555594) :bus (bus:make-mock-bus) :height-fn hf)))
+                  (setf (gethash id (nd:node-ledgers m))
+                        (nd::make-record :id-hex id :ledger (lg:replay (reverse hist)) :history hist))
+                  (dolist (u ord) (nd::handle-update m (w:update-event (nd::node-keypair b) u)))
+                  (incf orders)
+                  (let ((f (nd:find-fork m id bk)))
+                    (unless (and f (equalp (up:content-hash (own f :dispute-enter)) (up:content-hash e2))
+                                 (own f :dispute-armed) (equalp (up:content-hash (own f :dispute-armed)) (up:content-hash a2)))
+                      (incf wrong)
+                      (format t "~&    order ~a: fork enter ~a~%" (mapcar (lambda (u) (position u four)) ord)
+                              (and f (up:update-seq (own f :dispute-enter)))))))))
+            (check-equal "every order tried" orders (if yield-first 120 24))
+            (check-equal "every order ends on the later entry's fork, with its arm" wrong 0))))))))
+
+(with-gate ("a member's fork of a disputant is the same in every arrival order: a continuation (DEP-03)")
+  (%arrival-order-gate nil "genesis:ao"))
+(with-gate ("a member's fork of a disputant is the same in every arrival order: a superseding fork (DEP-03)")
+  (%arrival-order-gate t "genesis:ap"))
+
+
 ;; DEP-06 "A yield binds only its author": a yield builder runs the judge first (YIELD-SELF-CHECK in
 ;; YIELD-ONCE).  Invalid: never signed or broadcast.  Pending: held, signed once the chain answers.
 (with-gate ("a yield builder runs the judge before signing (DEP-06 self-check)")
