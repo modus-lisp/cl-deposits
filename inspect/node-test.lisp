@@ -1209,58 +1209,72 @@
             (check "c sees b's new DisputeEnter on a fresh fork (its stale copy retired)"
                    (let ((f (nd:find-fork c id (nd:node-pubkey b)))) (and f (null (nd::fork-op f :dispute-yield)))))))))))
 
-;; DEP-06 "A yield binds only its author" (ruled 2026-11-24): the one place another member acts on a
-;; yield is the disputant's next DisputeEnter arriving on its yielded fork.  Pending counts as live:
-;; c holds b's re-entry while the lost_to claim b's yield names is unconfirmed, and takes it on the
-;; next tip once it confirms (RETRY-HELD-ENTERS, the watch pass).  Vector enter_after_yield.txt.
-(with-gate ("re-entry on a yielded fork waits while its yield's verdict is pending (DEP-06)")
+;; DEP-06 "A yield binds only its author" (ruled 2026-11-24, latest counts): a disputant's later
+;; DisputeEnter supersedes its earlier fork whatever that fork's yield says, and superseding never
+;; ends a pledge (DEP-03 "When a pledge is live").  b arms (pledging P), yields naming a claim not yet
+;; confirmed (void), and enters again: c takes the new entry at once; b's superseded fork keeps P
+;; held until its own yield counts.  Then c takes a re-entry over a live fork that never yielded.
+;; Vector enter_after_yield.txt.
+(with-gate ("a re-entry supersedes the disputant's fork; superseding ends no pledge (DEP-03, DEP-06)")
   (let ((lg:+current-ruleset+ "yield-evidence-v9"))   ; the reasons are v9 TLVs
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (claim (u:sha256 (hx "c1a1")))
+         (pledge (u:sha256 (hx "c0be")))
          (confirmed nil)
          (a (nd:make-node :priv (tk 11111111111111111198) :bus bus :height-fn hf))
-         (b (nd:make-node :priv (tk 22222222222222222298) :bus bus :height-fn hf))
-         (c (nd:make-node :priv (tk 33333333333333333398) :bus bus :height-fn hf
+         (b (nd:make-node :priv (tk 22222222222222222298) :bus bus :height-fn hf
                           :tx-confs-fn (lambda (txid) (and confirmed (equalp txid claim) 3))))
+         (c (nd:make-node :priv (tk 33333333333333333398) :bus bus :height-fn hf))
          (d (nd:make-node :priv (tk 44444444444444444498) :bus bus :height-fn hf))
          (la (nd:open-ledger a :reserves-id "genesis:ry" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
     (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
       (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
     (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d98")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
-    (let ((*height* (+ (lg:ledger-quorum-expiry (nd:record-ledger la)) 4)) (bk (nd:node-pubkey b)))
+    (let ((*height* (+ (lg:ledger-quorum-expiry (nd:record-ledger la)) 4)) (bk (nd:node-pubkey b))
+          (pkey (nd::outpoint-key pledge 0)))
       (check-equal "b opens an expiry dispute" (nd:dispute-expired-quorums b :grace 3) (list id))
-      (multiple-value-bind (enter eo) (nd::fork-op (nd:find-fork c id bk) :dispute-enter)
-        (check "c holds b's fork" enter)
-        (flet ((signed (seq prev height op)
-                 (let ((u (up:make-signed-update :operator-id bk :ledger-id (u:hex->bytes id) :seq seq :prev-hash prev
-                                                 :block-height height :block-hash (u:sha256 (hx (format nil "~8,'0x" height)))
-                                                 :message (op:encode-operation op))))
-                   (up:sign-operator u (nd::node-priv b)) u))
-               (deliver (u) (nd::handle-update c (w:update-event (nd::node-keypair b) u))))
-          ;; b yields naming a claim (lost_to): its verdict waits on the chain
-          (let* ((tip (first (nd::record-history (nd:find-fork c id bk))))
-                 (yu (signed (1+ (up:update-seq tip)) (up:chain-hash tip) *height* (list :type :dispute-yield :lost-to claim))))
-            (deliver yu)
-            (check "c applied b's yield" (nd::fork-op (nd:find-fork c id bk) :dispute-yield))
-            (check-equal "its verdict: pending while the claim is unconfirmed"
-                         (nd::reentry-yield-verdict (list enter yu) enter yu :chain (nd::node-chain-view c)) :pending))
-          ;; ...and enters again at the same fork point (one block later)
-          (let* ((base (find (op:field eo :last-valid-sequence) (nd::record-history (nd:find-record c id)) :key #'up:update-seq))
-                 (re (signed (up:update-seq enter) (up:chain-hash base) (1+ *height*) eo)))
-            (deliver re)
-            (let ((f (nd:find-fork c id bk)))
-              (check "pending counts as live: c kept b's yielded fork" (and f (nd::fork-op f :dispute-yield)))
-              (check "and holds the new DisputeEnter" (plusp (hash-table-count (nd::node-held-enters c)))))
-            (nd::retry-held-enters c)
-            (check "the next tip, still unconfirmed: still held" (and (nd::fork-op (nd:find-fork c id bk) :dispute-yield)
-                                                                   (plusp (hash-table-count (nd::node-held-enters c)))))
-            (setf confirmed t)
-            (nd::retry-held-enters c)
-            (let ((f (nd:find-fork c id bk)))
-              (check "once the claim confirms (valid), the re-entry replaces the yielded fork"
-                     (and f (null (nd::fork-op f :dispute-yield))
-                          (equalp (up:content-hash (nd::fork-op f :dispute-enter)) (up:content-hash re))))
-              (check-equal "nothing is held any more" (hash-table-count (nd::node-held-enters c)) 0)))))))))
+      (let ((old (nd:find-fork b id bk)))
+        (nd::commit-update b old (nd::new-update b old (list :type :dispute-armed :armed-block *height*
+                                                             :commitment-hash (make-array 20 :element-type '(unsigned-byte 8) :initial-element 7)
+                                                             :target-reserves "genesis:ry"
+                                                             :replacement-collateral-txid pledge :replacement-collateral-vout 0
+                                                             :replacement-collateral-amount 1000)))
+        (setf (gethash pkey (nd:node-pledges b)) id)
+        (check "b's fork armed, pledging P" (nd::fork-op old :dispute-armed))
+        (nd::commit-update b old (nd::new-update b old (list :type :dispute-yield :lost-to claim)))
+        (check "b yielded naming a claim not confirmed: void, P still held"
+               (and (nd::fork-op old :dispute-yield)
+                    (equal (nd::fork-pledges-held (nd::fork-pledge-events b old)) (list pkey))))
+        (check "c applied b's yield" (nd::fork-op (nd:find-fork c id bk) :dispute-yield))
+        ;; the operator moves on; b enters again at its new tip
+        (nd:add-member a la (nd:node-pubkey d) :member-ledger-id (nd::node-member-ledger-hex d))
+        (let* ((lvs (lg:ledger-sequence (nd:record-ledger (nd:find-record b id))))
+               (new (nd::enter-dispute b (nd:find-record b id) lvs :reason "quorum_expired")))
+          (check "b's re-entry opens a new fork" (and new (not (eq new old)) (eq new (nd:find-fork b id bk))))
+          (check "c takes it at once, the yield's claim still unconfirmed"
+                 (let ((f (nd:find-fork c id bk)))
+                   (and f (null (nd::fork-op f :dispute-yield))
+                        (equalp (up:content-hash (nd::fork-op f :dispute-enter)) (up:content-hash (nd::fork-op new :dispute-enter))))))
+          (check-equal "superseding ended no pledge: b's superseded fork still holds P" (nd::superseded-holds b) (list pkey))
+          (setf confirmed t)
+          (check-equal "once the claim confirms, its own yield counts: P is free" (nd::superseded-holds b) '())
+          (check "and the superseded fork is forgotten" (null (nd::node-superseded b)))))
+      ;; a re-entry over a live fork that never yielded: taken too; a relay's echo of it changes nothing
+      (nd:add-member a la (nd:node-pubkey d) :member-ledger-id (nd::node-member-ledger-hex d))
+      (let* ((base (nd:find-record c id))
+             (lvs (lg:ledger-sequence (nd:record-ledger base)))
+             (at (find lvs (nd::record-history base) :key #'up:update-seq))
+             (live (nd:find-fork c id bk))
+             (re (up:make-signed-update :operator-id bk :ledger-id (u:hex->bytes id) :seq (1+ lvs) :prev-hash (up:chain-hash at)
+                                        :block-height *height* :block-hash (u:sha256 (hx (format nil "~8,'0x" *height*)))
+                                        :message (op:encode-operation (list :type :dispute-enter :last-valid-sequence lvs :reason "quorum_expired")))))
+        (up:sign-operator re (nd::node-priv b))
+        (check "c's fork of b is live and never yielded" (and live (nd:fork-live-p c live) (null (nd::fork-op live :dispute-yield))))
+        (nd::handle-update c (w:update-event (nd::node-keypair b) re))
+        (let ((f (nd:find-fork c id bk)))
+          (check "c takes the later entry over it" (and f (not (eq f live)) (equalp (up:content-hash (nd::fork-op f :dispute-enter)) (up:content-hash re))))
+          (nd::handle-update c (w:update-event (nd::node-keypair b) re))
+          (check "the echo is not a new entry" (eq f (nd:find-fork c id bk)))))))))
 
 ;; DEP-06 "A yield binds only its author": a yield builder runs the judge first (YIELD-SELF-CHECK in
 ;; YIELD-ONCE).  Invalid: never signed or broadcast.  Pending: held, signed once the chain answers.
@@ -3288,7 +3302,7 @@
     (let ((st (nd::watch-stats n)))
       (check-equal "two passes counted" (getf st :passes) 2)
       (check-equal "every step of the pass, in order (the vault watch has its own thread)" (mapcar #'car (getf st :last-steps))
-                   '(:parked-proofs :dispute-expired :held-enters :drive-disputes :drive-rearms :dereliction :migration-watch :obligation-watch :rotation-rebroadcast))
+                   '(:parked-proofs :dispute-expired :drive-disputes :drive-rearms :dereliction :migration-watch :obligation-watch :rotation-rebroadcast))
       (check "the slow step is measured" (>= (cdr (assoc :obligation-watch (getf st :last-steps))) 240))
       (check-equal "totals add both passes" (cddr (assoc :obligation-watch (getf st :totals))) 2)
       (check "no step is shown running between passes" (null (getf st :current))))

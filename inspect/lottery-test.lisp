@@ -728,11 +728,12 @@
     (check-equal "every dispute_scope case ran" cases 5)))
 
 ;;; inspect/vectors/enter_after_yield.txt: DEP-06 "A yield binds only its author" (ruled
-;;; 2026-11-24), shared with deposits-rust (deposits-core/tests/enter_after_yield_vector.rs).
-;;; Each case runs through DISPUTE-SCOPE (the expect lines) and REENTRY-YIELD-VERDICT (verdict),
-;;; and every waiting/taken entry also through the ingest's REENTRY-TAKES-P.
-(with-gate ("enter after yield: a re-entry replaces a yielded fork only on a valid verdict (shared vector)")
-  (let ((cases 0) (verdicts 0) (keys (make-hash-table)))
+;;; 2026-11-24, latest counts), shared with deposits-rust (deposits-core/tests/
+;;; enter_after_yield_vector.rs; deposits-node enter_after_yield_pledge_tests).  The scope cases
+;;; through DISPUTE-SCOPE; the pledge cases through what a superseded fork of ours keeps
+;;; (SUPERSEDED-ENTRY, SUPERSEDED-PLEDGES-HELD) and FORK-PLEDGES-HELD for the forks still ours.
+(with-gate ("enter after yield: latest counts, and superseding ends no pledge (shared vector)")
+  (let ((cases 0) (pledge-cases 0) (keys (make-hash-table)))
     (labels ((key (c) (or (gethash c keys)
                           (setf (gethash c keys) (let ((k (make-array 33 :element-type '(unsigned-byte 8) :initial-element (char-code c))))
                                                    (setf (aref k 0) 2) k))))
@@ -746,14 +747,21 @@
                                           (push c cur)))
                              (when cur (push (coerce (nreverse cur) 'string) out))
                              (nreverse out))))
-      (let ((ups '()) (name nil) (chain (make-hash-table :test #'equalp)) (no-chain nil))
+      (let ((ups '()) (name nil) (pledge nil) (forks '()) (superseded '()) (seen '()) (others '()))
         ;; ups: (tag fork-tag update), in input order
         (labels ((built (tag) (third (find tag ups :key #'first :test #'string=)))
                  (ref (tag) (let ((u (built tag))) (if u (up:content-hash u) (str-hash (format nil "enter_after_yield:~a" tag)))))
                  (chn (tag) (let ((u (built tag)))
                               (if u (up:chain-hash u) (u:sha256 (u:cat (str-hash (format nil "enter_after_yield:~a" tag)) (make-array 64 :element-type '(unsigned-byte 8) :initial-element 0))))))
                  (txid (n) (str-hash (format nil "tx:~a" n)))
-                 (view () (if no-chain nil (lambda (tx) (gethash tx chain))))
+                 (fork-events (n &key (later t))    ; fork N's ops as FORK-PLEDGE-EVENTS gives them (LATER: now)
+                   (loop for o in (reverse (cdr (assoc n forks)))
+                         collect (cond ((string= (first o) "enter") (list :enter))
+                                       ((string= (first o) "arm") (list :arm (format nil "~a:0" (u:bytes->hex (txid (second o))))
+                                                                        (if (third o) (parse-integer (third o)) 1)))
+                                       ((string= (first o) "yield")
+                                        (if (or (string= (second o) "seen") (and later (member n seen))) (list :yield) (list :void-yield)))
+                                       ((string= (first o) "acquire") (list :acquire "claim:0" (string= (second o) "binds"))))))
                  (msg (rest)
                    (let ((kind (first rest)))
                      (op:encode-operation
@@ -777,9 +785,29 @@
             (loop for line = (read-line in nil) while line
                   for w = (words line)
                   do (cond ((or (null w) (char= (char (first w) 0) #\#)))
-                           ((string= (first w) "case") (setf name (second w) ups '() no-chain nil) (clrhash chain))
-                           ((string= (first w) "chain") (setf (gethash (txid (second w)) chain) (parse-integer (third w))))
-                           ((string= (first w) "nochain") (setf no-chain t))
+                           ((string= (first w) "case") (setf name (second w) ups '() pledge nil))
+                           ((string= (first w) "pledge")
+                            (setf name (second w) pledge t forks '() superseded '() seen '() others '()))
+                           ((string= (first w) "end") (setf pledge nil))
+                           ((and pledge (string= (first w) "fork"))
+                            (let* ((n (parse-integer (second w))) (cell (assoc n forks)))
+                              (unless cell (setf cell (list n)) (setf forks (append forks (list cell))))
+                              (push (cddr w) (cdr cell))))
+                           ((and pledge (string= (first w) "supersede")) (push (parse-integer (second w)) superseded))
+                           ((and pledge (string= (first w) "later-seen")) (push (parse-integer (second w)) seen))
+                           ((and pledge (string= (first w) "others")) (push (parse-integer (second w)) others))
+                           ((and pledge (string= (first w) "held"))
+                            (incf pledge-cases)
+                            (let ((got (loop for (n) in forks
+                                             append (if (member n superseded)
+                                                        ;; kept at the supersede (its void yield unseen), judged now
+                                                        (let ((e (nd::superseded-entry "ledger" (fork-events n :later nil) :yield-txid (txid "yield"))))
+                                                          (and e (nd::superseded-pledges-held e :others others :yield-seen (and (member n seen) t))))
+                                                        (nd::fork-pledges-held (fork-events n) :others others))))
+                                  (want (loop for c in (rest w) unless (string= c "-")
+                                              collect (format nil "~a:0" (u:bytes->hex (txid c))))))
+                              (check-equal (format nil "enter_after_yield pledge ~a" name)
+                                           (sort (copy-list got) #'string<) (sort (copy-list want) #'string<))))
                            ((string= (first w) "u")
                             (let* ((who (char (second w) 0)) (seq (parse-integer (third w))) (rest (cdddr w))
                                    (tag (or (opt rest "as=") (format nil "~a:~a" who seq)))
@@ -799,20 +827,13 @@
                                                              :block-hash (b32 1) :operator-sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element 0)
                                                              :message (msg rest))))
                               (setf ups (append ups (list (list tag fork u))))))
-                           ((string= (first w) "verdict")
-                            (let* ((e (find (second w) ups :key #'first :test #'string=))
-                                   (enter (built (second e))))
-                              (incf verdicts)
-                              (check-equal (format nil "enter_after_yield ~a: verdict" name)
-                                           (string-downcase (symbol-name (nd::reentry-yield-verdict (mapcar #'third ups) enter (third e) :chain (view))))
-                                           (third w))))
                            ((string= (first w) "expect")
                             (let* ((all (mapcar #'third ups))
-                                   (kept (nd::dispute-scope all :chain (view)))
+                                   (kept (nd::dispute-scope all))
                                    (got (mapcar (lambda (k) (first (find k ups :key #'third))) kept)))
                               (incf cases)
                               (check-equal (format nil "enter_after_yield ~a" name) got (rest w))))))))
-        (check-equal "every enter_after_yield case ran" (list cases verdicts) '(20 19))))))
+        (check-equal "every enter_after_yield case ran" (list cases pledge-cases) '(13 8))))))
 
 (defun split-sequence-simple (s)
   (let ((out '()) (cur '()))
