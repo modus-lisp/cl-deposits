@@ -49,7 +49,7 @@
 ;; change is a new name.
 (defparameter +rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7" "strict-lottery-v8" "yield-evidence-v9"))
 (defparameter +supported-rulesets+ '("cltv-offset-v2" "fee-cap-v3" "balance-commit-v4" "anchor-ladder-v5" "balance-anchor-v6" "grounded-arms-v7" "strict-lottery-v8" "yield-evidence-v9"))
-(defparameter +current-ruleset+ "strict-lottery-v8"
+(defparameter +current-ruleset+ "yield-evidence-v9"
   "What a new ledger's LedgerOpen names, and what a quorum moves to when every member declares it.")
 
 (defparameter +ruleset-rules+
@@ -67,10 +67,6 @@
      :grounded-arms :strict-lottery :fraud-survives-rotation :acquire-on-confirm
      :expiry-ends-on-spend :recorded-threshold-answer :yield-evidence))
   "DEP-18: the gated rules each ruleset adds to the intrinsic ones.")
-
-;; DEP-18 §operator policy step 1 names +CURRENT-RULESET+, not yet yield-evidence-v9: an operator
-;; names v9 only by its own choice, since one yield (an un-armed expiry disputant standing down for
-;; a punitive dispute) has no reason among its three (held for a ruling, 2026-11-23).
 
 (defun ruleset-rule-p (ruleset rule)
   "Does RULESET (a name, or NIL for none) enforce the gated RULE?  NIL is dormant: a ledger
@@ -164,11 +160,12 @@
 
 (defun planned-ruleset (current declarations)
   "DEP-18 §operator policy, not consensus: the ruleset an operator names at its next QuorumBegin.
-   strict-lottery-v8 (+current-ruleset+) when every member declares it, else grounded-arms-v7, else balance-anchor-v6 when
+   yield-evidence-v9 (+current-ruleset+) when every member declares it, else strict-lottery-v8, else grounded-arms-v7, else balance-anchor-v6 when
    every member declares that; otherwise a balance-commit-v4 ledger keeps it (anchor-ladder-v5 lacks MissingBalanceCommitment), any other
    moves to anchor-ladder-v5 when every member declares it; else the current ruleset, else
    cltv-offset-v2."
   (cond ((every-declares-p +current-ruleset+ declarations) +current-ruleset+)
+        ((every-declares-p "strict-lottery-v8" declarations) "strict-lottery-v8")
         ((every-declares-p "grounded-arms-v7" declarations) "grounded-arms-v7")
         ((every-declares-p "balance-anchor-v6" declarations) "balance-anchor-v6")
         ((equal current "balance-commit-v4") current)
@@ -1097,7 +1094,7 @@
        ;; yield-evidence-v9 (the fork point's ruleset): exactly one reason (DEP-06 "What a yield must
        ;; say").  Under an earlier ruleset a yield is taken as before, reason or none.
        (when (and (ruleset-rule-p (ledger-active-ruleset ledger) :yield-evidence)
-                  (/= 1 (count-if #'f '(:lost-to :reestablished :excluded-by))))
+                  (/= 1 (count-if #'f '(:lost-to :reestablished :excluded-by :superseded-by))))
          (fail :dispute-yield "under yield-evidence-v9 a yield carries exactly one reason"))
        (setf (ledger-dispute-state ledger) :tombstoned))
       (:transfer-lock

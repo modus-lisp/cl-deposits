@@ -784,15 +784,14 @@
   "FORK's yields are judged under yield-evidence-v9 (its ruleset, the fork point's)."
   (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :yield-evidence))
 
-;; Case C5 of the yield-builder audit, HELD pending a ruling (2026-11-23): an un-armed expiry
-;; fork standing down for our punitive dispute of the same ledger has none of yield-evidence-v9's
-;; three reasons (its expiry ground is not answered).  The choices before the user: retire it
-;; without a yield, or a fourth reason superseded_by (the hash of our own later DisputeEnter,
-;; un-armed forks only).  Kept here, alone, so either is a small change; until then it is today's
-;; behaviour: YIELD-ONCE with no reason, which under v9 holds (signs nothing) and is a no-op.
-(defun stand-down-for-punitive (node expiry)
-  "Yield our un-armed expiry fork EXPIRY because a punitive dispute of its ledger supersedes it."
-  (yield-once node expiry))
+;; Case C5 of the yield-builder audit, ruled 2026-11-24 (option B): an un-armed expiry fork
+;; standing down for our punitive dispute of the same ledger yields naming that dispute's
+;; DisputeEnter, reason 4 superseded_by (TLV 373: its content hash; DEP-06 "What a yield must say").
+(defun stand-down-for-punitive (node expiry superseding)
+  "Yield our un-armed expiry fork EXPIRY because our DisputeEnter SUPERSEDING (a signed update, not
+   yet committed) of the same ledger supersedes it.  Earlier rulesets: no reason, as before."
+  (yield-once node expiry :reason (and (fork-yield-evidence-p expiry)
+                                       (list :superseded-by (up:content-hash superseding)))))
 
 (defun yield-once (node fork &key reason)
   "Yield our FORK: adopt the DisputeYield of ours the relays already hold at its next sequence,
@@ -801,7 +800,7 @@
    the yield's evidence, a plist of one of :LOST-TO :REESTABLISHED :EXCLUDED-BY (DEP-06 \"What a
    yield must say\"): carried whenever known, and required under yield-evidence-v9, where a yield
    without one is never signed (the fold would refuse it)."
-  (when (and (fork-yield-evidence-p fork) (/= 1 (count-if (lambda (k) (getf reason k)) '(:lost-to :reestablished :excluded-by))))
+  (when (and (fork-yield-evidence-p fork) (/= 1 (count-if (lambda (k) (getf reason k)) '(:lost-to :reestablished :excluded-by :superseded-by))))
     (log! node "yield of ~a held: yield-evidence-v9 needs exactly one reason, have ~s" (subseq (record-id-hex fork) 0 8) reason)
     (return-from yield-once nil))
   (let* ((tip (tip fork)) (seq (if tip (1+ (up:update-seq tip)) 0))
@@ -809,7 +808,7 @@
                  (error (e) (log! node "yield of ~a held: the relay query failed: ~a" (subseq (record-id-hex fork) 0 8) e)
                    (return-from yield-once nil)))))
     (cond ((null ours) (commit-update node fork (new-update node fork (append (list :type :dispute-yield)
-                                                                               (loop for k in '(:lost-to :reestablished :excluded-by)
+                                                                               (loop for k in '(:lost-to :reestablished :excluded-by :superseded-by)
                                                                                      when (getf reason k) append (list k (getf reason k)))))))
           ((and (null (rest ours))
                 (eq (getf (ignore-errors (op:update-op (first ours))) :type) :dispute-yield)
@@ -4492,7 +4491,7 @@
         finally (return :not-this-lottery)))
 
 (defun judge-yield (&key ruleset reasons yield-height (arm-round 1) yielder targets pledges vaults tx-fn
-                      dispute-reason last-valid-sequence quorum-begins participants)
+                      dispute-reason last-valid-sequence quorum-begins participants ledger-id fork-enter-seq enters)
   "The verdict on a DisputeYield: (values VERDICT WHY), VERDICT :valid, :invalid or :pending (no
    verdict yet: asked again).  RULESET: the fork's (the fork point's).  REASONS: a plist of the
    yield's :lost-to / :reestablished / :excluded-by.  YIELD-HEIGHT: its signed block_height.
@@ -4501,9 +4500,12 @@
    declared.  VAULTS: the dispute's vault outpoints (JUDGE-ACQUIRE).  TX-FN: txid -> (values tx
    height-or-NIL), NIL when unknown.  DISPUTE-REASON / LAST-VALID-SEQUENCE: the fork's DisputeEnter.
    QUORUM-BEGINS: the operator chain's QuorumBegins as (content-hash seq spend-confirmed-p).
-   PARTICIPANTS: the x-only keys of the lottery an :excluded-by names, as the judge rebuilt it."
+   PARTICIPANTS: the x-only keys of the lottery an :excluded-by names, as the judge rebuilt it.
+   :SUPERSEDED-BY (ruled 2026-11-24): LEDGER-ID is the fork's ledger, FORK-ENTER-SEQ the sequence
+   of the yielded fork's own DisputeEnter, ENTERS the DisputeEnters the judge holds, each a plist
+   (:hash :by x-only :ledger :seq :punitive :on-ledger); ARM-ROUND 0 is a fork that never armed."
   (unless (lg:ruleset-rule-p ruleset :yield-evidence) (return-from judge-yield (values :valid :legacy)))
-  (let ((named (loop for k in '(:lost-to :reestablished :excluded-by) when (getf reasons k) collect k)))
+  (let ((named (loop for k in '(:lost-to :reestablished :excluded-by :superseded-by) when (getf reasons k) collect k)))
     (unless (= 1 (length named)) (return-from judge-yield (values :invalid :no-reason)))
     (let ((hash (getf reasons (first named)))
           (conf-fn (lambda (txid) (multiple-value-bind (tx height) (funcall tx-fn txid)
@@ -4535,6 +4537,18 @@
                    ((null q) (values :pending :unknown-quorum-begin))
                    ((<= (second q) (or last-valid-sequence -1)) (values :invalid :not-after-fork-point))
                    ((not (third q)) (values :pending :rotation-unconfirmed))
+                   (t (values :valid :valid)))))
+          (:superseded-by
+           ;; DEP-06, reason 4: a fork that never armed, superseded by its disputant's own later
+           ;; DisputeEnter of the same ledger that is on the ledger.
+           (let ((e (find hash enters :key (lambda (e) (getf e :hash)) :test #'equalp)))
+             (cond ((plusp arm-round) (values :invalid :armed))
+                   ((null e) (values :pending :unknown-dispute-enter))
+                   ((not (equalp (getf e :by) yielder)) (values :invalid :other-disputant))
+                   ((not (equalp (getf e :ledger) ledger-id)) (values :invalid :other-ledger))
+                   ((not (if (getf e :punitive) (>= (getf e :seq) fork-enter-seq) (> (getf e :seq) fork-enter-seq)))
+                    (values :invalid :not-later))
+                   ((not (getf e :on-ledger)) (values :invalid :not-on-ledger))
                    (t (values :valid :valid)))))
           (:excluded-by
            (seen hash)
@@ -4665,10 +4679,10 @@
                               qb-seq disputes :ruleset (lg:ledger-active-ruleset (record-ledger rec)))))
     (when why (fail "ledger disputed: ~a" why))))
 
-(defun make-fork (node rec last-valid-seq operator33)
+(defun make-fork (node rec last-valid-seq operator33 &key (insert t))
   "A fork of REC's ledger from LAST-VALID-SEQ, operated by OPERATOR33: the
    truncated history replayed, quorum cleared (the reference does the same,
-   so fork operations need no cosignatures)."
+   so fork operations need no cosignatures).  INSERT NIL: not yet entered in our table."
   ;; The base's history is shared from the fork point (not copied), and its state comes from the
   ;; nearest checkpoint: replaying the whole chain per fork was seconds of CPU and a second copy
   ;; of every update list in memory (signet soak, 2026-10-28: 7 forks of a 190k-update ledger).
@@ -4677,7 +4691,7 @@
           (lg:ledger-quorum-members ledger) '() (lg:ledger-next-quorum-members ledger) '())
     (let ((fork (make-view rec last-valid-seq :fork-p t :fork-operator operator33
                                               :owned-p (equalp operator33 (node-pubkey node)) :ledger ledger)))
-    (setf (gethash (fork-key (record-id-hex rec) operator33) (node-ledgers node)) fork)
+    (when insert (setf (gethash (fork-key (record-id-hex rec) operator33) (node-ledgers node)) fork))
     fork)))
 
 (defvar *received-broadcast* nil
@@ -4733,10 +4747,20 @@
   (let ((expiry (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and expiry (null anchor-block-height) (not (expiry-reason-p reason))
                (unarmed-expiry-fork-p expiry))
-      (stand-down-for-punitive node expiry)
-      (release-pledges node (record-id-hex rec))
-      (note-dispute node (record-id-hex rec) "un-armed expiry dispute yielded for a punitive one (~a)" reason)
-      (retire-fork node expiry)))
+      ;; The punitive DisputeEnter is signed first, on a fork view not yet in our table (one key,
+      ;; one fork per ledger here), so the yield can name it (superseded_by); then the expiry fork
+      ;; yields and is retired, and the punitive one takes its place.
+      (let* ((view (make-fork node rec last-valid-seq (node-pubkey node) :insert nil))
+             (enter (new-update node view (punitive-enter-op last-valid-seq reason anchor-block-hash anchor-block-height
+                                                             fraud-proof-hash fraud-proof))))
+        (stand-down-for-punitive node expiry enter)
+        (release-pledges node (record-id-hex rec))
+        (note-dispute node (record-id-hex rec) "un-armed expiry dispute yielded for a punitive one (~a)" reason)
+        (retire-fork node expiry)
+        (setf (gethash (fork-key (record-id-hex rec) (node-pubkey node)) (node-ledgers node)) view)
+        (commit-update node view enter)
+        (drive-dispute-now node view)
+        (return-from enter-dispute view))))
   ;; One DisputeEnter per dispute: a live fork that already entered keeps the grounds it entered
   ;; on (a second, groundless one would be its latest and lose them, DEP-03 §Grounded arms).
   (let ((live (find-fork node (record-id-hex rec) (node-pubkey node))))
@@ -4748,13 +4772,18 @@
       (return-from enter-dispute live)))
   (let ((fork (or (find-fork node (record-id-hex rec) (node-pubkey node))
                   (make-fork node rec last-valid-seq (node-pubkey node)))))
-    (commit-update node fork (new-update node fork (%strip-nil-fields
-                                                    (list :type :dispute-enter :last-valid-sequence last-valid-seq :reason reason
-                                                          :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height
-                                                          :fraud-proof-hash fraud-proof-hash
-                                                          :fraud-proof (dispute-grounds-json fraud-proof-hash fraud-proof)))))
+    (commit-update node fork (new-update node fork (punitive-enter-op last-valid-seq reason anchor-block-hash anchor-block-height
+                                                                      fraud-proof-hash fraud-proof)))
     (drive-dispute-now node fork)
     fork))
+
+(defun punitive-enter-op (last-valid-seq reason anchor-block-hash anchor-block-height fraud-proof-hash fraud-proof)
+  "The DisputeEnter operation ENTER-DISPUTE publishes."
+  (%strip-nil-fields
+   (list :type :dispute-enter :last-valid-sequence last-valid-seq :reason reason
+         :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height
+         :fraud-proof-hash fraud-proof-hash
+         :fraud-proof (dispute-grounds-json fraud-proof-hash fraud-proof))))
 
 (defun dispute-lottery-n (rec &optional fork-point)
   "N disputants = the DEP-06 recovery voters."

@@ -1242,7 +1242,8 @@
 
 (defun ye-reasons (r)
   "A vector `reasons` object as YIELD-ONCE's plist: txids as wire bytes, the reestablished hash as written."
-  (loop for (json key txid) in '(("lost_to" :lost-to t) ("reestablished" :reestablished nil) ("excluded_by" :excluded-by t))
+  (loop for (json key txid) in '(("lost_to" :lost-to t) ("reestablished" :reestablished nil) ("excluded_by" :excluded-by t)
+                                 ("superseded_by" :superseded-by nil))
         for x = (gethash json r)
         when (stringp x) append (list key (if txid (u:txid-bytes x) (u:hex->bytes x)))))
 
@@ -1281,10 +1282,16 @@
                                   :last-valid-sequence (gethash "last_valid_sequence" (gethash "dispute" c))
                                   :quorum-begins (map 'list (lambda (q) (list (u:hex->bytes (gethash "hash" q)) (gethash "seq" q) (eq (gethash "spend_confirmed" q) t)))
                                                       (gethash "quorum_begins" c))
-                                  :participants (map 'list #'u:hex->bytes (gethash "participants" c)))
+                                  :participants (map 'list #'u:hex->bytes (gethash "participants" c))
+                                  :ledger-id (u:hex->bytes (gethash "ledger" c)) :fork-enter-seq (gethash "fork_enter_seq" c)
+                                  :enters (map 'list (lambda (e) (list :hash (u:hex->bytes (gethash "hash" e)) :by (u:hex->bytes (gethash "by" e))
+                                                                       :ledger (u:hex->bytes (gethash "ledger" e)) :seq (gethash "seq" e)
+                                                                       :punitive (not (nd::expiry-reason-p (gethash "reason" e)))
+                                                                       :on-ledger (eq (gethash "on_ledger" e) t)))
+                                               (gethash "enters" c)))
                (check-equal (format nil "verdict: ~a" name) (string-downcase (symbol-name verdict)) (gethash "verdict" c))
                (check-equal (format nil "why: ~a" name) (string-downcase (symbol-name why)) (gethash "why" c))))
-    (check "every yield_evidence case ran" (>= n 24))))
+    (check "every yield_evidence case ran" (>= n 35))))
 
 ;;; inspect/vectors/rearm_round_agree.json: DEP-03 §"The dispute" and DEP-06 Phase 4 step 2 over
 ;;; real regtest ledgers (2026-11-19/21), shared with deposits-rust (armers.rs) and the spec.  A
