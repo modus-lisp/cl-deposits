@@ -5431,7 +5431,8 @@
   "UPDATES (a disputed ledger's, every operator's) reduced to its current dispute (see above), a
    function of the SET of UPDATES: each disputant takes part through its counted DisputeEnter
    (COUNTED-ENTRY: canonical order, latest counts, an acquired fork never superseded) and the
-   updates on that fork's chain (FORK-FROM) past its fork point; superseding ends no pledge
+   updates on the chain it is on, from that chain's first entry (CHAIN-ROOT, CHAIN-FROM), past its
+   fork point; superseding ends no pledge
    (DEP-03 \"When a pledge is live\").  As deposits-rust's rotation_order::dispute_scope.  Vector
    inspect/vectors/enter_after_yield.txt."
   (let* ((open (find-if (lambda (u) (zerop (up:update-seq u))) updates))
@@ -5460,8 +5461,11 @@
                      (when (and (equalp (up:update-operator-id u) (up:update-operator-id cur))
                                 (equalp (up:content-hash u) (up:content-hash cur)) (> (up:update-seq u) lvs))
                        (setf (gethash u keep) t)))
-                   (dolist (u (fork-from updates cur))
-                     (when (> (up:update-seq u) lvs) (setf (gethash u keep) t))))
+                   ;; the chain CUR is on, from its first entry (a continuation shares its fork's)
+                   (let ((mine (remove-if-not (lambda (u) (equalp (up:update-operator-id u) (up:update-operator-id cur))) updates)))
+                     (dolist (u (chain-from mine (chain-root mine cur)))
+                       (when (and (> (up:update-seq u) lvs) (not (eq (%op-type u) :dispute-enter)))
+                         (setf (gethash u keep) t)))))
           (remove-if-not (lambda (u) (or (equalp (up:update-operator-id u) origin) (gethash u keep))) updates)))))
 
 (defun node-chain-view (node)
