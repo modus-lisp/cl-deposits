@@ -1749,30 +1749,35 @@
         ((not (equalp signer (node-pubkey node)))
          (ingest-member-update node rec id signer update))))))
 
+(defun entry-supersedes-p (old new &key acquired)
+  "DEP-03 \"The dispute\" (latest counts, ruled 2026-11-24): whether a disputant's DisputeEnter
+   NEW supersedes OLD, the entry its counted fork opened, both at or above Q.  Never a fork its
+   author ACQUIRED on (a DisputeAcquire on it); else a later sequence, or at the same sequence a
+   punitive entry over an expiry one.  DISPUTE-SCOPE and the ingest (SUPERSEDES-FORK-P) both ask
+   this, as deposits-rust's rotation_order::dispute_scope does.  Vector enter_after_yield.txt."
+  (and (not acquired)
+       (let ((so (up:update-seq old)) (sn (up:update-seq new)))
+         (or (> sn so)
+             (and (= sn so)
+                  (expiry-reason-p (op:field (op:update-op old) :reason))
+                  (not (expiry-reason-p (op:field (op:update-op new) :reason))))))))
+
 (defun supersedes-fork-p (rec fork update)
-  "Whether a disputant's DisputeEnter UPDATE supersedes its FORK we hold (DEP-03 \"The dispute\":
-   its latest DisputeEnter counts, ruled 2026-11-24 \"latest counts\"), whatever the fork's yield
-   says or whether it yielded at all: a later sequence, or at the fork's own sequence a punitive
-   entry over an expiry one (DEP-06 reason 4, superseded_by).  Not a relay's echo of one the fork
-   holds, not one chained onto the fork's own tip (a continuation), not a fork whose custody changed (a DisputeAcquire: its author is the operator now and
-   enters no dispute of the ledger), and not an entry the scope would not count: one forking below
-   Q, the latest QuorumBegin of REC (the disputed ledger) at or below either fork point.
+  "Whether a disputant's DisputeEnter UPDATE replaces its FORK we hold (ENTRY-SUPERSEDES-P),
+   whatever the fork's yield says or whether it yielded at all.  Not a relay's echo of the entry
+   the fork holds, not one chained onto the fork's own tip (a continuation: it is accepted on the
+   fork and counts from there), and not an entry the scope would not count: one forking below Q,
+   the latest QuorumBegin of REC (the disputed ledger) at or below either fork point.
    Superseding ends no pledge (RETIRE-FORK :SUPERSEDED)."
   (multiple-value-bind (old oo) (fork-op fork :dispute-enter)
-    (let* ((no (op:update-op update))
-           (lvs (op:field no :last-valid-sequence))
+    (let* ((lvs (op:field (op:update-op update) :last-valid-sequence))
            (top (max lvs (or (and oo (op:field oo :last-valid-sequence)) 0)))
            (q (record-latest rec :quorum-begin :below (1+ top))))
-      (cond ((null old) nil)
-            ((fork-op fork :dispute-acquire) nil)
-            ((equalp (up:content-hash old) (up:content-hash update)) nil)
-            ;; one signed on top of the fork itself (ENTER-DISPUTE on its own live fork) continues it
-            ((let ((tp (tip fork))) (and tp (equalp (up:update-prev-hash update) (up:chain-hash tp)))) nil)
-            ((and q (< lvs (up:update-seq q))) nil)
-            ((> (up:update-seq update) (up:update-seq old)) t)
-            ((= (up:update-seq update) (up:update-seq old))
-             (and (expiry-reason-p (op:field oo :reason)) (not (expiry-reason-p (op:field no :reason)))))
-            (t nil)))))
+      (and old
+           (not (equalp (up:content-hash old) (up:content-hash update)))
+           (let ((tp (tip fork))) (not (and tp (equalp (up:update-prev-hash update) (up:chain-hash tp)))))
+           (not (and q (< lvs (up:update-seq q))))
+           (entry-supersedes-p old update :acquired (fork-op fork :dispute-acquire))))))
 
 (defun ingest-member-update (node rec id signer update)
   "A quorum member's dispute fork (or its continuation)."
@@ -5305,7 +5310,7 @@
                             when (and (not (equalp (up:update-operator-id u) origin))
                                       (eq (%op-type u) :dispute-enter))
                               collect (list (up:update-operator-id u) (up:update-seq u)
-                                            (op:field (op:update-op u) :last-valid-sequence))))))
+                                            (op:field (op:update-op u) :last-valid-sequence) u)))))
     (if (null enters)
         updates
         (let* ((top (reduce #'max enters :key #'third))
@@ -5315,16 +5320,20 @@
                               maximize (up:update-seq u))
                       0))
                (fork-of (make-hash-table :test #'equalp)))
-          (dolist (e enters)
-            (destructuring-bind (op seq lvs) e
-              (when (>= lvs q)
-                (let ((cur (gethash op fork-of)))
-                  (when (or (null cur) (> seq (car cur))) (setf (gethash op fork-of) (cons seq lvs)))))))
-          ;; a repeat entry after the counted one names no fork point (vector rearm_round_agree.json)
+          ;; each disputant's counted entry: in sequence order (stable), ENTRY-SUPERSEDES-P
+          (dolist (e (stable-sort (remove-if (lambda (e) (< (third e) q)) enters) #'< :key #'second))
+            (let ((cur (gethash (first e) fork-of)))
+              (when (or (null cur)
+                        (entry-supersedes-p cur (fourth e)
+                                            :acquired (some (lambda (u) (eq (%op-type u) :dispute-acquire)) (fork-from updates cur))))
+                (setf (gethash (first e) fork-of) (fourth e)))))
+          ;; any other entry (below Q, superseded, not superseding) names no fork point
+          ;; (vector rearm_round_agree.json)
           (remove-if-not (lambda (u) (or (equalp (up:update-operator-id u) origin)
                                          (let ((f (gethash (up:update-operator-id u) fork-of)))
-                                           (and f (> (up:update-seq u) (cdr f))
-                                                (or (= (up:update-seq u) (car f)) (not (eq (%op-type u) :dispute-enter)))))))
+                                           (and f (> (up:update-seq u) (op:field (op:update-op f) :last-valid-sequence))
+                                                (or (equalp (up:content-hash u) (up:content-hash f))
+                                                    (not (eq (%op-type u) :dispute-enter)))))))
                          updates)))))
 
 (defun node-chain-view (node)
