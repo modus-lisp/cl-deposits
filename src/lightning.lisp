@@ -9,6 +9,7 @@
 
 (defpackage #:cl-deposits.lightning
   (:use #:cl #:cl-deposits.util)
+  (:local-nicknames (#:sock #:cl-transport.sockets))
   (:export #:ln-make-invoice #:ln-invoice-status #:ln-pay #:ln-payment-status #:clp-backend #:make-clp-backend
            #:mock-ln #:make-mock-ln #:mock-ln-settle #:mock-ln-external-invoice #:invoice-cosign-message
            #:invoice-payment-hash #:invoice-amount-msat #:ln-refused #:mock-ln-hold #:mock-ln-resolve))
@@ -56,13 +57,13 @@
 (defun make-clp-backend (host port) (%make-clp-backend :host host :port port))
 
 (defun clp-call (backend form)
-  (let ((sock (usocket:socket-connect (clp-backend-host backend) (clp-backend-port backend))))
+  (let ((conn (sock:tcp-connect (clp-backend-host backend) (clp-backend-port backend))))
     (unwind-protect
-         (let ((s (usocket:socket-stream sock)))
+         (let ((s (sock:tcp-socket-stream conn :element-type 'character)))
            (write-line form s) (finish-output s)
            (let ((line (read-line s nil nil)))
              (and line (let ((*read-eval* nil)) (read-from-string line)))))
-      (usocket:socket-close sock))))
+      (sock:tcp-close conn))))
 
 (defmethod ln-make-invoice ((b clp-backend) amount-msat description)
   (let ((r (clp-call b (let ((*print-pretty* nil))

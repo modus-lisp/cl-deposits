@@ -17,7 +17,8 @@
   (:use #:cl #:cl-deposits.util)
   (:local-nicknames (#:nd #:cl-deposits.node) (#:lg #:cl-deposits.ledger) (#:up #:cl-deposits.update)
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
-                    (#:bus #:cl-deposits.bus) (#:js #:json-simple) (#:fr #:cl-deposits.fraud))
+                    (#:bus #:cl-deposits.bus) (#:js #:json-simple) (#:fr #:cl-deposits.fraud)
+                    (#:sock #:cl-transport.sockets))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
            #:bitcoin-cli-broadcast-fn #:bitcoin-cli-tx-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn #:bitcoin-cli-feerate-fn #:bitcoin-cli-tx-confs-fn))
 (in-package #:cl-deposits.daemon)
@@ -331,22 +332,23 @@
     (error (e) (let ((*print-pretty* nil)) (format nil "~s" (list :status :error :message (princ-to-string e)))))))
 
 (defun start-control-server (node port)
-  (let ((sock (usocket:socket-listen "127.0.0.1" port :reuse-address t)))
+  (let ((listener (sock:tcp-listen :host "127.0.0.1" :port port)))
     (bt:make-thread
      (lambda ()
        (loop
-         (let ((client (usocket:socket-accept sock)))
-           (bt:make-thread
+         (let ((client (sock:tcp-accept listener)))   ; NIL: an hour with no client
+           (when client
+            (bt:make-thread
             (lambda ()
               (handler-case
-                  (let ((stream (usocket:socket-stream client)))
+                  (let ((stream (sock:tcp-socket-stream client :element-type 'character)))
                     (loop for line = (read-line stream nil nil) while line
                           do (let* ((form (handler-case (let ((*read-eval* nil)) (read-from-string line)) (error () nil)))
                                     (reply (if (consp form) (handle-command node form) "(:status :error :message \"unreadable\")")))
                                (write-line reply stream) (finish-output stream))))
                 (error () nil))
-              (ignore-errors (usocket:socket-close client)))
-            :name "cld-control-client"))))
+              (sock:tcp-close client))
+            :name "cld-control-client")))))
      :name "cld-control")
     port))
 
@@ -449,20 +451,19 @@
           do (let ((conn (bt:with-lock-held ((rpc-endpoint-lock e))
                            (loop for c = (pop (rpc-endpoint-pool e)) while c
                                  if (< (- now (cdr c)) *rpc-idle-seconds*) return (car c)
-                                   else do (ignore-errors (usocket:socket-close (car c)))))))
+                                   else do (sock:tcp-close (car c) :abort t)))))
                (when (or (null conn) (plusp attempt))
-                 (when conn (ignore-errors (usocket:socket-close conn)))
-                 (setf conn (usocket:socket-connect (rpc-endpoint-host e) (rpc-endpoint-port e)
-                                                    :element-type '(unsigned-byte 8) :timeout 10)))
+                 (when conn (sock:tcp-close conn :abort t))
+                 (setf conn (sock:tcp-connect (rpc-endpoint-host e) (rpc-endpoint-port e) :timeout-secs 10)))
                (handler-case
-                   (let ((s (usocket:socket-stream conn)))
+                   (let ((s (sock:tcp-socket-stream conn)))
                      (write-sequence request s) (finish-output s)
                      (multiple-value-bind (status body) (rpc-read-response s)
                        (bt:with-lock-held ((rpc-endpoint-lock e))
                          (push (cons conn (get-universal-time)) (rpc-endpoint-pool e)))
                        (return-from rpc-exchange (values status body))))
                  (error (err)
-                   (ignore-errors (usocket:socket-close conn))
+                   (sock:tcp-close conn :abort t)
                    (when (plusp attempt) (error err))))))))
 
 (defun rpc-call-text (e method args)

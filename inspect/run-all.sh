@@ -37,5 +37,6 @@ lisp_gate nodes   inspect/update-test.lisp inspect/operation-test.lisp inspect/i
 lisp_gate property inspect/update-test.lisp inspect/operation-test.lisp inspect/property-test.lisp
 lisp_gate chaos    inspect/chaos-test.lisp
 lisp_gate restart  inspect/index-test.lisp inspect/restart-test.lisp
+lisp_gate sockets  inspect/sockets-test.lisp   # bitcoind RPC vs Python http.server, control sockets
 echo; echo "$pass passed, $fail failed ${failed[*]:+(${failed[*]})}"
 [ "$fail" -eq 0 ]

@@ -8,7 +8,7 @@
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("sb-posix" "natrium" "secp256k1-fast" "bordeaux-threads" "cl-consensus" "cl-nostr" "json-simple" "usocket")
+  :depends-on ("sb-posix" "natrium" "secp256k1-fast" "bordeaux-threads" "cl-consensus" "cl-nostr" "json-simple" "cl-transport/sockets")
   :serial t
   :components
   ((:module "src"
