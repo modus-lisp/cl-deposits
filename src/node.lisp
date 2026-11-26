@@ -153,6 +153,9 @@
   (pledge-fn nil)                              ; (lambda (txid vout scan-from)) -> plist :created :value-sats :spend (DEP-03 cut), or NIL
   (utxos-fn nil)                               ; (lambda (address)) -> list of plists :txid :vout :sats :confirmations
   (pledges (make-hash-table :test #'equal :synchronized t))   ; "txidhex:vout" -> ledger id hex we pledged it to
+  (superseded '())                             ; what our superseded forks still hold (NOTE-SUPERSEDED)
+  ;; "ledger_disputant" -> that member's updates not on the fork we hold of it (INGEST-MEMBER-UPDATE)
+  (side-forks (make-hash-table :test #'equal :synchronized t))
   (dispute-notes (make-hash-table :test #'equal :synchronized t))   ; ledger id -> the last dispute-driver state we logged
   (parent nil)                                 ; a DISPUTE-VIEW's node: whose records judge an arm's grounds
   (grounds-verdicts (make-hash-table :test #'equalp :synchronized t)) ; DisputeEnter chain hash -> (verdict . why)
@@ -780,15 +783,62 @@
   (run-hooks node rec update)
   update)
 
-(defun yield-once (node fork)
+(defun fork-yield-evidence-p (fork)
+  "FORK's yields are judged under yield-evidence-v9 (its ruleset, the fork point's)."
+  (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :yield-evidence))
+
+;; Case C5 of the yield-builder audit, ruled 2026-11-24 (option B): an un-armed expiry fork
+;; standing down for our punitive dispute of the same ledger yields naming that dispute's
+;; DisputeEnter, reason 4 superseded_by (TLV 373: its content hash; DEP-06 "What a yield must say").
+(defun stand-down-for-punitive (node expiry superseding)
+  "Yield our un-armed expiry fork EXPIRY because our DisputeEnter SUPERSEDING (a signed update, not
+   yet committed) of the same ledger supersedes it.  Earlier rulesets: no reason, as before."
+  (yield-once node expiry :reason (and (fork-yield-evidence-p expiry)
+                                       (list :superseded-by (up:content-hash superseding)))
+                          :also (list superseding)))
+
+(defun yield-self-check (node fork reason &key also (height (known-height node)))
+  "DEP-06 \"What a yield must say\": our own judge's verdict on the yield REASON (a plist,
+   YIELD-ONCE's) we would sign on FORK at HEIGHT: REENTRY-YIELD-VERDICT over the ledger's replica, FORK and ALSO (updates signed and not yet
+   committed, as STAND-DOWN-FOR-PUNITIVE's DisputeEnter), on our chain view.  A builder signs only
+   on :VALID: :INVALID is never signed or broadcast, :PENDING waits."
+  (let* ((base (find-record node (record-fork-of fork)))
+         (enter (fork-op fork :dispute-enter))
+         (tip (tip fork)))
+    (if (not (and enter tip))
+        :valid
+        (let ((draft (up:make-signed-update
+                      :operator-id (node-pubkey node) :ledger-id (up:update-ledger-id tip)
+                      :seq (1+ (up:update-seq tip)) :prev-hash (up:chain-hash tip) :block-height height
+                      :message (op:encode-operation
+                                (append (list :type :dispute-yield)
+                                        (loop for k in '(:lost-to :reestablished :excluded-by :superseded-by)
+                                              when (getf reason k) append (list k (getf reason k))))))))
+          (reentry-yield-verdict (append (and base (reverse (record-history base))) (reverse (record-history fork)) also)
+                                 enter draft :chain (node-chain-view node))))))
+
+(defun yield-once (node fork &key reason also)
   "Yield our FORK: adopt the DisputeYield of ours the relays already hold at its next sequence,
    or sign one only when nothing of ours is there.  NIL (and a note) when holding: the query
-   failed, or something of ours other than that yield is already at that sequence."
+   failed, or something of ours other than that yield is already at that sequence.  REASON is
+   the yield's evidence, a plist of one of :LOST-TO :REESTABLISHED :EXCLUDED-BY (DEP-06 \"What a
+   yield must say\"): carried whenever known, and required under yield-evidence-v9, where a yield
+   without one is never signed (the fold would refuse it).  Nor one our own judge does not find
+   valid (YIELD-SELF-CHECK, ALSO its extra updates): invalid is never signed, pending waits."
+  (when (and (fork-yield-evidence-p fork) (/= 1 (count-if (lambda (k) (getf reason k)) '(:lost-to :reestablished :excluded-by :superseded-by))))
+    (log! node "yield of ~a held: yield-evidence-v9 needs exactly one reason, have ~s" (subseq (record-id-hex fork) 0 8) reason)
+    (return-from yield-once nil))
   (let* ((tip (tip fork)) (seq (if tip (1+ (up:update-seq tip)) 0))
          (ours (handler-case (our-updates-at node fork seq)
                  (error (e) (log! node "yield of ~a held: the relay query failed: ~a" (subseq (record-id-hex fork) 0 8) e)
                    (return-from yield-once nil)))))
-    (cond ((null ours) (commit-update node fork (new-update node fork (list :type :dispute-yield))))
+    (cond ((and (null ours) (not (eq :valid (yield-self-check node fork reason :also also))))
+           (log! node "yield of ~a held: our own judge reads ~s as ~(~a~) (DEP-06 \"What a yield must say\")"
+                 (subseq (record-id-hex fork) 0 8) reason (yield-self-check node fork reason :also also))
+           nil)
+          ((null ours) (commit-update node fork (new-update node fork (append (list :type :dispute-yield)
+                                                                               (loop for k in '(:lost-to :reestablished :excluded-by :superseded-by)
+                                                                                     when (getf reason k) append (list k (getf reason k)))))))
           ((and (null (rest ours))
                 (eq (getf (ignore-errors (op:update-op (first ours))) :type) :dispute-yield)
                 (chains-on-p fork (first ours)))
@@ -1699,23 +1749,181 @@
         ((relay-blind-p node id) nil)
         ;; A quorum member's dispute fork (or its continuation).
         ((not (equalp signer (node-pubkey node)))
-         (let* ((o (op:decode-operation (up:update-message update)))
-                (fork (let ((f (find-fork node id signer)))
-                        (if (and f (eq (op:operation-type o) :dispute-enter) (not (fork-live-p node f))
-                                 (not (record-owned-p f)))
-                            (progn (retire-fork node f) nil)
-                            f))))
-           (cond (fork
-                  ;; a burst published out of order (the reference appends its QuorumAddMembers
-                  ;; and DisputeArmed at once): fill the gap first, or the fork never arms here
-                  (when (> (up:update-seq update) (1+ (lg:ledger-sequence (record-ledger fork))))
-                    (catch-up-fork node fork (1- (up:update-seq update))))
-                  (accept-update node fork update))
-                 ((and (eq (op:operation-type o) :dispute-enter)
-                       (member signer (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp))
-                  (let ((fork (make-fork node rec (op:field o :last-valid-sequence) signer)))
-                    (accept-update node fork update)
-                    (log! node "fork of ~a by ~a at seq ~a" (subseq id 0 8) (subseq (bytes->hex signer) 0 8) (op:field o :last-valid-sequence)))))))))))
+         (ingest-member-update node rec id signer update))))))
+
+;;; DEP-03 "The dispute": a disputant's counted DisputeEnter is a function of the SET of its
+;;; updates, never of their order (two honest nodes receive them in different orders).
+
+(defun entry-order< (a b)
+  "The canonical order of one disputant's DisputeEnters: sequence; at one sequence a punitive entry
+   before a quorum_expired one; then content hash ascending."
+  (let ((sa (up:update-seq a)) (sb (up:update-seq b)))
+    (if (/= sa sb) (< sa sb)
+        (let ((ea (expiry-reason-p (op:field (op:update-op a) :reason)))
+              (eb (expiry-reason-p (op:field (op:update-op b) :reason))))
+          (if (not (eq ea eb)) eb
+              (let ((ha (up:content-hash a)) (hb (up:content-hash b)))
+                (loop for x across ha for y across hb
+                      when (/= x y) return (< x y) finally (return nil))))))))
+
+(defun counted-entry (enters acquired-p)
+  "Of one disputant's ENTERS (all at or above Q), the one it takes part through: in ENTRY-ORDER<,
+   the first, replaced by each later one at a higher sequence unless ACQUIRED-P of the counted
+   entry (its fork carries its author's DisputeAcquire), which nothing supersedes.  DISPUTE-SCOPE
+   and the ingest (INGEST-MEMBER-UPDATE) both ask this, as deposits-rust's
+   rotation_order::dispute_scope does.  Vector enter_after_yield.txt (every permutation)."
+  (let* ((es (sort (remove-duplicates (copy-list enters) :test #'equalp :key #'up:content-hash) #'entry-order<))
+         (cur (first es)))
+    (dolist (e (rest es) cur)
+      (when (funcall acquired-p cur) (return cur))
+      (when (> (up:update-seq e) (up:update-seq cur)) (setf cur e)))))
+
+(defun fork-acquired-p (updates enter)
+  (some (lambda (u) (eq (%op-type u) :dispute-acquire)) (fork-from updates enter)))
+
+(defvar *side-fork-limit* 512 "At most this many held updates per disputant's other forks.")
+
+(defun side-key (id signer) (fork-key id signer))
+
+(defun pool-counted (rec pool)
+  "The counted entry among POOL (one disputant's updates of REC's ledger): its enters at or above
+   Q (REC's latest QuorumBegin at or below their highest fork point), COUNTED-ENTRY."
+  (let* ((enters (remove-if-not (lambda (u) (eq (%op-type u) :dispute-enter)) pool))
+         (top (and enters (reduce #'max enters :key (lambda (u) (op:field (op:update-op u) :last-valid-sequence)))))
+         (q (and top (record-latest rec :quorum-begin :below (1+ top))))
+         (in (remove-if (lambda (u) (and q (< (op:field (op:update-op u) :last-valid-sequence) (up:update-seq q)))) enters)))
+    (and in (counted-entry in (lambda (e) (fork-acquired-p pool e))))))
+
+(defun ingest-member-update (node rec id signer update)
+  "A quorum member's dispute fork (or its continuation).  The fork we hold for it is the one its
+   counted DisputeEnter opens (POOL-COUNTED over everything it sent us of this ledger, whatever
+   the order it arrived in); its other updates are held aside (NODE-SIDE-FORKS) until they are
+   counted or pruned, so a late DisputeAcquire on a superseded fork, or an earlier entry arriving
+   after a later one, moves us to the same fork every member holds."
+  (let* ((o (op:decode-operation (up:update-message update)))
+         (f (find-fork node id signer))
+         (key (side-key id signer)))
+    (when (and f (record-owned-p f))
+      (return-from ingest-member-update (%ingest-on-fork node f update)))
+    (unless (member signer (lg:ledger-quorum-members (record-ledger rec)) :key #'lg:member-pubkey :test #'equalp)
+      (return-from ingest-member-update (and f (%ingest-on-fork node f update))))
+    (cond ((and f (on-fork-p f update)) (%ingest-on-fork node f update))
+          ((and f (not (eq (op:operation-type o) :dispute-enter)) (> (up:update-seq update) (1+ (up:update-seq (tip f))))
+                (not (side-chains-p (gethash key (node-side-forks node)) update)))
+           ;; a gap on the fork we hold (a burst out of order): CATCH-UP-FORK, as before; what still
+           ;; does not land on it is held aside, never dropped
+           (handler-case (%ingest-on-fork node f update)
+             (error (e) (log! node "fork of ~a by ~a: seq ~a held aside (~a)" (subseq id 0 8) (subseq (bytes->hex signer) 0 8)
+                              (up:update-seq update) e)))
+           (unless (on-fork-p f update) (hold-aside node key update)))
+          ((null f)
+           (if (and (eq (op:operation-type o) :dispute-enter) (chains-to-base-p rec update))
+               (let ((fork (make-fork node rec (op:field o :last-valid-sequence) signer)))
+                 (accept-update node fork update)
+                 (log! node "fork of ~a by ~a at seq ~a" (subseq id 0 8) (subseq (bytes->hex signer) 0 8) (op:field o :last-valid-sequence)))
+               (hold-aside node key update)))
+          (t (hold-aside node key update)))
+    (recount-disputant node rec id signer)))
+
+(defun on-fork-p (fork update)
+  "UPDATE continues FORK (its previous_hash is FORK's tip's chain hash), or FORK already holds it."
+  (let ((tp (tip fork)))
+    (or (and tp (equalp (up:update-prev-hash update) (up:chain-hash tp)))
+        (find (up:content-hash update) (record-history fork) :key #'up:content-hash :test #'equalp
+              :end (min 64 (length (record-history fork)))))))
+
+(defun side-chains-p (side update)
+  (some (lambda (u) (equalp (up:update-prev-hash update) (up:chain-hash u))) side))
+
+(defun %ingest-on-fork (node fork update)
+  ;; a burst published out of order (the reference appends its QuorumAddMembers and DisputeArmed
+  ;; at once): fill the gap first, or the fork never arms here
+  (when (> (up:update-seq update) (1+ (lg:ledger-sequence (record-ledger fork))))
+    (catch-up-fork node fork (1- (up:update-seq update))))
+  (accept-update node fork update))
+
+(defun hold-aside (node key update)
+  (let ((side (gethash key (node-side-forks node))))
+    (unless (find (up:content-hash update) side :key #'up:content-hash :test #'equalp)
+      (setf (gethash key (node-side-forks node))
+            (let ((l (cons update side))) (if (> (length l) *side-fork-limit*) (subseq l 0 *side-fork-limit*) l)))
+      (save-side-forks node))))
+
+(defun fork-own-pool (fork signer)
+  "FORK's own updates by SIGNER past its fork point: the history is newest first, and past the
+   fork point every update is the disputant's."
+  (loop for u in (record-history fork) while (equalp (up:update-operator-id u) signer) collect u))
+
+(defun chain-from (pool root)
+  "ROOT and every update of POOL chained from it (continuation entries included), by sequence."
+  (let ((hashes (make-hash-table :test #'equalp)) (out (list root)))
+    (setf (gethash (up:chain-hash root) hashes) t)
+    (dolist (u (sort (copy-list pool) #'< :key #'up:update-seq) (nreverse out))
+      (when (and (not (eq u root)) (gethash (up:update-prev-hash u) hashes))
+        (setf (gethash (up:chain-hash u) hashes) t)
+        (push u out)))))
+
+(defun chain-root (pool u)
+  "The first update of the chain U is on, walking previous_hash back through POOL."
+  (loop for p = (find (up:update-prev-hash u) pool :key #'up:chain-hash :test #'equalp)
+        while (and p (not (eq p u))) do (setf u p))
+  u)
+
+(defun chains-to-base-p (rec enter)
+  "ENTER's previous_hash is the chain hash of REC's update at its last_valid_sequence."
+  (let* ((lvs (op:field (op:update-op enter) :last-valid-sequence))
+         (at (find lvs (record-history rec) :key #'up:update-seq)))
+    (and at (equalp (up:update-prev-hash enter) (up:chain-hash at)))))
+
+(defun drain-aside (node key fork)
+  "Move onto FORK, in order, what is held aside under KEY and now continues it."
+  (loop for u = (find-if (lambda (u) (on-fork-p fork u)) (gethash key (node-side-forks node)))
+        while u
+        do (setf (gethash key (node-side-forks node)) (remove u (gethash key (node-side-forks node)) :test #'eq))
+           (save-side-forks node)
+           (ignore-errors (accept-update node fork u))
+           (unless (and (tip fork) (equalp (up:content-hash (tip fork)) (up:content-hash u)))
+             (return))))
+
+(defun recount-disputant (node rec id signer)
+  "Hold the fork SIGNER's counted DisputeEnter is on (POOL-COUNTED over the fork we hold and
+   everything held aside): what continues the fork we hold is moved onto it first; when the counted
+   entry is on another chain, and that chain is complete back to REC, swap: the fork we hold goes
+   aside and the counted one is rebuilt from its first entry with its whole chain."
+  (let ((key (side-key id signer)))
+    (let ((f (find-fork node id signer))) (when f (drain-aside node key f)))
+    (let* ((f (find-fork node id signer))
+           (side (gethash key (node-side-forks node)))
+           (mine (and f (fork-own-pool f signer)))
+           (pool (append mine side))
+           (counted (and side (pool-counted rec pool)))
+           (root (and counted (not (member counted mine :test #'eq)) (chain-root pool counted))))
+      (when (and root (eq (%op-type root) :dispute-enter) (chains-to-base-p rec root))
+        (let ((chain (chain-from pool root)))
+          (when f (retire-fork node f :superseded t))
+          (let ((fork (make-fork node rec (op:field (op:update-op root) :last-valid-sequence) signer)))
+            (dolist (u chain) (ignore-errors (accept-update node fork u)))
+            (setf (gethash key (node-side-forks node)) (set-difference pool chain :test #'eq))
+            (save-side-forks node)
+            (drain-aside node key fork))
+          (log! node "fork of ~a by ~a: its counted DisputeEnter is seq ~a (DEP-03, set-wise)" (subseq id 0 8)
+                (subseq (bytes->hex signer) 0 8) (up:update-seq counted)))))))
+
+(defun save-side-forks (node)
+  (when (node-data-dir node)
+    (ensure-directories-exist (node-data-dir node))
+    (with-open-file (out (merge-pathnames "side-forks.sexp" (node-data-dir node)) :direction :output :if-exists :supersede)
+      (with-standard-io-syntax
+        (prin1 (loop for k being the hash-keys of (node-side-forks node) using (hash-value v)
+                     when v collect (cons k (mapcar (lambda (u) (bytes->hex (up:encode-update u))) v)))
+               out)))))
+
+(defun load-side-forks (node)
+  (let ((f (and (node-data-dir node) (probe-file (merge-pathnames "side-forks.sexp" (node-data-dir node))))))
+    (when f
+      (with-open-file (in f)
+        (loop for (k . us) in (with-standard-io-syntax (let ((*read-eval* nil)) (read in nil '())))
+              do (setf (gethash k (node-side-forks node)) (mapcar (lambda (h) (up:decode-update (hex->bytes h))) us)))))))
 
 (defun accept-update (node rec update)
   "Validate an operator's update against our replica and apply it, one writer at a time."
@@ -3367,6 +3575,15 @@
                 (progn (remhash txid *unconfirmed-rungs*) (setf (gethash txid *confirmed-rungs*) t))
                 (progn (setf (gethash txid *unconfirmed-rungs*) (get-universal-time)) nil)))))))
 
+(defun reestablishing-quorum-begin (node rec last-valid-seq &key (on-spend t))
+  "The newest QuorumBegin of REC after LAST-VALID-SEQ (a re-establishment of the quorum after
+   the fork point), with its vault spend confirmed when ON-SPEND (strict-lottery-v8): what a
+   yield-evidence-v9 stand-down names (its content hash, DEP-06 \"What a yield must say\")."
+  (loop for u in (record-updates-of rec :quorum-begin)        ; newest first
+        while (> (up:update-seq u) (or last-valid-seq -1))
+        when (or (not on-spend) (quorum-begin-spend-confirmed-p node u))
+          return u))
+
 (defun reestablishment-confirmed-p (node rec last-valid-seq)
   "Some QuorumBegin of REC after LAST-VALID-SEQ has its vault spend confirmed (strict-lottery-v8,
    :expiry-ends-on-spend)."
@@ -3526,6 +3743,18 @@
   "Drive FORK one step (%DRIVE-DISPUTE), timed (DRIVE-TIMED)."
   (drive-timed node fork (lambda () (%drive-dispute node fork))))
 
+(defun lost-to-acquire (node fork our-round)
+  "Another participant's binding acquire (OTHERS-BINDING-ACQUIRES: (acquirer round claim-txid))
+   of round OUR-ROUND or later whose claim is not ours (its output 0 does not pay our key): what a
+   loser's yield names as lost_to (DEP-06 \"What a yield must say\", reason 1), or NIL."
+  (let ((mine (lot:key-path-spk (up:x-only (node-pubkey node)))))
+    (find-if (lambda (a)
+               (and (>= (second a) our-round)
+                    (let ((tx (and (node-tx-fn node) (ignore-errors (funcall (node-tx-fn node) (third a))))))
+                      (and tx (plusp (length (btx:tx-outputs tx)))
+                           (not (equalp (btx:txout-script (elt (btx:tx-outputs tx) 0)) mine))))))
+             (others-binding-acquires node fork))))
+
 (defun %drive-dispute (node fork)
   (bt:with-lock-held (*drive-threads-lock*)   ; DRIVE-SCHEDULE: least recently driven first
     (setf (gethash (cons (node-pubkey node) (record-id-hex fork)) *drive-last*) (get-universal-time)))
@@ -3534,8 +3763,8 @@
       (unless (and base enter)
         (return-from %drive-dispute
           (note-dispute node id "not driven: ~:[no replica of the ledger~;no DisputeEnter of ours on the fork~]" base)))
-      (flet ((conclude (fmt &rest args)
-               (unless (dstep :yield (yield-once node fork))
+      (flet ((conclude (reason fmt &rest args)
+               (unless (dstep :yield (yield-once node fork :reason reason))
                  (return-from %drive-dispute (note-dispute node id "yield held (YIELD-ONCE)")))
                (release-pledges node id)
                (return-from %drive-dispute (apply #'note-dispute node id fmt args))))
@@ -3546,17 +3775,9 @@
         (multiple-value-bind (au ao) (fork-op fork :dispute-armed)
           (declare (ignore au))
           (when (and ao (eq (lg:ledger-dispute-state (record-ledger fork)) :armed))
-            (let* ((our-round (or (op:field ao :rearm-round) 1))
-                   (mine (lot:key-path-spk (up:x-only (node-pubkey node))))
-                   ;; Not a claim of ours that someone else named: its output 0 pays our target.
-                   (won (find-if (lambda (a)
-                                   (and (>= (second a) our-round)
-                                        (let ((tx (and (node-tx-fn node) (ignore-errors (funcall (node-tx-fn node) (third a))))))
-                                          (and tx (plusp (length (btx:tx-outputs tx)))
-                                               (not (equalp (btx:txout-script (elt (btx:tx-outputs tx) 0)) mine))))))
-                                 (others-binding-acquires node fork))))
+            (let ((won (lost-to-acquire node fork (or (op:field ao :rearm-round) 1))))
               (when won
-                (conclude "lost to ~a's binding acquire (claim ~a, round ~a); yielded"
+                (conclude (list :lost-to (third won)) "lost to ~a's binding acquire (claim ~a, round ~a); yielded"
                           (subseq (bytes->hex (first won)) 0 16) (txid-hex (third won)) (second won))))))
         (when (find-if (lambda (r) (> (getf r :round) 1)) (rearm-rounds node id))
           (return-from %drive-dispute (note-dispute node id "in a re-arm round (DRIVE-REARM)")))
@@ -3591,14 +3812,21 @@
             ;; confirmed ends it; recorded but unspent, the race goes on (regtest 2026-11-15:
             ;; the reference yielded its armed stake while its own confiscation sat in the
             ;; mempool, and that confiscation then won).
-            (when (and (dispute-enter-expiry-p enter enter-op expiry) (not confirmed)
-                       (let* ((lvs (op:field enter-op :last-valid-sequence))
-                              (on-spend (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :expiry-ends-on-spend))
-                              (spent (or (not on-spend) (dstep :reestablished (reestablishment-confirmed-p node base lvs)))))
-                         (or (expiry-dispute-ended-p lvs (latest-quorum-begin-seq base) nil
-                                                     :on-spend on-spend :rotation-confirmed spent)
-                             (and expiry (<= h (+ expiry *expiry-grace-blocks*)) spent))))
-              (conclude "quorum re-established (expiry ~a); yielded" expiry)))
+            ;; yield-evidence-v9: the yield names the re-establishing QuorumBegin (DEP-06 "What a
+            ;; yield must say", reason 2), so only that answers it: never the tip-based arm below
+            ;; (the re-established quorum's expiry ahead of the tip), which names nothing.
+            (when (and (dispute-enter-expiry-p enter enter-op expiry) (not confirmed))
+              (let* ((lvs (op:field enter-op :last-valid-sequence))
+                     (on-spend (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger fork)) :expiry-ends-on-spend))
+                     (qb (dstep :reestablished (reestablishing-quorum-begin node base lvs :on-spend on-spend)))
+                     (reason (and qb (list :reestablished (up:content-hash qb)))))
+                (when (if (fork-yield-evidence-p fork)
+                          qb
+                          (let ((spent (or (not on-spend) qb)))
+                            (or (expiry-dispute-ended-p lvs (latest-quorum-begin-seq base) nil
+                                                        :on-spend on-spend :rotation-confirmed spent)
+                                (and expiry (<= h (+ expiry *expiry-grace-blocks*)) spent))))
+                  (conclude reason "quorum re-established (expiry ~a); yielded" expiry)))))
           (let ((reserves-spent (dstep :reserves-spent
                                 (multiple-value-bind (r txid vout) (disputed-reserves node base)
                                   (declare (ignore r))
@@ -3619,7 +3847,11 @@
                         (note-dispute node id "lottery round 1 spent into round 2's lottery"))
                        ((and r1 (not (lottery-spend-confirmed-p node r1)))
                         (note-dispute node id "lottery output spent in the mempool; judging it once it confirms"))
-                       (t (conclude "lottery claimed by its winner; yielded")))))
+                       ;; yield-evidence-v9: a spent output names no winner; the yield waits for the
+                       ;; winner's binding acquire (lost_to, above), and our pledge stays held until it.
+                       ((fork-yield-evidence-p fork)
+                        (note-dispute node id "lottery claimed; awaiting the winner's binding acquire to name (yield-evidence-v9)"))
+                       (t (conclude nil "lottery claimed by its winner; yielded")))))
               ((and reserves-spent (null conf))
                (note-dispute node id "reserves spent, but not by a confiscation we can rebuild"))
               ;; ADVERSARY :hold-arm — a member that disputes but does not arm (yet): without its
@@ -3680,7 +3912,8 @@
                       (note-dispute node id "~a of ~a revealed; the reveal deadline is ~a blocks after the confiscation"
                                     (length (revealed-indices node id lottery)) (length (lot:lottery-participants lottery)) lot:+reveal-csv+))
                      (t (handler-case (let ((outcome (dstep :claim (claim-or-yield node id :confiscation-txid (btx:tx-txid conf)))))
-                                        (release-pledges node id)
+                                        ;; not while awaiting the winner's claim (yield-evidence-v9)
+                                        (when (member outcome '(:won :yielded)) (release-pledges node id))
                                         (note-dispute node id "lottery: ~(~a~)" outcome))
                           (error (e) (note-dispute node id "waiting to claim: ~a" e))))))
               ;; Our assembled confiscation fell out of the mempool: push the rung the schedule
@@ -4280,17 +4513,97 @@
   (let ((f (live-fork node id-hex (node-pubkey node))))
     (and f (fork-reuse-p t (unarmed-expiry-fork-p f) punitive) f)))
 
-(defun retire-fork (node fork)
+(defun retire-fork (node fork &key superseded)
   "Drop a fork that is no longer live so a new dispute can open in its place; what it knew of
-   a confiscation is kept (note-confiscation persists it)."
+   a confiscation is kept (note-confiscation persists it).  SUPERSEDED: it is dropped because a
+   later DisputeEnter of its disputant replaces it (DEP-03 \"The dispute\", latest counts), which
+   is not retiring it for its pledges (DEP-03 \"When a pledge is live\", ruled 2026-11-24): a fork
+   of ours keeps whatever it still holds (NOTE-SUPERSEDED), and its dispute's reservation stays."
   (when (record-confiscation fork) (note-confiscation node (record-fork-of fork) (btx:tx-txid (record-confiscation fork))))
-  (remhash (fork-key (record-fork-of fork) (record-fork-operator fork)) (node-ledgers node))
-  ;; DEP-03 "When a pledge is live": retiring our fork ends its dispute's hold on our pledges.
-  ;; (Not while a re-arm round is under way: a yield ends a round, not the dispute, as in DRIVE-DISPUTE.)
-  (when (and (equalp (record-fork-operator fork) (node-pubkey node)) (not (rearm-rounds node (record-fork-of fork))))
-    (release-pledges node (record-fork-of fork)))
-  (log! node "fork of ~a by ~a retired (concluded or superseded by a later QuorumBegin)"
-        (subseq (record-fork-of fork) 0 8) (subseq (bytes->hex (record-fork-operator fork)) 0 8)))
+  (let* ((ours (equalp (record-fork-operator fork) (node-pubkey node)))
+         (kept (and ours superseded (note-superseded node fork))))
+    (remhash (fork-key (record-fork-of fork) (record-fork-operator fork)) (node-ledgers node))
+    ;; DEP-03 "When a pledge is live": retiring our fork ends its dispute's hold on our pledges.
+    ;; (Not while a re-arm round is under way: a yield ends a round, not the dispute, as in DRIVE-DISPUTE.)
+    ;; Superseded, only when it held nothing any more (KEPT: what it still holds).
+    (when (and ours (not kept) (not (rearm-rounds node (record-fork-of fork))))
+      (release-pledges node (record-fork-of fork))))
+  (log! node "fork of ~a by ~a ~a" (subseq (record-fork-of fork) 0 8) (subseq (bytes->hex (record-fork-operator fork)) 0 8)
+        (if superseded "superseded by its disputant's later DisputeEnter (its pledges stay held)"
+            "retired (concluded or superseded by a later QuorumBegin)")))
+
+;;; DEP-03 "When a pledge is live" (ruled 2026-11-24): superseding never ends a pledge.  A fork of
+;;; ours that a later DisputeEnter of ours supersedes leaves this table holding what it still held:
+;;; its pledges, each until its own valid yield (a void one's evidence confirming), or a binding
+;;; claim of its round or a later one (OTHERS-BINDING-ACQUIRES' rule).  One key holds one fork per
+;;; ledger here, so the superseded fork itself is gone; what judges its pledges is kept, and saved.
+;;; Vector inspect/vectors/enter_after_yield.txt (its pledge cases).
+
+(defun superseded-entry (id-hex events &key enter-seq vault yield-txid)
+  "What a superseded fork of ID-HEX still holds, from its EVENTS (FORK-PLEDGE-EVENTS): a plist
+   (:id :pledges ((key . round) ...) :enter-seq :vault :yield-txid), or NIL when it holds nothing.
+   YIELD-TXID: the transaction its void yield names (its pledges end once that confirms)."
+  (let ((pledges (nth-value 3 (fork-pledges-held events)))
+        (void (position :void-yield events :key #'first :from-end t)))
+    (and pledges (list :id id-hex :pledges pledges :enter-seq enter-seq :vault vault
+                       ;; a void yield after its last arm: once its evidence confirms, it ends them
+                       :yield-txid (and void (> void (or (position :arm events :key #'first :from-end t) -1))
+                                        yield-txid)))))
+
+(defun superseded-pledges-held (entry &key others yield-seen)
+  "ENTRY's pledges still held: none once its void yield's evidence is seen (YIELD-SEEN), and
+   none of a round at or below the latest OTHERS (rounds closed by binding claims)."
+  (unless (and yield-seen (getf entry :yield-txid))
+    (let ((over (and others (reduce #'max others))))
+      (loop for (k . r) in (getf entry :pledges) unless (and over (<= r over)) collect k))))
+
+(defun note-superseded (node fork)
+  "Keep what our FORK, being superseded, still holds (SUPERSEDED-ENTRY), and save it."
+  (let* ((enter (fork-op fork :dispute-enter))
+         (q (and enter (record-latest fork :quorum-begin :below (up:update-seq enter))))
+         (y (nth-value 1 (fork-op fork :dispute-yield)))
+         (e (superseded-entry (record-fork-of fork) (fork-pledge-events node fork)
+                              :enter-seq (and enter (up:update-seq enter))
+                              :vault (and q (first (fr:rotation-rungs (op:update-op q))))
+                              :yield-txid (and y (or (op:field y :lost-to) (op:field y :excluded-by))))))
+    (when e
+      (push e (node-superseded node))
+      (save-superseded node))
+    e))
+
+(defun superseded-holds (node)
+  "The coins our superseded forks still hold (SUPERSEDED-PLEDGES-HELD); entries holding nothing
+   any more are dropped."
+  (let ((held '()) (keep '()))
+    (dolist (e (node-superseded node))
+      (let ((h (superseded-pledges-held
+                e :others (mapcar #'second (%others-binding-acquires node (getf e :id) (getf e :enter-seq) (getf e :vault) nil))
+                  :yield-seen (and (getf e :yield-txid) (yield-evidence-seen-p node (list :type :dispute-yield :lost-to (getf e :yield-txid)))))))
+        (when h (push e keep) (setf held (append held h)))))
+    (unless (= (length keep) (length (node-superseded node)))
+      (setf (node-superseded node) (nreverse keep))
+      (save-superseded node))
+    held))
+
+(defun save-superseded (node)
+  (when (node-data-dir node)
+    (ensure-directories-exist (node-data-dir node))
+    (with-open-file (out (merge-pathnames "superseded.sexp" (node-data-dir node)) :direction :output :if-exists :supersede)
+      (with-standard-io-syntax
+        (prin1 (mapcar (lambda (e) (list (getf e :id) (getf e :pledges) (getf e :enter-seq)
+                                         (and (getf e :vault) (bytes->hex (getf e :vault)))
+                                         (and (getf e :yield-txid) (bytes->hex (getf e :yield-txid)))))
+                       (node-superseded node))
+               out)))))
+
+(defun load-superseded (node)
+  (let ((f (and (node-data-dir node) (probe-file (merge-pathnames "superseded.sexp" (node-data-dir node))))))
+    (when f
+      (with-open-file (in f)
+        (setf (node-superseded node)
+              (loop for (id pledges seq vault ytx) in (with-standard-io-syntax (let ((*read-eval* nil)) (read in nil '())))
+                    collect (list :id id :pledges pledges :enter-seq seq :vault (and vault (hex->bytes vault))
+                                  :yield-txid (and ytx (hex->bytes ytx)))))))))
 
 (defun fork-summaries (node)
   "Every dispute fork we hold: ledger, its operator (the disputant), state, and whether it is
@@ -4322,11 +4635,44 @@
 
 (defun acquire-binds-p (node fork)
   "FORK's DisputeAcquire moves custody: as published under an earlier ruleset, and under
-   strict-lottery-v8 (the base ledger's ruleset) only once its claim confirmed (DEP-06 §Phase 4)."
-  (and (fork-op fork :dispute-acquire)
-       (let ((base (find-record node (record-id-hex fork))))
-         (or (not (and base (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger base)) :acquire-on-confirm)))
-             (acquire-confirmed-p node fork)))))
+   strict-lottery-v8 (the base ledger's ruleset) only once its claim confirmed (DEP-06 §Phase 4).
+   An acquire after its author's own yield (DEP-06 \"A claim after the claimant's own yield\",
+   the advantage rule) moves custody only by the binding judgment, under every ruleset."
+  (multiple-value-bind (u o) (fork-op fork :dispute-acquire)
+    (declare (ignore o))
+    (and u
+         (let ((base (find-record node (record-id-hex fork))))
+           (or (and (not (and base (lg:ruleset-rule-p (lg:ledger-active-ruleset (record-ledger base)) :acquire-on-confirm)))
+                    (zerop (fork-acquire-min-round fork u)))
+               (acquire-confirmed-p node fork))))))
+
+(defun acquire-min-round (events)
+  "DEP-06 \"A claim after the claimant's own yield\": EVENTS are the acquirer's own dispute
+   operations on its fork before the acquire, oldest first, as (:arm ROUND), (:yield) or anything
+   else.  When a yield follows its latest arm, the acquire must bind that arm's round or a later
+   one: that round.  Otherwise 0 (no bound).  Vector: claim_after_yield.json (min_round)."
+  (let ((arm 0) (yielded nil))
+    (dolist (e events)
+      (case (first e)
+        (:arm (setf arm (or (second e) 1) yielded nil))
+        (:yield (setf yielded t))
+        (:acquire (setf yielded nil))))
+    (if yielded arm 0)))
+
+(defun fork-acquire-min-round (fork u)
+  "ACQUIRE-MIN-ROUND of the DisputeAcquire U on FORK, from U's author's arms and yields before it."
+  (let ((me (up:update-operator-id u)))
+    (acquire-min-round
+     (loop for x in (sort (remove-if-not (lambda (x) (and (equalp (up:update-operator-id x) me) (< (up:update-seq x) (up:update-seq u))))
+                                         (append (copy-list (fork-own-updates fork :dispute-armed))
+                                                 (copy-list (fork-own-updates fork :dispute-yield))
+                                                 (copy-list (fork-own-updates fork :dispute-acquire))))
+                          #'< :key #'up:update-seq)
+           for o = (op:update-op x)
+           collect (case (op:operation-type o)
+                     (:dispute-armed (list :arm (or (op:field o :rearm-round) 1)))
+                     (:dispute-yield (list :yield))
+                     (t (list :acquire)))))))
 
 (defun acquired-fork (node id-hex)
   "The fork of ID-HEX's ledger whose DisputeAcquire took custody, if any (ACQUIRE-BINDS-P)."
@@ -4389,6 +4735,98 @@
                             (setf txid (btx:txin-prev-hash i) vout (btx:txin-prev-index i))))
                      finally (return :not-this-lottery)))))))
 
+;;; DEP-06 "What a yield must say" (yield-evidence-v9, ruled 2026-11-23): a DisputeYield names why
+;;; its round ended, and a judge checks it from public state.  Shared vector
+;;; inspect/vectors/yield_evidence.json (deposits-rust deposits-node judge_yield).
+
+(defun lottery-tx-round (tx-fn vaults txid)
+  "The round of the lottery the transaction TXID created for the dispute of VAULTS: 1 when it
+   spends a vault, one more for each confirmed re-arm spend walked back (each spending output 0 of
+   the previous).  (values :binds round), or :unconfirmed (a transaction unknown) or
+   :not-this-lottery."
+  (loop with cur = txid
+        for round from 1 to (1+ +acquire-max-rounds+)
+        do (multiple-value-bind (tx conf) (funcall tx-fn cur)
+             (unless tx (return :unconfirmed))
+             (when (some (lambda (i) (member (list (btx:txin-prev-hash i) (btx:txin-prev-index i)) vaults :test #'equalp))
+                         (coerce (btx:tx-inputs tx) 'list))
+               (return (values :binds round)))
+             (unless (and conf (rearm-shaped-p tx)) (return :not-this-lottery))
+             (let ((i (elt (btx:tx-inputs tx) 0)))
+               (unless (zerop (btx:txin-prev-index i)) (return :not-this-lottery))
+               (setf cur (btx:txin-prev-hash i))))
+        finally (return :not-this-lottery)))
+
+(defun judge-yield (&key ruleset reasons yield-height (arm-round 1) yielder targets pledges vaults tx-fn
+                      dispute-reason last-valid-sequence quorum-begins participants ledger-id fork-enter-seq enters)
+  "The verdict on a DisputeYield: (values VERDICT WHY), VERDICT :valid, :invalid or :pending (no
+   verdict yet: asked again).  RULESET: the fork's (the fork point's).  REASONS: a plist of the
+   yield's :lost-to / :reestablished / :excluded-by.  YIELD-HEIGHT: its signed block_height.
+   ARM-ROUND: the yielder's latest arm's round before it.  YIELDER: its x-only key; TARGETS: the
+   scriptPubKeys of the target_reserves it declared; PLEDGES: the collateral outpoints (txid vout) it
+   declared.  VAULTS: the dispute's vault outpoints (JUDGE-ACQUIRE).  TX-FN: txid -> (values tx
+   height-or-NIL), NIL when unknown.  DISPUTE-REASON / LAST-VALID-SEQUENCE: the fork's DisputeEnter.
+   QUORUM-BEGINS: the operator chain's QuorumBegins as (content-hash seq spend-confirmed-p).
+   PARTICIPANTS: the x-only keys of the lottery an :excluded-by names, as the judge rebuilt it.
+   :SUPERSEDED-BY (ruled 2026-11-24): LEDGER-ID is the fork's ledger, FORK-ENTER-SEQ the sequence
+   of the yielded fork's own DisputeEnter, ENTERS the DisputeEnters the judge holds, each a plist
+   (:hash :by x-only :ledger :seq :punitive :on-ledger); ARM-ROUND 0 is a fork that never armed."
+  (unless (lg:ruleset-rule-p ruleset :yield-evidence) (return-from judge-yield (values :valid :legacy)))
+  (let ((named (loop for k in '(:lost-to :reestablished :excluded-by :superseded-by) when (getf reasons k) collect k)))
+    (unless (= 1 (length named)) (return-from judge-yield (values :invalid :no-reason)))
+    (let ((hash (getf reasons (first named)))
+          (conf-fn (lambda (txid) (multiple-value-bind (tx height) (funcall tx-fn txid)
+                                    (and tx (values tx (and height t)))))))
+      (flet ((seen (txid)
+               ;; the named transaction: confirmed, and at or below the yield's height
+               (multiple-value-bind (tx height) (funcall tx-fn txid)
+                 (cond ((not (and tx height)) (return-from judge-yield (values :pending :unconfirmed)))
+                       ((> height yield-height) (return-from judge-yield (values :invalid :early)))
+                       (t tx)))))
+        (ecase (first named)
+          (:lost-to
+           (let ((tx (seen hash)))
+             (multiple-value-bind (v round) (judge-acquire conf-fn vaults hash)
+               (case v
+                 (:unconfirmed (values :pending :unconfirmed))
+                 ((:not-a-claim :not-this-lottery) (values :invalid v))
+                 (t (cond ((< round arm-round) (values :invalid :earlier-round))
+                          ((or (and (plusp (length (btx:tx-outputs tx)))
+                                    (member (btx:txout-script (elt (btx:tx-outputs tx) 0)) targets :test #'equalp))
+                               (and (> (length (btx:tx-inputs tx)) 1)
+                                    (let ((i (elt (btx:tx-inputs tx) 1)))
+                                      (member (list (btx:txin-prev-hash i) (btx:txin-prev-index i)) pledges :test #'equalp))))
+                           (values :invalid :own-claim))
+                          (t (values :valid :valid))))))))
+          (:reestablished
+           (let ((q (find hash quorum-begins :key #'first :test #'equalp)))
+             (cond ((not (expiry-reason-p dispute-reason)) (values :invalid :not-expiry))
+                   ((null q) (values :pending :unknown-quorum-begin))
+                   ((<= (second q) (or last-valid-sequence -1)) (values :invalid :not-after-fork-point))
+                   ((not (third q)) (values :pending :rotation-unconfirmed))
+                   (t (values :valid :valid)))))
+          (:superseded-by
+           ;; DEP-06, reason 4: a fork that never armed, superseded by its disputant's own later
+           ;; DisputeEnter of the same ledger that is on the ledger.
+           (let ((e (find hash enters :key (lambda (e) (getf e :hash)) :test #'equalp)))
+             (cond ((plusp arm-round) (values :invalid :armed))
+                   ((null e) (values :pending :unknown-dispute-enter))
+                   ((not (equalp (getf e :by) yielder)) (values :invalid :other-disputant))
+                   ((not (equalp (getf e :ledger) ledger-id)) (values :invalid :other-ledger))
+                   ((not (if (getf e :punitive) (>= (getf e :seq) fork-enter-seq) (> (getf e :seq) fork-enter-seq)))
+                    (values :invalid :not-later))
+                   ((not (getf e :on-ledger)) (values :invalid :not-on-ledger))
+                   (t (values :valid :valid)))))
+          (:excluded-by
+           (seen hash)
+           (multiple-value-bind (v round) (lottery-tx-round conf-fn vaults hash)
+             (case v
+               (:unconfirmed (values :pending :unconfirmed))
+               (:not-this-lottery (values :invalid :not-this-lottery))
+               (t (cond ((< round arm-round) (values :invalid :earlier-round))
+                        ((member yielder participants :test #'equalp) (values :invalid :in-lottery))
+                        (t (values :valid :valid))))))))))))
+
 (defun fork-acquire-vaults (fork u)
   "The vault the DisputeAcquire U on FORK is judged against: every rung's vault outpoint of the
    latest QuorumBegin before it not authored by the acquirer (it rotates only after acquiring)."
@@ -4414,6 +4852,16 @@
       (and vaults (gethash (list txid (first (first vaults))) *acquire-rounds*)))))
 
 (defun acquire-confirmed-p (node fork)
+  "%ACQUIRE-CLAIM-BINDS-P, and for an acquire after its author's own yield (DEP-06 \"A claim after
+   the claimant's own yield\") only when the claim binds the yielded arm's round or a later one
+   (FORK-ACQUIRE-MIN-ROUND), which only the chain judgment can tell."
+  (multiple-value-bind (u o) (fork-op fork :dispute-acquire)
+    (and o (%acquire-claim-binds-p node fork)
+         (let ((min (fork-acquire-min-round fork u)))
+           (or (zerop min)
+               (and (node-tx-fn node) (>= (or (acquire-round fork) 0) min)))))))
+
+(defun %acquire-claim-binds-p (node fork)
   "FORK carries a DisputeAcquire that binds: its claim_txid confirmed AND spending its dispute's
    lottery outpoint (JUDGE-ACQUIRE).  With no TX-FN, the confirmation alone (TX-CONFS-FN); with
    neither, T: the acquire as published, the reading before the rule.  The round it closes is
@@ -4498,10 +4946,10 @@
                               qb-seq disputes :ruleset (lg:ledger-active-ruleset (record-ledger rec)))))
     (when why (fail "ledger disputed: ~a" why))))
 
-(defun make-fork (node rec last-valid-seq operator33)
+(defun make-fork (node rec last-valid-seq operator33 &key (insert t))
   "A fork of REC's ledger from LAST-VALID-SEQ, operated by OPERATOR33: the
    truncated history replayed, quorum cleared (the reference does the same,
-   so fork operations need no cosignatures)."
+   so fork operations need no cosignatures).  INSERT NIL: not yet entered in our table."
   ;; The base's history is shared from the fork point (not copied), and its state comes from the
   ;; nearest checkpoint: replaying the whole chain per fork was seconds of CPU and a second copy
   ;; of every update list in memory (signet soak, 2026-10-28: 7 forks of a 190k-update ledger).
@@ -4510,7 +4958,7 @@
           (lg:ledger-quorum-members ledger) '() (lg:ledger-next-quorum-members ledger) '())
     (let ((fork (make-view rec last-valid-seq :fork-p t :fork-operator operator33
                                               :owned-p (equalp operator33 (node-pubkey node)) :ledger ledger)))
-    (setf (gethash (fork-key (record-id-hex rec) operator33) (node-ledgers node)) fork)
+    (when insert (setf (gethash (fork-key (record-id-hex rec) operator33) (node-ledgers node)) fork))
     fork)))
 
 (defvar *received-broadcast* nil
@@ -4557,7 +5005,8 @@
                     reason why)
       (return-from enter-dispute nil)))
   (let ((stale (find-fork node (record-id-hex rec) (node-pubkey node))))
-    (when (and stale (not (fork-live-p node stale))) (retire-fork node stale)))
+    ;; re-entry: our later DisputeEnter supersedes it, which ends none of its pledges
+    (when (and stale (not (fork-live-p node stale))) (retire-fork node stale :superseded t)))
   ;; A punitive dispute is never absorbed by an un-armed expiry fork (BLOCKING-FORK), and one key
   ;; holds one fork per ledger here, so the expiry dispute stands down for it: yielded (DEP-05
   ;; §"When a quorum_expired dispute ends" and DEP-06 §Race have an un-armed disputant yield) and
@@ -4566,10 +5015,19 @@
   (let ((expiry (find-fork node (record-id-hex rec) (node-pubkey node))))
     (when (and expiry (null anchor-block-height) (not (expiry-reason-p reason))
                (unarmed-expiry-fork-p expiry))
-      (yield-once node expiry)
-      (release-pledges node (record-id-hex rec))
-      (note-dispute node (record-id-hex rec) "un-armed expiry dispute yielded for a punitive one (~a)" reason)
-      (retire-fork node expiry)))
+      ;; The punitive DisputeEnter is signed first, on a fork view not yet in our table (one key,
+      ;; one fork per ledger here), so the yield can name it (superseded_by); then the expiry fork
+      ;; yields and is retired, and the punitive one takes its place.
+      (let* ((view (make-fork node rec last-valid-seq (node-pubkey node) :insert nil))
+             (enter (new-update node view (punitive-enter-op last-valid-seq reason anchor-block-hash anchor-block-height
+                                                             fraud-proof-hash fraud-proof))))
+        (stand-down-for-punitive node expiry enter)
+        (note-dispute node (record-id-hex rec) "un-armed expiry dispute yielded for a punitive one (~a)" reason)
+        (retire-fork node expiry :superseded t)
+        (setf (gethash (fork-key (record-id-hex rec) (node-pubkey node)) (node-ledgers node)) view)
+        (commit-update node view enter)
+        (drive-dispute-now node view)
+        (return-from enter-dispute view))))
   ;; One DisputeEnter per dispute: a live fork that already entered keeps the grounds it entered
   ;; on (a second, groundless one would be its latest and lose them, DEP-03 §Grounded arms).
   (let ((live (find-fork node (record-id-hex rec) (node-pubkey node))))
@@ -4581,13 +5039,18 @@
       (return-from enter-dispute live)))
   (let ((fork (or (find-fork node (record-id-hex rec) (node-pubkey node))
                   (make-fork node rec last-valid-seq (node-pubkey node)))))
-    (commit-update node fork (new-update node fork (%strip-nil-fields
-                                                    (list :type :dispute-enter :last-valid-sequence last-valid-seq :reason reason
-                                                          :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height
-                                                          :fraud-proof-hash fraud-proof-hash
-                                                          :fraud-proof (dispute-grounds-json fraud-proof-hash fraud-proof)))))
+    (commit-update node fork (new-update node fork (punitive-enter-op last-valid-seq reason anchor-block-hash anchor-block-height
+                                                                      fraud-proof-hash fraud-proof)))
     (drive-dispute-now node fork)
     fork))
+
+(defun punitive-enter-op (last-valid-seq reason anchor-block-hash anchor-block-height fraud-proof-hash fraud-proof)
+  "The DisputeEnter operation ENTER-DISPUTE publishes."
+  (%strip-nil-fields
+   (list :type :dispute-enter :last-valid-sequence last-valid-seq :reason reason
+         :anchor-block-hash anchor-block-hash :anchor-block-height anchor-block-height
+         :fraud-proof-hash fraud-proof-hash
+         :fraud-proof (dispute-grounds-json fraud-proof-hash fraud-proof))))
 
 (defun dispute-lottery-n (rec &optional fork-point)
   "N disputants = the DEP-06 recovery voters."
@@ -4886,34 +5349,134 @@
   (let ((lvs (dispute-fork-point node id-hex fork)))
     (remove-if-not (lambda (u) (> (up:update-seq u) lvs)) (fork-own-updates fork type))))
 
+(defun %op-type (u) (ignore-errors (op:update-type u)))
+
+(defun fork-from (updates enter)
+  "The updates on the fork ENTER opens: its author's non-DisputeEnter updates in UPDATES chained
+   from it (each previous_hash the CHAIN-HASH of one already on it), in sequence order: one pass,
+   since a chain only climbs."
+  (let* ((by (up:update-operator-id enter))
+         ;; copied: REMOVE-IF-NOT may share UPDATES' tail, and SORT is destructive
+         (mine (sort (copy-list (remove-if-not (lambda (u) (and (equalp (up:update-operator-id u) by) (not (eq u enter))
+                                                                (> (up:update-seq u) (up:update-seq enter))))
+                                               updates))
+                     #'< :key #'up:update-seq))
+         (hashes (make-hash-table :test #'equalp))
+         (out '()))
+    (setf (gethash (up:chain-hash enter) hashes) t)
+    (dolist (u mine (nreverse out))
+      (when (and (gethash (up:update-prev-hash u) hashes) (not (eq (%op-type u) :dispute-enter)))
+        (setf (gethash (up:chain-hash u) hashes) t)
+        (push u out)))))
+
+(defun reentry-yield-verdict (updates enter yield &key chain)
+  "DEP-06 \"What a yield must say\": the verdict a yield builder's own judge gives YIELD, the
+   DisputeYield it would sign on the fork ENTER opens (YIELD-SELF-CHECK): :VALID (sign),
+   :INVALID (never signed) or :PENDING (wait).  No other member reads a yield (\"A yield binds
+   only its author\", ruled 2026-11-24).  CHAIN: txid -> the height of the block confirming it, or NIL while unconfirmed;
+   NIL itself = no chain view, the chain reasons as published.  No reason: valid (before
+   yield-evidence-v9; the v9 fold refuses one); more than one: invalid.  :SUPERSEDED-BY is judged
+   from UPDATES alone: invalid if the fork armed before the yield; pending until the named
+   DisputeEnter is held; invalid if another disputant's or ledger's, or not later (a punitive one
+   at or after the fork's own entry, any other strictly after); pending until the operator's
+   update it forks from is held; invalid if it does not chain onto it.  :LOST-TO / :EXCLUDED-BY:
+   pending until the transaction confirms, invalid if above the yield's height.  :REESTABLISHED:
+   an expiry dispute, and a QuorumBegin of the operator's after the fork point, pending until
+   held and its rotation confirmed.  Mirrors deposits-rust's rotation_order::reentry_yield_verdict."
+  (let* ((eo (op:update-op enter)) (yo (op:update-op yield))
+         (lvs (or (op:field eo :last-valid-sequence) -1))
+         (named (loop for k in '(:lost-to :reestablished :excluded-by :superseded-by) when (op:field yo k) collect k))
+         (origin (let ((o (find-if (lambda (u) (zerop (up:update-seq u))) updates))) (and o (up:update-operator-id o)))))
+    (cond ((null named) :valid)
+          ((rest named) :invalid)
+          (t (let ((v (op:field yo (first named))))
+               (flet ((conf (txid) (if chain (list (funcall chain txid)) nil)))
+                 (ecase (first named)
+                   ((:lost-to :excluded-by)
+                    (let ((c (conf v)))
+                      (cond ((null c) :valid)
+                            ((null (first c)) :pending)
+                            ((> (first c) (up:update-block-height yield)) :invalid)
+                            (t :valid))))
+                   (:reestablished
+                    (let ((q (find-if (lambda (u) (and (equalp (up:update-operator-id u) origin)
+                                                       (equalp (up:content-hash u) v)
+                                                       (eq (%op-type u) :quorum-begin)))
+                                      updates)))
+                      (cond ((not (expiry-reason-p (op:field eo :reason))) :invalid)
+                            ((null q) :pending)
+                            ((<= (up:update-seq q) lvs) :invalid)
+                            ((let ((c (conf (op:field (op:update-op q) :new-outpoint-txid)))) (and c (null (first c)))) :pending)
+                            (t :valid))))
+                   (:superseded-by
+                    (let ((n (find-if (lambda (u) (and (equalp (up:content-hash u) v) (eq (%op-type u) :dispute-enter))) updates)))
+                      (cond ((some (lambda (u) (and (< (up:update-seq u) (up:update-seq yield)) (eq (%op-type u) :dispute-armed)))
+                                   (fork-from updates enter))
+                             :invalid)
+                            ((null n) :pending)
+                            ((not (equalp (up:update-operator-id n) (up:update-operator-id yield))) :invalid)
+                            ((not (equalp (up:update-ledger-id n) (up:update-ledger-id enter))) :invalid)
+                            ((not (if (expiry-reason-p (op:field (op:update-op n) :reason))
+                                      (> (up:update-seq n) (up:update-seq enter))
+                                      (>= (up:update-seq n) (up:update-seq enter))))
+                             :invalid)
+                            (t (let* ((nl (op:field (op:update-op n) :last-valid-sequence))
+                                      (base (find-if (lambda (u) (and (equalp (up:update-operator-id u) origin) (eql (up:update-seq u) nl)))
+                                                     updates)))
+                                 (cond ((null base) :pending)
+                                       ((not (equalp (up:chain-hash base) (up:update-prev-hash n))) :invalid)
+                                       (t :valid))))))))))))))
+
 (defun dispute-scope (updates)
-  "UPDATES (a disputed ledger's, every operator's) reduced to its current dispute (see above)."
+  "UPDATES (a disputed ledger's, every operator's) reduced to its current dispute (see above), a
+   function of the SET of UPDATES: each disputant takes part through its counted DisputeEnter
+   (COUNTED-ENTRY: canonical order, latest counts, an acquired fork never superseded) and the
+   updates on the chain it is on, from that chain's first entry (CHAIN-ROOT, CHAIN-FROM), past its
+   fork point; superseding ends no pledge
+   (DEP-03 \"When a pledge is live\").  As deposits-rust's rotation_order::dispute_scope.  Vector
+   inspect/vectors/enter_after_yield.txt."
   (let* ((open (find-if (lambda (u) (zerop (up:update-seq u))) updates))
          (origin (and open (up:update-operator-id open)))
          (enters (and origin
-                      (loop for u in updates
-                            when (and (not (equalp (up:update-operator-id u) origin))
-                                      (eq (ignore-errors (op:update-type u)) :dispute-enter))
-                              collect (list (up:update-operator-id u) (up:update-seq u)
-                                            (op:field (op:update-op u) :last-valid-sequence))))))
+                      (remove-if-not (lambda (u) (and (not (equalp (up:update-operator-id u) origin))
+                                                      (eq (%op-type u) :dispute-enter)))
+                                     updates))))
     (if (null enters)
         updates
-        (let* ((top (reduce #'max enters :key #'third))
+        (let* ((top (reduce #'max enters :key (lambda (u) (op:field (op:update-op u) :last-valid-sequence))))
                (q (or (loop for u in updates
                             when (and (equalp (up:update-operator-id u) origin) (<= (up:update-seq u) top)
-                                      (eq (ignore-errors (op:update-type u)) :quorum-begin))
+                                      (eq (%op-type u) :quorum-begin))
                               maximize (up:update-seq u))
                       0))
-               (fork-of (make-hash-table :test #'equalp)))
+               (by (make-hash-table :test #'equalp))
+               (keep (make-hash-table :test #'eq)))
           (dolist (e enters)
-            (destructuring-bind (op seq lvs) e
-              (when (>= lvs q)
-                (let ((cur (gethash op fork-of)))
-                  (when (or (null cur) (> seq (car cur))) (setf (gethash op fork-of) (cons seq lvs)))))))
-          (remove-if-not (lambda (u) (or (equalp (up:update-operator-id u) origin)
-                                         (let ((f (gethash (up:update-operator-id u) fork-of)))
-                                           (and f (> (up:update-seq u) (cdr f))))))
-                         updates)))))
+            (when (>= (op:field (op:update-op e) :last-valid-sequence) q)
+              (push e (gethash (up:update-operator-id e) by))))
+          (loop for es being the hash-values of by
+                for cur = (counted-entry es (lambda (e) (fork-acquired-p updates e)))
+                for lvs = (op:field (op:update-op cur) :last-valid-sequence)
+                do (dolist (u updates)
+                     (when (and (equalp (up:update-operator-id u) (up:update-operator-id cur))
+                                (equalp (up:content-hash u) (up:content-hash cur)) (> (up:update-seq u) lvs))
+                       (setf (gethash u keep) t)))
+                   ;; the chain CUR is on, from its first entry (a continuation shares its fork's)
+                   (let ((mine (remove-if-not (lambda (u) (equalp (up:update-operator-id u) (up:update-operator-id cur))) updates)))
+                     (dolist (u (chain-from mine (chain-root mine cur)))
+                       (when (and (> (up:update-seq u) lvs) (not (eq (%op-type u) :dispute-enter)))
+                         (setf (gethash u keep) t)))))
+          (remove-if-not (lambda (u) (or (equalp (up:update-operator-id u) origin) (gethash u keep))) updates)))))
+
+(defun node-chain-view (node)
+  "NODE's chain view for REENTRY-YIELD-VERDICT: txid -> the height of the block confirming it,
+   NIL while unconfirmed (or unknown); NIL with no TX-FN or TX-CONFS-FN (as published)."
+  (let ((tx-fn (node-tx-fn node)) (confs-fn (node-tx-confs-fn node)))
+    (when (or tx-fn confs-fn)
+      (lambda (txid)
+        (let ((c (ignore-errors (if tx-fn (nth-value 1 (funcall tx-fn txid)) (funcall confs-fn txid))))
+              (tip (funcall (node-height-fn node))))
+          (and c tip (plusp c) (1+ (- tip c))))))))
 
 (defun armers-of (node id-hex &key until (round 1))
   "Each armer's latest DisputeArmed (highest sequence) on any fork of the ledger:
@@ -6271,8 +6834,25 @@
           ;; output stays unspent, and the re-arm round (DEP-06 Phase 4) must recover it.
           (unless (and (equalp winner-pk (up:x-only (node-pubkey node)))
                        (not (and (getf (node-adversary node) :yield-win) (null lottery-tx))))
-            (unless (yield-once node fork) (fail "yield held (YIELD-ONCE)"))
+            ;; DEP-06 "What a yield must say" (yield-evidence-v9): a lottery we armed for and are not
+            ;; in is reason 3 (excluded_by, the transaction that created it); a draw we merely
+            ;; computed as lost is no reason yet: wait for the winner's claim to bind (lost_to,
+            ;; %DRIVE-DISPUTE), our pledge held meanwhile.  The :yield-win adversary (a drawn winner
+            ;; yielding) has no reason at all, so under v9 it only withholds its claim.
+            (let* ((in-lottery (member (up:x-only (node-pubkey node)) (mapcar #'lot:participant-pubkey participants) :test #'equalp))
+                   (won (and in-lottery (fork-yield-evidence-p fork)
+                             (lost-to-acquire node fork (or (op:field (or (nth-value 1 (fork-op fork :dispute-armed)) '(:type :dispute-armed)) :rearm-round) 1))))
+                   (reason (cond ((not in-lottery) (and conf (list :excluded-by (btx:tx-txid conf))))
+                                 (won (list :lost-to (third won))))))
+              (when (and (fork-yield-evidence-p fork) (null reason))
+                (return-from claim-or-yield (values :awaiting-claim nil)))
+              (unless (yield-once node fork :reason reason) (fail "yield held (YIELD-ONCE)")))
             (return-from claim-or-yield (values :yielded nil)))
+          ;; DEP-06 "A claim after the claimant's own yield": the fold takes such an acquire, but a
+          ;; node SHOULD never make one.  Our fork yielded this arm's round: broadcast no claim
+          ;; (regtest c8b9b7b1, 2026-11-21: deposits-rust ref7's).
+          (when (eq (lg:ledger-dispute-state (record-ledger fork)) :tombstoned)
+            (fail "our fork yielded this round; not claiming"))
           (let* ((txid (or confiscation-txid (and conf (btx:tx-txid conf)) (fail "no confiscation tx")))
                  (claim-txid (if lottery-tx (btx:tx-txid lottery-tx) txid))   ; the output we spend
                  (amount (btx:txout-value (first (btx:tx-outputs conf))))
@@ -7196,7 +7776,8 @@
    of the dispute for the arm's round or a later one (OTHERS: the rounds those claims close, by
    JUDGE-ACQUIRE; the round is over whether or not we yielded to it -- regtest 1121-next4c, 12 of
    deposits-rust ref6's 25 holding forks), or retirement (RETIRED); a binding claim's output 0 is
-   custody while that acquire stands; ENDED is true when the dispute has ended for us.
+   custody while that acquire stands; ENDED is true when the dispute has ended for us.  Fourth
+   value: the held pledges with their rounds, ((key . round) ...).
    Regtest 1120-next4 (deposits-rust ref6): counting every pledge ever declared left a long-lived
    node with 31 coins and none it could pledge.  Vector: pledge_pick.json (its forks cases)."
   (if retired
@@ -7208,6 +7789,7 @@
             (:arm (when (second e) (push (cons (second e) (or (third e) 1)) pledges))
              (setf custody nil ended nil last-round (or (third e) 1)))
             (:yield (setf pledges '() custody nil ended t))
+            (:void-yield)                ; a yield whose evidence is not seen: absent (DEP-06)
             (:acquire (if (third e)
                           (setf pledges '() custody (second e) ended t)
                           (setf custody nil)))))
@@ -7215,7 +7797,7 @@
           (when over
             (setf pledges (remove-if (lambda (p) (<= (cdr p) over)) pledges))
             (when (and (plusp last-round) (<= last-round over)) (setf ended t))))
-        (values (mapcar #'car (nreverse pledges)) custody ended))))
+        (let ((ps (nreverse pledges))) (values (mapcar #'car ps) custody ended ps)))))
 
 (defun others-binding-acquires (node fork)
   "The binding DisputeAcquires by OTHER participants of the dispute our FORK is in: on the other
@@ -7223,19 +7805,38 @@
    against the same vault as ours (the latest QuorumBegin before our DisputeEnter).  A list of
    (acquirer round claim-txid)."
   (let* ((enter (fork-op fork :dispute-enter))
-         (us (node-pubkey node))
          (q (and enter (record-latest fork :quorum-begin :below (up:update-seq enter))))
          (ours (and q (first (fr:rotation-rungs (op:update-op q))))))
-    (when ours
-      (loop for f in (forks-of node (record-id-hex fork))
+    (%others-binding-acquires node (record-id-hex fork) (and enter (up:update-seq enter)) ours fork)))
+
+(defun %others-binding-acquires (node id-hex enter-seq vault except)
+  "OTHERS-BINDING-ACQUIRES for a dispute of ID-HEX entered at ENTER-SEQ on VAULT (its rung-0
+   txid), over our forks of it but EXCEPT (also a superseded fork's, NOTE-SUPERSEDED)."
+  (let ((us (node-pubkey node)))
+    (when (and vault enter-seq)
+      (loop for f in (forks-of node id-hex)
             for (u o) = (multiple-value-list (fork-op f :dispute-acquire))
-            when (and o (not (eq f fork))
+            when (and o (not (eq f except))
                       (not (equalp (up:update-operator-id u) us))
                       (not (equalp (op:field o :new-custodian) us))
-                      (> (up:update-seq u) (up:update-seq enter))
-                      (equalp (first (first (fork-acquire-vaults f u))) ours)
+                      (> (up:update-seq u) enter-seq)
+                      (equalp (first (first (fork-acquire-vaults f u))) vault)
                       (acquire-confirmed-p node f))
               collect (list (up:update-operator-id u) (or (acquire-round f) 1) (op:field o :claim-txid))))))
+
+(defun yield-evidence-seen-p (node yield-op)
+  "DEP-06 \"What a yield must say\": whether the transaction a DisputeYield names (:LOST-TO or
+   :EXCLUDED-BY) is confirmed, so the yield counts.  A yield naming none (an earlier ruleset's, or
+   :REESTABLISHED, checked when it was signed) counts as before; with no chain view, as
+   published.  Only the confirmation is asked here: the full judgment is JUDGE-YIELD."
+  (let ((txid (or (op:field yield-op :lost-to) (op:field yield-op :excluded-by))))
+    (cond ((null txid) t)
+          ((node-tx-fn node)
+           (let ((c (nth-value 1 (ignore-errors (funcall (node-tx-fn node) txid)))))
+             (and c (plusp c))))
+          ((node-tx-confs-fn node)
+           (let ((c (ignore-errors (funcall (node-tx-confs-fn node) txid)))) (and c (plusp c))))
+          (t t))))
 
 (defun fork-pledge-events (node fork)
   "FORK's own dispute operations as FORK-PLEDGES-HELD reads them, oldest first; its latest
@@ -7253,7 +7854,9 @@
                                                     (outpoint-key (op:field o :replacement-collateral-txid)
                                                                   (op:field o :replacement-collateral-vout)))
                                           (or (op:field o :rearm-round) 1)))
-                    (:dispute-yield (list :yield))
+                    ;; DEP-06 "An invalid yield is void": one naming a transaction not confirmed
+                    ;; (YIELD-EVIDENCE-SEEN-P) frees no pledge; read as absent until it is.
+                    (:dispute-yield (if (yield-evidence-seen-p node o) (list :yield) (list :void-yield)))
                     (:dispute-acquire (list :acquire (and (op:field o :claim-txid) (outpoint-key (op:field o :claim-txid) 0))
                                             (and (eq u last-acquire) (acquire-confirmed-p node fork) t)))))))
 
@@ -7370,7 +7973,8 @@
                            for h = (find v held :key #'first :test #'equal)
                            unless (and h (fourth h)) collect k))
            (keyed (loop for u in utxos collect (list* :key (outpoint-key (getf u :txid) (getf u :vout)) u)))
-           (taken (append declared custody reserved))
+           ;; and what our superseded forks still hold: superseding ends no pledge (ruled 2026-11-24)
+           (taken (append declared custody reserved (superseded-holds node)))
            (free (remove-if (lambda (u) (or (< (getf u :confirmations) (max 1 (node-min-confs node)))
                                             (member (getf u :key) taken :test #'equal)))
                             keyed))
@@ -8564,8 +9168,7 @@
            ;; Our fork from the dispute that moved custody is history now.
            (let ((own (find-fork node id us)))
              (when (and own (not (eq own chain)))
-               (release-pledges node id)
-               (retire-fork node own)))
+               (retire-fork node own :superseded t)))
            (enter-dispute node chain (lg:ledger-sequence l) :reason "unhonoured_obligation"
                                                             :fraud-proof-hash (fr:proof-hash proof) :fraud-proof proof)))))
 
@@ -8864,5 +9467,7 @@
              (id (loop for k being the hash-keys of (node-ledgers node) when (and (>= (length k) 16) (string= prefix (subseq k 0 16))) return k)))
         (when id (handler-case (load-rearms node id f) (error (e) (funcall log-fn "could not load ~a: ~a" f e))))))
     (handler-case (load-pledges node) (error (e) (funcall log-fn "could not load pledges: ~a" e)))
+    (handler-case (load-superseded node) (error (e) (funcall log-fn "could not load superseded forks: ~a" e)))
+    (handler-case (load-side-forks node) (error (e) (funcall log-fn "could not load side forks: ~a" e)))
     (publish-pending node)
     node))

@@ -1,0 +1,325 @@
+# DEP-06 "A yield binds only its author" (ruled 2026-11-24, "latest counts"): no other member
+# reads a yield, and a disputant's later DisputeEnter supersedes its earlier fork for the scope
+# (DEP-03 "The dispute": voters, accused set, arms) whatever that fork's yield says, or whether it
+# yielded at all.  The scope is a function of the SET of updates, never of their order: a
+# disputant's entries at or above Q in the canonical order (sequence; at one sequence a punitive
+# entry before a quorum_expired one; then content hash ascending), the first counted and each
+# later one at a higher sequence replacing it, except over a fork carrying its author's
+# DisputeAcquire, which nothing supersedes; and the disputant takes part through that entry and
+# the updates past its fork point on the chain it is on (from that chain's first entry, so a
+# continuation shares its fork's) only.  Superseding never ends a pledge (DEP-03 "When a pledge is
+# live"): a pledge on a superseded fork stays held until its own valid yield or a binding claim of
+# its round or a later one.
+#
+# deposits-rust: deposits-core/tests/enter_after_yield_vector.rs (rotation_order::dispute_scope,
+# the scope cases) and deposits-node node::dispute (forks_hold, the pledge cases).  cl-deposits:
+# inspect/lottery-test.lisp (dispute-scope; superseded-entry / superseded-pledges-held and
+# fork-pledges-held for the pledge cases) and inspect/node-test.lisp (its ingest, in every arrival
+# order).  Both run each scope case in every order of its updates (all permutations up to six
+# updates; else the input order, its reverse and 300 shuffles) and require the same scope.
+#
+# Scope cases:
+#   case <name> ... end
+#   u <who> <seq> <kind> [args] [h=<height>] [as=<tag>] [on=<tag>]
+#       who: o = the ledger's operator, a..z = disputants; tag <who>:<seq>, or as=<tag>.
+#       kinds: open | other | qb | enter <lvs> [punitive] [cont] | arm [<round>] | acquire
+#              | yield [lost_to=<name>] [excluded_by=<name>] [reestablished=<tag>] [superseded_by=<tag>]
+#   expect <tag> ...         dispute_scope's kept updates, in input order
+# Building them: each who's key the compressed public key of the secret key 32 x <its character
+# code>; ledger_id 32 x 0x09, block_hash 32 x 0x01, signature 64 x 0, no cosignatures, block_height
+# h (default 0); content_hash the update's DEP-02 hash and its chain hash SHA256(content_hash ||
+# signature), as for any update.  previous_hash: an operator update's, the chain hash of the
+# operator's update before it (32 x 0 for the first); an enter's, the chain hash of the operator's
+# update at its last_valid_sequence, or with "cont" of its fork's latest update (a continuation
+# onto the fork's tip); any other disputant update's, the chain hash of the latest update on its
+# fork (its latest DisputeEnter's, or on=<tag>'s); a chain hash of a tag no update carries is
+# SHA256(SHA256("enter_after_yield:" || tag) || 64 x 0).  A punitive enter's reason "equivocation", any
+# other "quorum_expired"; a yield's TLVs SHA256("tx:" || name) for lost_to / excluded_by, and for
+# reestablished / superseded_by the content hash of the update tagged so (SHA256("enter_after_yield:"
+# || tag) when there is none); an arm: armed_block 0, commitment 20 x 0, target "", rearm_round
+# <round> when > 1; an acquire: new_custodian the key of "m", claim_txid SHA256("tx:claim"),
+# new_reserves_address "".
+#
+# Pledge cases, one disputant's (our) forks of one ledger:
+#   pledge <name> ... end
+#   fork <n> enter | arm <coin> [<round>] | yield seen | yield void | acquire binds | acquire pending
+#                            fork n's own dispute operations, oldest first; a void yield names a
+#                            transaction not confirmed (DEP-06 "An invalid yield is void")
+#   supersede <n>            our later DisputeEnter (the next fork) supersedes fork n
+#   later-seen <n>           after that, fork n's void yield's transaction confirms (now valid)
+#   others <round>           another participant's binding claim closes this round (every fork)
+#   held <coin> ... | held -   the coins still held, sorted by name
+# A coin is the outpoint SHA256("tx:" || coin):0.
+
+# 1. A lost_to yield whose claim is not confirmed (pending): the new entry is taken anyway.
+case lost-to-pending-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 7 arm
+u a 8 yield lost_to=C h=100
+u o 10 other
+u a 11 enter 10
+expect o:0 o:5 o:10 a:11
+end
+# 2. An excluded_by yield, pending or forged: taken; b, who never yielded, is unaffected.
+case excluded-by-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u b 6 enter 5
+u a 7 arm
+u a 8 yield excluded_by=L h=100
+u o 10 other
+u a 11 enter 10
+u b 11 other
+expect o:0 o:5 b:6 o:10 a:11 b:11
+end
+# 3. A yield with two reasons (invalid, void): taken.
+case two-reasons-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 7 arm
+u a 8 yield lost_to=C excluded_by=L h=100
+u o 10 other
+u a 11 enter 10
+expect o:0 o:5 o:10 a:11
+end
+# 4. A yield naming no reason (an earlier ruleset's): taken.
+case legacy-yield-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 7 arm
+u a 8 yield h=100
+u o 10 other
+u a 11 enter 10
+expect o:0 o:5 o:10 a:11
+end
+# 5. An open fork that never yielded nor armed: taken.
+case open-fork-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u o 10 other
+u a 11 enter 10
+expect o:0 o:5 o:10 a:11
+end
+# 6. An open ARMED fork that never yielded: taken (its arm leaves the scope; its pledge does not
+#    end, see the pledge cases).
+case armed-open-fork-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 7 arm
+u o 10 other
+u a 11 enter 10
+expect o:0 o:5 o:10 a:11
+end
+# 7. reestablished, the new entry at a fork point before the re-establishing QuorumBegin: taken.
+case reestablished-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u o 7 other
+u a 8 enter 7 as=a:8e
+u o 9 qb
+u a 10 yield reestablished=o:9 h=100
+expect o:0 o:5 o:7 a:8e o:9 a:10
+end
+# 8. reestablished naming a QuorumBegin at or before the fork point (invalid): taken.
+case reestablished-invalid-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u o 7 other
+u a 8 enter 7 as=a:8e
+u a 9 yield reestablished=o:5 h=100
+expect o:0 o:5 o:7 a:8e a:9
+end
+# 9. superseded_by its own later punitive entry: taken.
+case superseded-by-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u o 7 other
+u a 8 enter 7 punitive
+u a 9 yield superseded_by=a:8 h=100
+expect o:0 o:5 o:7 a:8 a:9
+end
+# 10. superseded_by on a fork that armed (invalid): taken.
+case superseded-by-armed-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 7 arm
+u o 7 other
+u a 8 enter 7 punitive
+u a 9 yield superseded_by=a:8 h=100
+expect o:0 o:5 o:7 a:8 a:9
+end
+# 11. superseded_by naming an entry nobody holds; a different later entry: taken.
+case superseded-by-unknown-taken
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u o 11 other
+u a 9 yield superseded_by=a:8 h=100
+u a 12 enter 11
+expect o:0 o:5 o:11 a:12
+end
+# 12. Same sequence, a punitive entry over an expiry one: it supersedes (DEP-06 reason 4).
+case same-sequence-punitive-over-expiry
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 6 enter 5 punitive as=a:6p
+u a 9 yield superseded_by=a:6p h=100
+expect o:0 o:5 a:6p a:9
+end
+# 13. A later QuorumBegin at or below the new fork point: Q moves past the old fork.
+case quorum-begin-past-old-fork
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u o 9 qb
+u a 10 yield reestablished=o:9 h=100
+u o 12 other
+u a 13 enter 12
+expect o:0 o:5 o:9 o:12 a:13
+end
+# 14. A fork its author acquired on is never superseded: the later entry is not taken.
+case reentry-over-acquired-fork
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 7 arm
+u a 8 acquire
+u o 10 other
+u a 11 enter 10
+expect o:0 o:5 a:6 a:7 a:8 o:10
+end
+# 15. Same sequence, an expiry entry after a punitive one: not taken.
+case same-sequence-expiry-over-punitive
+u o 0 open
+u o 5 qb
+u a 6 enter 5 punitive
+u a 6 enter 5 as=a:6e
+expect o:0 o:5 a:6
+end
+# 16. Same sequence, same kind: the lower content hash counts, whatever the order.
+case same-sequence-same-kind
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 6 enter 5 h=1 as=a:6b
+expect o:0 o:5 a:6
+end
+# 17. A continuation: an entry chained onto the fork's own tip counts from its own fork point.
+case continuation-onto-fork-tip
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 7 arm
+u o 8 other
+u a 9 enter 8 cont
+u a 10 arm
+expect o:0 o:5 o:8 a:9 a:10
+end
+# 18. An acquire arriving after a later entry: the acquired fork stands, the later entry is out.
+case acquire-after-later-entry
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 7 arm
+u o 10 other
+u a 11 enter 10
+u a 8 acquire on=a:6
+expect o:0 o:5 a:6 a:7 o:10 a:8
+end
+# 19. A superseded fork's arm above the counted fork point is no part of the dispute: only the
+#     counted fork's chain is.
+case superseded-fork-arm-out
+u o 0 open
+u o 5 qb
+u a 6 enter 5
+u a 7 arm on=a:6
+u a 6 enter 5 punitive as=a:6p
+u a 7 arm on=a:6p as=a:7p
+expect o:0 o:5 a:6p a:7p
+end
+
+# P1. An armed fork superseded by our re-entry keeps its pledge; the new fork's is held too.
+pledge armed-superseded-held
+fork 1 enter
+fork 1 arm A
+supersede 1
+fork 2 enter
+fork 2 arm B
+held A B
+end
+# P2. Superseded after a void yield (its claim not confirmed): still held.
+pledge void-yield-superseded-held
+fork 1 enter
+fork 1 arm A
+fork 1 yield void
+supersede 1
+fork 2 enter
+held A
+end
+# P3. ...and released once that yield's claim confirms (its own valid yield).
+pledge void-yield-later-valid-releases
+fork 1 enter
+fork 1 arm A
+fork 1 yield void
+supersede 1
+fork 2 enter
+later-seen 1
+held -
+end
+# P4. A pledge its own valid yield ended before the re-entry stays free.
+pledge valid-yield-then-superseded-free
+fork 1 enter
+fork 1 arm A
+fork 1 yield seen
+supersede 1
+fork 2 enter
+fork 2 arm B
+held B
+end
+# P5. Superseded, then another participant's binding claim of its round: released; the new
+#     fork's round-2 pledge is not.
+pledge others-claim-releases-superseded
+fork 1 enter
+fork 1 arm A
+supersede 1
+fork 2 enter
+fork 2 arm B 2
+others 1
+held B
+end
+# P6. A superseded fork's re-arm (round 2) pledge outlives a claim that closes round 1 only.
+pledge rearm-pledge-outlives-earlier-claim
+fork 1 enter
+fork 1 arm A
+fork 1 arm A2 2
+supersede 1
+fork 2 enter
+others 1
+held A2
+end
+# P7. Our own binding claim ends the pledge (custody follows, not a pledge).
+pledge own-binding-claim-ends
+fork 1 enter
+fork 1 arm A
+fork 1 acquire binds
+held -
+end
+# P8. Our own claim not yet binding ends nothing.
+pledge own-pending-claim-holds
+fork 1 enter
+fork 1 arm A
+fork 1 acquire pending
+held A
+end

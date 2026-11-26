@@ -1209,16 +1209,181 @@
             (check "c sees b's new DisputeEnter on a fresh fork (its stale copy retired)"
                    (let ((f (nd:find-fork c id (nd:node-pubkey b)))) (and f (null (nd::fork-op f :dispute-yield)))))))))))
 
+;; DEP-06 "A yield binds only its author" (ruled 2026-11-24, latest counts): a disputant's later
+;; DisputeEnter supersedes its earlier fork whatever that fork's yield says, and superseding never
+;; ends a pledge (DEP-03 "When a pledge is live").  b arms (pledging P), yields naming a claim not yet
+;; confirmed (void), and enters again: c takes the new entry at once; b's superseded fork keeps P
+;; held until its own yield counts.  Then c takes a re-entry over a live fork that never yielded.
+;; Vector enter_after_yield.txt.
+(with-gate ("a re-entry supersedes the disputant's fork; superseding ends no pledge (DEP-03, DEP-06)")
+  (let ((lg:+current-ruleset+ "yield-evidence-v9"))   ; the reasons are v9 TLVs
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (claim (u:sha256 (hx "c1a1")))
+         (pledge (u:sha256 (hx "c0be")))
+         (confirmed nil)
+         (a (nd:make-node :priv (tk 11111111111111111198) :bus bus :height-fn hf))
+         (b (nd:make-node :priv (tk 22222222222222222298) :bus bus :height-fn hf
+                          :tx-confs-fn (lambda (txid) (and confirmed (equalp txid claim) 3))))
+         (c (nd:make-node :priv (tk 33333333333333333398) :bus bus :height-fn hf))
+         (d (nd:make-node :priv (tk 44444444444444444498) :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:ry" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d98")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
+    (let ((*height* (+ (lg:ledger-quorum-expiry (nd:record-ledger la)) 4)) (bk (nd:node-pubkey b))
+          (pkey (nd::outpoint-key pledge 0)))
+      (check-equal "b opens an expiry dispute" (nd:dispute-expired-quorums b :grace 3) (list id))
+      (let ((old (nd:find-fork b id bk)))
+        (nd::commit-update b old (nd::new-update b old (list :type :dispute-armed :armed-block *height*
+                                                             :commitment-hash (make-array 20 :element-type '(unsigned-byte 8) :initial-element 7)
+                                                             :target-reserves "genesis:ry"
+                                                             :replacement-collateral-txid pledge :replacement-collateral-vout 0
+                                                             :replacement-collateral-amount 1000)))
+        (setf (gethash pkey (nd:node-pledges b)) id)
+        (check "b's fork armed, pledging P" (nd::fork-op old :dispute-armed))
+        (nd::commit-update b old (nd::new-update b old (list :type :dispute-yield :lost-to claim)))
+        (check "b yielded naming a claim not confirmed: void, P still held"
+               (and (nd::fork-op old :dispute-yield)
+                    (equal (nd::fork-pledges-held (nd::fork-pledge-events b old)) (list pkey))))
+        (check "c applied b's yield" (nd::fork-op (nd:find-fork c id bk) :dispute-yield))
+        ;; the operator moves on; b enters again at its new tip
+        (nd:add-member a la (nd:node-pubkey d) :member-ledger-id (nd::node-member-ledger-hex d))
+        (let* ((lvs (lg:ledger-sequence (nd:record-ledger (nd:find-record b id))))
+               (new (nd::enter-dispute b (nd:find-record b id) lvs :reason "quorum_expired")))
+          (check "b's re-entry opens a new fork" (and new (not (eq new old)) (eq new (nd:find-fork b id bk))))
+          (check "c takes it at once, the yield's claim still unconfirmed"
+                 (let ((f (nd:find-fork c id bk)))
+                   (and f (null (nd::fork-op f :dispute-yield))
+                        (equalp (up:content-hash (nd::fork-op f :dispute-enter)) (up:content-hash (nd::fork-op new :dispute-enter))))))
+          (check-equal "superseding ended no pledge: b's superseded fork still holds P" (nd::superseded-holds b) (list pkey))
+          (setf confirmed t)
+          (check-equal "once the claim confirms, its own yield counts: P is free" (nd::superseded-holds b) '())
+          (check "and the superseded fork is forgotten" (null (nd::node-superseded b)))))
+      ;; a re-entry over a live fork that never yielded: taken too; a relay's echo of it changes nothing
+      (nd:add-member a la (nd:node-pubkey d) :member-ledger-id (nd::node-member-ledger-hex d))
+      (let* ((base (nd:find-record c id))
+             (lvs (lg:ledger-sequence (nd:record-ledger base)))
+             (at (find lvs (nd::record-history base) :key #'up:update-seq))
+             (live (nd:find-fork c id bk))
+             (re (up:make-signed-update :operator-id bk :ledger-id (u:hex->bytes id) :seq (1+ lvs) :prev-hash (up:chain-hash at)
+                                        :block-height *height* :block-hash (u:sha256 (hx (format nil "~8,'0x" *height*)))
+                                        :message (op:encode-operation (list :type :dispute-enter :last-valid-sequence lvs :reason "quorum_expired")))))
+        (up:sign-operator re (nd::node-priv b))
+        (check "c's fork of b is live and never yielded" (and live (nd:fork-live-p c live) (null (nd::fork-op live :dispute-yield))))
+        (nd::handle-update c (w:update-event (nd::node-keypair b) re))
+        (let ((f (nd:find-fork c id bk)))
+          (check "c takes the later entry over it" (and f (not (eq f live)) (equalp (up:content-hash (nd::fork-op f :dispute-enter)) (up:content-hash re))))
+          (nd::handle-update c (w:update-event (nd::node-keypair b) re))
+          (check "the echo is not a new entry" (eq f (nd:find-fork c id bk)))))))))
+
+;; DEP-03 "The dispute": the fork a member holds for a disputant is a function of the SET of that
+;; disputant's updates, never of the order they arrived in.  b enters (fork A) and arms, the operator
+;; moves on, b enters again and arms: as a continuation of A (A live: ENTER-DISPUTE appends to it),
+;; or, A yielded first, on a new fork B that supersedes A.  A fresh member is handed b's updates in
+;; every order and must end on the fork holding b's later entry and its arm.
+(defun %arrival-order-gate (yield-first tag)
+  (let ((lg:+current-ruleset+ "yield-evidence-v9"))
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (a (nd:make-node :priv (tk 11111111111111111194) :bus bus :height-fn hf))
+         (b (nd:make-node :priv (tk 22222222222222222294) :bus bus :height-fn hf))
+         (c (nd:make-node :priv (tk 33333333333333333394) :bus bus :height-fn hf))
+         (d (nd:make-node :priv (tk 44444444444444444494) :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id tag :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d94")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
+    (let ((*height* (+ (lg:ledger-quorum-expiry (nd:record-ledger la)) 4)) (bk (nd:node-pubkey b)))
+      (flet ((arm (fork n)
+               (nd::commit-update b fork (nd::new-update b fork (list :type :dispute-armed :armed-block *height*
+                                                                      :commitment-hash (make-array 20 :element-type '(unsigned-byte 8) :initial-element n)
+                                                                      :target-reserves tag))))
+             (own (fork type) (nd::fork-op fork type)))
+        (check-equal "b opens an expiry dispute" (nd:dispute-expired-quorums b :grace 3) (list id))
+        (let* ((fa (nd:find-fork b id bk)) (e1 (progn (arm fa 1) (own fa :dispute-enter))) (a1 (own fa :dispute-armed))
+               (y1 (when yield-first
+                     (nd::commit-update b fa (nd::new-update b fa (list :type :dispute-yield :lost-to (u:sha256 (hx "c1a9")))))
+                     (own fa :dispute-yield))))
+          (nd:add-member a la (nd:node-pubkey d) :member-ledger-id (nd::node-member-ledger-hex d))
+          (let* ((fb (nd::enter-dispute b (nd:find-record b id) (lg:ledger-sequence (nd:record-ledger (nd:find-record b id))) :reason "quorum_expired"))
+                 (e2 (progn (arm fb 2) (own fb :dispute-enter))) (a2 (own fb :dispute-armed))
+                 (four (remove nil (list e1 a1 y1 e2 a2)))
+                 (base (nd:find-record c id)) (hist (nd::record-history base))
+                 (wrong 0) (orders 0))
+            (check "b's updates: two entries, two arms" (and e1 a1 e2 a2 (not (eq e1 e2))))
+            (check "the second entry is on a new fork iff A yielded first" (eq (null yield-first) (eq fa fb)))
+            (labels ((perms (l) (if (null l) (list nil) (loop for x in l append (mapcar (lambda (p) (cons x p)) (perms (remove x l)))))))
+              (dolist (ord (perms four))
+                (let ((m (nd:make-node :priv (tk 55555555555555555594) :bus (bus:make-mock-bus) :height-fn hf)))
+                  (setf (gethash id (nd:node-ledgers m))
+                        (nd::make-record :id-hex id :ledger (lg:replay (reverse hist)) :history hist))
+                  (dolist (u ord) (nd::handle-update m (w:update-event (nd::node-keypair b) u)))
+                  (incf orders)
+                  (let ((f (nd:find-fork m id bk)))
+                    (unless (and f (equalp (up:content-hash (own f :dispute-enter)) (up:content-hash e2))
+                                 (own f :dispute-armed) (equalp (up:content-hash (own f :dispute-armed)) (up:content-hash a2)))
+                      (incf wrong)
+                      (format t "~&    order ~a: fork enter ~a~%" (mapcar (lambda (u) (position u four)) ord)
+                              (and f (up:update-seq (own f :dispute-enter)))))))))
+            (check-equal "every order tried" orders (if yield-first 120 24))
+            (check-equal "every order ends on the later entry's fork, with its arm" wrong 0))))))))
+
+(with-gate ("a member's fork of a disputant is the same in every arrival order: a continuation (DEP-03)")
+  (%arrival-order-gate nil "genesis:ao"))
+(with-gate ("a member's fork of a disputant is the same in every arrival order: a superseding fork (DEP-03)")
+  (%arrival-order-gate t "genesis:ap"))
+
+
+;; DEP-06 "A yield binds only its author": a yield builder runs the judge first (YIELD-SELF-CHECK in
+;; YIELD-ONCE).  Invalid: never signed or broadcast.  Pending: held, signed once the chain answers.
+(with-gate ("a yield builder runs the judge before signing (DEP-06 self-check)")
+  (let ((lg:+current-ruleset+ "yield-evidence-v9"))   ; the reasons are v9 TLVs
+  (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
+         (claim (u:sha256 (hx "c1a2")))
+         (confirmed nil)
+         (a (nd:make-node :priv (tk 11111111111111111196) :bus bus :height-fn hf))
+         (b (nd:make-node :priv (tk 22222222222222222296) :bus bus :height-fn hf
+                          :tx-confs-fn (lambda (txid) (and confirmed (equalp txid claim) 3))))
+         (c (nd:make-node :priv (tk 33333333333333333396) :bus bus :height-fn hf))
+         (d (nd:make-node :priv (tk 44444444444444444496) :bus bus :height-fn hf))
+         (la (nd:open-ledger a :reserves-id "genesis:ys" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+    (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
+      (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
+    (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d96")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
+    (let ((*height* (+ (lg:ledger-quorum-expiry (nd:record-ledger la)) 4)) (bk (nd:node-pubkey b)))
+      (check-equal "b opens an expiry dispute" (nd:dispute-expired-quorums b :grace 3) (list id))
+      (let* ((fork (nd:find-fork b id bk))
+             (qb (find :quorum-begin (nd::record-history (nd:find-record b id)) :key (lambda (u) (ignore-errors (op:update-type u)))))
+             (yields-published (lambda () (count-if (lambda (e) (let ((u (ignore-errors (w:event->update e))))
+                                                                   (and u (equalp (up:update-operator-id u) bk)
+                                                                        (eq (ignore-errors (op:update-type u)) :dispute-yield))))
+                                                    (bus:mock-bus-events bus)))))
+        (check "the fork judges yields under yield-evidence-v9" (nd::fork-yield-evidence-p fork))
+        (check-equal "invalid (reestablished by a QuorumBegin at or before the fork point): its verdict"
+                     (nd::yield-self-check b fork (list :reestablished (up:content-hash qb))) :invalid)
+        (check "and it is never signed" (null (nd::yield-once b fork :reason (list :reestablished (up:content-hash qb)))))
+        (check-equal "pending (superseded_by a DisputeEnter nobody holds): its verdict"
+                     (nd::yield-self-check b fork (list :superseded-by (u:sha256 (hx "dead")))) :pending)
+        (check "and it waits" (null (nd::yield-once b fork :reason (list :superseded-by (u:sha256 (hx "dead"))))))
+        (check-equal "pending (lost_to a claim not confirmed): its verdict" (nd::yield-self-check b fork (list :lost-to claim)) :pending)
+        (check "and it waits" (null (nd::yield-once b fork :reason (list :lost-to claim))))
+        (check "nothing was signed or broadcast" (and (null (nd::fork-op fork :dispute-yield)) (zerop (funcall yields-published))))
+        (setf confirmed t)
+        (check-equal "once the claim confirms: valid" (nd::yield-self-check b fork (list :lost-to claim)) :valid)
+        (check "and the yield is signed" (nd::yield-once b fork :reason (list :lost-to claim)))
+        (check "once" (and (nd::fork-op fork :dispute-yield) (= 1 (funcall yields-published)))))))))
+
 ;; deposits-rust ref7 (signet, 2026-11-20): an un-armed quorum_expired fork of 5effb9e8 absorbed a
 ;; self-detected Equivocation, so ref7 signed no punitive DisputeEnter and cld4 proved it derelict.
 ;; Here the same fork made HANDLE-OPERATOR-FRAUD skip the proof (it was "live").
-(with-gate ("a punitive proof is not absorbed by an un-armed expiry dispute")
+(defun %punitive-not-absorbed (v9)
+  "The gate below, under the pinned ruleset (V9 NIL) or yield-evidence-v9 (V9 T: the expiry fork's
+   yield names the punitive DisputeEnter, superseded_by, and the judge finds it valid)."
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (a (nd:make-node :priv (tk 11111111111111111197) :bus bus :height-fn hf))
          (b (nd:make-node :priv (tk 22222222222222222297) :bus bus :height-fn hf))
          (c (nd:make-node :priv (tk 33333333333333333397) :bus bus :height-fn hf))
          (d (nd:make-node :priv (tk 44444444444444444497) :bus bus :height-fn hf))
-         (la (nd:open-ledger a :reserves-id "genesis:pf" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+         (la (nd:open-ledger a :reserves-id (if v9 "genesis:pf9" "genesis:pf") :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
     (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
       (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
     (nd:begin-quorum a la :funding-txid (u:sha256 (hx "f00d9f")) :funding-vout 0 :amount-msats 15600000 :collateral-msats 23400000 :expiry-blocks 100)
@@ -1254,7 +1419,45 @@
                (some (lambda (e) (let ((u (ignore-errors (w:event->update e))))
                                    (and u (equalp (up:update-operator-id u) (nd:node-pubkey b))
                                         (eq (ignore-errors (op:update-type u)) :dispute-yield))))
-                     (bus:mock-bus-events bus)))))))
+                     (bus:mock-bus-events bus)))
+        ;; DEP-06 reason 4 (ruled 2026-11-24): under yield-evidence-v9 that yield names b's punitive
+        ;; DisputeEnter by its content hash, and a judge holding the relay's DisputeEnters finds it
+        ;; valid.  (Without the reason, the v9 fold refuses the yield and it is never published.)
+        (when v9
+          (let* ((mine (loop for e in (bus:mock-bus-events bus)
+                             for u = (ignore-errors (w:event->update e))
+                             when (and u (equalp (up:update-operator-id u) (nd:node-pubkey b))
+                                       (equalp (up:update-ledger-id u) (u:hex->bytes id)))
+                               collect u))
+                 (y (find :dispute-yield mine :key (lambda (u) (ignore-errors (op:update-type u)))))
+                 (enters (remove :dispute-enter mine :key (lambda (u) (ignore-errors (op:update-type u))) :test-not #'eq))
+                 (exp-enter (find-if (lambda (u) (nd::expiry-reason-p (op:field (op:update-op u) :reason))) enters))
+                 (pun-enter (find-if-not (lambda (u) (nd::expiry-reason-p (op:field (op:update-op u) :reason))) enters))
+                 (sb (and y (op:field (op:update-op y) :superseded-by))))
+            (check-equal "v9: the fork is under yield-evidence-v9"
+                         (lg:ledger-active-ruleset (nd:record-ledger (nd:find-record b id))) "yield-evidence-v9")
+            (check "v9: b's yield names its punitive DisputeEnter (superseded_by)"
+                   (and sb pun-enter (equalp sb (up:content-hash pun-enter))))
+            (check-equal "v9: the judge finds that yield valid"
+                         (and y exp-enter
+                              (multiple-value-list
+                               (nd::judge-yield :ruleset "yield-evidence-v9" :reasons (list :superseded-by sb)
+                                                :yield-height (up:update-block-height y) :arm-round 0
+                                                :yielder (up:x-only (nd:node-pubkey b)) :ledger-id (u:hex->bytes id)
+                                                :fork-enter-seq (up:update-seq exp-enter)
+                                                :enters (mapcar (lambda (u) (list :hash (up:content-hash u) :by (up:x-only (up:update-operator-id u))
+                                                                                  :ledger (up:update-ledger-id u) :seq (up:update-seq u)
+                                                                                  :punitive (not (nd::expiry-reason-p (op:field (op:update-op u) :reason)))
+                                                                                  :on-ledger t))
+                                                                enters))))
+                         '(:valid :valid))))))))
+
+(with-gate ("a punitive proof is not absorbed by an un-armed expiry dispute")
+  (%punitive-not-absorbed nil))
+
+(with-gate ("a punitive proof is not absorbed by an un-armed expiry dispute (yield-evidence-v9: superseded_by)")
+  (let ((lg:+current-ruleset+ "yield-evidence-v9"))
+    (%punitive-not-absorbed t)))
 
 (with-gate ("confiscation signs the tier open at the height: a minority past expiry + 720")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
@@ -1316,12 +1519,18 @@
         (setf utxos (list (utxo "08" 1000 3)))
         (check-equal "too little altogether: declined" (nd:pledge-collateral b id) nil)))))
 
-(with-gate ("dispute driver: an expired quorum is armed, confiscated, revealed and claimed without a command")
+(defun %dispute-driver (v9)
+  "The gate below, under the pinned ruleset (V9 NIL), or under yield-evidence-v9 (V9 T), where a
+   loser yields only once the winner's claim binds, naming it (lost_to): so each node also gets a
+   TX-FN over the mock chain's broadcast transactions once the reserves are confiscated, which
+   the binding judgment reads."
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (chain (make-hash-table :test #'equalp))   ; (txid-list . vout) -> (sats . spk)
+         (txs (make-hash-table :test #'equalp))     ; txid -> tx, every broadcast (V9's TX-FN)
          (cf (lambda (txid vout) (let ((v (gethash (cons (coerce txid 'list) vout) chain))) (and v (list :value-sats (car v) :confirmations 3)))))
          (bf (lambda (bytes)   ; the mock mempool confirms at once: spend the inputs, add the outputs
                (let ((tx (btx:parse-tx (cl-consensus.wire:make-reader bytes))))
+                 (setf (gethash (btx:tx-txid tx) txs) tx)
                  (dolist (in (btx:tx-inputs tx)) (remhash (cons (coerce (btx:txin-prev-hash in) 'list) (btx:txin-prev-index in)) chain))
                  (loop for o in (btx:tx-outputs tx) for i from 0
                        do (setf (gethash (cons (coerce (btx:tx-txid tx) 'list) i) chain) (cons (btx:txout-value o) (btx:txout-script o))))
@@ -1332,10 +1541,12 @@
                        (loop for k being the hash-keys of chain using (hash-value v)
                              when (equalp (cdr v) spk)
                                collect (list :txid (coerce (car k) '(vector (unsigned-byte 8))) :vout (cdr k) :sats (car v) :confirmations 3))))))
+         (tf (and v9 (lambda (txid) (let ((tx (gethash txid txs))) (and tx (values tx 3))))))
          (mk (lambda (priv) (nd:make-node :priv (tk priv) :bus bus :height-fn hf :chain-fn cf :broadcast-fn bf :utxos-fn (funcall uf-for priv))))
          (a (nd:make-node :priv (tk 11111111111111111111) :bus bus :height-fn hf))
          (b (funcall mk 22222222222222222222)) (c (funcall mk 33333333333333333333)) (d (funcall mk 44444444444444444444))
-         (la (nd:open-ledger a :reserves-id "genesis:ae" :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
+         ;; a ledger of its own per variant: the process-wide caches (confiscations seen, verdicts) key by ledger id
+         (la (nd:open-ledger a :reserves-id (if v9 "genesis:ae9" "genesis:ae") :reserves 15600000 :collateral 23400000)) (id (nd:record-id-hex la)))
     (dolist (m (list b c d)) (nd:open-ledger m :reserves-id (format nil "genesis:~a" (nd:node-pubkey-hex m)))
       (nd:add-member a la (nd:node-pubkey m) :member-ledger-id (nd::node-member-ledger-hex m) :membership-blocks 100))
     (setf (gethash (cons (coerce (u:sha256 (hx "f00de")) 'list) 0) chain) (cons (floor (+ 15600000 23400000) 1000) nil))
@@ -1376,6 +1587,21 @@
           (check "an unsigned tx goes out without the segwit marker (BIP-144)" (/= 0 (aref bytes 4)))
           (check "and parses back to the same txid"
                  (equalp (btx:tx-txid (btx:parse-tx (cl-consensus.wire:make-reader bytes))) (btx:tx-txid conf))))
+        ;; V9: from here each node reads the dispute's transactions (the confiscation and the claim),
+        ;; which a loser's binding judgment of the winner's claim needs.  Not earlier: the arm-time
+        ;; pledge checks read the mock coins' creation from the chain view, and a TX-FN that cannot
+        ;; answer for them refuses them.
+        (when v9
+          ;; the members' mock coins get a funding transaction to read (a claim's collateral input is
+          ;; refused when its funding transaction cannot be read: CLAIM-COLLATERAL-REFUSAL)
+          (dolist (m (list b c d))
+            (setf (gethash (u:sha256 (nd:node-pubkey m)) txs)
+                  (btx:make-tx :version 2 :locktime 0
+                               :inputs (list (btx:make-txin :prev-hash (u:sha256 (hx "f0f0")) :prev-index 0
+                                                            :script (make-array 0 :element-type '(unsigned-byte 8))
+                                                            :sequence #xfffffffd))
+                               :outputs (list (btx:make-txout :value 50000 :script (lot:key-path-spk (up:x-only (nd:node-pubkey m))))))))
+          (dolist (m (list b c d)) (setf (nd::node-tx-fn m) tf)))
         (loop repeat 3 do (dolist (m (list b c d)) (nd:drive-disputes m)))
         (check "every member revealed" (= 3 (length (nd:reveals-of b id))))
         (let ((acquired (count-if (lambda (m) (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-acquire)) (list b c d)))
@@ -1396,7 +1622,23 @@
           (check "the claim output is unspent at the winner's own address"
                  (equalp (cdr (gethash (cons (coerce claim 'list) 0) chain)) (lot:key-path-spk (up:x-only (nd:node-pubkey w)))))
           (check-equal "and is never pledged to another dispute" (nd:pledge-collateral w (nd::node-member-ledger-hex w)) nil)
-          (check "nor consolidated away" (gethash (cons (coerce claim 'list) 0) chain)))))))
+          (check "nor consolidated away" (gethash (cons (coerce claim 'list) 0) chain))
+          ;; yield-evidence-v9: each loser's yield names the winner's claim (lost_to).
+          (when v9
+            (check-equal "v9: the ledger is under yield-evidence-v9"
+                         (lg:ledger-active-ruleset (nd:record-ledger (nd:find-record b id))) "yield-evidence-v9")
+            (check "v9: every loser's yield names the winning claim (lost_to)"
+                   (every (lambda (m)
+                            (let ((o (nth-value 1 (nd::fork-op (nd:find-fork m id (nd:node-pubkey m)) :dispute-yield))))
+                              (or (null o) (equalp (op:field o :lost-to) claim))))
+                          (list b c d)))))))))
+
+(with-gate ("dispute driver: an expired quorum is armed, confiscated, revealed and claimed without a command")
+  (%dispute-driver nil))
+
+(with-gate ("dispute driver under yield-evidence-v9: losers yield naming the winner's binding claim")
+  (let ((lg:+current-ruleset+ "yield-evidence-v9"))
+    (%dispute-driver t)))
 
 (with-gate ("withheld reveal: past the deadline the revealer claims its subset leaf, attested; never the operator")
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))

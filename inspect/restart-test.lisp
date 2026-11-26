@@ -79,6 +79,11 @@
         (nd:stop-node m)))))
 
 (with-gate ("restart: quorum, deposits, transfer, and a dispute across node restarts")
+  ;; Pinned to strict-lottery-v8: these nodes have no chain view (no TX-FN), and under
+  ;; yield-evidence-v9 a loser yields only once it can judge the winner's claim binding (lost_to),
+  ;; so here it would never yield.  The gate's subject is write-ahead and yield adoption across
+  ;; restarts; the v9 loser path is node-test's "dispute driver under yield-evidence-v9".
+  (let ((lg:+current-ruleset+ "strict-lottery-v8"))
   (let* ((bus (bus:make-mock-bus)) (hf (lambda () *height*))
          (pa 11111111111111111111) (pb 22222222222222222222) (pc 33333333333333333333) (pd 44444444444444444444)
          (a (boot pa bus hf)) (b (boot pb bus hf)) (c (boot pc bus hf)) (d (boot pd bus hf))
@@ -262,7 +267,7 @@
                                 (handler-case (nd:claim-or-yield l2 id) (error () nil))
                                 (check-equal "chaos residual: relay lost AND disk lost -> a second signature (archive holds 2)"
                                              (length (funcall in-archive)) 2))
-                              (nd:stop-node l2))))))))))))))))
+                              (nd:stop-node l2)))))))))))))))))
 
 ;; A draft dated outside the cosigners' window is re-stamped, never resent; and never once signed.
 (with-gate ("restart: a cosign draft that falls behind the window is re-stamped on retry (write-ahead holds)")
