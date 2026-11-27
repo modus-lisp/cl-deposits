@@ -6,6 +6,7 @@
 ;;;; 2. the control socket (START-CONTROL-SERVER): one s-expression a line, a character
 ;;;;    stream each way.
 ;;;; 3. cl-payments' control socket (CLP-CALL): against a stand-in speaking its protocol.
+;;;; 4. one pump: cl-consensus's net layer and our lanes and timers, in one process.
 ;;;;
 ;;;; 127.0.0.1 and ephemeral ports only.  The fake bitcoind exits by itself.
 
@@ -49,6 +50,52 @@ print('ready', flush=True)
 while served < 7: s.handle_request()
 s.server_close()
 ")
+
+(defvar *held-conn* nil "The server side of the composition test's connection (owner-side).")
+
+(defun %net-composition ()
+  "A lane waiting in OWN:WAIT-UNTIL gets network input delivered; a net wait (CONN-READ) runs our
+   timers.  Loopback, an ephemeral port, everything closed at the end."
+  (cl-consensus.netloop:start-net)
+  (multiple-value-bind (port lid)
+      (cl-consensus.netloop:net-listen
+       "127.0.0.1" 0
+       (lambda (c)
+         (setf *held-conn* c)
+         (setf (cl-consensus.netloop:netconn-on-data c)
+               (lambda (c)
+                 (when (>= (cl-consensus.netloop:conn-available c) 4)
+                   (let ((req (cl-consensus.netloop:conn-read c 4)))
+                     (if (= (aref req 0) 1)
+                         (cl-consensus.netloop:conn-write c req)            ; echo now
+                         ;; answer later, from one of OUR timers
+                         (own:after-seconds 0.3 (lambda () (cl-consensus.netloop:conn-write *held-conn* req))
+                                            :name "late answer"))))))))
+    (let ((c (cl-consensus.netloop:net-connect "127.0.0.1" port)) (lane-got nil))
+      (unwind-protect
+           (progn
+             (let ((lane (own:make-lane :name "net waiter")))
+               (own:lane-push lane (lambda ()
+                                     (cl-consensus.netloop:conn-write c (coerce #(1 2 3 4) '(vector (unsigned-byte 8))))
+                                     (own:wait-until (lambda () (>= (cl-consensus.netloop:conn-available c) 4)) :timeout 10)
+                                     (setf lane-got (coerce (cl-consensus.netloop:conn-read c 4) 'list))))
+               (own:wait-until (lambda () lane-got) :timeout 15)
+               (own:lane-close lane))
+             (check-equal "a lane waiting in WAIT-UNTIL gets the net layer's input" lane-got '(1 2 3 4))
+             (cl-consensus.netloop:conn-write c (coerce #(2 5 6 7) '(vector (unsigned-byte 8))))
+             (let* ((t0 (get-internal-real-time))
+                    (got (let ((cl-consensus.netloop:*conn-deadline*
+                                 (+ t0 (* 10 internal-time-units-per-second))))
+                           (handler-case (coerce (cl-consensus.netloop:conn-read c 4) 'list)
+                             (error (e) (list :error (princ-to-string e))))))
+                    (dt (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+               (check-equal "a net wait (CONN-READ) runs our timers: the answer they send arrives" got '(2 5 6 7))
+               (check "...after the timer's delay" (>= dt 0.25))))
+        (cl-consensus.netloop:net-close c)
+        (when *held-conn* (cl-consensus.netloop:net-close *held-conn*))
+        (cl-consensus.netloop:net-unlisten lid)
+        (cl-consensus.netloop:stop-net)))))
+
 
 (with-gate ("sockets")
   ;; --- 1. JSON-RPC to an independent HTTP/1.1 server ---
@@ -148,6 +195,10 @@ s.server_close()
                  (cl-deposits.lightning::clp-call (ln:make-clp-backend "127.0.0.1" port) "(:invoice :amount-msat 2100 :description \"x\")")
                  '(:status :ok :echo 2100))
     (sb-thread:join-thread server :default nil))
+  ;; --- 4. one pump for cl-consensus's net layer and our lanes and timers ---
+  (let ((nl-pause (find-symbol "PAUSE-FOR" "CL-CONSENSUS.NETLOOP")))
+    (check "the net layer's PAUSE-FOR is ours (bobbin's owner loop)" (eq nl-pause 'own:pause-for)))
+  (%net-composition)
   (check "usocket is not loaded" (not (find-package "USOCKET"))))
 
 (report)

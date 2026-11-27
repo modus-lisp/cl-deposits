@@ -31,8 +31,9 @@ a thread may not store what it made into anything another thread can reach), on
 every Lisp: one owner thread holds the nodes and runs their relay lanes, dispute
 drives and watches as lanes and timers, pumping whenever it waits; control
 clients, relay readers and bitcoind calls are threads that reach it by copied
-messages over [bobbin](https://github.com/modus-lisp/bobbin) channels.  See
-`src/owner.lisp`.
+messages over [bobbin](https://github.com/modus-lisp/bobbin) channels.  The
+owner loop is bobbin's (`bobbin.owner`); `src/owner.lisp` re-exports it as
+`cl-deposits.owner`, and the same pump drains cl-consensus's net layer.
 
 See `ROADMAP.md` for what exists and what is next, and `UPSTREAM-NOTES.md` for
 what we learned about the spec and the reference implementation on the way.
