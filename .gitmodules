@@ -22,3 +22,6 @@
 [submodule "deps/cl-transport"]
 	path = deps/cl-transport
 	url = https://github.com/modus-lisp/cl-transport.git
+[submodule "deps/bobbin"]
+	path = deps/bobbin
+	url = https://github.com/modus-lisp/bobbin.git
