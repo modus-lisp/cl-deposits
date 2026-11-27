@@ -4,7 +4,7 @@
 
 (defpackage #:cl-deposits.bus
   (:use #:cl)
-  (:local-nicknames (#:ev #:cl-nostr.event) (#:flt #:cl-nostr.filter))
+  (:local-nicknames (#:ev #:cl-nostr.event) (#:flt #:cl-nostr.filter) (#:own #:cl-deposits.owner))
   (:export #:bus #:bus-publish #:bus-subscribe #:bus-fetch #:bus-unsubscribe #:mock-bus #:make-mock-bus
            #:mock-bus-events #:ephemeral-kind-p #:bus-async-p #:chaos-bus #:make-chaos-bus #:bus-settle #:bus-add-idle-hook))
 (in-package #:cl-deposits.bus)
@@ -54,69 +54,50 @@
 (defmethod bus-async-p ((bus mock-bus)) nil)
 
 ;;; ---------------------------------------------------------------------------
-;;; The chaos bus: what a relay does to you.  Delivery happens on the bus's own
-;;; thread (handlers never run on the publisher's thread), events may be delayed,
-;;; reordered within a window, and delivered twice.  BUS-SETTLE waits until
-;;; nothing is in flight — scenarios assert only then.
+;;; The chaos bus: what a relay does to you.  Delivery never happens inside BUS-PUBLISH: each
+;;; event is delivered later, by a timer on the owner (cl-deposits.owner), after a random delay
+;;; of up to MAX-DELAY, so events published close together arrive reordered; some arrive twice.
+;;; BUS-SETTLE pumps until nothing is in flight -- scenarios assert only then.
+;;;   It had a delivery thread of its own, which ran every subscriber's handler there: on modus a
+;;; thread may not change what another thread made, and every handler changes a node.
 
 (defclass chaos-bus (mock-bus)
-  ((queue :initform '() :accessor queue)
-   (in-flight :initform 0 :accessor in-flight)
-   (cv :initform (bt:make-condition-variable) :reader cv)
-   (thread :initform nil :accessor thread)
+  ((in-flight :initform 0 :accessor in-flight)
    (seed :initarg :seed :initform 1 :accessor seed)
    (state :accessor state)
    (max-delay :initarg :max-delay :initform 0.02 :accessor max-delay)     ; seconds
-   (window :initarg :window :initform 3 :accessor window)                  ; reorder window
+   (window :initarg :window :initform 3 :accessor window)                  ; kept for callers; the delays reorder
    (dup-rate :initarg :dup-rate :initform 0.1 :accessor dup-rate)
    (idle-hooks :initform '() :accessor idle-hooks)))                       ; (lambda ()) -> T when a node is idle
 
 (defun make-chaos-bus (&key (seed 1) (max-delay 0.02) (window 3) (dup-rate 0.1))
   (let ((b (make-instance 'chaos-bus :seed seed :max-delay max-delay :window window :dup-rate dup-rate)))
     (setf (state b) (sb-ext:seed-random-state seed))
-    (setf (thread b) (bt:make-thread (lambda () (chaos-loop b)) :name "chaos-bus"))
     b))
 
 (defmethod bus-async-p ((bus chaos-bus)) t)
 
+(defun %chaos-deliver (bus event)
+  (unwind-protect
+       (dolist (s (copy-list (subscriptions bus)))
+         (when (flt:filter-matches-p (car s) event)
+           (handler-case (funcall (cdr s) event) (error () nil))))
+    (decf (in-flight bus))))
+
 (defmethod bus-publish ((bus chaos-bus) event)
-  (bt:with-lock-held ((lock bus))
-    (unless (ephemeral-kind-p (ev:event-kind event)) (push event (mock-bus-events bus)))
-    (setf (queue bus) (append (queue bus) (list event)))
-    (when (< (random 1.0 (state bus)) (dup-rate bus)) (setf (queue bus) (append (queue bus) (list event))))
-    (bt:condition-notify (cv bus)))
+  (unless (ephemeral-kind-p (ev:event-kind event)) (push event (mock-bus-events bus)))
+  (loop repeat (if (< (random 1.0 (state bus)) (dup-rate bus)) 2 1)
+        do (incf (in-flight bus))
+           (own:after-seconds (random (max-delay bus) (state bus)) (lambda () (%chaos-deliver bus event))
+                              :name "chaos-bus"))
   event)
 
-(defun chaos-loop (bus)
-  (loop
-    (let (batch)
-      (bt:with-lock-held ((lock bus))
-        (loop until (queue bus) do (bt:condition-wait (cv bus) (lock bus)))
-        ;; take up to WINDOW events and shuffle them
-        (let ((n (min (window bus) (length (queue bus)))))
-          (setf batch (subseq (queue bus) 0 n) (queue bus) (nthcdr n (queue bus)))
-          (incf (in-flight bus) n)))
-      (let ((v (coerce batch 'vector)))
-        (loop for i from (1- (length v)) downto 1 do (rotatef (aref v i) (aref v (random (1+ i) (state bus)))))
-        (loop for event across v
-              do (let ((d (random (max-delay bus) (state bus)))) (when (plusp d) (sleep d)))
-                 (dolist (s (bt:with-lock-held ((lock bus)) (copy-list (subscriptions bus))))
-                   (when (flt:filter-matches-p (car s) event)
-                     (handler-case (funcall (cdr s) event) (error () nil))))
-                 (bt:with-lock-held ((lock bus)) (decf (in-flight bus))))))))
-
 (defun bus-settle (bus &key (timeout 30))
-  "Wait until the bus has nothing queued or in flight and every idle hook says idle."
-  (loop with deadline = (+ (get-internal-real-time) (* timeout internal-time-units-per-second))
-        do (let ((quiet (and (bt:with-lock-held ((lock bus)) (and (null (queue bus)) (zerop (in-flight bus))))
-                             (every #'funcall (idle-hooks bus)))))
-             (when quiet
-               ;; stay quiet for a moment: a handler may be about to publish
-               (sleep 0.05)
-               (when (and (bt:with-lock-held ((lock bus)) (and (null (queue bus)) (zerop (in-flight bus))))
-                          (every #'funcall (idle-hooks bus)))
-                 (return t))))
-           (when (> (get-internal-real-time) deadline) (return nil))
-           (sleep 0.02)))
+  "Pump until the bus has nothing in flight and every idle hook says idle."
+  (flet ((quiet () (and (zerop (in-flight bus)) (every #'funcall (idle-hooks bus)))))
+    (own:wait-until (lambda ()
+                      ;; stay quiet for a moment: a handler may be about to publish
+                      (and (quiet) (progn (own:pause-for 0.05) (quiet))))
+                    :timeout timeout :step 0.02)))
 
 (defun bus-add-idle-hook (bus fn) (push fn (idle-hooks bus)))

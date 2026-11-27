@@ -3146,24 +3146,25 @@
       (setf (gethash id (nd::node-ledgers n)) (nd::make-record :id-hex id :fork-p t :owned-p t)))
     ;; one fork in a re-arm round: DRIVE-REARM's, never queued
     (setf (gethash (first ids) (nd::node-rearms n)) (list (list :round 1) (list :round 2)))
-    ;; SETF, not LET: the slots are threads, which do not see this thread's bindings.
+    ;; A drive slot is a lane on the owner thread (cl-deposits.owner): a drive that waits
+    ;; (OWN:PAUSE-FOR, as every wait in a node does) lets the other slots' drives run.
     (let ((saved nd::*drive-fn*))
      (setf nd::*drive-fn* (lambda (node rec)
                             (declare (ignore node))
                             (bt:with-lock-held (lock) (setf peak (max peak (incf inside))))
-                            (sleep 0.05)
+                            (own:pause-for 0.05)
                             (bt:with-lock-held (lock) (decf inside) (push (nd:record-id-hex rec) driven))))
      (unwind-protect
      (let ((t0 (get-internal-real-time)))
       (nd::drive-disputes n :parallel t)
-      (loop repeat 200 until (= (length driven) 23) do (sleep 0.05))
+      (own:wait-until (lambda () (= (length driven) 23)) :timeout 10)
       (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
         (check-equal "one pass drives every live fork but the re-arm round" (length driven) 23)
         (check "the re-arm-round fork is not driven" (not (member (first ids) driven :test #'equal)))
         (check "each fork once" (= (length (remove-duplicates driven :test #'equal)) 23))
         (check-equal "never more than the live slots at once" peak nd::*max-drive-threads*)
         (check "in about 23 x 50 ms / 3 slots, not 8 passes" (< secs 2))
-        (loop repeat 40 until (zerop (gethash (nd:node-pubkey n) nd::*drive-threads* 0)) do (sleep 0.05))
+        (own:wait-until (lambda () (zerop (gethash (nd:node-pubkey n) nd::*drive-threads* 0))) :timeout 2)
         (check-equal "every slot given back" (gethash (nd:node-pubkey n) nd::*drive-threads* 0) 0)
         (check "nothing left in flight"
                (notany (lambda (id) (gethash (cons (nd:node-pubkey n) id) nd::*drive-inflight*)) ids))))
@@ -3329,22 +3330,26 @@
   ;; regtest 1119-194245: cld364's drive slots were all busy for 12 minutes, finished no drive, and
   ;; nothing said what they were waiting on.  :drive-stats lists every drive in flight with its
   ;; step; one in flight over *DRIVE-STALL-SECONDS* logs its own thread's backtrace, once.
+  ;; A drive runs on a lane of the owner thread, and one in flight is suspended in a wait, which
+  ;; pumps: the checks run from timers inside that wait (the watch would call LOG-STALLED-DRIVES
+  ;; the same way), then the drive is let go.
   (let* ((n (nd:make-node :priv (tk 88888888888888888888) :bus (bus:make-mock-bus) :height-fn (lambda () 100)))
          (fork (nd::make-record :id-hex "9a8b7c6d00000000000000000000000000000000000000000000000000000000"))
-         (gate (bt:make-semaphore)) (nd::*drive-stall-seconds* 1)
-         (th (bt:make-thread (lambda () (nd::drive-timed n fork (lambda () (nd::dstep :fork-lottery (bt:wait-on-semaphore gate :timeout 20)))))
-                             :name "drive-dispute")))
-    (sleep 0.3)
-    (let ((in (nd::drive-inflight n)))
-      (check-equal "the running drive is listed with its step" (mapcar (lambda (r) (list (first r) (third r) (fourth r))) in)
-                   '(("9a8b7c6d" :fork-lottery "drive-dispute"))))
-    (sleep 1.8)
-    (nd::log-stalled-drives n) (sleep 0.5) (nd::log-stalled-drives n) (sleep 0.5)
+         (released nil) (in nil) (nd::*drive-stall-seconds* 1)
+         (lane (own:make-lane :name "drive-dispute")))
+    (own:after-seconds 0.3 (lambda () (setf in (nd::drive-inflight n))))
+    (own:after-seconds 2.1 (lambda () (nd::log-stalled-drives n)))
+    (own:after-seconds 2.6 (lambda () (nd::log-stalled-drives n)))
+    (own:after-seconds 3.1 (lambda () (setf released t)))
+    (own:lane-push lane (lambda () (nd::drive-timed n fork (lambda () (nd::dstep :fork-lottery (own:wait-until (lambda () released) :timeout 20))))))
+    (own:wait-until (lambda () (and released (own:lane-idle-p lane))) :timeout 30)
+    (own:lane-close lane)
+    (check-equal "the running drive is listed with its step" (mapcar (lambda (r) (list (first r) (third r) (fourth r))) in)
+                 '(("9a8b7c6d" :fork-lottery "drive-dispute")))
     (let ((lines (remove-if-not (lambda (l) (search "drive in flight" l)) (nd:node-log n))))
       (check-equal "logged once" (length lines) 1)
       (check "with its step and its own backtrace (the wait it is in)"
-             (and lines (search "in step FORK-LOTTERY" (first lines)) (search "WAIT-ON-SEMAPHORE" (string-upcase (first lines))))))
-    (bt:signal-semaphore gate) (bt:join-thread th)
+             (and lines (search "in step FORK-LOTTERY" (first lines)) (search "WAIT-UNTIL" (string-upcase (first lines))))))
     (check "a finished drive is no longer listed" (null (nd::drive-inflight n)))))
 
 
@@ -3371,21 +3376,29 @@
 (with-gate ("nodes: the vault watch runs on its own thread, while a watch pass is stuck in DRIVE-REARMS")
   ;; regtest 1120-063204 (40cb3c4): cld364's first watch pass after a restart spent 20 minutes in
   ;; DRIVE-REARMS before the vault watch's turn, and a theft went unreported for the 300 s it had.
+  ;; The watch and the vault watch are two timers on the owner thread; a step that waits pumps,
+  ;; and the vault timer runs inside that wait.  The stuck step here waits (OWN:WAIT-UNTIL, as
+  ;; every node wait does) until the vault watch has run three times, and looks at the stats then.
   (let* ((n (nd:make-node :priv (tk 88888888888888888888) :bus (bus:make-mock-bus) :height-fn (lambda () 100)))
-         (gate (bt:make-semaphore)) (vaults 0))
-    (sb-int:encapsulate 'nd::drive-rearms 'stuck (lambda (f node) (bt:wait-on-semaphore gate) (funcall f node)))
+         (vaults 0) (seen nil) (stuck-in nil))
+    (sb-int:encapsulate 'nd::drive-rearms 'stuck
+                        (lambda (f node)
+                          (unless stuck-in
+                            (setf stuck-in t)
+                            (own:wait-until (lambda () (>= vaults 3)) :timeout 10)
+                            (setf seen (list (nd::watch-stats n) vaults (getf (nd::vault-watch-stats n) :passes))))
+                          (funcall f node)))
     (sb-int:encapsulate 'nd::drive-vault-watch 'count (lambda (f node) (incf vaults) (funcall f node)))
     (multiple-value-bind (expiry vault) (nd:start-expiry-watch n :interval 0.05 :vault-interval 0.05)
       (unwind-protect
            (progn
-             (loop repeat 200 until (>= vaults 3) do (sleep 0.05))
-             (let ((w (nd::watch-stats n)))
+             (own:wait-until (lambda () seen) :timeout 15)
+             (destructuring-bind (&optional w v vp) seen
                (check "a watch pass is stuck in DRIVE-REARMS" (eq (first (getf w :current)) :drive-rearms))
-               (check-equal "and no watch pass has completed" (getf w :passes) nil))
-             (check "the vault watch ran meanwhile, more than once" (>= vaults 3))
-             (check "and its own stats count it" (>= (getf (nd::vault-watch-stats n) :passes) 3)))
-        (bt:destroy-thread vault) (bt:destroy-thread expiry)
-        (bt:signal-semaphore gate :count 10)
+               (check-equal "and no watch pass has completed" (getf w :passes) nil)
+               (check "the vault watch ran meanwhile, more than once" (and v (>= v 3)))
+               (check "and its own stats count it" (and vp (>= vp 3)))))
+        (own:cancel-timer vault) (own:cancel-timer expiry)
         (sb-int:unencapsulate 'nd::drive-rearms 'stuck)
         (sb-int:unencapsulate 'nd::drive-vault-watch 'count)))))
 
@@ -3534,7 +3547,7 @@
 ;; A relay that answers every fetch after 2 s (the catch-up a parked proof starts must not run on
 ;; the handler's thread).
 (defclass slow-relay (bus:mock-bus) ())
-(defmethod bus:bus-fetch :before ((b slow-relay) filter) (declare (ignore filter)) (sleep 2))
+(defmethod bus:bus-fetch :before ((b slow-relay) filter) (declare (ignore filter)) (own:pause-for 2))
 
 (with-gate ("a proof we cannot judge YET is parked, not refused (regtest 1120-075609)")
   ;; ref7 held seq 0-4 of 7341c3d1 when four NonConformingUpdate proofs of a seq-9 fault arrived;
@@ -3574,9 +3587,8 @@
                                          (nd::make-record :id-hex id :ledger (lg:replay history) :history (reverse history)))))
              (parked (lambda (n) (length (gethash id (nd::node-parked-proofs n)))))
              ;; the catch-up a parked proof starts runs on a thread of its own: wait for it
-             (settle (lambda (n) (loop repeat 200 until (zerop (hash-table-count (nd::node-proof-catch-ups n)))
-                                       do (sleep 0.05))
-                       (zerop (hash-table-count (nd::node-proof-catch-ups n)))))
+             ;; (on a lane of the owner thread: pump until it is done)
+             (settle (lambda (n) (own:wait-until (lambda () (zerop (hash-table-count (nd::node-proof-catch-ups n)))) :timeout 10)))
              (logged (lambda (n what) (some (lambda (l) (search what l)) (nd::node-log n)))))
         (check "the fault is behind our replica's tip" (< qb-seq (1- (up:update-seq bad))))
         (check-equal "the proof needs the update before its fault" (fr:proof-history-needs proof)
@@ -3615,7 +3627,7 @@
                  (check-equal "blind: still nothing fetched" fetches 0)
                  ;; Control: the same replica on a node that is not blind does fetch.
                  (nd::handle-operator-fraud (funcall behind (bus:make-mock-bus)) proof)
-                 (loop repeat 200 until (plusp fetches) do (sleep 0.05))
+                 (own:wait-until (lambda () (plusp fetches)) :timeout 10)
                  (check "not blind: the catch-up fetches" (plusp fetches)))
             (sb-int:unencapsulate 'nd::catch-up-to 'count)))
         ;; Behind, and the relays hold the updates but answer slowly (2 s a fetch): the handler

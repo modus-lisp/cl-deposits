@@ -8,7 +8,7 @@
                     (#:lg #:cl-deposits.ledger) (#:d17 #:cl-deposits.dep17) (#:d16 #:cl-deposits.dep16) (#:rs #:cl-deposits.reserves) (#:rot #:cl-deposits.rotation) (#:lot #:cl-deposits.lottery)
                     (#:btx #:cl-consensus.tx) (#:nd #:cl-deposits.node) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:ln #:cl-deposits.lightning) (#:fr #:cl-deposits.fraud) (#:cr #:cl-deposits.courier)
-                    (#:secp #:secp256k1-fast.schnorr))
+                    (#:secp #:secp256k1-fast.schnorr) (#:own #:cl-deposits.owner))
   (:export #:check #:check-equal #:check-bytes #:check-signals #:with-gate #:report
            #:*failures* #:*checks* #:tk #:hx #:read-json-string-array #:vector-path))
 (in-package #:cl-deposits.test)

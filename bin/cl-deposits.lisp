@@ -75,4 +75,6 @@
       (when cp (cl-deposits.daemon:start-control-server node (parse-integer cp))
         (format t "~&control socket on 127.0.0.1:~a~%" cp)))
     (finish-output)
-    (loop (sleep 3600))))
+    ;; The owner thread's life from here: pump.  Every lane, timer and control command runs in
+    ;; these pumps (cl-deposits.owner).
+    (loop (cl-deposits.owner:pause-for 3600))))

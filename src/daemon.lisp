@@ -18,7 +18,7 @@
   (:local-nicknames (#:nd #:cl-deposits.node) (#:lg #:cl-deposits.ledger) (#:up #:cl-deposits.update)
                     (#:op #:cl-deposits.operation) (#:rs #:cl-deposits.reserves) (#:w #:cl-deposits.wire)
                     (#:bus #:cl-deposits.bus) (#:js #:json-simple) (#:fr #:cl-deposits.fraud)
-                    (#:sock #:cl-transport.sockets))
+                    (#:sock #:cl-transport.sockets) (#:own #:cl-deposits.owner))
   (:export #:handle-command #:start-control-server #:bitcoin-cli-height-fn #:bitcoin-cli-chain-fn #:run-cli
            #:bitcoin-cli-broadcast-fn #:bitcoin-cli-tx-fn #:bitcoin-cli-height-of-block-fn #:bitcoin-cli-block-hash-fn #:bitcoin-cli-utxos-fn #:bitcoin-cli-spender-fn #:bitcoin-cli-pledge-fn #:bitcoin-cli-feerate-fn #:bitcoin-cli-tx-confs-fn))
 (in-package #:cl-deposits.daemon)
@@ -89,7 +89,7 @@
            (let ((sprof (find-package :sb-sprof)))
              (funcall (intern "RESET" sprof))
              (funcall (intern "START-PROFILING" sprof) :mode :cpu :sample-interval 0.005 :threads :all)
-             (sleep secs)
+             (own:pause-for secs)
              (funcall (intern "STOP-PROFILING" sprof))
              (ok :report (with-output-to-string (*standard-output*)
                            (funcall (intern "REPORT" sprof) :type :flat :max top))))))
@@ -331,25 +331,51 @@
            (ok))))
     (error (e) (let ((*print-pretty* nil)) (format nil "~s" (list :status :error :message (princ-to-string e)))))))
 
+(defvar *control-nodes* (make-hash-table) "Control server id -> its node (the owner's).")
+(defvar *control-next* 0)
+
+(defun control-form (id form)
+  "On the owner (OWN:OWNER-CALL from a control client's thread): the reply to one control FORM for
+   control server ID's node."
+  (handle-command (gethash id *control-nodes*) form))
+
+(defun %control-client (sock id)
+  "One control connection, on its own thread: lines in, each read here and run by the owner,
+   lines out.  Nothing here touches the node: CONTROL-FORM runs on the owner, the form and the
+   reply travel as plain data (copied)."
+  (let ((client (sock:tcp-socket-from sock)))
+    (handler-case
+        (let ((stream (sock:tcp-socket-stream client :element-type 'character)))
+          (loop for line = (read-line stream nil nil) while line
+                do (let ((form (handler-case (let ((*read-eval* nil)) (read-from-string line)) (error () nil))))
+                     (write-line (if (consp form)
+                                     (handler-case (own:owner-call 'control-form (list id form) :timeout 3600)
+                                       (own:owner-call-error (e)
+                                         (let ((*print-pretty* nil))
+                                           (format nil "~s" (list :status :error :message (princ-to-string e))))))
+                                     "(:status :error :message \"unreadable\")")
+                                 stream))
+                   (finish-output stream)))
+      (error () nil))
+    (sock:tcp-close client)))
+
+(defun %control-accept (listener id)
+  (loop
+    (let ((client (sock:tcp-accept listener)))   ; NIL: an hour with no client
+      (when client
+        ;; a named function and plain arguments: this is the accept thread, and a thread a
+        ;; closure made here starts is refused on modus (threads share nothing)
+        (sb-thread:make-thread #'%control-client :name "cld-control-client"
+                                                 :arguments (list (sock:tcp-socket-sock client) id))))))
+
 (defun start-control-server (node port)
-  (let ((listener (sock:tcp-listen :host "127.0.0.1" :port port)))
-    (bt:make-thread
-     (lambda ()
-       (loop
-         (let ((client (sock:tcp-accept listener)))   ; NIL: an hour with no client
-           (when client
-            (bt:make-thread
-            (lambda ()
-              (handler-case
-                  (let ((stream (sock:tcp-socket-stream client :element-type 'character)))
-                    (loop for line = (read-line stream nil nil) while line
-                          do (let* ((form (handler-case (let ((*read-eval* nil)) (read-from-string line)) (error () nil)))
-                                    (reply (if (consp form) (handle-command node form) "(:status :error :message \"unreadable\")")))
-                               (write-line reply stream) (finish-output stream))))
-                (error () nil))
-              (sock:tcp-close client))
-            :name "cld-control-client")))))
-     :name "cld-control")
+  "Listen on 127.0.0.1:PORT for control lines.  Each client has a thread of its own for its socket;
+   every command runs on the owner thread (OWN:OWNER-CALL), which must pump (the daemon's main
+   loop does: OWN:PAUSE-FOR)."
+  (let ((listener (sock:tcp-listen :host "127.0.0.1" :port port))
+        (id (incf *control-next*)))
+    (setf (gethash id *control-nodes*) node)
+    (sb-thread:make-thread #'%control-accept :name "cld-control" :arguments (list listener id))
     port))
 
 ;;; bitcoin-cli as the chain view.
@@ -367,11 +393,16 @@
 (defparameter *rpc-idle-seconds* 20 "Drop a pooled connection idle this long (bitcoind's -rpcservertimeout is 30).")
 
 (defun rpc-endpoint-of (cli)
-  "The endpoint bitcoin-cli's flags in CLI name, or NIL when they cannot be read."
-  (bt:with-lock-held (*rpc-endpoints-lock*)
-    (multiple-value-bind (e found) (gethash cli *rpc-endpoints*)
-      (when found (return-from rpc-endpoint-of e))
-      (setf (gethash cli *rpc-endpoints*)
+  "The endpoint bitcoin-cli's flags in CLI name, or NIL when they cannot be read.  On a work thread
+   (RUN-CLI's) the endpoints, and so their pooled connections, are that thread's own."
+  (let ((local (own:work-local :rpc-endpoints (lambda () (make-hash-table :test #'equal)))))
+    (if local (%rpc-endpoint-of cli local) (bt:with-lock-held (*rpc-endpoints-lock*) (%rpc-endpoint-of cli *rpc-endpoints*)))))
+
+(defun %rpc-endpoint-of (cli table)
+  (progn
+    (multiple-value-bind (e found) (gethash cli table)
+      (when found (return-from %rpc-endpoint-of e))
+      (setf (gethash cli table)
             (ignore-errors
              (let ((flags (make-hash-table :test #'equal)) (chain "main"))
                (dolist (tok (rest (uiop:split-string cli :separator " ")))
@@ -492,6 +523,14 @@
                        (string-trim '(#\Newline #\Space) (subseq text start end)))))))))))
 
 (defun run-cli (cli &rest args)
+  "bitcoin-cli's stdout for ARGS.  On the owner thread the call runs on a work thread
+   (OWN:RUN-WORK) while the owner pumps, so a node's lanes, drives and timers go on meanwhile."
+  (if (own:owner-p)
+      (handler-case (own:run-work 'run-cli-here (cons cli args) :timeout 600)
+        (own:work-error () ""))
+      (apply #'run-cli-here cli args)))
+
+(defun run-cli-here (cli &rest args)
   (let ((e (rpc-endpoint-of cli)))
     (or (and e (handler-case (rpc-call-text e (first args) (rest args))
                  (error () nil)))
@@ -602,7 +641,7 @@
                                             :sats (round (* (gethash "amount" u) 100000000))
                                             :confirmations (1+ (- tip (gethash "height" u)))))
                               (gethash "unspents" j))))
-          do (sleep 2))))
+          do (own:pause-for 2))))
 
 (defun bitcoin-cli-spender-fn (cli)
   "(from to outpoints) -> the spends, in blocks FROM..TO, of any of OUTPOINTS (a list of

@@ -26,5 +26,13 @@ wallets, disputes, escalation and couriers on an in-process bus), `property`
 rebuilt from their data dirs).  `inspect/mutate.sh` checks that the ledger and
 update gates notice each of two dozen single-rule mutations.
 
+Threads share nothing (as on [modus](https://github.com/modus-lisp/modus), where
+a thread may not store what it made into anything another thread can reach), on
+every Lisp: one owner thread holds the nodes and runs their relay lanes, dispute
+drives and watches as lanes and timers, pumping whenever it waits; control
+clients, relay readers and bitcoind calls are threads that reach it by copied
+messages over [bobbin](https://github.com/modus-lisp/bobbin) channels.  See
+`src/owner.lisp`.
+
 See `ROADMAP.md` for what exists and what is next, and `UPSTREAM-NOTES.md` for
 what we learned about the spec and the reference implementation on the way.

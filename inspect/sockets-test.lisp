@@ -46,7 +46,7 @@ class H(http.server.BaseHTTPRequestHandler):
 s = http.server.HTTPServer(('127.0.0.1', port), H)
 s.timeout = 20
 print('ready', flush=True)
-while served < 6: s.handle_request()
+while served < 7: s.handle_request()
 s.server_close()
 ")
 
@@ -69,7 +69,17 @@ s.server_close()
                           (cl-deposits.daemon::rpc-call-text e "nosuch" nil) "")
              ;; the same endpoint (this one-connection fake serves the pooled socket only)
              (setf (cl-deposits.daemon::rpc-endpoint-password e) "x")
-             (check-equal "the credentials are what decide" (cl-deposits.daemon::rpc-call-text e "getblockcount" nil) "")))
+             (check-equal "the credentials are what decide" (cl-deposits.daemon::rpc-call-text e "getblockcount" nil) ""))
+           ;; RUN-CLI on the owner thread runs the call on a work thread (OWN:RUN-WORK), with its
+           ;; own endpoint and connection, while the owner pumps.
+           (let ((ticks 0))
+             (let ((tm (own:every-seconds 0 (lambda () (incf ticks)))))
+               (check-equal "run-cli: bitcoind's answer through a work thread"
+                            (cl-deposits.daemon:run-cli (format nil "bitcoin-cli -regtest -rpcconnect=127.0.0.1 -rpcport=~d -rpcuser=u -rpcpassword=p" port)
+                                                        "getblockcount")
+                            "812345")
+               (own:cancel-timer tm))
+             (check "and the owner pumped while it waited" (plusp ticks))))
       (sb-ext:process-wait proc)
       (sb-ext:process-close proc)))
   ;; a server that closes after each answer: the pooled connection is dead, the retry dials
@@ -99,6 +109,31 @@ s.server_close()
                   (check-equal "the control socket answers a line with a line" (read-line s nil)
                                "(:status :error :message \"unreadable\")"))
         (cl-transport.sockets:tcp-close c))))
+  ;; a command: the client's thread sends it to the owner (OWN:OWNER-CALL), which runs it on the
+  ;; node when it pumps; the reply travels back as a string
+  (let* ((port (%free-port))
+         (n (nd:make-node :priv (tk 31415926535897932384) :bus (bus:make-mock-bus) :height-fn (lambda () 7)))
+         (replies (bobbin:make-channel :name "control replies")))
+    (cl-deposits.daemon:start-control-server n port)
+    (sb-thread:make-thread
+     (lambda ()
+       (let* ((c (cl-transport.sockets:tcp-connect "127.0.0.1" port))
+              (s (cl-transport.sockets:tcp-socket-stream c :element-type 'character)))
+         (unwind-protect
+              (dolist (line (list "(:info)" "(:no-such-command)"))
+                (write-line line s) (finish-output s)
+                (bobbin:channel-send replies (or (read-line s nil) "")))
+           (cl-transport.sockets:tcp-close c))))
+     :name "control client")
+    (let ((got '()))
+      (own:wait-until (lambda () (loop (multiple-value-bind (r ok) (bobbin:channel-try-receive replies)
+                                         (unless ok (return (= (length got) 2)))
+                                         (push r got))))
+                      :timeout 30)
+      (setf got (reverse got))
+      (check "a command runs on the owner: (:info) answers with the node's key"
+             (and (first got) (search (format nil ":PUBKEY ~s" (nd:node-pubkey-hex n)) (first got)) t))
+      (check "and an error comes back as one" (and (second got) (search ":STATUS :ERROR" (second got)) t))))
   ;; --- 3. cl-payments' control socket ---
   (let* ((listener (cl-transport.sockets:tcp-listen :port 0)) (port (cl-transport.sockets:tcp-listener-port listener))
          (server (sb-thread:make-thread

@@ -8,13 +8,14 @@
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("sb-posix" "natrium" "secp256k1-fast" "bordeaux-threads" "cl-consensus" "cl-nostr" "json-simple" "cl-transport/sockets")
+  :depends-on ("sb-posix" "natrium" "secp256k1-fast" "bordeaux-threads" "cl-consensus" "cl-nostr" "json-simple" "cl-transport/sockets" "bobbin")
   :serial t
   :components
   ((:module "src"
     :serial t
     :components
-    ((:file "util")    ; bytes, hex, integers, sha256, tagged hashes
+    ((:file "owner")   ; one thread owns the nodes: lanes, timers, OWNER-CALL, work threads
+     (:file "util")    ; bytes, hex, integers, sha256, tagged hashes
      (:file "tlv")     ; DEP-02: BigSize TLV streams, canonical ordering
      (:file "update")  ; DEP-02: SignedLedgerUpdate, hash chain, signatures
      (:file "operation") ; DEP-02: the 27 ledger operations, typed

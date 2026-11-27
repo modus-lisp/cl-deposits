@@ -29,7 +29,7 @@
                     (#:fr #:cl-deposits.fraud) (#:lot #:cl-deposits.lottery) (#:rot #:cl-deposits.rotation)
                     (#:d16 #:cl-deposits.dep16)
                     (#:btx #:cl-consensus.tx) (#:bw #:cl-consensus.wire)
-                    (#:schnorr #:secp256k1-fast.schnorr))
+                    (#:schnorr #:secp256k1-fast.schnorr) (#:own #:cl-deposits.owner))
   (:export #:node #:make-node #:node-pubkey #:node-pubkey-hex #:node-ledgers #:node-log
            #:record #:record-ledger #:record-history #:record-owned-p #:record-id-hex #:record-reserves
            #:find-record #:own-ledger
@@ -69,12 +69,12 @@
   fork-p fork-of fork-operator                 ; a dispute fork: of which ledger, signed by whom
   last-event-id                                ; Nostr id of the last update we published
   (persisted 0)                                ; how many history entries the file on disk holds (append-only save)
-  (append-lock (bt:make-lock "append"))        ; one append at a time per owned ledger, cosign wait included
+  (append-lock nil)                            ; unused: one append at a time is OWN:WITH-OWNER-LOCK (APPEND-OPERATION)
   ;; One writer at a time on a replica: the replica lane, a cosign or consent request and a
   ;; rotation check each caught up the same record from their own threads, applied the same
   ;; update twice, and the doubled balance read as a cl operator's BalanceCommitmentMismatch
   ;; (signet soak, 2026-10-30).  Recursive: catch-up applies through ACCEPT-UPDATE.
-  (apply-lock (sb-thread:make-mutex :name "replica apply"))
+  (apply-lock nil)                             ; unused: one writer is OWN:WITH-OWNER-LOCK (WITH-REPLICA-WRITER)
   preimage lottery confiscation                ; our lottery secret; the built lottery; the confiscation tx
   rotation                                     ; broadcast rotation awaiting its QuorumBegin (plist; persisted)
   (offers (make-hash-table :test #'equalp))    ; DEP-10 funding offers we made: offer id -> plist
@@ -92,6 +92,12 @@
   (ckpt-mismatches 0)                          ; checkpoints whose replay disagreed with the live state (a bug of ours)
   (ckpt-events '())                            ; messages for the node's log, drained by SAVE-RECORD
   (ckpt-persisted -1))                         ; the sequence of the checkpoint last written to disk                               ; history entries not in this record's file (a fork's inherited prefix)
+
+(defmacro with-replica-writer ((rec) &body body)
+  "One writer at a time on a replica (see the record's apply-lock note): re-entrant for the task
+   writing it (catch-up applies through ACCEPT-UPDATE); another task's write, suspended in a wait,
+   makes this one run again later (OWN:OWNER-BUSY)."
+  `(own:with-owner-lock ((list :apply ,rec)) ,@body))
 
 (defstruct (node (:constructor %make-node))
   priv pubkey pubkey-hex keypair bus network
@@ -235,16 +241,19 @@
                            ;; for a replica we had lost, and rebuilt it from the relay: 80k
                            ;; updates, racing the load, through every fork's updates too.
                            :loading (and data-dir t)) priv)))
-    ;; On a real relay, events arrive on the reader thread.  Responses are
-    ;; consumed inline (they only wake a waiter); requests and updates go to a
-    ;; worker, because handling a request may itself wait for responses.
+    ;; On a real relay, events arrive from the relay.  Responses are consumed inline (they only
+    ;; wake a waiter); requests and updates go to the node's two lanes (cl-deposits.owner), because
+    ;; handling a request may itself wait for responses.  A lane runs on the owner thread, one
+    ;; event at a time, and while one waits the other runs (the waits pump).
     (when (bus:bus-async-p bus)
-      (setf (node-worker node)
-            (bt:make-thread (lambda () (worker-loop node)) :name "cld-worker"))
-      (setf (node-fast-worker node)
-            (bt:make-thread (lambda () (fast-worker-loop node)) :name "cld-cosigner"))
+      (let ((ready (lambda () (not (node-loading node)))))   ; see above: the lanes wait for the load
+        (setf (node-worker node)
+              (own:make-lane :name "cld-worker" :ready ready :run (lambda (item) (declare (ignore item)) (worker-step node)))
+              (node-fast-worker node)
+              (own:make-lane :name "cld-cosigner" :ready ready :run (lambda (item) (declare (ignore item)) (fast-worker-step node)))))
       (when (typep bus 'bus:chaos-bus)
-        (bus:bus-add-idle-hook bus (lambda () (and (null (node-inbox node)) (not (node-busy node)))))))
+        (bus:bus-add-idle-hook bus (lambda () (and (null (node-inbox node)) (null (node-fast-inbox node))
+                                                   (own:lane-idle-p (node-worker node)) (own:lane-idle-p (node-fast-worker node)))))))
     (setf (node-subscription node)
           ;; SINCE a minute ago: the relay would otherwise replay its whole store
           ;; (tens of thousands of events) into this subscription at every start;
@@ -264,24 +273,33 @@
   "Leave the bus and stop the worker: what a process exit does, for tests that
    then rebuild the node from its data dir."
   (bus:bus-unsubscribe (node-bus node) (node-subscription node))
-  (when (node-worker node) (ignore-errors (bt:destroy-thread (node-worker node))) (setf (node-worker node) nil))
-  (when (node-fast-worker node) (ignore-errors (bt:destroy-thread (node-fast-worker node))) (setf (node-fast-worker node) nil))
+  (when (node-worker node) (own:lane-close (node-worker node)) (setf (node-worker node) nil))
+  (when (node-fast-worker node) (own:lane-close (node-fast-worker node)) (setf (node-fast-worker node) nil))
+  (setf (node-inbox node) '() (node-fast-inbox node) '())
+  (stop-node-work node)
   node)
 
 (defun enqueue (node event)
-  (bt:with-lock-held ((node-inbox-lock node))
-    (setf (node-inbox node) (append (node-inbox node) (list event)))
-    (bt:condition-notify (node-inbox-cv node))))
+  (setf (node-inbox node) (append (node-inbox node) (list event)))
+  (when (node-worker node) (own:lane-push (node-worker node) :next)))
 
-(defun worker-loop (node)
-  (loop while (node-loading node) do (sleep 0.1))   ; see make-node
-  (loop
-    (let ((event (bt:with-lock-held ((node-inbox-lock node))
-                   (loop until (node-inbox node) do (bt:condition-wait (node-inbox-cv node) (node-inbox-lock node)))
-                   (setf (node-busy node) t)
-                   (pop (node-inbox node)))))
+(defun requeue-on-busy (node event place)
+  "A handler refused an owner lock another (suspended) task holds: forget we saw EVENT and put it
+   back first in PLACE (:inbox or :fast), so the lane runs it again (OWN:OWNER-BUSY reaches the
+   lane runner, which waits a little)."
+  (unless (functionp event)
+    (bt:with-lock-held ((node-lock node)) (remhash (ev:event-id event) (node-seen node))))
+  (if (eq place :inbox) (push event (node-inbox node)) (push event (node-fast-inbox node))))
+
+(defun worker-step (node)
+  "The main lane's next event (one lane item per queued event)."
+  (let ((event (pop (node-inbox node))))
+    (when event
+      (setf (node-busy node) t)
       ;; A function is work queued for this lane (KICK-PROOF-CATCH-UP's re-judge).
-      (unwind-protect (if (functionp event) (ignore-errors (funcall event)) (handle-event node event))
+      (unwind-protect
+           (handler-bind ((own:owner-busy (lambda (c) (declare (ignore c)) (requeue-on-busy node event :inbox))))
+             (if (functionp event) (ignore-errors (funcall event)) (handle-event node event)))
         (setf (node-busy node) nil)))))
 
 (defun cosign-request-event-p (event)
@@ -308,7 +326,7 @@
   ;; traffic.  A cosign request goes ahead of everything queued except earlier cosign
   ;; requests and its own ledger's events (the updates it chains onto, see the lane note
   ;; on NODE).  Behind a burst of other ledgers' updates it missed the operator's window.
-  (bt:with-lock-held ((node-fast-lock node))
+  (progn
     (setf (node-fast-inbox node)
           (if (cosign-request-event-p event)
               (let* ((inbox (node-fast-inbox node)) (ledger (fast-event-ledger event))
@@ -318,17 +336,14 @@
                     (append (subseq inbox 0 (1+ after)) (list event) (nthcdr (1+ after) inbox))
                     (cons event inbox)))
               (append (node-fast-inbox node) (list event))))
-    (bt:condition-notify (node-fast-cv node))))
+    (when (node-fast-worker node) (own:lane-push (node-fast-worker node) :next))))
 
-(defun fast-worker-loop (node)
-  ;; Replicas are applied and read here only; the main worker mutates owned
-  ;; records.  What the two share (the seen table, the ledgers table) is locked.
-  (loop while (node-loading node) do (sleep 0.1))   ; see make-node
-  (loop
-    (let ((event (bt:with-lock-held ((node-fast-lock node))
-                   (loop until (node-fast-inbox node) do (bt:condition-wait (node-fast-cv node) (node-fast-lock node)))
-                   (pop (node-fast-inbox node)))))
-      (handle-event node event))))
+(defun fast-worker-step (node)
+  ;; Replicas are applied and read here only; the main lane mutates owned records.
+  (let ((event (pop (node-fast-inbox node))))
+    (when event
+      (handler-bind ((own:owner-busy (lambda (c) (declare (ignore c)) (requeue-on-busy node event :fast))))
+        (handle-event node event)))))
 
 (defun inbox-depths (node)
   "(:inbox N :cosign-inbox N) — how far behind the two lanes are."
@@ -610,13 +625,12 @@
 
 (defun wait-for (node request-id want &key (timeout *cosign-timeout*))
   "Block until WANT responses (or DONE) for REQUEST-ID, or TIMEOUT.  Returns the responses."
+  ;; Responses arrive on the owner while it pumps (OWN:WAIT-UNTIL), so this wait lets the
+  ;; node's other lanes, the drives and the timers run.
   (let ((wt (gethash request-id (node-pending node))))
-    (bt:with-lock-held ((waiter-lock wt))
-      (loop with deadline = (+ (get-internal-real-time) (* timeout internal-time-units-per-second))
-            until (or (waiter-done wt) (>= (waiter-count wt) want)
-                      (and (waiter-settled wt) (funcall (waiter-settled wt) (waiter-responses wt)))
-                      (> (get-internal-real-time) deadline))
-            do (bt:condition-wait (waiter-cv wt) (waiter-lock wt) :timeout 0.2)))
+    (own:wait-until (lambda () (or (waiter-done wt) (>= (waiter-count wt) want)
+                                   (and (waiter-settled wt) (funcall (waiter-settled wt) (waiter-responses wt)))))
+                    :timeout timeout :step 0.2)
     (remhash request-id (node-pending node))
     (reverse (waiter-responses wt))))
 
@@ -1039,7 +1053,7 @@
                  (republish-missed node rec r))
                (take-round)
                (incf attempt)
-               (unless (enough) (sleep 0.3))))
+               (unless (enough) (own:pause-for 0.3))))
     (when (< (length (up:update-cosignatures update)) required)
       (fail "only ~a of ~a cosignatures for seq ~a" (length (up:update-cosignatures update)) required (up:update-seq update)))
     (end-cosign-round node update)
@@ -1060,7 +1074,10 @@
   ;; cosign round commits as "SEQUENCE (expected N+1, got N)".  Under steady
   ;; traffic a rotation never won that race and only succeeded post-expiry,
   ;; when value-moving operations were being refused and nothing competed.
-  (bt:with-lock-held ((record-append-lock rec))
+  ;; An owner lock (one thread runs every append): another task's append to this ledger is
+  ;; suspended in its cosign wait, below us on the stack; we cannot wait for it, so the work
+  ;; that wanted this append is run again later (OWN:OWNER-BUSY).
+  (own:with-owner-lock ((list :append rec))
    ;; RE-STAMPING.  An update that needs cosignatures is a DRAFT until COMMIT-UPDATE: we sign it
    ;; only after the cosignatures are in (DEP-02 §Operator, "the operator signs after collecting
    ;; the required majority"), and only a signed update is written ahead.  So a draft whose
@@ -1927,7 +1944,7 @@
 
 (defun accept-update (node rec update)
   "Validate an operator's update against our replica and apply it, one writer at a time."
-  (sb-thread:with-recursive-lock ((record-apply-lock rec))
+  (with-replica-writer (rec)
     (%accept-update node rec update)))
 
 (defun %accept-update (node rec update)
@@ -2019,7 +2036,7 @@
   "A replica that missed an update (a restart, a relay that dropped us) can never
    apply another: every later one fails 'expected seq N'.  Fetch the operator's
    chain past our sequence and apply it in order.  Returns how many applied."
-  (sb-thread:with-recursive-lock ((record-apply-lock rec)) (%catch-up node rec)))
+  (with-replica-writer (rec) (%catch-up node rec)))
 
 (defun %catch-up (node rec)
   (let ((ledger (record-ledger rec)) (n 0) (from (lg:ledger-sequence (record-ledger rec))) (window 200))
@@ -2062,7 +2079,7 @@
   "Another member's dispute fork past whose tip an update arrived (or, at startup, any it
    published while we were down): apply that operator's updates from the relays, in order,
    to UPTO (default 200 past our tip).  Returns how many applied."
-  (sb-thread:with-recursive-lock ((record-apply-lock fork)) (%catch-up-fork node fork upto)))
+  (with-replica-writer (fork) (%catch-up-fork node fork upto)))
 
 (defun %catch-up-fork (node fork upto)
   (let* ((ledger (record-ledger fork)) (lo (1+ (lg:ledger-sequence ledger))) (n 0))
@@ -2208,7 +2225,7 @@
                (unless (record-fork-p rec) (check-not-deposed node rec))
                ;; DEP-02: our tip is only a bound.  A height a little above it we wait for (the
                ;; operator saw a block before we did); the hash is never judged against our chain.
-               (let ((ours (loop repeat *cosign-tip-wait-seconds* while (> block-height (height node)) do (sleep 1)
+               (let ((ours (loop repeat *cosign-tip-wait-seconds* while (> block-height (height node)) do (own:pause-for 1)
                                  finally (return (height node)))))
                  (when (plusp ours)
                    (when (> (- block-height ours) *cosign-height-tolerance*)
@@ -3015,7 +3032,7 @@
                                    (case st
                                      (:succeeded (setf outcome :succeeded preimage pre) (return))
                                      (:failed (setf outcome :failed) (return))
-                                     (t (sleep 0.5))))))
+                                     (t (own:pause-for 0.5))))))
                ;; Declined before any HTLC went out: nothing was sent, so the lock
                ;; can be released.
                (ln:ln-refused (e) (log! node "pay refused: ~a" e) (setf outcome :failed))
@@ -3175,7 +3192,8 @@
     n))
 
 (defun start-transfer-timeout-poller (node &key (interval 30))
-  (bt:make-thread (lambda () (loop (sleep interval) (ignore-errors (fail-expired-transfers node)))) :name "cld-timeouts"))
+  "FAIL-EXPIRED-TRANSFERS every INTERVAL s, a timer on the owner thread (OWN:CANCEL-TIMER stops it)."
+  (own:every-seconds interval (lambda () (ignore-errors (fail-expired-transfers node))) :name "cld-timeouts"))
 
 ;;; DEP-19 / DEP-11: a quorum member disputes an operator who let the quorum
 ;;; lapse.  CHECK-EXPIRED-QUORUMS was only reachable from the control socket,
@@ -3671,7 +3689,7 @@
 (defvar *drive-current* nil "Inside a drive: this thread's (id start-time . current step), listed in *DRIVE-INFLIGHT-STEPS*.")
 (defvar *drive-serial* 0)
 (defvar *drive-inflight-steps* (make-hash-table :test #'equalp :synchronized t)
-  "(node pubkey . drive serial) -> (thread fork-id start-universal-time . step): what every running
+  "(node pubkey . drive serial) -> (task-name fork-id start-universal-time . step): what every running
    drive is doing now.  Keyed by a serial, not the thread: EQUALP hashes a thread by its slots, and
    one that finished hashed elsewhere, so its entry could not be removed.
    regtest 1119-194245: cld364's slots were all busy for 12 minutes and finished no drive, and
@@ -3681,9 +3699,9 @@
   "Every drive of NODE running now: (fork-id8 seconds step thread-name), longest first."
   (let ((pk (node-pubkey node)) (now (get-universal-time)))
     (sort (loop for k being the hash-keys of *drive-inflight-steps* using (hash-value tv)
-                for thread = (car tv) for v = (cdr tv)
+                for name = (car tv) for v = (cdr tv)
                 when (equalp (car k) pk)
-                  collect (list (subseq (first v) 0 8) (- now (second v)) (cddr v) (bt:thread-name thread)))
+                  collect (list (subseq (first v) 0 8) (- now (second v)) (cddr v) name))
           #'> :key #'second)))
 
 (defparameter *drive-stall-seconds* 120 "A drive in flight this long has its thread's backtrace logged, once.")
@@ -3691,27 +3709,24 @@
   "*DRIVE-INFLIGHT-STEPS* keys whose backtrace was logged.")
 
 (defun log-stalled-drives (node)
-  "Every drive of NODE in flight over *DRIVE-STALL-SECONDS*: log, once per drive, where its thread
-   is (its fork, step, and a backtrace taken inside it by INTERRUPT-THREAD), so a stall names the
-   lock or call it waits on (regtest 1119-194245: three slots busy 12 minutes, no drive finished)."
+  "Every drive of NODE in flight over *DRIVE-STALL-SECONDS*: log, once per drive, where it is (its
+   fork, step, and a backtrace), so a stall names the lock or call it waits on (regtest
+   1119-194245: three slots busy 12 minutes, no drive finished).  A drive runs on the owner thread
+   and a drive in flight is one suspended in a wait (OWN:WAIT-UNTIL pumps, and this runs inside
+   that pump), so the owner's own stack, taken here, holds the stalled drive's frames below ours."
   (let ((pk (node-pubkey node)) (now (get-universal-time)))
     (loop for k being the hash-keys of *drive-inflight-steps* using (hash-value tv)
-          for thread = (car tv) for v = (cdr tv)
+          for name = (car tv) for v = (cdr tv)
           when (and (equalp (car k) pk) (> (- now (second v)) *drive-stall-seconds*)
                     (not (gethash k *drive-stall-dumped*)))
             do (setf (gethash k *drive-stall-dumped*) t)
                (let ((id (subseq (first v) 0 8)) (secs (- now (second v))) (step (cddr v)))
                  (ignore-errors
-                  (sb-thread:interrupt-thread
-                   thread
-                   (lambda ()
-                     (ignore-errors
-                      (log! node "dispute ~a: drive in flight ~a s, in step ~a, on ~a; backtrace: ~{~a~^ | ~}" id secs step
-                            (bt:thread-name thread)
-                            (uiop:split-string (string-trim '(#\Newline)
-                                                            (with-output-to-string (s) (let ((*print-length* 10) (*print-level* 4))
-                                                                                         (sb-debug:print-backtrace :stream s :count 40))))
-                                               :separator '(#\Newline)))))))))))
+                  (log! node "dispute ~a: drive in flight ~a s, in step ~a, on ~a; backtrace: ~{~a~^ | ~}" id secs step name
+                        (uiop:split-string (string-trim '(#\Newline)
+                                                        (with-output-to-string (s) (let ((*print-length* 10) (*print-level* 4))
+                                                                                     (sb-debug:print-backtrace :stream s :count 80))))
+                                           :separator '(#\Newline))))))))
 
 (defun drive-timed (node fork thunk)
   "Run THUNK (a drive of FORK) timing it and its DSTEPs; log a slow one with its breakdown and
@@ -3719,7 +3734,7 @@
   (let* ((*drive-steps* (list :steps)) (t0 (get-internal-real-time)) (id (record-id-hex fork))
          (*drive-current* (list* id (get-universal-time) :start))
          (key (cons (node-pubkey node) (bt:with-lock-held (*drive-stats-lock*) (incf *drive-serial*)))))
-    (setf (gethash key *drive-inflight-steps*) (cons (bt:current-thread) *drive-current*))
+    (setf (gethash key *drive-inflight-steps*) (cons (own:task-name) *drive-current*))
     (unwind-protect (funcall thunk)
       (remhash key *drive-inflight-steps*) (remhash key *drive-stall-dumped*)
       (let ((ms (ms-since t0)) (pk (node-pubkey node)))
@@ -3934,15 +3949,11 @@
                           (error (e) (note-dispute node id "confiscation not yet: ~a" e))))
                        (t (note-dispute node id "armed; another armer proposes first"))))))))))))
 
-(defvar *drive-locks* (make-hash-table :test #'equalp))
-(defvar *drive-locks-lock* (bt:make-lock "drive-locks"))
-
 (defun drive-lock (node fork)
-  "One lock per (node, disputed ledger): a fork is never driven twice at once, and a long
-   pass over old forks never blocks arming a new one."
-  (let ((key (cons (node-pubkey node) (record-id-hex fork))))
-    (bt:with-lock-held (*drive-locks-lock*)
-      (or (gethash key *drive-locks*) (setf (gethash key *drive-locks*) (bt:make-lock "drive-fork"))))))
+  "The owner lock (OWN:WITH-OWNER-LOCK) of one (node, disputed ledger): a fork is never driven
+   twice at once, and a long pass over old forks never blocks arming a new one.  A drive that
+   finds it held skips the fork: its holder is driving it."
+  (list :drive (bytes->hex (node-pubkey node)) (record-id-hex fork)))
 
 (defparameter *max-drive-threads* 3
   "Forks one node drives at once in the watch.  Unbounded, every fork of every node ran
@@ -3994,32 +4005,38 @@
   "Round 2 or later: DRIVE-REARM drives it, and DRIVE-DISPUTE would only say so."
   (find-if (lambda (r) (> (getf r :round) 1)) (rearm-rounds node id)))
 
-(defun drive-worker (node pk key)
-  "One drive slot: drive the forks queued under KEY, one after another, until none is left.
-   Runs with KEY's slot already counted in *DRIVE-THREADS*; gives it back on exit."
-  (unwind-protect
-       (loop
-         (destructuring-bind (&optional id . rec)
-             (bt:with-lock-held (*drive-threads-lock*)
-               (loop for e = (pop (gethash key *drive-queues*))
-                     while e
-                     unless (gethash (cons pk (car e)) *drive-inflight*)
-                       do (setf (gethash (cons pk (car e)) *drive-inflight*) t)
-                          (remhash (cons pk (car e)) *drive-waiting*)
-                          (return e)))
-           (unless id (return))
-           (let ((lock (drive-lock node rec)))
-             (unwind-protect
-                  ;; The slot takes the fork's lock itself (a mutex is released by its owner);
-                  ;; a fork DRIVE-DISPUTE-NOW holds is skipped, not waited on.
-                  (when (bt:acquire-lock lock nil)
-                    (unwind-protect (handler-case (funcall *drive-fn* node rec)
-                                      (error (e) (note-dispute node id "error: ~a" e)))
-                      (bt:release-lock lock)))
-               (bt:with-lock-held (*drive-threads-lock*)
-                 (remhash (cons pk id) *drive-inflight*))))))
-    (bt:with-lock-held (*drive-threads-lock*)
-      (decf (gethash key *drive-threads*)))))
+(defun drive-slot-step (node pk key lane)
+  "One step of a drive slot, which is a lane (OWN:MAKE-LANE): drive the next fork queued under
+   KEY, then queue the slot's next step, so the slot takes the next fork the moment its drive
+   ends.  With none left the slot gives its count in *DRIVE-THREADS* back and closes.  A drive's
+   waits pump, so the other slots' drives run meanwhile (never more than the slots at once)."
+  (destructuring-bind (&optional id . rec)
+      (bt:with-lock-held (*drive-threads-lock*)
+        (loop for e = (pop (gethash key *drive-queues*))
+              while e
+              unless (gethash (cons pk (car e)) *drive-inflight*)
+                do (setf (gethash (cons pk (car e)) *drive-inflight*) t)
+                   (remhash (cons pk (car e)) *drive-waiting*)
+                   (return e)))
+    (if (null id)
+        (progn (own:lane-close lane)
+               (bt:with-lock-held (*drive-threads-lock*) (decf (gethash key *drive-threads*))))
+        (unwind-protect
+             ;; a fork DRIVE-DISPUTE-NOW (or another task) is driving is skipped, not waited on
+             (own:with-owner-lock ((drive-lock node rec) :busy nil)
+               (handler-case (funcall *drive-fn* node rec)
+                 (error (e) (note-dispute node id "error: ~a" e))
+                 (own:owner-busy (c) (note-dispute node id "not driven: ~a" c))))
+          (bt:with-lock-held (*drive-threads-lock*)
+            (remhash (cons pk id) *drive-inflight*))
+          (own:lane-push lane :next)))))
+
+(defun start-drive-slot (node pk key)
+  (let ((lane nil))
+    (setf lane (own:make-lane :name "drive-dispute"
+                              :run (lambda (item) (declare (ignore item)) (drive-slot-step node pk key lane))))
+    (own:lane-push lane :next)
+    lane))
 
 (defun drive-load (node)
   "(values owned live waiting): the forks we own, those a watch pass queues for a live slot (not
@@ -4050,7 +4067,7 @@
     (when parallel (ignore-errors (log-stalled-drives node)))
     (if (not parallel)
         (dolist (rec forks)
-          (bt:with-lock-held ((drive-lock node rec))
+          (own:with-owner-lock ((drive-lock node rec) :busy nil)   ; held: being driven now
             (handler-case (drive-dispute node rec)
               (error (e) (note-dispute node (record-id-hex rec) "error: ~a" e)))))
         ;; Dormant forks share one slot, so live disputes always have the rest: three slow
@@ -4088,9 +4105,7 @@
                     for n = (min (- cap (gethash key *drive-threads* 0)) (length (gethash key *drive-queues*)))
                     do (loop repeat (max n 0)
                              do (incf (gethash key *drive-threads* 0)) (push key spawn)))))
-          (dolist (key spawn)
-            (let ((key key))
-              (bt:make-thread (lambda () (drive-worker node pk key)) :name "drive-dispute")))))
+          (dolist (key spawn) (start-drive-slot node pk key))))
     (when rearms (drive-rearms node))))
 
 (defvar *drive-dispute-async* nil
@@ -4106,17 +4121,16 @@
    handler)."
   (let ((lock (drive-lock node fork)))
     (flet ((drive ()
-             (when (bt:acquire-lock lock nil)
-               (unwind-protect (handler-case (drive-dispute node fork)
-                                 (error (e) (note-dispute node (record-id-hex fork) "error: ~a" e)))
-                 (bt:release-lock lock)))))
+             (own:with-owner-lock (lock :busy nil)
+               (handler-case (drive-dispute node fork)
+                 (error (e) (note-dispute node (record-id-hex fork) "error: ~a" e))))))
       (when *drive-dispute-on-enter*
         (if *drive-dispute-async*
-            ;; Off the caller's thread: entering is the worker handling a fraud proof, and a
-            ;; drive can walk the chain for minutes (a confiscation rebuild).  On the worker it
-            ;; held every request behind it: an operator's deposit_open timed out (regtest
-            ;; 2026-10-14).  The thread takes the lock itself (a mutex is released by its owner).
-            (bt:make-thread #'drive :name "drive-dispute-now")
+            ;; Off the caller's lane: entering is the worker handling a fraud proof, and a drive
+            ;; can walk the chain for minutes (a confiscation rebuild).  On the worker it held
+            ;; every request behind it: an operator's deposit_open timed out (regtest 2026-10-14).
+            (let ((lane (own:make-lane :name "drive-dispute-now" :close-when-empty t)))
+              (own:lane-push lane #'drive))
             (drive))))))
 
 (defun watch-pass (node)
@@ -4162,8 +4176,6 @@
 (defvar *vault-watch-stats* (make-hash-table :test #'equalp :synchronized t)
   "node pubkey -> plist :passes :last-ms :max-ms :current-since (universal time, while a pass runs).")
 
-(defvar *vault-watch-locks* (make-hash-table :test #'equalp :synchronized t))
-
 (defun vault-watch-pass (node)
   "One timed DRIVE-VAULT-WATCH, never two at once for a node (its thread and the :vault-watch
    control command).  It has its own thread, not a step of WATCH-PASS: regtest 1120-063204 (40cb3c4)
@@ -4171,11 +4183,9 @@
    watch's turn, and a theft went unreported for the 300 s it had (the re-arm follow cache is in
    memory, so a restart pays the whole first scan again).  A theft proof must not wait on that."
   (let* ((pk (node-pubkey node))
-         (lock (sb-ext:with-locked-hash-table (*vault-watch-locks*)
-                 (or (gethash pk *vault-watch-locks*)
-                     (setf (gethash pk *vault-watch-locks*) (bt:make-lock "vault-watch")))))
          (t0 (get-internal-real-time)))
-    (bt:with-lock-held (lock)
+    ;; held by a pass suspended in a wait: the caller runs it again later (OWN:OWNER-BUSY)
+    (own:with-owner-lock ((list :vault-watch (bytes->hex pk)))
       (setf (getf (gethash pk *vault-watch-stats*) :current-since) (get-universal-time))
       (unwind-protect (drive-vault-watch node)
         (let ((st (alexandria:remove-from-plist (gethash pk *vault-watch-stats*) :current-since))
@@ -4191,18 +4201,19 @@
 
 (defun start-expiry-watch (node &key (interval 60) (vault-interval 30))
   "Start the expiry watch (WATCH-PASS every INTERVAL s) and the vault watch (VAULT-WATCH-PASS every
-   VAULT-INTERVAL s) on threads of their own; return (values expiry-thread vault-thread)."
-  (let ((vault (bt:make-thread (lambda () (loop (sleep vault-interval) (ignore-errors (vault-watch-pass node))))
-                               :name "cld-vault-watch")))
-    (values (bt:make-thread (lambda () (loop (sleep interval) (watch-pass node)))
-                            :name "cld-expiry")
+   VAULT-INTERVAL s), two timers of their own on the owner thread; return (values expiry-timer
+   vault-timer) (OWN:CANCEL-TIMER stops one).  Separate timers, so a watch pass waiting in a step
+   (a drive asking for signatures, bitcoind) does not hold the vault watch back: the wait pumps,
+   and the vault timer runs inside it."
+  (let ((vault (own:every-seconds vault-interval (lambda () (ignore-errors (vault-watch-pass node))) :name "cld-vault-watch")))
+    (values (own:every-seconds interval (lambda () (watch-pass node)) :name "cld-expiry")
             vault)))
 
 (defun start-invoice-poller (node &key (interval 3))
-  (bt:make-thread (lambda () (loop (sleep interval)
-                                   (ignore-errors (credit-paid-invoices node))
-                                   (ignore-errors (settle-pending-payments node))))
-                 :name "cld-invoices"))
+  (own:every-seconds interval (lambda ()
+                                (ignore-errors (credit-paid-invoices node))
+                                (ignore-errors (settle-pending-payments node)))
+                     :name "cld-invoices"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Wallet: a key, a bus, and the requests it can make
@@ -4228,10 +4239,7 @@
          (wt (make-waiter :want 1)))
     (setf (gethash (ev:event-id event) (wallet-pending wal)) wt)
     (bus:bus-publish (wallet-bus wal) event)
-    (bt:with-lock-held ((waiter-lock wt))
-      (loop with deadline = (+ (get-internal-real-time) (* timeout internal-time-units-per-second))
-            until (or (waiter-responses wt) (> (get-internal-real-time) deadline))
-            do (bt:condition-wait (waiter-cv wt) (waiter-lock wt) :timeout 0.2)))
+    (own:wait-until (lambda () (waiter-responses wt)) :timeout timeout :step 0.2)
     (remhash (ev:event-id event) (wallet-pending wal))
     ;; The FIRST response is the answer.  An operator that receives the request twice
     ;; (a relay redelivery) answers twice, and the second answer to a lock is "nonce
@@ -5149,7 +5157,7 @@
           (loop until (>= (height node) created)
                 do (when (> (get-universal-time) deadline)
                      (fail "pledge confirmed at ~a, our chain height is still ~a" created (height node)))
-                   (sleep 0.5)))))))
+                   (own:pause-for 0.5)))))))
 
 (defun record-obligations (node fork)
   "DEP-06: if the disputed ledger had an unresolved DormancyAccept at the fork point and its source
@@ -7221,7 +7229,7 @@
     (unless (find-record node id) (return-from handle-lottery-rearm-sign nil))
     ;; ADVERSARY :slow-rearm-sign SECONDS — testing only: answer after SECONDS, as a voter whose
     ;; worker is behind slow dispute work (signet soak 2026-11-11; redteam/check-rearm-slow.sh).
-    (let ((d (getf (node-adversary node) :slow-rearm-sign))) (when (and (realp d) (plusp d)) (sleep d)))
+    (let ((d (getf (node-adversary node) :slow-rearm-sign))) (when (and (realp d) (plusp d)) (own:pause-for d)))
     (handler-case
         (multiple-value-bind (tx lottery round height) (current-lottery node id)
           (unless (and tx lottery height) (fail "no unclaimed lottery output on chain"))
@@ -8030,7 +8038,7 @@
 (defun repair-replica (node rec)
   "Rebuild REC's state from its history, one update per sequence along the chain, and forget
    the refusal, so catch-up resumes.  For a replica whose state disagrees with a replay."
-  (sb-thread:with-recursive-lock ((record-apply-lock rec))
+  (with-replica-writer (rec)
     (let* ((seen (make-hash-table)) (chain '()))
       (dolist (u (reverse (record-history rec)))
         (unless (gethash (up:update-seq u) seen)
@@ -9081,23 +9089,28 @@
       t)))
 
 (defun kick-proof-catch-up (node id seq)
-  "Catch our replica of ID up to SEQ on a thread of its own (one per ledger at a time), then have
-   the parked proofs judged again: on the main worker when the node runs one, else on that thread.
-   Returns the thread, or NIL when one is already running for ID, or when we are blind to ID on the
-   relays (RELAY-BLIND-P)."
+  "Catch our replica of ID up to SEQ on a lane of its own (one per ledger at a time; OWN:MAKE-LANE),
+   not on the handler's, then have the parked proofs judged again: on the main worker when the node
+   runs one, else on that lane.  Returns the lane, or NIL when one is already running for ID, or
+   when we are blind to ID on the relays (RELAY-BLIND-P)."
   (let ((running (gethash id (node-proof-catch-ups node))))
-    (unless (or (and running (bt:thread-alive-p running)) (relay-blind-p node id))
-      (setf (gethash id (node-proof-catch-ups node))
-            (bt:make-thread
-             (lambda ()
-               (unwind-protect
-                    (let ((r (find-record node id)))
-                      (when r (ignore-errors (catch-up-to node r seq)))
-                      (if (node-worker node)
-                          (enqueue node (lambda () (rejudge-parked-proofs node)))
-                          (ignore-errors (rejudge-parked-proofs node))))
-                 (remhash id (node-proof-catch-ups node))))
-             :name "cld-proof-catch-up")))))
+    (unless (or (own:lane-live-p running) (relay-blind-p node id))
+      (let ((lane (own:make-lane :name "cld-proof-catch-up" :close-when-empty t)))
+        (own:lane-push lane
+                       (lambda ()
+                         (unwind-protect
+                              (let ((r (find-record node id)))
+                                (when r (ignore-errors (catch-up-to node r seq)))
+                                (if (node-worker node)
+                                    (enqueue node (lambda () (rejudge-parked-proofs node)))
+                                    (ignore-errors (rejudge-parked-proofs node))))
+                           (remhash id (node-proof-catch-ups node)))))
+        (setf (gethash id (node-proof-catch-ups node)) lane)))))
+
+(defun stop-node-work (node)
+  "Close the lanes a node started for itself (its proof catch-ups): STOP-NODE."
+  (loop for lane being the hash-values of (node-proof-catch-ups node) do (own:lane-close lane))
+  (clrhash (node-proof-catch-ups node)))
 
 (defun rejudge-parked-proofs (node &optional (now (get-universal-time)))
   "Drop expired parked proofs and judge again every one whose needs our replicas now meet, or
@@ -9439,6 +9452,7 @@
   (let* ((dir (node-data-dir node))
          (log-lock (bt:make-lock "load-log"))
          (files (directory (merge-pathnames "ledger_*.json" dir))))
+    (declare (ignorable log-lock))
     (flet ((load-one (f)
              (handler-case
                  (let* ((first (with-open-file (in f) (read-line in)))
@@ -9450,12 +9464,13 @@
                      (funcall log-fn "loaded ~a (~a)" (file-namestring f)
                               (cond ((and fork-op (record-owned-p rec)) "our fork") (fork-op "their fork") (owned "ours") (t "replica")))))
                (error (e) (bt:with-lock-held (log-lock) (funcall log-fn "could not load ~a: ~a" f e))))))
-      ;; Bases, then forks (a fork is built from its base), each set in parallel:
-      ;; the files are independent and a restart waited on them one at a time.
+      ;; Bases, then forks (a fork is built from its base).  On the owner thread, one file at a
+      ;; time: a record is the node's, and only the owner may make what the node holds (on modus
+      ;; a loading thread could not store its record into the node's ledgers table).  They loaded
+      ;; in parallel before, one thread per file.
       (dolist (set (list (remove-if (lambda (f) (search "_fork_" (file-namestring f))) files)
                          (remove-if-not (lambda (f) (search "_fork_" (file-namestring f))) files)))
-        (mapc #'bt:join-thread
-              (mapcar (lambda (f) (bt:make-thread (lambda () (load-one f)) :name "cld-load")) set))))
+        (mapc #'load-one set)))
     (dolist (f (directory (merge-pathnames "reveals_*.json" dir)))
       (let* ((prefix (subseq (pathname-name f) 8))
              (id (loop for k being the hash-keys of (node-ledgers node) when (and (>= (length k) 16) (string= prefix (subseq k 0 16))) return k)))
